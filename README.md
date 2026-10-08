@@ -189,6 +189,52 @@ Open source, actively developed, and built for anyone who values control over th
 
 ---
 
+## Standalone build and assistant-history checks
+
+Use Node.js 24.16.0, npm 11.13.0 (the declared `packageManager`), and Git. Run these
+commands from this repository's root; no sibling checkout or parent build scripts are required.
+Keep npm lifecycle scripts enabled so a Git-installed `@librechat/agents` can build its declared
+exports during `prepare`.
+
+The assistant-history capability uses the public `zoran/LibreChat-agents` SDK fork at commit
+`a2ccbc528f52821bcce150dbbe7813523945adaa`, pinned in `api/package.json` and the root
+`package-lock.json`. Use the declared dependency and lock together. npm builds the Git dependency
+through its own `prepare` script; no local SDK tarball or generated `dist` directory is required.
+This source pin does not replace application and model acceptance for the capability.
+
+Install and build the application:
+
+```sh
+npm ci --no-audit
+npm run frontend
+```
+
+Both Dockerfiles build from this checkout and include Git for the SDK dependency. The shared
+base in `Dockerfile.multi` also supplies Git to its production-only dependency install:
+
+```sh
+docker build -f Dockerfile -t librechat:local .
+docker build -f Dockerfile.multi -t librechat:local-multi .
+```
+
+Run the focused history tests after building the workspace packages. Typecheck the changed
+TypeScript workspaces separately because a bundle build alone does not check their types:
+
+```sh
+npm run test:ci --workspace=librechat-data-provider -- --runInBand --runTestsByPath src/config.spec.ts
+npm run test:ci --workspace=@librechat/api -- --runInBand --runTestsByPath src/agents/completeAssistantHistory.spec.ts src/agents/__tests__/initialize.test.ts src/endpoints/openai/config.spec.ts
+npm run test:ci --workspace=@librechat/backend -- --runInBand --runTestsByPath server/controllers/agents/__tests__/client.completeAssistantHistory.spec.js
+npm exec --workspace=librechat-data-provider -- tsc --noEmit
+npm exec --workspace=@librechat/api -- tsc --noEmit
+```
+
+The optional custom-endpoint setting `customParams.preserveAssistantHistory: true` preserves
+complete assistant history through a compatible Chat Completions SDK. It currently requires a
+single agent; graphs, child agents, handoffs, and the Responses API are rejected. Omitting the
+setting or setting it to `false` retains the existing behavior. The setting is a client capability,
+not a model request parameter. The focused tests cover this contract; actual provider and
+application acceptance still require an integration check with the selected SDK and model.
+
 ## 🌐 Resources
 
 **GitHub Repo:**

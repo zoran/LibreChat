@@ -68,6 +68,7 @@ export interface InitializedAgentContextSource {
   toolRegistryDefinitions?: readonly object[];
   tool_options?: object;
   execution?: object;
+  preserveAssistantHistory?: boolean;
   manualSkillPrimes?: readonly {
     _id: { toString(): string } | string;
     name: string;
@@ -324,7 +325,10 @@ export function createInitializedAgentContextFingerprint(input: {
       toolDefinitions: agent.toolDefinitions,
       toolRegistryDefinitions: agent.toolRegistryDefinitions,
       toolOptions: agent.tool_options,
-      execution: agent.execution,
+      execution:
+        agent.preserveAssistantHistory === true
+          ? { ...agent.execution, preserveAssistantHistory: true }
+          : agent.execution,
       skills:
         index === 0
           ? [...skillIdentities(agent), ...(input.invokedSkills ?? [])]

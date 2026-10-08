@@ -220,9 +220,17 @@ export function getOpenAIConfig(
    */
   if (
     options.customParams?.includeReasoningContent === true ||
-    options.customParams?.includeReasoningHistory === true
+    options.customParams?.includeReasoningHistory === true ||
+    options.customParams?.preserveAssistantHistory === true
   ) {
     llmConfig.includeReasoningContent = true;
+  }
+
+  if (options.customParams?.preserveAssistantHistory === true) {
+    if (llmConfig.useResponsesApi === true) {
+      throw new Error('Complete assistant history requires Chat Completions.');
+    }
+    llmConfig.preserveAssistantHistory = true;
   }
 
   const configOptions: t.OpenAIConfiguration = {};

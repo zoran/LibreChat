@@ -693,6 +693,8 @@ export type InitializedAgent = Agent & {
   reasoningKey?: ReasoningResponseKey;
   /** Whether to reconstruct `reasoning_content` from persisted history across turns (custom endpoint opt-in). */
   includeReasoningHistory?: boolean;
+  /** Explicit singleton-only complete assistant-history capability. */
+  preserveAssistantHistory?: boolean;
   /**
    * Whether the code-execution environment is available *for this agent*.
    * Narrower than the incoming `params.codeEnvAvailable` admin flag — this
@@ -1300,6 +1302,9 @@ export async function initializeAgent(
     provider,
     appConfig,
   });
+  if (customEndpointConfig?.customParams?.preserveAssistantHistory === true && !isInitialAgent) {
+    throw new Error('Complete assistant history cannot initialize a child or handoff agent.');
+  }
   if (overrideProvider !== agent.provider) {
     agent.provider = overrideProvider;
   }
@@ -2519,6 +2524,9 @@ export async function initializeAgent(
     codeExecutionContext: trustedCodeExecutionContext,
     reasoningKey: customEndpointConfig?.customParams?.reasoningKey,
     includeReasoningHistory: customEndpointConfig?.customParams?.includeReasoningHistory,
+    ...(customEndpointConfig?.customParams?.preserveAssistantHistory === true
+      ? { preserveAssistantHistory: true }
+      : {}),
     skillAuthoringAvailable,
     fileAuthoringToolNames: fileAuthoringToolNames.size > 0 ? fileAuthoringToolNames : undefined,
     skillCount,

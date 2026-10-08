@@ -1771,6 +1771,8 @@ export const endpointSchema = baseEndpointSchema.merge(
         includeReasoningContent: z.boolean().optional(),
         /** Also reconstructs `reasoning_content` from persisted history across turns (implies `includeReasoningContent`). */
         includeReasoningHistory: z.boolean().optional(),
+        /** Complete assistant history; admitted only for a single compatible endpoint. */
+        preserveAssistantHistory: z.boolean().optional(),
         paramDefinitions: z.array(paramDefinitionSchema).optional(),
       })
       .strict()

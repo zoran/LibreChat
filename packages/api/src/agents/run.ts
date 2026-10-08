@@ -407,12 +407,13 @@ export function shouldReplayReasoningContent(
     model?: string | null;
     model_parameters?: { model?: string | null } | null;
     includeReasoningHistory?: boolean | null;
+    preserveAssistantHistory?: boolean | null;
   } | null,
 ): boolean {
   if (agent == null) {
     return false;
   }
-  if (agent.includeReasoningHistory === true) {
+  if (agent.includeReasoningHistory === true || agent.preserveAssistantHistory === true) {
     return true;
   }
   return isDeepSeekReasoningProvider(agent.provider, agent.model_parameters?.model ?? agent.model);
@@ -469,6 +470,7 @@ type RunAgent = Omit<Agent, 'tools'> & {
   reasoningKey?: ReasoningResponseKey;
   /** Whether to reconstruct `reasoning_content` from persisted history across turns. */
   includeReasoningHistory?: boolean;
+  preserveAssistantHistory?: boolean;
   /**
    * Maximum characters allowed in a single tool result before truncation.
    * Overrides the default computed from maxContextTokens.
@@ -510,6 +512,7 @@ type LazySubagentAgent = Pick<
   | 'codeSessionKey'
   | 'skillAuthoringAvailable'
   | 'includeReasoningHistory'
+  | 'preserveAssistantHistory'
   | 'mcpToolAliases'
 > & {
   configId: string;
@@ -533,6 +536,7 @@ type SubagentTreeNode = Pick<
   | 'codeSessionKey'
   | 'skillAuthoringAvailable'
   | 'includeReasoningHistory'
+  | 'preserveAssistantHistory'
   | 'mcpToolAliases'
 > & {
   subagentAgentConfigs?: SubagentTreeNode[];
@@ -1796,6 +1800,43 @@ export function isAskUserQuestionAdminDisabled(appConfig?: AppConfig): boolean {
   return appConfig?.filteredTools?.includes(ASK_USER_QUESTION_TOOL_NAME) === true;
 }
 
+/** Complete history is currently a singleton capability, never a graph-wide projection.
+ * Lazy descriptors are inspected without resolving tools or executing provider code. */
+export function assertCompleteAssistantHistorySingleton(
+  agents: Array<RunAgent | null | undefined>,
+  isSubagent = false,
+): boolean {
+  const roots = agents.filter((agent): agent is RunAgent => agent != null);
+  const pending: Array<SubagentTreeNode | null | undefined> = [...roots];
+  const visited = new Set<SubagentTreeNode>();
+  let requested = false;
+  let graph = isSubagent || roots.length !== 1;
+  for (let index = 0; index < pending.length; index++) {
+    const node = pending[index];
+    if (node == null || visited.has(node)) {
+      continue;
+    }
+    visited.add(node);
+    const agent = node as RunAgent & SubagentTreeNode;
+    requested ||= agent.preserveAssistantHistory === true;
+    graph ||=
+      (agent.edges?.length ?? 0) > 0 ||
+      agent.subagents?.enabled === true ||
+      (agent.subagents?.agent_ids?.length ?? 0) > 0 ||
+      (agent.subagents?.graphs?.length ?? 0) > 0 ||
+      (agent.subagentAgentConfigs?.length ?? 0) > 0 ||
+      (agent.lazySubagentConfigs?.length ?? 0) > 0 ||
+      (agent.subagentGraphConfigs?.length ?? 0) > 0 ||
+      (agent.subagentGraphMemberMetadata?.length ?? 0) > 0;
+    // Object identity avoids losing a capability on a second descriptor of the same agent ID.
+    enqueueSubagentChildren(agent, pending, new Set<string>());
+  }
+  if (requested && graph) {
+    throw new Error('Complete assistant history supports one endpoint without agent graphs.');
+  }
+  return requested;
+}
+
 /**
  * Whether any agent reachable in the run — primary, handoff/parallel, or a
  * nested subagent — opts into cross-turn `reasoning_content` reconstruction.
@@ -2267,6 +2308,7 @@ export async function createRun({
   RunConfig,
   'tokenCounter' | 'customHandlers' | 'indexTokenCountMap' | 'initialSessions'
 >): Promise<Run<IState>> {
+  assertCompleteAssistantHistorySingleton(agents);
   const resolvedRunId = runId ?? randomUUID();
   const runFilesActive =
     runFiles?.activate(
@@ -2321,6 +2363,7 @@ export async function createRun({
 
   const buildAgentInput = (agent: RunAgent, opts: { isSubagent?: boolean } = {}): AgentInputs => {
     const isSubagent = opts.isSubagent === true;
+    assertCompleteAssistantHistorySingleton([agent], isSubagent);
     if (runFilesActive) {
       for (const { memberConfigs } of agent.subagentGraphConfigs ?? []) {
         const deliveryTargets = new Set(

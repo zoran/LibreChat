@@ -5107,3 +5107,56 @@ describe('initializeAgent turn delivery routing', () => {
     expect(filesOrder).toBeLessThan(toolsOrder);
   });
 });
+
+describe('initializeAgent complete assistant history', () => {
+  beforeEach(() => jest.clearAllMocks());
+  it.each([undefined, false, true])(
+    'projects only explicit true from endpoint config (%s)',
+    async (value) => {
+      const { agent, req, res, loadTools, db } = createMocks({ provider: 'Synthetic' });
+      mockGetProviderConfig.mockReturnValue({
+        overrideProvider: Providers.OPENAI,
+        getOptions: jest.fn().mockResolvedValue({ llmConfig: { model: 'test-model' } }),
+        customEndpointConfig: { customParams: { preserveAssistantHistory: value } },
+      });
+      const result = await initializeAgent(
+        {
+          req,
+          res,
+          agent,
+          loadTools,
+          endpointOption: { endpoint: EModelEndpoint.agents },
+          allowedProviders: new Set(['Synthetic']),
+          isInitialAgent: true,
+        },
+        db,
+      );
+      expect(result.preserveAssistantHistory).toBe(value === true ? true : undefined);
+    },
+  );
+  it('rejects opt-in during child initialization before client or tools setup', async () => {
+    const { agent, req, res, loadTools, db } = createMocks({ provider: 'Synthetic' });
+    const getOptions = jest.fn();
+    mockGetProviderConfig.mockReturnValue({
+      overrideProvider: Providers.OPENAI,
+      getOptions,
+      customEndpointConfig: { customParams: { preserveAssistantHistory: true } },
+    });
+    await expect(
+      initializeAgent(
+        {
+          req,
+          res,
+          agent,
+          loadTools,
+          endpointOption: { endpoint: EModelEndpoint.agents },
+          allowedProviders: new Set(['Synthetic']),
+          isInitialAgent: false,
+        },
+        db,
+      ),
+    ).rejects.toThrow('child or handoff');
+    expect(getOptions).not.toHaveBeenCalled();
+    expect(loadTools).not.toHaveBeenCalled();
+  });
+});

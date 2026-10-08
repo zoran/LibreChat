@@ -35,6 +35,7 @@ const {
   priorRunOutputTokens,
   createSubagentUsageSink,
   anyAgentReplaysReasoningContent,
+  assertCompleteAssistantHistorySingleton,
   GenerationJobManager,
   PENDING_ACTION_EXPIRED_CODE,
   getTransactionsConfig,
@@ -661,6 +662,10 @@ class AgentClient extends BaseClient {
       usageEmitSink?.filter((event) => event?.usage_type === 'subagent').length ?? 0;
     /** @type {AgentClientOptions} */
     this.options = Object.assign({ endpoint: options.endpoint }, clientOptions);
+    assertCompleteAssistantHistorySingleton([
+      this.options.agent,
+      ...(this.agentConfigs?.values() ?? []),
+    ]);
     if (
       this.options.req?._isAgentTrigger === true &&
       this.options.req?._agentEventBindingParentConversationId != null
@@ -675,6 +680,7 @@ class AgentClient extends BaseClient {
         instructions: agent.instructions,
         additional_instructions: agent.additional_instructions,
         model_parameters: JSON.parse(JSON.stringify(agent.model_parameters ?? {})),
+        ...(agent.preserveAssistantHistory === true ? { preserveAssistantHistory: true } : {}),
         toolDefinitions: JSON.parse(JSON.stringify(agent.toolDefinitions ?? [])),
         toolRegistryDefinitions: JSON.parse(
           JSON.stringify(
@@ -4639,7 +4645,12 @@ class AgentClient extends BaseClient {
         this.options.agent,
         ...(this.agentConfigs?.values() ?? []),
       ]);
+      const completeAssistantHistory = assertCompleteAssistantHistorySingleton([
+        this.options.agent,
+        ...(this.agentConfigs?.values() ?? []),
+      ]);
       const messageFormatOptions = {
+        ...(completeAssistantHistory ? { preserveAssistantHistory: true } : {}),
         ...(needsReasoningContentFormat ? { preserveReasoningContent: true } : {}),
         ...(freshSkillPrimeNames.size > 0 ? { skipSkillBodyNames: freshSkillPrimeNames } : {}),
         ...(useLegacyContent ? { legacyContent: true } : {}),

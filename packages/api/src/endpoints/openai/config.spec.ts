@@ -2247,3 +2247,31 @@ describe('Grok 4.7 xAI configuration', () => {
     expect(result.llmConfig.modelKwargs?.reasoning_effort).toBeUndefined();
   });
 });
+
+describe('complete assistant-history client capability', () => {
+  it.each([undefined, false, true])('keeps opt-in %s outside modelKwargs', (value) => {
+    const result = getOpenAIConfig(
+      'synthetic-only',
+      {
+        customParams: { preserveAssistantHistory: value },
+        modelOptions: { model: 'synthetic-k3' },
+      },
+      'custom-endpoint',
+    );
+    expect(result.llmConfig.preserveAssistantHistory).toBe(value === true ? true : undefined);
+    expect(result.llmConfig.modelKwargs ?? {}).not.toHaveProperty('preserveAssistantHistory');
+    if (value === true) expect(result.llmConfig.includeReasoningContent).toBe(true);
+  });
+  it('rejects an unsupported Responses route', () => {
+    expect(() =>
+      getOpenAIConfig(
+        'synthetic-only',
+        {
+          customParams: { preserveAssistantHistory: true },
+          modelOptions: { model: 'synthetic-k3', useResponsesApi: true },
+        },
+        'custom-endpoint',
+      ),
+    ).toThrow('Chat Completions');
+  });
+});

@@ -38,6 +38,7 @@ export type OAIClientOptions = Omit<OpenAIClientOptions, 'verbosity'> & {
   include_reasoning?: boolean;
   /** Replays `reasoning_content` on tool-bearing turns (DeepSeek thinking-mode, #13366). */
   includeReasoningContent?: boolean;
+  preserveAssistantHistory?: boolean;
   promptCache?: boolean;
   promptCacheTtl?: '5m' | '1h';
   /**

@@ -687,6 +687,7 @@ export type TConfig = {
     reasoningFormat?: ReasoningParameterFormat;
     reasoningKey?: ReasoningResponseKey;
     includeReasoningContent?: boolean;
+    preserveAssistantHistory?: boolean;
     includeReasoningHistory?: boolean;
     paramDefinitions?: Partial<SettingDefinition>[];
   };

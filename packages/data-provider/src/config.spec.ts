@@ -1990,3 +1990,41 @@ describe('MCP UI refresh configuration', () => {
     ).toBe(false);
   });
 });
+
+describe('complete assistant history schema', () => {
+  it.each([undefined, false, true])('accepts only an optional Boolean %s', (value) => {
+    const result = configSchema.parse({
+      version: '1.3.1',
+      endpoints: {
+        custom: [
+          {
+            name: 'Synthetic',
+            apiKey: 'synthetic-only',
+            baseURL: 'http://localhost:1',
+            models: { default: ['synthetic-k3'] },
+            customParams: { preserveAssistantHistory: value },
+          },
+        ],
+      },
+    });
+    expect(result.endpoints?.custom?.[0].customParams?.preserveAssistantHistory).toBe(value);
+  });
+  it('rejects string capability values', () => {
+    expect(() =>
+      configSchema.parse({
+        version: '1.3.1',
+        endpoints: {
+          custom: [
+            {
+              name: 'Synthetic',
+              apiKey: 'synthetic-only',
+              baseURL: 'http://localhost:1',
+              models: { default: ['synthetic-k3'] },
+              customParams: { preserveAssistantHistory: 'true' },
+            },
+          ],
+        },
+      }),
+    ).toThrow();
+  });
+});
