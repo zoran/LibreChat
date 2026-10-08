@@ -1,4 +1,6 @@
 import type { RoleMethods, RoleDeps } from './role';
+import { createBrowserMethods, type BrowserMethods } from './browser';
+export type { BrowserIdentity, BrowserUser, BrowserMethods } from './browser';
 import {
   createOpenIDRefreshFlightMethods,
   type OpenIDRefreshFlightMethods,
@@ -226,6 +228,7 @@ export {
 };
 
 export type AllMethods = UserMethods &
+  BrowserMethods &
   SessionMethods &
   TokenMethods &
   RefreshTokenBridgeMethods &
@@ -456,6 +459,7 @@ export function createMethods(
   const agentMethods = createAgentMethods(mongoose, agentDeps);
   return {
     ...createUserMethods(mongoose, { getCache: deps.getCache }),
+    ...createBrowserMethods(mongoose),
     ...createSessionMethods(mongoose),
     ...createTokenMethods(mongoose),
     ...createRefreshTokenBridgeMethods(mongoose),

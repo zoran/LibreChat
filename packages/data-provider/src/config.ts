@@ -2513,6 +2513,8 @@ export type StartupConfigContext = 'share';
 export type EndpointsDropParamsMap = Record<string, string[] | Record<string, string[]>>;
 
 export type TStartupConfig = {
+  /** Optional browser identity; never enables registration or administrative login. */
+  browserSessionEnabled?: boolean;
   appTitle: string;
   socialLogins?: string[];
   langfuseFanoutEnabled?: boolean;
@@ -3213,6 +3215,14 @@ export const configSchema = z.object({
     .optional(),
   registration: z
     .object({
+      browserSession: z
+        .object({
+          enabled: z.boolean().default(false),
+          maxAgeSeconds: z.number().int().min(60).max(31_536_000).default(15_552_000),
+          /** New browser enrollments per trusted client IP per hour; tune for source NAT. */
+          enrollmentMax: z.number().int().min(1).max(100_000).default(100),
+        })
+        .optional(),
       socialLogins: z.array(z.string()).optional(),
       allowedDomains: z.array(z.string()).optional(),
       /** Milliseconds a started social login may take to reach its callback; defaults to `DEFAULT_OAUTH_STATE_TTL_MS`. */

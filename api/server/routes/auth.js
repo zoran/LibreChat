@@ -1,5 +1,8 @@
 const express = require('express');
+const { getTenantId, DEFAULT_SESSION_EXPIRY } = require('@librechat/data-schemas');
 const {
+  createBrowserAuth,
+  math,
   limiterCache,
   createSetBalanceConfig,
   createTwoFactorManagementLimiter,
@@ -23,6 +26,7 @@ const { verify2FAWithTempToken } = require('~/server/controllers/auth/TwoFactorA
 const { logoutController } = require('~/server/controllers/auth/LogoutController');
 const { loginController } = require('~/server/controllers/auth/LoginController');
 const { findBalanceByUser, upsertBalanceFields } = require('~/models');
+const browserMethods = require('~/models');
 const { getAppConfig } = require('~/server/services/Config');
 const middleware = require('~/server/middleware');
 
@@ -33,6 +37,15 @@ const setBalanceConfig = createSetBalanceConfig({
 });
 
 const router = express.Router();
+const browserAuth = createBrowserAuth({
+  ...browserMethods,
+  getAppConfig: () => getAppConfig({ baseOnly: true }),
+  getTenantId,
+  origin: process.env.DOMAIN_CLIENT,
+  store: limiterCache('browser_enrollment_limiter'),
+  mintToken: (user) =>
+    browserMethods.generateToken(user, math(process.env.SESSION_EXPIRY, DEFAULT_SESSION_EXPIRY)),
+});
 const twoFactorManagementLimiter = createTwoFactorManagementLimiter({
   getAppConfig: () => getAppConfig({ baseOnly: true }),
   store: limiterCache('two_factor_management_user_limiter'),
@@ -48,7 +61,7 @@ const getCloudFrontAuthCookieRefreshResult = (req, res) => {
 
 const ldapAuth = !!process.env.LDAP_URL && !!process.env.LDAP_USER_SEARCH_BASE;
 //Local
-router.post('/logout', middleware.requireJwtAuth, logoutController);
+router.post('/logout', middleware.requireJwtAuth, browserAuth.forget, logoutController);
 router.post(
   '/login',
   middleware.logHeaders,
@@ -60,7 +73,9 @@ router.post(
   setBalanceConfig,
   loginController,
 );
-router.post('/refresh', refreshController);
+router.post('/refresh', browserAuth.refresh, refreshController);
+router.post('/browser', middleware.checkBan, browserAuth.bootstrap);
+router.post('/browser/reset', browserAuth.reset);
 router.post('/cloudfront/refresh', middleware.requireJwtAuth, (req, res) => {
   const result = getCloudFrontAuthCookieRefreshResult(req, res);
   if (!result.enabled) {

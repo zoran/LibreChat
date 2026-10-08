@@ -2,6 +2,11 @@
 import axios from 'axios';
 import type { AxiosRequestConfig, AxiosResponse } from 'axios';
 import type * as t from './types';
+import {
+  notifyBrowserSessionFailure,
+  BrowserSessionError,
+  BROWSER_SESSION_MARKER,
+} from './browser';
 import { setTokenHeader } from './headers-helpers';
 import * as endpoints from './api-endpoints';
 
@@ -84,6 +89,27 @@ type AuthRecoveryWindow = Window & {
 
 const refreshToken = (retry?: boolean): Promise<t.TRefreshTokenResponse | undefined> =>
   _post(endpoints.refreshToken(retry));
+
+const enrollBrowser = async (): Promise<t.TRefreshTokenResponse> => {
+  const response = await axios.post(
+    endpoints.browserSession(),
+    {},
+    {
+      headers: { 'Content-Type': 'application/json', 'X-LibreChat-Browser': '1' },
+    },
+  );
+  return response.data;
+};
+
+const resetBrowser = async (): Promise<void> => {
+  await axios.post(
+    endpoints.browserSession(true),
+    {},
+    {
+      headers: { 'Content-Type': 'application/json', 'X-LibreChat-Browser': '1' },
+    },
+  );
+};
 
 const SHARE_PAGE_PATH_REGEX = /^\/share\/[^/]+\/?$/;
 const SHARED_MESSAGES_PATH_REGEX = /^\/api\/share\/[^/]+$/;
@@ -214,6 +240,12 @@ const startAuthRecovery = (retryRefresh?: boolean) => {
     .then((response) => {
       const token = response?.token ?? '';
       if (!token) {
+        if (
+          typeof window !== 'undefined' &&
+          localStorage.getItem(BROWSER_SESSION_MARKER) === 'active'
+        ) {
+          throw new BrowserSessionError('BROWSER_SESSION_EXPIRED');
+        }
         return null;
       }
       dispatchTokenUpdatedEvent(token);
@@ -324,8 +356,10 @@ async function _authenticatedFetch(url: string, options?: RequestInit): Promise<
   let refreshedToken: string | null;
   try {
     refreshedToken = await startAuthRecovery(false);
-  } catch {
-    redirectToLoginOnce();
+  } catch (error) {
+    if (!notifyBrowserSessionFailure(error)) {
+      redirectToLoginOnce();
+    }
     return response;
   }
 
@@ -359,6 +393,9 @@ if (typeof window !== 'undefined') {
       }
 
       const isRefreshRequest = originalRequest.url?.includes('/api/auth/refresh') === true;
+      if (notifyBrowserSessionFailure(error)) {
+        return Promise.reject(error);
+      }
       if (isAuthRecoveryEndpoint(originalRequest.url) && !isRefreshRequest) {
         return Promise.reject(error);
       }
@@ -405,11 +442,13 @@ if (typeof window !== 'undefined') {
 
           redirectToLoginOnce();
           return Promise.reject(error);
-        } catch {
+        } catch (refreshError) {
           /** A rejected refresh (stale/invalid session → 401/403) must route to
            *  login just like an empty-token refresh, otherwise the original 401
            *  surfaces to the caller (e.g. the share fork button) with no redirect. */
-          redirectToLoginOnce();
+          if (!notifyBrowserSessionFailure(refreshError)) {
+            redirectToLoginOnce();
+          }
           return Promise.reject(error);
         }
       }
@@ -420,6 +459,8 @@ if (typeof window !== 'undefined') {
 }
 
 export default {
+  enrollBrowser,
+  resetBrowser,
   get: _get,
   getResponse: _getResponse,
   post: _post,

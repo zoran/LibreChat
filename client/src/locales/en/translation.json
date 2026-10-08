@@ -3057,5 +3057,12 @@
   "com_insights_invalid_date_range": "Choose an end date after the start date, within {{days}} days.",
   "com_insights_sparkline_accessibility": "{{label}} over time",
   "com_nav_mobile_drawer_strip": "Show chat beside the sidebar on mobile",
-  "com_nav_mobile_drawer_strip_info": "The sidebar stops short of the edge so a strip of the conversation stays visible. Tapping it closes the sidebar."
+  "com_nav_mobile_drawer_strip_info": "The sidebar stops short of the edge so a strip of the conversation stays visible. Tapping it closes the sidebar.",
+  "com_auth_browser_title": "Browser workspace",
+  "com_auth_browser_expired": "This browser can no longer open the previous workspace. You can start a new one. This does not delete the previous conversations.",
+  "com_auth_browser_unavailable": "Your workspace could not be opened. Try again. If this continues, contact your administrator.",
+  "com_auth_browser_new": "Start a new workspace",
+  "com_auth_browser_forget": "Forget browser access",
+  "com_auth_browser_forget_confirm": "This browser will lose access to its workspace. The conversations will remain stored and cannot be restored here. Continue?",
+  "com_auth_browser_unsupported": "Automatic access is not supported by this browser or its settings. Contact your administrator."
 }

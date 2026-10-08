@@ -8,8 +8,9 @@ import {
   createContext,
 } from 'react';
 import { debounce } from 'lodash';
-import { getDefaultStore } from 'jotai';
 import { useNavigate } from 'react-router-dom';
+import { getDefaultStore, useAtom } from 'jotai';
+import { useQueryClient } from '@tanstack/react-query';
 import { useRecoilState, useSetRecoilState } from 'recoil';
 import {
   apiBaseUrl,
@@ -18,6 +19,13 @@ import {
   setTokenHeader,
   isSystemRoleName,
   buildLoginRedirectUrl,
+  dataService,
+  request,
+  enrollBrowserSession,
+  isBrowserSessionEntry,
+  browserSessionErrorCode,
+  BROWSER_SESSION_MARKER,
+  BROWSER_SESSION_EVENT,
 } from 'librechat-data-provider';
 import type * as t from 'librechat-data-provider';
 import type { ReactNode } from 'react';
@@ -37,8 +45,10 @@ import {
   useLogoutUserMutation,
   useRefreshTokenMutation,
 } from '~/data-provider';
+import BrowserSession, { browserSessionState } from '~/components/Auth/BrowserSession';
 import { resetChatFilterSessionAtom } from '~/components/Conversations/chatFilters';
 import { TAuthConfig, TUserContext, TAuthContext, TResError } from '~/common';
+import useClearStates from '~/hooks/Config/useClearStates';
 import useTimeout from './useTimeout';
 import store from '~/store';
 
@@ -68,6 +78,17 @@ const AuthContextProvider = ({
   children: ReactNode;
 }) => {
   const isExternalRedirectRef = useRef(false);
+  const queryClient = useQueryClient();
+  const clearStates = useClearStates();
+  const [browserState, setBrowserStateAtom] = useAtom(browserSessionState);
+  const browserStateRef = useRef<string | null>(null);
+  const setBrowserState = useCallback(
+    (value: string | null) => {
+      browserStateRef.current = value;
+      setBrowserStateAtom(value);
+    },
+    [setBrowserStateAtom],
+  );
   const [user, setUser] = useRecoilState(store.user);
   const logoutRedirectRef = useRef<string | undefined>(undefined);
   const [token, setToken] = useState<string | undefined>(undefined);
@@ -143,6 +164,7 @@ const AuthContextProvider = ({
         navigate(`/login/2fa?tempToken=${tempToken}`, { replace: true });
         return;
       }
+      setBrowserState(null);
       setError(undefined);
       setUserContext({ token, isAuthenticated: true, user, redirect: '/c/new' });
     },
@@ -197,12 +219,39 @@ const AuthContextProvider = ({
 
   const logout = useCallback(
     (redirect?: string) => {
+      if (user?.provider === 'browser') {
+        void request
+          .resetBrowser()
+          .then(async () => {
+            localStorage.setItem(BROWSER_SESSION_MARKER, 'paused');
+            setTokenHeader(undefined);
+            setQueriesEnabled(false);
+            endSessionClientState();
+            await queryClient.cancelQueries();
+            await clearStates();
+            queryClient.removeQueries();
+            setBrowserState('BROWSER_SESSION_FORGOTTEN');
+            setUserContext({ token: undefined, user: undefined, isAuthenticated: false });
+          })
+          .catch(() => {
+            setBrowserState('BROWSER_SESSION_UNAVAILABLE');
+          });
+        return;
+      }
       if (redirect) {
         logoutRedirectRef.current = redirect;
       }
       logoutUser.mutate(undefined);
     },
-    [logoutUser],
+    [
+      logoutUser,
+      user?.provider,
+      queryClient,
+      clearStates,
+      setQueriesEnabled,
+      setUserContext,
+      setBrowserState,
+    ],
   );
 
   const userQuery = useGetUserQuery({ enabled: !!(token ?? '') });
@@ -212,6 +261,9 @@ const AuthContextProvider = ({
   };
 
   const silentRefresh = useCallback(() => {
+    if (browserStateRef.current && isBrowserSessionEntry(window.location.pathname, apiBaseUrl())) {
+      return;
+    }
     if (authConfig?.test === true) {
       return;
     }
@@ -219,12 +271,37 @@ const AuthContextProvider = ({
       return;
     }
     refreshToken.mutate(undefined, {
-      onSuccess: (data: t.TRefreshTokenResponse | undefined) => {
+      onSuccess: async (data: t.TRefreshTokenResponse | undefined) => {
         if (isExternalRedirectRef.current) {
           return;
         }
+        if (
+          !data?.token &&
+          authConfig?.optional !== true &&
+          isBrowserSessionEntry(window.location.pathname, apiBaseUrl())
+        ) {
+          try {
+            const config = await queryClient.fetchQuery({
+              queryKey: ['startupConfig', false, 'default'],
+              queryFn: () => dataService.getStartupConfig(),
+            });
+            if (config.browserSessionEnabled) {
+              setBrowserState('busy');
+              data = await enrollBrowserSession({
+                refresh: request.refreshToken,
+                enroll: request.enrollBrowser,
+              });
+              setBrowserState(null);
+            }
+          } catch (error) {
+            setBrowserState(browserSessionErrorCode(error) ?? 'BROWSER_SESSION_UNAVAILABLE');
+            setIsAuthReady(true);
+            return;
+          }
+        }
         const { user, token = '' } = data ?? {};
         if (token) {
+          setBrowserState(null);
           const storedRedirect = readStoredRedirect();
           dropStoredRedirect();
           const baseUrl = apiBaseUrl();
@@ -254,6 +331,12 @@ const AuthContextProvider = ({
         if (isExternalRedirectRef.current) {
           return;
         }
+        const browserCode = browserSessionErrorCode(error);
+        if (browserCode) {
+          setBrowserState(browserCode);
+          setIsAuthReady(true);
+          return;
+        }
         console.log('refreshToken mutation error:', error);
         endSessionClientState();
         setIsAuthReady(true);
@@ -269,12 +352,65 @@ const AuthContextProvider = ({
   }, []);
 
   useEffect(() => {
+    if (authConfig?.optional === true) {
+      return;
+    }
+    const recovery = (event: Event) => {
+      setBrowserState((event as CustomEvent<string>).detail);
+      setQueriesEnabled(false);
+    };
+    const changed = (event: StorageEvent) => {
+      if (
+        event.key !== BROWSER_SESSION_MARKER ||
+        event.newValue !== 'paused' ||
+        user?.provider !== 'browser'
+      ) {
+        return;
+      }
+      setTokenHeader(undefined);
+      setQueriesEnabled(false);
+      endSessionClientState();
+      setBrowserState('BROWSER_SESSION_FORGOTTEN');
+      setUserContext({ token: undefined, user: undefined, isAuthenticated: false });
+      void queryClient.cancelQueries().then(async () => {
+        await clearStates();
+        queryClient.removeQueries();
+      });
+    };
+    window.addEventListener(BROWSER_SESSION_EVENT, recovery);
+    window.addEventListener('storage', changed);
+    return () => {
+      window.removeEventListener(BROWSER_SESSION_EVENT, recovery);
+      window.removeEventListener('storage', changed);
+    };
+  }, [
+    authConfig?.optional,
+    user?.provider,
+    clearStates,
+    queryClient,
+    setBrowserState,
+    setQueriesEnabled,
+    setUserContext,
+  ]);
+
+  useEffect(() => {
     if (isExternalRedirectRef.current) {
       return;
     }
     if (userQuery.data) {
       setUser(userQuery.data);
     } else if (userQuery.isError) {
+      const browserCode = browserSessionErrorCode(userQuery.error);
+      if (
+        authConfig?.optional !== true &&
+        isBrowserSessionEntry(window.location.pathname, apiBaseUrl()) &&
+        (browserCode || user?.provider === 'browser')
+      ) {
+        setBrowserState(browserCode ?? browserStateRef.current ?? 'BROWSER_SESSION_UNAVAILABLE');
+        setQueriesEnabled(false);
+        setIsAuthReady(true);
+        return;
+      }
       endSessionClientState();
       doSetError((userQuery.error as Error).message);
       setIsAuthReady(true);
@@ -355,7 +491,17 @@ const AuthContextProvider = ({
     ],
   );
 
-  return <AuthContext.Provider value={memoedValue}>{children}</AuthContext.Provider>;
+  return (
+    <AuthContext.Provider value={memoedValue}>
+      {browserState &&
+      authConfig?.optional !== true &&
+      isBrowserSessionEntry(window.location.pathname, apiBaseUrl()) ? (
+        <BrowserSession code={browserState} onState={setBrowserState} />
+      ) : (
+        children
+      )}
+    </AuthContext.Provider>
+  );
 };
 
 const useAuthContext = () => {

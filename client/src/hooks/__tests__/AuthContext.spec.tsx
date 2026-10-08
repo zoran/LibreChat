@@ -5,8 +5,14 @@ import React from 'react';
 import { RecoilRoot } from 'recoil';
 import { getDefaultStore } from 'jotai';
 import { MemoryRouter } from 'react-router-dom';
-import { render, act } from '@testing-library/react';
+import { render, act, fireEvent } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import {
+  request,
+  LocalStorageKeys,
+  BROWSER_SESSION_EVENT,
+  BrowserSessionError,
+} from 'librechat-data-provider';
 import type { TAuthConfig } from '~/common';
 import {
   chatFilterStatusAtom,
@@ -14,6 +20,7 @@ import {
   chatSortAtom,
   resetChatFilterSessionAtom,
 } from '~/components/Conversations/chatFilters';
+import { browserSessionState } from '~/components/Auth/BrowserSession';
 import { AuthContextProvider, useAuthContext } from '../AuthContext';
 import { SESSION_KEY } from '~/utils';
 
@@ -24,11 +31,18 @@ jest.mock('react-router-dom', () => ({
 }));
 
 const mockApiBaseUrl = jest.fn(() => '');
+const mockStartupConfig = jest.fn(async () => ({ browserSessionEnabled: false }));
+const mockEnrollBrowserSession = jest.fn();
 
 jest.mock('librechat-data-provider', () => ({
   ...jest.requireActual('librechat-data-provider'),
   setTokenHeader: jest.fn(),
   apiBaseUrl: () => mockApiBaseUrl(),
+  dataService: {
+    ...jest.requireActual('librechat-data-provider').dataService,
+    getStartupConfig: () => mockStartupConfig(),
+  },
+  enrollBrowserSession: (...args: unknown[]) => mockEnrollBrowserSession(...args),
 }));
 
 let mockCapturedLoginOptions: {
@@ -152,6 +166,133 @@ describe('AuthContextProvider — test mode', () => {
 
     expect(getByTestId('consumer')).toHaveAttribute('data-auth-ready', 'true');
     expect(mockRefreshMutate).not.toHaveBeenCalled();
+  });
+});
+
+describe('AuthContextProvider — optional browser access', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    jest.useFakeTimers();
+    getDefaultStore().set(browserSessionState, null);
+    mockApiBaseUrl.mockReturnValue('');
+    mockStartupConfig.mockResolvedValue({ browserSessionEnabled: false });
+    window.history.replaceState({}, '', '/c/retained-conversation');
+  });
+  afterEach(() => {
+    getDefaultStore().set(browserSessionState, null);
+    jest.useRealTimers();
+  });
+
+  it('keeps normal login behavior when the feature is disabled', async () => {
+    renderProviderLive();
+    await act(async () => {
+      await mockRefreshMutate.mock.calls[0][1].onSuccess(undefined);
+    });
+    expect(mockEnrollBrowserSession).not.toHaveBeenCalled();
+    expect(mockNavigate).toHaveBeenCalledWith('/login?redirect_to=%2Fc%2Fretained-conversation');
+  });
+
+  it('opens the existing requested route with the browser principal', async () => {
+    mockStartupConfig.mockResolvedValue({ browserSessionEnabled: true });
+    mockEnrollBrowserSession.mockResolvedValue({
+      token: 'browser-token',
+      user: { id: 'browser-1', provider: 'browser', role: 'USER' },
+    });
+    const { getByTestId } = renderProviderLive();
+    await act(async () => {
+      await mockRefreshMutate.mock.calls[0][1].onSuccess(undefined);
+      jest.advanceTimersByTime(100);
+    });
+    expect(getByTestId('consumer')).toHaveAttribute('data-authenticated', 'true');
+    expect(mockNavigate).toHaveBeenCalledWith('/c/retained-conversation', { replace: true });
+  });
+
+  it('shows explicit recovery instead of login or a new identity after expiry', async () => {
+    mockStartupConfig.mockResolvedValue({ browserSessionEnabled: true });
+    mockEnrollBrowserSession.mockRejectedValue(new BrowserSessionError('BROWSER_SESSION_EXPIRED'));
+    const { queryByTestId } = renderProviderLive();
+    await act(async () => {
+      await mockRefreshMutate.mock.calls[0][1].onSuccess(undefined);
+    });
+    expect(getDefaultStore().get(browserSessionState)).toBe('BROWSER_SESSION_EXPIRED');
+    expect(queryByTestId('consumer')).toBeNull();
+    expect(mockNavigate).not.toHaveBeenCalled();
+  });
+
+  it('allows a real administrator login to leave browser recovery', () => {
+    renderProvider();
+    act(() => {
+      getDefaultStore().set(browserSessionState, 'BROWSER_SESSION_FORGOTTEN');
+    });
+    act(() => {
+      mockCapturedLoginOptions.onSuccess({
+        token: 'admin-token',
+        user: { id: 'admin', role: 'ADMIN', provider: 'local' },
+      });
+      jest.advanceTimersByTime(100);
+    });
+    expect(getDefaultStore().get(browserSessionState)).toBeNull();
+  });
+
+  it('keeps browser recovery when a user query fails after the refresh failure', async () => {
+    const mockUserQuery = jest.requireMock('~/data-provider').useGetUserQuery;
+    renderProviderLive();
+    await act(async () => {
+      await mockRefreshMutate.mock.calls[0][1].onSuccess({
+        token: 'browser-token',
+        user: { id: 'browser-1', provider: 'browser', role: 'USER' },
+      });
+      jest.advanceTimersByTime(100);
+    });
+    mockNavigate.mockClear();
+    try {
+      mockUserQuery.mockReturnValue({ data: undefined, isError: true, error: new Error('401') });
+      act(() => {
+        window.dispatchEvent(
+          new CustomEvent(BROWSER_SESSION_EVENT, { detail: 'BROWSER_SESSION_EXPIRED' }),
+        );
+      });
+      expect(getDefaultStore().get(browserSessionState)).toBe('BROWSER_SESSION_EXPIRED');
+      expect(mockNavigate).not.toHaveBeenCalled();
+    } finally {
+      mockUserQuery.mockReturnValue({ data: undefined, isError: false, error: null });
+    }
+  });
+
+  it('clears the departing workspace drafts before explicitly enrolling its replacement', async () => {
+    const draftKey = `${LocalStorageKeys.TEXT_DRAFT}previous`;
+    localStorage.setItem(draftKey, 'private previous draft');
+    const secure = Object.getOwnPropertyDescriptor(window, 'isSecureContext');
+    const locks = Object.getOwnPropertyDescriptor(navigator, 'locks');
+    Object.defineProperty(window, 'isSecureContext', { value: true, configurable: true });
+    Object.defineProperty(navigator, 'locks', {
+      configurable: true,
+      value: { request: (_name: string, callback: () => Promise<void>) => callback() },
+    });
+    jest.spyOn(request, 'resetBrowser').mockResolvedValue(undefined);
+    const enroll = jest.spyOn(request, 'enrollBrowser').mockImplementation(async () => {
+      expect(localStorage.getItem(draftKey)).toBeNull();
+      return { token: 'new', user: { id: 'new' } } as Awaited<
+        ReturnType<typeof request.enrollBrowser>
+      >;
+    });
+    jest.spyOn(window.location, 'assign').mockImplementation(() => undefined);
+    try {
+      const { getAllByRole } = renderProvider();
+      act(() => {
+        window.dispatchEvent(
+          new CustomEvent(BROWSER_SESSION_EVENT, { detail: 'BROWSER_SESSION_EXPIRED' }),
+        );
+      });
+      await act(async () => {
+        fireEvent.click(getAllByRole('button')[0]);
+      });
+      expect(enroll).toHaveBeenCalledTimes(1);
+    } finally {
+      Object.defineProperty(window, 'isSecureContext', secure ?? { value: undefined });
+      Object.defineProperty(navigator, 'locks', locks ?? { value: undefined });
+      localStorage.removeItem(draftKey);
+    }
   });
 });
 

@@ -223,6 +223,7 @@ router.get('/', async function (req, res) {
       /** @type {Partial<TStartupConfig>} */
       const payload = {
         ...preLoginPayload,
+        browserSessionEnabled: baseConfig?.registration?.browserSession?.enabled === true,
         socialLogins: baseConfig?.registration?.socialLogins ?? defaultSocialLogins,
         turnstile: baseConfig?.turnstileConfig,
         ...(rum ? { rum } : {}),
@@ -294,6 +295,7 @@ router.get('/', async function (req, res) {
       ...preLoginPayload,
       ...publicSharePayload,
       ...buildPostLoginPayload(),
+      browserSessionEnabled: appConfig?.registration?.browserSession?.enabled === true,
       sharedLinksSnapshotFilesEnabled: sharedLinksEnabled && isFileSnapshotEnabled(appConfig),
       socialLogins: appConfig?.registration?.socialLogins ?? defaultSocialLogins,
       interface: appConfig?.interfaceConfig,

@@ -171,9 +171,19 @@ function AccountSettings({ collapsed = false }: { collapsed?: boolean }) {
           {localize('com_nav_settings')}
         </Menu.MenuItem>
         <DropdownMenuSeparator />
-        <Menu.MenuItem onClick={() => logout()} className="select-item text-sm">
+        <Menu.MenuItem
+          onClick={() => {
+            if (
+              user?.provider !== 'browser' ||
+              window.confirm(localize('com_auth_browser_forget_confirm'))
+            ) {
+              logout();
+            }
+          }}
+          className="select-item text-sm"
+        >
           <LogOut className="icon-md" aria-hidden="true" />
-          {localize('com_nav_log_out')}
+          {localize(user?.provider === 'browser' ? 'com_auth_browser_forget' : 'com_nav_log_out')}
         </Menu.MenuItem>
       </Menu.Menu>
       {showArchived && (

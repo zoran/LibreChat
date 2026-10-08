@@ -1,0 +1,36 @@
+name: Fork Employee Image
+
+on:
+  push:
+    branches:
+      - fix/complete-assistant-history
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lighthouse:
+    if: ${{ github.repository != 'LibreChat-AI/LibreChat' }}
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/lighthouse.yml
+
+  publish:
+    needs: lighthouse
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      images: '[{"target":"node","file":"Dockerfile","image_name":"librechat"}]'
+      arches: '["amd64"]'
+      checkout_ref: ${{ github.sha }}
+      build_branch: ${{ github.ref_name }}
+      tag_suffixes: ${{ github.sha }}
+      publish_dockerhub: false

@@ -45,6 +45,7 @@ export function createUserMethods(
     balanceConfig?: BalanceConfig,
     disableTTL?: boolean,
     returnUser?: boolean,
+    session?: mongoose.ClientSession,
   ) => Promise<mongoose.Types.ObjectId | Partial<IUser>>;
   updateUser: (userId: string, updateData: Partial<IUser>) => Promise<IUser | null>;
   claimSamlIdentity: (
@@ -229,6 +230,7 @@ export function createUserMethods(
     balanceConfig?: BalanceConfig,
     disableTTL: boolean = true,
     returnUser: boolean = false,
+    session?: mongoose.ClientSession,
   ): Promise<mongoose.Types.ObjectId | Partial<IUser>> {
     const User = mongoose.models.User;
     const Balance = mongoose.models.Balance;
@@ -242,7 +244,9 @@ export function createUserMethods(
       delete userData.expiresAt;
     }
 
-    const user = await User.create(userData);
+    const user = session
+      ? (await User.create([userData], { session }))[0]
+      : await User.create(userData);
 
     // If balance is enabled, create or update a balance record for the user
     if (balanceConfig?.enabled && balanceConfig?.startBalance) {
@@ -275,7 +279,7 @@ export function createUserMethods(
       await Balance.findOneAndUpdate(
         { _id: user._id },
         { ...update, $setOnInsert: { user: user._id } },
-        { upsert: true, new: true },
+        { upsert: true, new: true, ...(session ? { session } : {}) },
       ).lean();
     }
 
