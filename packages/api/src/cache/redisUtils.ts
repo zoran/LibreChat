@@ -1,6 +1,6 @@
 import { logger } from '@librechat/data-schemas';
 import type { ClusterOptions, RedisOptions, Cluster, Redis } from 'ioredis';
-import type { RedisClientType, RedisClusterType } from '@redis/client';
+import type { SharedRedisClient } from './redisClients';
 import { startRedisHeartbeat } from './heartbeat';
 import { cacheConfig } from './cacheConfig';
 
@@ -87,7 +87,7 @@ export function createIoRedisSubscriber(client: Redis | Cluster, label: string):
  * ```
  */
 export async function batchDeleteKeys(
-  client: RedisClientType | RedisClusterType,
+  client: SharedRedisClient,
   keys: string[],
   chunkSize?: number,
 ): Promise<number> {
@@ -168,7 +168,7 @@ export async function batchDeleteKeys(
  * ```
  */
 export async function scanKeys(
-  client: RedisClientType | RedisClusterType,
+  client: SharedRedisClient,
   pattern: string,
   count?: number,
 ): Promise<string[]> {

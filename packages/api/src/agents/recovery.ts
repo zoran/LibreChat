@@ -1,3 +1,5 @@
+import type { ApplicationWorkPort } from '~/app';
+
 export interface IdleRecoveryLoopOptions {
   intervalMs: number;
   maxIdleIntervalMs: number;
@@ -21,6 +23,8 @@ export function createIdleRecoveryLoop({
     throw new TypeError('Maximum idle recovery interval must be at least the recovery interval');
   }
 
+  let pausedBy: string | undefined;
+  let unconfirmed = false;
   let started = false;
   let stopped = false;
   let idleStreak = 0;
@@ -33,7 +37,7 @@ export function createIdleRecoveryLoop({
   const MAX_DEADLINES = 64;
 
   const schedule = (): void => {
-    if (!started || stopped || active != null) {
+    if (!started || stopped || pausedBy || active != null) {
       return;
     }
     if (timer != null) {
@@ -52,7 +56,7 @@ export function createIdleRecoveryLoop({
   };
 
   const runNow = (): Promise<void> => {
-    if (stopped || !started) {
+    if (stopped || pausedBy || !started) {
       return Promise.resolve();
     }
     if (active != null) {
@@ -73,9 +77,11 @@ export function createIdleRecoveryLoop({
       .then(scan)
       .then(
         (idle) => {
+          if (idle) unconfirmed = false;
           idleStreak = idle && before === generation ? idleStreak + 1 : 0;
         },
         (error: unknown) => {
+          unconfirmed = true;
           idleStreak = 0;
           onError(error);
         },
@@ -89,6 +95,7 @@ export function createIdleRecoveryLoop({
         }
         nextPollAt =
           Date.now() + Math.min(intervalMs * 2 ** Math.min(idleStreak, 30), maxIdleIntervalMs);
+        if (pausedBy) return;
         if (wakePending) {
           wakePending = false;
           queueMicrotask(() => void runNow());
@@ -100,7 +107,34 @@ export function createIdleRecoveryLoop({
     return current;
   };
 
+  const maintenance: ApplicationWorkPort = {
+    pauseAdmissions(requestId) {
+      if (!requestId || (pausedBy && pausedBy !== requestId)) return false;
+      pausedBy = requestId;
+      if (timer != null) clearTimeout(timer);
+      timer = undefined;
+      return true;
+    },
+    resumeAdmissions(requestId) {
+      if (pausedBy !== requestId || stopped || unconfirmed) return false;
+      pausedBy = undefined;
+      if (wakePending) {
+        wakePending = false;
+        void runNow();
+      } else schedule();
+      return true;
+    },
+    async getMaintenanceCensus(requestId) {
+      return {
+        admissionClosed: stopped || (!!requestId && pausedBy === requestId),
+        queuedContinuations: active ? 1 : 0,
+        pendingWrites: active ? 1 : 0,
+        complete: !unconfirmed && (pausedBy == null || pausedBy === requestId),
+      };
+    },
+  };
   return {
+    ...maintenance,
     start: (): Promise<void> => {
       if (stopped) {
         return Promise.resolve();
@@ -121,6 +155,8 @@ export function createIdleRecoveryLoop({
       idleStreak = 0;
       if (active != null) {
         wakePending = true;
+      } else if (pausedBy) {
+        wakePending = true;
       } else if (started) {
         void runNow();
       }
@@ -135,6 +171,8 @@ export function createIdleRecoveryLoop({
           generation += 1;
           idleStreak = 0;
           if (active != null) {
+            wakePending = true;
+          } else if (pausedBy) {
             wakePending = true;
           } else {
             void runNow();

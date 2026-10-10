@@ -73,10 +73,16 @@ function withBaseSkillSyncConfig(req, baseConfig) {
   };
 }
 
-function createRunner({ getConfig, loadAppConfig, allowServerCredentials = true } = {}) {
+function createRunner({
+  getConfig,
+  loadAppConfig,
+  allowServerCredentials = true,
+  onUnconfirmedWork,
+} = {}) {
   const resolveAppConfig = loadAppConfig ?? loadCurrentAppConfig;
   const resolveConfig = getConfig ?? (() => getSyncConfig(resolveAppConfig));
   const createdRunner = createGitHubSkillSyncRunner({
+    onUnconfirmedWork,
     getConfig: resolveConfig,
     getCredentialToken: db.getSkillSyncCredentialToken,
     getCredentialSummary: db.getSkillSyncCredentialSummary,
@@ -146,6 +152,7 @@ function createRunner({ getConfig, loadAppConfig, allowServerCredentials = true 
     deleteFile: async (file) => {
       const strategy = getStrategyFunctions(file.source);
       if (!strategy.deleteFile) {
+        onUnconfirmedWork?.();
         return;
       }
       await strategy.deleteFile(
@@ -184,17 +191,24 @@ async function maybeRunGitHubSkillSyncForRequest(req) {
 
 function initializeGitHubSkillSync(appConfig) {
   appConfigRef = appConfig;
-  runner = createRunner();
-  scheduler = startGitHubSkillSyncScheduler({
+  runner ??= triggerOrchestrator.createRunner({
+    getConfig: getSyncConfig,
+    loadAppConfig: loadCurrentAppConfig,
+  });
+  scheduler ??= startGitHubSkillSyncScheduler({
     getConfig: getSyncConfig,
     runner,
   });
+  triggerOrchestrator.attachScheduler(scheduler);
   return { runner, scheduler };
 }
 
 function getGitHubSkillSyncRunner() {
   if (!runner) {
-    runner = createRunner();
+    runner = triggerOrchestrator.createRunner({
+      getConfig: getSyncConfig,
+      loadAppConfig: loadCurrentAppConfig,
+    });
   }
   return runner;
 }
@@ -202,11 +216,12 @@ function getGitHubSkillSyncRunner() {
 function stopGitHubSkillSyncScheduler() {
   if (scheduler) {
     scheduler.stop();
-    scheduler = undefined;
+    // Retain the stopped child while its already accepted promises settle.
   }
 }
 
 module.exports = {
+  skillSyncMaintenance: triggerOrchestrator,
   initializeGitHubSkillSync,
   getGitHubSkillSyncRunner,
   getGitHubSkillSyncRunnerForRequest,

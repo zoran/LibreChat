@@ -1,3 +1,7 @@
+jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
+  ...jest.requireActual('../../../../packages/api/src/conversations/historyHttp'),
+}));
 const mongoose = require('mongoose');
 const { MongoMemoryServer } = require('mongodb-memory-server');
 const { ViolationTypes } = require('librechat-data-provider');
@@ -111,6 +115,45 @@ describe('validateConvoAccess', () => {
       expect.any(Number),
     );
   });
+
+  it.each([false, true])(
+    'retains a detached access-cache write and failed=%s outcome after next',
+    async (fails) => {
+      const {
+        createHistoryMutationOwner,
+      } = require('../../../../packages/api/src/conversations/history');
+      const {
+        createHistoryMutationHandler,
+      } = require('../../../../packages/api/src/conversations/historyHttp');
+      const owner = createHistoryMutationOwner();
+      const req = createRequest(OWNER_ID, CONVERSATION_ID);
+      req.app = { locals: { historyMaintenance: owner } };
+      let resolve, reject;
+      mockCache.set.mockReturnValueOnce(
+        new Promise((yes, no) => {
+          resolve = yes;
+          reject = no;
+        }),
+      );
+      await createHistoryMutationHandler('conversation-pin', validateConvoAccess, async () => {})(
+        req,
+        res,
+        next,
+      );
+      owner.pauseAdmissions('a');
+      expect(await owner.getMaintenanceCensus('a')).toMatchObject({
+        pendingWrites: 1,
+        queuedContinuations: 0,
+      });
+      if (fails) reject(new Error('cache acknowledgment lost'));
+      else resolve(true);
+      await new Promise((done) => setImmediate(done));
+      expect(await owner.getMaintenanceCensus('a')).toMatchObject({
+        pendingWrites: 0,
+        complete: !fails,
+      });
+    },
+  );
 
   it('skips the database entirely when access is already cached', async () => {
     mockCache.get.mockResolvedValue('authorized');

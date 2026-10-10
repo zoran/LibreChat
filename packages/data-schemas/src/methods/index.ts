@@ -1,3 +1,11 @@
+import type { GenerationAdmissionMethods } from '~/types/generationAdmission';
+import type { AuthPersistenceObserver } from './authPersistence';
+export type { AuthPersistenceObserver, AuthContinuationObserver } from './authPersistence';
+import { createGenerationAdmissionMethods } from './generationAdmission';
+export {
+  createGenerationAdmissionMethods,
+  GenerationAdmissionStorageError,
+} from './generationAdmission';
 import type { RoleMethods, RoleDeps } from './role';
 import { createBrowserMethods, type BrowserMethods } from './browser';
 export type { BrowserIdentity, BrowserUser, BrowserMethods } from './browser';
@@ -229,6 +237,7 @@ export {
 
 export type AllMethods = UserMethods &
   BrowserMethods &
+  GenerationAdmissionMethods &
   SessionMethods &
   TokenMethods &
   RefreshTokenBridgeMethods &
@@ -418,11 +427,13 @@ export function createMethods(
   // Role and user-group methods with optional cache injection; user-group methods
   // are created before prompt methods so prompt methods can resolve ACL principals.
   // The membership hook is late-bound: prompt methods do not exist yet here.
-  const promptAccessInvalidator: { current?: () => Promise<void> } = {};
+  const promptAccessInvalidator: {
+    current?: (observer?: AuthPersistenceObserver) => Promise<void>;
+  } = {};
   const roleDeps: RoleDeps = { getCache: deps.getCache };
   const userGroupDeps: UserGroupDeps = {
     getCache: deps.getCache,
-    onMemberGroupsInvalidated: () => promptAccessInvalidator.current?.(),
+    onMemberGroupsInvalidated: (observer) => promptAccessInvalidator.current?.(observer),
   };
   const roleMethods = createRoleMethods(mongoose, roleDeps);
   const userGroupMethods = createUserGroupMethods(mongoose, userGroupDeps);
@@ -460,6 +471,7 @@ export function createMethods(
   return {
     ...createUserMethods(mongoose, { getCache: deps.getCache }),
     ...createBrowserMethods(mongoose),
+    ...createGenerationAdmissionMethods(mongoose),
     ...createSessionMethods(mongoose),
     ...createTokenMethods(mongoose),
     ...createRefreshTokenBridgeMethods(mongoose),

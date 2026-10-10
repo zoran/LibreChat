@@ -1,3 +1,4 @@
+const { authSessionStore } = require('~/server/services/LegacyAuthMaintenance');
 const passport = require('passport');
 const session = require('express-session');
 const { CacheKeys } = require('librechat-data-provider');
@@ -54,7 +55,7 @@ async function configureOpenId(app, appConfig) {
     secret: process.env.OPENID_SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
-    store: getLogStores(CacheKeys.OPENID_SESSION),
+    store: authSessionStore(getLogStores(CacheKeys.OPENID_SESSION)),
     cookie: {
       maxAge: sessionExpiry,
       secure: shouldUseSecureCookie(),
@@ -129,7 +130,7 @@ const configureSocialLogins = async (app, appConfig) => {
       secret: process.env.SAML_SESSION_SECRET,
       resave: false,
       saveUninitialized: false,
-      store: getLogStores(CacheKeys.SAML_SESSION),
+      store: authSessionStore(getLogStores(CacheKeys.SAML_SESSION)),
       cookie: {
         maxAge: sessionExpiry,
         secure: shouldUseSecureCookie(),

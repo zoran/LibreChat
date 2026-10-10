@@ -1310,3 +1310,159 @@ describe('createAgentTriggerDeliveryEngine', () => {
     );
   });
 });
+
+function maintenanceDeferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+describe('trigger engine maintenance ownership', () => {
+  it('releases a claim arriving after pause without starting an attempt, then resumes exactly', async () => {
+    const claim = maintenanceDeferred<AgentTriggerDeliveryRecord | null>();
+    const store = storeWith({ claimNext: jest.fn(() => claim.promise) });
+    const dispatch = jest.fn(async () => successResult());
+    const engine = createAgentTriggerDeliveryEngine(
+      { store, dispatch, workerId: 'worker-1' },
+      { concurrency: 2 },
+    );
+    const pass = engine.runTick();
+    expect(engine.pauseAdmissions('op')).toBe(true);
+    expect((await engine.getMaintenanceCensus('op')).queuedContinuations).toBeGreaterThan(0);
+    claim.resolve(delivery());
+    await pass;
+    expect(store.claimNext).toHaveBeenCalledTimes(1);
+    expect(store.release).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'delivery-row-1',
+        workerId: 'worker-1',
+        claimToken: 'claim-1',
+      }),
+    );
+    expect(store.beginAttempt).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    await expect(engine.runTick()).resolves.toBe(0);
+    expect(engine.resumeAdmissions('foreign')).toBe(false);
+    expect(engine.resumeAdmissions('op')).toBe(true);
+    await engine.runTick();
+    expect(dispatch).toHaveBeenCalled();
+  });
+
+  it.each(['success', 'false', 'throw'] as const)(
+    'defers after attempt/batch admission with %s durable result',
+    async (outcome) => {
+      const entered = maintenanceDeferred<void>();
+      const batch = maintenanceDeferred<never[]>();
+      const store = storeWith({
+        getBatch: jest.fn(() => {
+          entered.resolve();
+          return batch.promise;
+        }),
+        defer: jest.fn(async () => {
+          if (outcome === 'throw') throw new Error('store unavailable');
+          return outcome === 'success';
+        }),
+      });
+      const dispatch = jest.fn(async () => successResult());
+      const engine = createAgentTriggerDeliveryEngine(
+        { store, dispatch, workerId: 'worker-1' },
+        { concurrency: 1 },
+      );
+      const pass = engine.runTick();
+      await entered.promise;
+      engine.pauseAdmissions('op');
+      batch.resolve([]);
+      await pass;
+      expect(store.defer).toHaveBeenCalledWith(
+        expect.objectContaining({
+          id: 'delivery-row-1',
+          workerId: 'worker-1',
+          claimToken: 'claim-1',
+          attempt: 1,
+        }),
+      );
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(store.retry).not.toHaveBeenCalled();
+      expect(store.dead).not.toHaveBeenCalled();
+      expect((await engine.getMaintenanceCensus('op')).complete).toBe(outcome === 'success');
+      expect(engine.resumeAdmissions('op')).toBe(outcome === 'success');
+    },
+  );
+
+  it.each([false, 'throw'] as const)('retains unconfirmed claim release %s', async (outcome) => {
+    const claim = maintenanceDeferred<AgentTriggerDeliveryRecord | null>();
+    const store = storeWith({
+      claimNext: () => claim.promise,
+      release: async () => {
+        if (outcome === 'throw') throw new Error('unknown');
+        return false;
+      },
+    });
+    const engine = createAgentTriggerDeliveryEngine(
+      { store, dispatch: async () => successResult() },
+      { concurrency: 1 },
+    );
+    const pass = engine.runTick();
+    engine.pauseAdmissions('op');
+    claim.resolve(delivery());
+    await pass;
+    expect((await engine.getMaintenanceCensus('op')).complete).toBe(false);
+    expect(engine.resumeAdmissions('op')).toBe(false);
+  });
+
+  it('preserves a dispatched provider and counts final persistence until it settles', async () => {
+    const started = maintenanceDeferred<void>();
+    const provider = maintenanceDeferred<AgentTriggerExecutionResult>();
+    const writing = maintenanceDeferred<void>();
+    const written = maintenanceDeferred<boolean>();
+    let signal: AbortSignal | undefined;
+    const store = storeWith({
+      complete: () => {
+        writing.resolve();
+        return written.promise;
+      },
+    });
+    const engine = createAgentTriggerDeliveryEngine(
+      {
+        store,
+        dispatch: (_envelope, options) => {
+          signal = options?.signal;
+          started.resolve();
+          return provider.promise;
+        },
+      },
+      { concurrency: 1 },
+    );
+    const pass = engine.runTick();
+    await started.promise;
+    engine.pauseAdmissions('op');
+    expect(signal?.aborted).toBe(false);
+    expect((await engine.getMaintenanceCensus('op')).queuedContinuations).toBeGreaterThan(0);
+    provider.resolve(successResult());
+    await writing.promise;
+    expect((await engine.getMaintenanceCensus('op')).pendingWrites).toBe(1);
+    written.resolve(true);
+    await pass;
+    expect(await engine.getMaintenanceCensus('op')).toEqual({
+      admissionClosed: true,
+      queuedContinuations: 0,
+      pendingWrites: 0,
+      complete: true,
+    });
+  });
+
+  it('rejects mismatched and changed census ownership', async () => {
+    const engine = createAgentTriggerDeliveryEngine({
+      store: storeWith(),
+      dispatch: async () => successResult(),
+    });
+    engine.pauseAdmissions('op');
+    expect((await engine.getMaintenanceCensus('foreign')).complete).toBe(false);
+    const sample = engine.getMaintenanceCensus('op');
+    engine.resumeAdmissions('op');
+    engine.pauseAdmissions('op');
+    expect((await sample).complete).toBe(false);
+  });
+});

@@ -2,6 +2,7 @@ import { logger, runAsSystem } from '@librechat/data-schemas';
 import { getScheduleMCPDisabledReason } from 'librechat-data-provider';
 import type { ScheduleMethods, IScheduleRun } from '@librechat/data-schemas';
 import type { JobState, ScheduleEngineDeps } from './types';
+import type { ApplicationWorkPort } from '~/app';
 import {
   hasResumeHandoffInFlight,
   hasAbortInFlight,
@@ -28,7 +29,7 @@ const TERMINAL_JOB_OUTCOMES: Record<string, 'success' | 'error' | 'interrupted' 
   aborted: 'interrupted',
 };
 
-export interface ScheduleErasureSweep {
+export interface ScheduleErasureSweep extends ApplicationWorkPort {
   stop: () => void;
 }
 
@@ -76,7 +77,11 @@ function jobMatchesRun(job: JobState | null, run: IScheduleRun): boolean {
  * (a terminal identity-matched job, or a confirmed-absent job past the owner-death
  * cutoff), and defer anything fenced by an in-flight abort or resume hand-off.
  */
-async function settleAbandonedRuns(deps: ScheduleErasureDeps, scheduleId: string): Promise<void> {
+async function settleAbandonedRuns(
+  deps: ScheduleErasureDeps,
+  scheduleId: string,
+  onUnknown: () => void,
+): Promise<void> {
   const runs = await deps.methods.getActiveRunsForSchedule(scheduleId);
   const now = Date.now();
   for (const run of runs) {
@@ -133,6 +138,7 @@ async function settleAbandonedRuns(deps: ScheduleErasureDeps, scheduleId: string
         autoDisableAfterFailures: Number.MAX_SAFE_INTEGER,
       });
     } catch (err) {
+      onUnknown();
       logger.warn(`[schedules] abandoned-run settle failed for ${scheduleId}:`, err);
     }
   }
@@ -237,7 +243,7 @@ async function settleFromObservedJob(
  * no-auto-disable policy; a durable MCP configuration receipt still disables via the
  * run-row transition, including when a retained job originally ended as a success.
  */
-async function settleStrandedRuns(deps: ScheduleErasureDeps): Promise<void> {
+async function settleStrandedRuns(deps: ScheduleErasureDeps, onUnknown: () => void): Promise<void> {
   const runs = await deps.methods.getRunsForReconciliation(
     new Date(Date.now() - STRANDED_RUN_MIN_AGE_MS),
     SWEEP_BATCH,
@@ -297,13 +303,17 @@ async function settleStrandedRuns(deps: ScheduleErasureDeps): Promise<void> {
         autoDisableAfterFailures: Number.MAX_SAFE_INTEGER,
       });
     } catch (err) {
+      onUnknown();
       logger.warn(`[schedules] stranded-run settle failed for ${run.scheduleId}:`, err);
     }
   }
 }
 
 /** Replays a crashed permanent-MCP terminal projection where no engine is armed. */
-async function replayUnbookkeptMCPRuns(deps: ScheduleErasureDeps): Promise<void> {
+async function replayUnbookkeptMCPRuns(
+  deps: ScheduleErasureDeps,
+  onUnknown: () => void,
+): Promise<void> {
   const runs = await deps.methods.getUnbookkeptRuns(
     new Date(Date.now() - STRANDED_RUN_MIN_AGE_MS),
     SWEEP_BATCH,
@@ -323,6 +333,7 @@ async function replayUnbookkeptMCPRuns(deps: ScheduleErasureDeps): Promise<void>
         autoDisableAfterFailures: Number.MAX_SAFE_INTEGER,
       });
     } catch (error) {
+      onUnknown();
       logger.warn(`[schedules] MCP bookkeeping replay failed for ${run.scheduleId}:`, error);
     }
   }
@@ -344,18 +355,28 @@ async function replayUnbookkeptMCPRuns(deps: ScheduleErasureDeps): Promise<void>
  * state, so concurrent clustered sweepers can re-drive cleanup safely.
  */
 export function startScheduleErasureSweep(deps: ScheduleErasureDeps): ScheduleErasureSweep {
+  let pausedBy: string | undefined;
+  let pending = 0;
+  let unconfirmed = false;
+  const onUnknown = () => {
+    unconfirmed = true;
+  };
   let stopped = false;
   let timer: NodeJS.Timeout | undefined;
 
   async function sweep(): Promise<void> {
+    if (pausedBy || stopped) return;
+    pending++;
     try {
       await runAsSystem(async () => {
         const deleting = await deps.methods.getDeletingSchedules(SWEEP_BATCH);
         for (const schedule of deleting) {
-          await settleAbandonedRuns(deps, schedule.id).catch((err) => {
+          await settleAbandonedRuns(deps, schedule.id, onUnknown).catch((err) => {
+            unconfirmed = true;
             logger.warn(`[schedules] abandoned-run pass failed for ${schedule.id}:`, err);
           });
           await deps.methods.eraseScheduleIfDrained(schedule.id).catch((err) => {
+            unconfirmed = true;
             logger.warn(`[schedules] erasure sweep failed for ${schedule.id}:`, err);
           });
         }
@@ -363,24 +384,32 @@ export function startScheduleErasureSweep(deps: ScheduleErasureDeps): ScheduleEr
         // cannot re-fill it every sweep and starve the rows behind them.
         await deps.methods
           .markEraseAttempted(deleting.map((schedule) => schedule.id))
-          .catch((err) => logger.warn('[schedules] failed to stamp erase attempts:', err));
+          .catch((err) => {
+            onUnknown();
+            logger.warn('[schedules] failed to stamp erase attempts:', err);
+          });
         // Live schedules too: converge reservations left stranded by a retained terminal
         // job or a dead delivery, so neither can hold a global capacity slot — and no
         // generation evidence can outlive its run — where no engine is armed.
-        await settleStrandedRuns(deps).catch((err) =>
-          logger.warn('[schedules] stranded-run convergence pass failed:', err),
-        );
-        await replayUnbookkeptMCPRuns(deps).catch((err) =>
-          logger.warn('[schedules] MCP bookkeeping replay pass failed:', err),
-        );
+        await settleStrandedRuns(deps, onUnknown).catch((err) => {
+          onUnknown();
+          logger.warn('[schedules] stranded-run convergence pass failed:', err);
+        });
+        await replayUnbookkeptMCPRuns(deps, onUnknown).catch((err) => {
+          onUnknown();
+          logger.warn('[schedules] MCP bookkeeping replay pass failed:', err);
+        });
       });
     } catch (err) {
+      unconfirmed = true;
       logger.error('[schedules] erasure sweep failed:', err);
+    } finally {
+      pending--;
     }
   }
 
   function schedule(): void {
-    if (stopped) {
+    if (stopped || pausedBy) {
       return;
     }
     // Jittered so replicas of a clustered deployment do not sweep in lockstep.
@@ -394,6 +423,27 @@ export function startScheduleErasureSweep(deps: ScheduleErasureDeps): ScheduleEr
   schedule();
 
   const engineSweep: ScheduleErasureSweep = {
+    pauseAdmissions(requestId) {
+      if (!requestId || (pausedBy && pausedBy !== requestId)) return false;
+      pausedBy = requestId;
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      return true;
+    },
+    resumeAdmissions(requestId) {
+      if (pausedBy !== requestId || stopped || unconfirmed) return false;
+      pausedBy = undefined;
+      schedule();
+      return true;
+    },
+    async getMaintenanceCensus(requestId) {
+      return {
+        admissionClosed: stopped || (!!requestId && pausedBy === requestId),
+        queuedContinuations: pending,
+        pendingWrites: pending,
+        complete: !unconfirmed && (pausedBy == null || pausedBy === requestId),
+      };
+    },
     stop: () => {
       stopped = true;
       if (timer) {

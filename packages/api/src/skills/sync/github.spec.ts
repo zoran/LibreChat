@@ -3732,3 +3732,86 @@ describe('files whose paths cannot be mirrored', () => {
     );
   });
 });
+
+describe('skill sync maintenance settlement', () => {
+  it('joins an already running renewal before the final lock release', async () => {
+    jest.useFakeTimers();
+    let continueSource!: (rows: []) => void;
+    let renew!: (value: boolean) => void;
+    let release!: () => void;
+    const onUnconfirmedWork = jest.fn();
+    const deps = createDeps({
+      onUnconfirmedWork,
+      listSkillsBySource: jest
+        .fn()
+        .mockResolvedValue([])
+        .mockImplementationOnce(
+          () =>
+            new Promise<[]>((resolve) => {
+              continueSource = resolve;
+            }),
+        ),
+      refreshLock: jest.fn(
+        () =>
+          new Promise((resolve) => {
+            renew = resolve;
+          }),
+      ),
+      releaseLock: jest.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            release = resolve;
+          }),
+      ),
+    });
+    try {
+      let settled = false;
+      const active = createGitHubSkillSyncRunner(deps)
+        .runOnce()
+        .finally(() => {
+          settled = true;
+        });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(continueSource).toBeDefined();
+      await jest.advanceTimersByTimeAsync(600_000);
+      expect(renew).toBeDefined();
+      continueSource([]);
+      await jest.advanceTimersByTimeAsync(0);
+      expect(deps.releaseLock).not.toHaveBeenCalled();
+      expect(settled).toBe(false);
+      renew(false);
+      await jest.advanceTimersByTimeAsync(0);
+      expect(onUnconfirmedWork).toHaveBeenCalled();
+      expect(settled).toBe(false);
+      release();
+      await active;
+      expect(settled).toBe(true);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('reports swallowed storage failure but not a config read failure', async () => {
+    const onUnconfirmedWork = jest.fn();
+    const deps = createDeps({
+      onUnconfirmedWork,
+      createSkill: async () => {
+        throw new Error('uncertain commit');
+      },
+    });
+    await createGitHubSkillSyncRunner(deps).runOnce();
+    expect(onUnconfirmedWork).toHaveBeenCalled();
+    onUnconfirmedWork.mockClear();
+    await expect(
+      createGitHubSkillSyncRunner(
+        createDeps({
+          onUnconfirmedWork,
+          getConfig: () => {
+            throw new Error('read unavailable');
+          },
+        }),
+      ).runOnce(),
+    ).rejects.toThrow('read unavailable');
+    expect(onUnconfirmedWork).not.toHaveBeenCalled();
+  });
+});

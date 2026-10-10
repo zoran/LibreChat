@@ -1,3 +1,10 @@
+const {
+  authAdmissionMiddleware,
+  ownAuthHandler,
+  authPersistence,
+  authCache,
+  authMutation,
+} = require('~/server/services/LegacyAuthMaintenance');
 const express = require('express');
 const passport = require('passport');
 const crypto = require('node:crypto');
@@ -41,13 +48,17 @@ const middleware = require('~/server/middleware');
 
 const requireAdminAccess = requireCapability(SystemCapabilities.ACCESS_ADMIN);
 
-const setBalanceConfig = createSetBalanceConfig({
-  getAppConfig,
-  findBalanceByUser,
-  upsertBalanceFields,
-});
+const setBalanceConfig = ownAuthHandler(
+  createSetBalanceConfig({
+    observer: authPersistence,
+    getAppConfig,
+    findBalanceByUser,
+    upsertBalanceFields,
+  }),
+);
 
 const router = express.Router();
+router.use(authAdmissionMiddleware);
 
 function getOptionalOpenIdConfig() {
   try {
@@ -204,7 +215,7 @@ function retrievePkceChallenge(provider) {
       return next();
     }
     try {
-      const cache = getLogStores(CacheKeys.ADMIN_OAUTH_EXCHANGE);
+      const cache = authCache(getLogStores(CacheKeys.ADMIN_OAUTH_EXCHANGE));
       const challenge = await cache.get(`pkce:${req.oauthState}`);
       if (challenge) {
         req.pkceChallenge = challenge;
@@ -233,7 +244,7 @@ function retrievePkceChallenge(provider) {
 
 router.get('/oauth/openid', requireOpenIdConfig, async (req, res, next) => {
   const state = generateState();
-  const cache = getLogStores(CacheKeys.ADMIN_OAUTH_EXCHANGE);
+  const cache = authCache(getLogStores(CacheKeys.ADMIN_OAUTH_EXCHANGE));
   const stored = await storeAndStripChallenge(cache, req, state, 'openid');
   if (!stored) {
     return res.redirect(
@@ -273,7 +284,7 @@ router.get(
 
 router.get('/oauth/saml', requireAdminStrategy('samlAdmin', 'SAML'), async (req, res, next) => {
   const state = generateState();
-  const cache = getLogStores(CacheKeys.ADMIN_OAUTH_EXCHANGE);
+  const cache = authCache(getLogStores(CacheKeys.ADMIN_OAUTH_EXCHANGE));
   const stored = await storeAndStripChallenge(cache, req, state, 'saml');
   if (!stored) {
     return res.redirect(
@@ -316,7 +327,7 @@ router.get(
   requireAdminStrategy('googleAdmin', 'Google'),
   async (req, res, next) => {
     const state = generateState();
-    const cache = getLogStores(CacheKeys.ADMIN_OAUTH_EXCHANGE);
+    const cache = authCache(getLogStores(CacheKeys.ADMIN_OAUTH_EXCHANGE));
     const stored = await storeAndStripChallenge(cache, req, state, 'google');
     if (!stored) {
       return res.redirect(
@@ -363,7 +374,7 @@ router.get(
   requireAdminStrategy('githubAdmin', 'GitHub'),
   async (req, res, next) => {
     const state = generateState();
-    const cache = getLogStores(CacheKeys.ADMIN_OAUTH_EXCHANGE);
+    const cache = authCache(getLogStores(CacheKeys.ADMIN_OAUTH_EXCHANGE));
     const stored = await storeAndStripChallenge(cache, req, state, 'github');
     if (!stored) {
       return res.redirect(
@@ -408,7 +419,7 @@ router.get(
   requireAdminStrategy('discordAdmin', 'Discord'),
   async (req, res, next) => {
     const state = generateState();
-    const cache = getLogStores(CacheKeys.ADMIN_OAUTH_EXCHANGE);
+    const cache = authCache(getLogStores(CacheKeys.ADMIN_OAUTH_EXCHANGE));
     const stored = await storeAndStripChallenge(cache, req, state, 'discord');
     if (!stored) {
       return res.redirect(
@@ -453,7 +464,7 @@ router.get(
   requireAdminStrategy('facebookAdmin', 'Facebook'),
   async (req, res, next) => {
     const state = generateState();
-    const cache = getLogStores(CacheKeys.ADMIN_OAUTH_EXCHANGE);
+    const cache = authCache(getLogStores(CacheKeys.ADMIN_OAUTH_EXCHANGE));
     const stored = await storeAndStripChallenge(cache, req, state, 'facebook');
     if (!stored) {
       return res.redirect(
@@ -495,7 +506,7 @@ router.get(
 
 router.get('/oauth/apple', requireAdminStrategy('appleAdmin', 'Apple'), async (req, res, next) => {
   const state = generateState();
-  const cache = getLogStores(CacheKeys.ADMIN_OAUTH_EXCHANGE);
+  const cache = authCache(getLogStores(CacheKeys.ADMIN_OAUTH_EXCHANGE));
   const stored = await storeAndStripChallenge(cache, req, state, 'apple');
   if (!stored) {
     return res.redirect(
@@ -574,7 +585,7 @@ router.post('/oauth/exchange', middleware.loginLimiter, async (req, res) => {
 
     const cache = getLogStores(CacheKeys.ADMIN_OAUTH_EXCHANGE);
     const requestOrigin = resolveRequestOrigin(req);
-    const result = await exchangeAdminCode(cache, code, requestOrigin, codeVerifier);
+    const result = await authMutation(exchangeAdminCode, cache, code, requestOrigin, codeVerifier);
 
     if (!result) {
       return res.status(401).json({

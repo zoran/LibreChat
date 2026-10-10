@@ -431,14 +431,12 @@ const executeOpenAIChatCompletion = async (envelope, { req, res }) => {
     isPrincipalActive: db.isSubagentOwnerAdmissible,
     beforeSettle: (execution) => {
       if (!artifactWritesCovered && artifactPromises.length > 0) {
-        execution.track(
-          waitForAgentExecutionWrites(artifactPromises).catch((artifactError) => {
-            logger.warn(
-              '[OpenAI API] Error processing artifacts:',
-              getSafeErrorMetadata(artifactError),
-            );
-          }),
-        );
+        execution.track(waitForAgentExecutionWrites(artifactPromises)).catch((artifactError) => {
+          logger.warn(
+            '[OpenAI API] Error processing artifacts:',
+            getSafeErrorMetadata(artifactError),
+          );
+        });
       }
     },
     onSettlementError: (error) => {
@@ -1143,36 +1141,38 @@ const executeOpenAIChatCompletion = async (envelope, { req, res }) => {
         // Record token usage against balance
         const balanceConfig = getBalanceConfig(appConfig);
         const transactionsConfig = getTransactionsConfig(appConfig);
-        execution.track(
-          recordCollectedUsage(
-            {
-              spendTokens: db.spendTokens,
-              spendStructuredTokens: db.spendStructuredTokens,
-              pricing: {
-                getMultiplier: db.getMultiplier,
-                getCacheMultiplier: db.getCacheMultiplier,
+        execution
+          .track(
+            recordCollectedUsage(
+              {
+                spendTokens: db.spendTokens,
+                spendStructuredTokens: db.spendStructuredTokens,
+                pricing: {
+                  getMultiplier: db.getMultiplier,
+                  getCacheMultiplier: db.getCacheMultiplier,
+                },
+                bulkWriteOps: {
+                  insertMany: db.bulkInsertTransactions,
+                  updateBalance: db.updateBalance,
+                },
               },
-              bulkWriteOps: {
-                insertMany: db.bulkInsertTransactions,
-                updateBalance: db.updateBalance,
+              {
+                user: userId,
+                conversationId,
+                collectedUsage,
+                context: 'message',
+                messageId: responseId,
+                balance: balanceConfig,
+                transactions: transactionsConfig,
+                model: primaryConfig.model || agent.model_parameters?.model,
+                endpointTokenConfig: primaryConfig.endpointTokenConfig,
+                resolveEndpointTokenConfig,
               },
-            },
-            {
-              user: userId,
-              conversationId,
-              collectedUsage,
-              context: 'message',
-              messageId: responseId,
-              balance: balanceConfig,
-              transactions: transactionsConfig,
-              model: primaryConfig.model || agent.model_parameters?.model,
-              endpointTokenConfig: primaryConfig.endpointTokenConfig,
-              resolveEndpointTokenConfig,
-            },
-          ).catch((err) => {
+            ),
+          )
+          .catch((err) => {
             logger.error('[OpenAI API] Error recording usage:', getSafeErrorMetadata(err));
-          }),
-        );
+          });
       });
 
       const usage = buildCompletionUsage(collectedUsage);
@@ -1186,21 +1186,19 @@ const executeOpenAIChatCompletion = async (envelope, { req, res }) => {
 
         // The HTTP response is complete, while destructive cleanup still waits for artifacts.
         if (artifactPromises.length > 0) {
-          execution.track(
-            waitForAgentExecutionWrites(artifactPromises).catch((artifactError) => {
-              logger.warn(
-                '[OpenAI API] Error processing artifacts:',
-                getSafeErrorMetadata(artifactError),
-              );
-            }),
-          );
+          execution.track(waitForAgentExecutionWrites(artifactPromises)).catch((artifactError) => {
+            logger.warn(
+              '[OpenAI API] Error processing artifacts:',
+              getSafeErrorMetadata(artifactError),
+            );
+          });
           artifactWritesCovered = true;
         }
       } else {
         // For non-streaming, wait for artifacts before sending response
         if (artifactPromises.length > 0) {
           try {
-            await waitForAgentExecutionWrites(artifactPromises);
+            await execution.track(waitForAgentExecutionWrites(artifactPromises));
           } catch (artifactError) {
             logger.warn(
               '[OpenAI API] Error processing artifacts:',

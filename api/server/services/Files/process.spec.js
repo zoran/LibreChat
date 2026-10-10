@@ -2478,6 +2478,21 @@ describe('processDeleteRequest', () => {
     jest.clearAllMocks();
   });
 
+  it('reports uncertainty when agent-reference cleanup fails after metadata deletion', async () => {
+    getStrategyFunctions.mockReturnValue({ deleteFile: jest.fn().mockResolvedValue(undefined) });
+    db.deleteFiles.mockResolvedValue({ deletedCount: 1 });
+    db.removeAgentResourceFilesFromAllAgents.mockRejectedValueOnce(
+      new Error('write outcome unknown'),
+    );
+    const result = await processDeleteRequest({
+      req: { body: {}, config: {}, user: { id: 'user-123', tenantId: 'tenant-a' } },
+      files: [
+        { file_id: 'expired-file', filepath: '/uploads/expired.txt', source: FileSources.local },
+      ],
+    });
+    expect(result).toEqual({ deletedFileIds: ['expired-file'], failedFileIds: ['expired-file'] });
+  });
+
   it('removes metadata when backing storage is already missing', async () => {
     const missingError = Object.assign(new Error('no such file'), { code: 'ENOENT' });
     const deleteFile = jest.fn().mockRejectedValue(missingError);

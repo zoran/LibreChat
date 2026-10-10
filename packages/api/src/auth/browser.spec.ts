@@ -1,6 +1,7 @@
 import express from 'express';
 import request from 'supertest';
 import type { AppConfig, BrowserIdentity } from '@librechat/data-schemas';
+import type { Store } from 'express-rate-limit';
 import { BROWSER_COOKIE, createBrowserAuth } from './browser';
 
 const parseCookies: (header: string) => Record<string, string> = jest.requireActual('cookie').parse;
@@ -21,9 +22,10 @@ const identity: BrowserIdentity = {
   },
 };
 
-function fixture(enabled = true, max = 100) {
+function fixture(enabled = true, max = 100, store?: Store) {
   const deps = {
     origin,
+    store,
     getTenantId: () => undefined,
     getAppConfig: jest.fn().mockResolvedValue({
       registration: {
@@ -52,7 +54,7 @@ function fixture(enabled = true, max = 100) {
     res.json({ legacy: true });
   });
   app.post('/reset', handlers.reset);
-  return { app, deps };
+  return { app, deps, handlers };
 }
 
 function post(app: express.Express, path: string) {
@@ -148,5 +150,130 @@ describe('optional browser identity HTTP boundary', () => {
     expect((await post(app, '/browser')).status).toBe(200);
     expect((await post(app, '/browser')).status).toBe(429);
     expect(deps.enrollBrowserIdentity).toHaveBeenCalledTimes(1);
+  });
+});
+
+function deferredBrowser<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+describe('browser owner maintenance', () => {
+  it('joins limiter admission and delayed enrollment across pause without abandoning accepted work', async () => {
+    const limiting = deferredBrowser<void>();
+    const allowed = deferredBrowser<{ totalHits: number; resetTime: Date }>();
+    const enrolling = deferredBrowser<void>();
+    const enrolled = deferredBrowser<BrowserIdentity & { credential: string }>();
+    const store: Store = {
+      increment: async () => {
+        limiting.resolve();
+        return allowed.promise;
+      },
+      decrement: async () => {},
+      resetKey: async () => {},
+    };
+    const { app, deps, handlers } = fixture(true, 100, store);
+    deps.enrollBrowserIdentity.mockImplementation(() => {
+      enrolling.resolve();
+      return enrolled.promise;
+    });
+    const response = post(app, '/browser').then((value) => value);
+    await limiting.promise;
+    expect(handlers.pauseAdmissions('op')).toBe(true);
+    expect(await handlers.getMaintenanceCensus('op')).toMatchObject({
+      queuedContinuations: 1,
+      pendingWrites: 1,
+    });
+    expect((await post(app, '/browser')).body.code).toBe('APP_QUIESCING');
+    allowed.resolve({ totalHits: 1, resetTime: new Date(Date.now() + 10000) });
+    await enrolling.promise;
+    expect((await handlers.getMaintenanceCensus('op')).queuedContinuations).toBe(1);
+    enrolled.resolve({ ...identity, credential });
+    expect((await response).status).toBe(200);
+    expect(await handlers.getMaintenanceCensus('op')).toEqual({
+      admissionClosed: true,
+      queuedContinuations: 0,
+      pendingWrites: 0,
+      complete: true,
+    });
+    expect(handlers.resumeAdmissions('foreign')).toBe(false);
+    expect(handlers.resumeAdmissions('op')).toBe(true);
+  });
+
+  it('settles limiter429 and known precondition rejection without uncertain writes', async () => {
+    const { app, handlers } = fixture(true, 1);
+    await post(app, '/browser');
+    expect((await post(app, '/browser')).status).toBe(429);
+    expect((await post(app, '/browser').set('Origin', 'https://foreign.test')).status).toBe(403);
+    handlers.pauseAdmissions('op');
+    expect(await handlers.getMaintenanceCensus('op')).toMatchObject({
+      complete: true,
+      queuedContinuations: 0,
+      pendingWrites: 0,
+    });
+  });
+
+  it('joins limiter store errors and keeps uncertain effects incomplete', async () => {
+    const store: Store = {
+      increment: async () => {
+        throw new Error('store uncertain');
+      },
+      decrement: async () => {},
+      resetKey: async () => {},
+    };
+    const { app, handlers, deps } = fixture(true, 100, store);
+    expect((await post(app, '/browser')).status).toBe(500);
+    handlers.pauseAdmissions('op');
+    expect(await handlers.getMaintenanceCensus('op')).toMatchObject({
+      complete: false,
+      queuedContinuations: 0,
+    });
+    expect(deps.enrollBrowserIdentity).not.toHaveBeenCalled();
+  });
+
+  it.each(['enrollBrowserIdentity', 'revokeBrowserIdentity'] as const)(
+    'retains uncertain %s failures despite sanitized handler response',
+    async (method) => {
+      const { app, handlers, deps } = fixture();
+      deps[method].mockRejectedValueOnce(new Error('unknown write'));
+      const response =
+        method === 'enrollBrowserIdentity'
+          ? await post(app, '/browser')
+          : await post(app, '/reset').set('Cookie', `${BROWSER_COOKIE}=${credential}`);
+      expect(response.status).toBe(503);
+      handlers.pauseAdmissions('op');
+      expect((await handlers.getMaintenanceCensus('op')).complete).toBe(false);
+      expect(handlers.resumeAdmissions('op')).toBe(false);
+    },
+  );
+
+  it('counts reset/forget once through revocation and rejects stale census ownership', async () => {
+    const started = deferredBrowser<void>();
+    const finish = deferredBrowser<void>();
+    const { app, handlers, deps } = fixture();
+    deps.revokeBrowserIdentity.mockImplementation(() => {
+      started.resolve();
+      return finish.promise;
+    });
+    const response = post(app, '/reset')
+      .set('Cookie', `${BROWSER_COOKIE}=${credential}`)
+      .then((value) => value);
+    await started.promise;
+    handlers.pauseAdmissions('op');
+    expect(await handlers.getMaintenanceCensus('op')).toMatchObject({
+      queuedContinuations: 1,
+      pendingWrites: 1,
+    });
+    expect((await handlers.getMaintenanceCensus('foreign')).complete).toBe(false);
+    const sample = handlers.getMaintenanceCensus('op');
+    handlers.resumeAdmissions('op');
+    handlers.pauseAdmissions('op');
+    expect((await sample).complete).toBe(false);
+    finish.resolve();
+    expect((await response).status).toBe(204);
+    expect((await handlers.getMaintenanceCensus('op')).queuedContinuations).toBe(0);
   });
 });

@@ -1,4 +1,4 @@
-const { isEnabled } = require('@librechat/api');
+const { isEnabled, trackHistoryWrite } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { Constants, ViolationTypes, Time } = require('librechat-data-provider');
 const denyRequest = require('~/server/middleware/denyRequest');
@@ -83,7 +83,11 @@ const validateConvoAccess = async (req, res, next) => {
     if (cache) {
       /** The marker only short-circuits the next check; the violations store is file-backed
        *  without Redis and its debounced write takes ~100ms, so it must not gate this request. */
-      cache.set(key, 'authorized', Time.TEN_MINUTES).catch((error) => {
+      trackHistoryWrite(
+        req,
+        () => cache.set(key, 'authorized', Time.TEN_MINUTES),
+        (result) => result !== false,
+      ).catch((error) => {
         logger.warn('[validateConvoAccess] Failed to cache conversation access', error);
       });
     }

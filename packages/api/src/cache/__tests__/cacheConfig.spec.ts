@@ -5,6 +5,7 @@ describe('cacheConfig', () => {
     originalEnv = { ...process.env };
 
     // Clear all related env vars first
+    delete process.env.REDIS_CONNECTION_MODE;
     delete process.env.REDIS_URI;
     delete process.env.REDIS_CA;
     delete process.env.REDIS_KEY_PREFIX_VAR;
@@ -321,5 +322,48 @@ describe('cacheConfig', () => {
       const { cacheConfig } = await import('../cacheConfig');
       expect(cacheConfig.VIOLATION_SCORE_TTL).toBe(3600000);
     });
+  });
+});
+
+describe('selected Sentinel trust admission', () => {
+  const originalEnv = process.env;
+  afterEach(() => {
+    process.env = originalEnv;
+    jest.resetModules();
+  });
+  it('rejects unreadable selected CA instead of defaulting to system trust', async () => {
+    jest.resetModules();
+    process.env = {
+      USE_REDIS: 'true',
+      REDIS_CONNECTION_MODE: 'sentinel',
+      REDIS_SENTINEL_ENDPOINTS: '[{"host":"sentinel.test","port":26379}]',
+      REDIS_SENTINEL_NAME: 'app',
+      REDIS_USERNAME: 'data',
+      REDIS_PASSWORD: 'secret',
+      REDIS_SENTINEL_USERNAME: 'sentinel',
+      REDIS_SENTINEL_PASSWORD: 'secret',
+      REDIS_CA: '/nonexistent-sentinel-fixture-ca',
+      REDIS_SENTINEL_CA: '/nonexistent-sentinel-fixture-ca',
+    };
+    await expect(import('../cacheConfig')).rejects.toThrow('Shared-state CA could not be loaded');
+  });
+  it('rejects local session namespace overrides in selected mode', async () => {
+    jest.resetModules();
+    process.env = {
+      USE_REDIS: 'true',
+      REDIS_CONNECTION_MODE: 'sentinel',
+      REDIS_SENTINEL_ENDPOINTS: '[{"host":"sentinel.test","port":26379}]',
+      REDIS_SENTINEL_NAME: 'app',
+      REDIS_USERNAME: 'data',
+      REDIS_PASSWORD: 'secret',
+      REDIS_SENTINEL_USERNAME: 'sentinel',
+      REDIS_SENTINEL_PASSWORD: 'secret',
+      REDIS_CA: '/unused',
+      REDIS_SENTINEL_CA: '/unused',
+      FORCED_IN_MEMORY_CACHE_NAMESPACES: 'OPENID_SESSION',
+    };
+    await expect(import('../cacheConfig')).rejects.toThrow(
+      'Shared-state namespaces cannot use local storage',
+    );
   });
 });

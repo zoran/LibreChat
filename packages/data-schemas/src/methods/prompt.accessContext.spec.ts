@@ -570,6 +570,9 @@ describe('runAfterTransaction', () => {
     });
     const rawSession = {
       inTransaction: () => active,
+      startTransaction: () => {
+        active = true;
+      },
       commitTransaction: jest.fn(async () => {
         active = false;
       }),
@@ -584,9 +587,7 @@ describe('runAfterTransaction', () => {
       abortTransaction,
       endedHandlers,
       session: rawSession as unknown as NonNullable<Parameters<typeof runAfterTransaction>[0]>,
-      startTransaction: () => {
-        active = true;
-      },
+      startTransaction: () => rawSession.startTransaction(),
     };
   }
 

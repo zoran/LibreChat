@@ -192,6 +192,19 @@ describe('Agent execution enrollment', () => {
     await expect(manager.getCleanupBlockingJobIdsForUser('user-1')).resolves.toEqual([]);
   });
 
+  it('does not mistake terminal retry for successful trailing persistence', async () => {
+    const enrollment = await enrollAgentExecution(enrollmentParams('trailing-rejected'), {
+      manager,
+    });
+    await enrollment.beginProviderExecution();
+    enrollment.track(Promise.reject(new Error('history write rejected')));
+    const settled = jest.spyOn(manager, 'settleGenerationExecution');
+    await expect(enrollment.settle()).rejects.toThrow('Remote agent execution failed');
+    expect(settled).not.toHaveBeenCalled();
+    await expect(manager.getJobStore().getJob('trailing-rejected')).resolves.toMatchObject({
+      providerDrained: false,
+    });
+  });
   it('does not mark the provider drained while terminalization remains unavailable', async () => {
     const enrollment = await enrollAgentExecution(enrollmentParams('chatcmpl-terminal-outage'), {
       manager,

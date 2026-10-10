@@ -18,6 +18,7 @@ const getFacebookConfig = (callbackURL) => ({
   clientID: process.env.FACEBOOK_CLIENT_ID,
   clientSecret: process.env.FACEBOOK_CLIENT_SECRET,
   callbackURL,
+  passReqToCallback: true,
   proxy: true,
   scope: ['public_profile'],
   profileFields: ['id', 'email', 'name'],

@@ -6,7 +6,7 @@ export const READONLY_ERROR_PREFIX = 'READONLY';
 export type ReconnectableClient = {
   readonly isOpen: boolean;
   readonly isReady: boolean;
-  destroy(): void;
+  destroy(): void | Promise<void>;
   connect(): Promise<unknown>;
 };
 
@@ -41,13 +41,13 @@ export function isReadonlyReplicaError(error: unknown): boolean {
 }
 
 /**
- * Creates the READONLY recovery hook for a standalone node-redis client.
+ * Creates the READONLY recovery hook for standalone or Sentinel node-redis clients.
  *
  * node-redis only reconnects when its socket closes, and a demoted replica keeps
  * existing sockets open while rejecting every write, so a READONLY reply never
  * reaches `socket.reconnectStrategy`. The returned handler mirrors what ioredis
  * does through `reconnectOnError`: it tears the socket down and reconnects, which
- * re-resolves the connection to whatever the master address now points at.
+ * re-resolves the connection or rediscovers the Sentinel primary.
  *
  * Tearing the socket down rejects the commands queued or in flight at that
  * moment (reads included); node-redis cannot replay them the way ioredis does.
@@ -76,7 +76,10 @@ export function createReadonlyRecovery(options: ReadonlyRecoveryOptions): Readon
   const reconnect = async (): Promise<void> => {
     logger.warn(`${label} client reconnecting due to READONLY error`);
     if (client.isOpen) {
-      client.destroy();
+      const destruction = client.destroy();
+      if (destruction) {
+        await destruction;
+      }
     }
     await client.connect();
     logger.info(`${label} client reconnected after READONLY error`);

@@ -467,3 +467,54 @@ describe('dead-delivery certainty fence', () => {
     );
   });
 });
+
+describe('erasure maintenance ownership', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+    jest.spyOn(Math, 'random').mockReturnValue(0);
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
+
+  it('retains an active fallback write and exposes a swallowed per-row failure', async () => {
+    let reject!: (error: Error) => void;
+    const methods = {
+      getDeletingSchedules: jest.fn(async () => [{ id: 'schedule-1' }]),
+      getActiveRunsForSchedule: jest.fn(async () => [oldRun()]),
+      recordRunOutcome: jest.fn(
+        () =>
+          new Promise<void>((_resolve, fail) => {
+            reject = fail;
+          }),
+      ),
+      eraseScheduleIfDrained: jest.fn(async () => false),
+      markEraseAttempted: jest.fn(async () => undefined),
+      getRunsForReconciliation: jest.fn(async () => []),
+      getUnbookkeptRuns: jest.fn(async () => []),
+      markRunsReconciled: jest.fn(async () => undefined),
+    };
+    const sweep = startScheduleErasureSweep({
+      methods: methods as unknown as ScheduleMethods,
+      getJobStatus: async () => null,
+      getTriggerDelivery: async () => null,
+      clearReconciledJob: async () => undefined,
+      canInferOwnerDeathFromMissingJob: true,
+    });
+    await jest.advanceTimersByTimeAsync(300_000);
+    expect(reject).toBeDefined();
+    sweep.pauseAdmissions('drain');
+    expect((await sweep.getMaintenanceCensus('drain')).pendingWrites).toBe(1);
+    reject(new Error('unknown outcome'));
+    await jest.advanceTimersByTimeAsync(0);
+    expect(await sweep.getMaintenanceCensus('drain')).toMatchObject({
+      complete: false,
+      pendingWrites: 0,
+    });
+    await jest.advanceTimersByTimeAsync(600_000);
+    expect(methods.getDeletingSchedules).toHaveBeenCalledTimes(1);
+    expect(sweep.resumeAdmissions('drain')).toBe(false);
+    sweep.stop();
+  });
+});

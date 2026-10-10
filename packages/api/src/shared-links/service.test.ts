@@ -1,3 +1,4 @@
+import { createHistoryMutationOwner, isHistoryDeleteResult } from '../conversations/history';
 jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
   logger: { error: jest.fn(), info: jest.fn(), warn: jest.fn(), debug: jest.fn() },
@@ -355,6 +356,34 @@ describe('deleteSharedLinkWithCleanup', () => {
 });
 
 describe('deleteConvoSharedLinksWithCleanup', () => {
+  test('retains the actual detached ACL promise and its failed outcome', async () => {
+    await createTestLink({ conversationId: 'history-cleanup' });
+    const owner = createHistoryMutationOwner();
+    const scope = owner.admit('conversation-delete')!;
+    let reject!: (error: Error) => void;
+    const pending = new Promise<never>((_resolve, no) => {
+      reject = no;
+    });
+    const remove = jest.spyOn(AclEntry, 'deleteMany').mockReturnValueOnce(pending as never);
+    const children: Promise<unknown>[] = [];
+    try {
+      await deleteConvoSharedLinksWithCleanup(userId, 'history-cleanup', (promise) => {
+        children.push(scope.write(() => promise, isHistoryDeleteResult).catch(() => {}));
+      });
+      scope.finish();
+      owner.pauseAdmissions('a');
+      expect((await owner.getMaintenanceCensus('a')).pendingWrites).toBe(1);
+      reject(new Error('ACL acknowledgment lost'));
+      await Promise.all(children);
+      expect(await owner.getMaintenanceCensus('a')).toMatchObject({
+        pendingWrites: 0,
+        complete: false,
+      });
+    } finally {
+      remove.mockRestore();
+    }
+  });
+
   test('deletes all links for conversation and cleans up ACLs', async () => {
     const link1 = await createTestLink({ conversationId: 'convo-a' });
     const link2 = await createTestLink({ conversationId: 'convo-a' });

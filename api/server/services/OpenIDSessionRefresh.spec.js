@@ -1,3 +1,20 @@
+jest.mock('./LegacyAuthMaintenance', () => {
+  const { createAuthMaintenance } = jest.requireActual(
+    '../../../packages/api/src/auth/maintenance.ts',
+  );
+  let owner = createAuthMaintenance();
+  const authWrite = (action) => owner.run(undefined, (operation) => operation.write(action));
+  return {
+    withAuthRequest: (req, action) => owner.run(req, action),
+    authTrack: (action) => owner.run(undefined, action),
+    authWrite,
+    authMutation: (method, ...args) => authWrite(() => method(...args)),
+    maintenance: () => owner,
+    resetMaintenance: () => {
+      owner = createAuthMaintenance();
+    },
+  };
+});
 jest.mock('openid-client', () => ({
   refreshTokenGrant: jest.fn(),
 }));
@@ -15,6 +32,7 @@ jest.mock('@librechat/data-schemas', () => ({
 }));
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
+  ...jest.requireActual('../../../packages/api/src/auth/openid/session.ts'),
   isEnabled: jest.fn(),
   math: jest.fn((_value, fallback) => fallback),
   createAuthIdentityContext: jest.fn(({ user, requestUser }) => ({
@@ -153,7 +171,7 @@ const {
   setOpenIDMarkerCookies,
   storeOpenIdSession,
 } = require('@librechat/api');
-const { upsertSession, deleteSession } = require('~/models');
+const { deleteSession } = require('~/models');
 const { getOpenIdConfig } = require('~/strategies/openidStrategy');
 const { deleteRefreshTokenBridges, storeRefreshTokenBridge } = require('./RefreshTokenBridge');
 const {
@@ -219,6 +237,7 @@ const ownershipLost = (message) => createOpenIDRefreshOwnershipError(message);
 
 describe('OpenIDSessionRefresh', () => {
   beforeEach(() => {
+    require('./LegacyAuthMaintenance').resetMaintenance();
     jest.clearAllMocks();
     __internals.inFlightRefreshes.clear();
     isEnabled.mockReturnValue(true);
@@ -671,6 +690,71 @@ describe('OpenIDSessionRefresh', () => {
       return sessionTokens;
     };
 
+    it('retains accepted IdP work and the actual session save callback after pause and response end', async () => {
+      const owner = require('./LegacyAuthMaintenance').maintenance();
+      const req = buildReq(buildExpiredSession('rt-old'));
+      const res = { ...buildRes(), end: jest.fn() };
+      owner.admissionMiddleware(req, res, () => undefined);
+      let grant;
+      let save;
+      openIdClient.refreshTokenGrant.mockReturnValueOnce(
+        new Promise((resolve) => {
+          grant = resolve;
+        }),
+      );
+      req.session.save.mockImplementationOnce((callback) => {
+        save = callback;
+      });
+      const work = refreshOpenIDSession(req, res, makeOpenIdUser(), 'access_token');
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(openIdClient.refreshTokenGrant).toHaveBeenCalledTimes(1);
+      owner.pauseAdmissions('refresh-drain');
+      res.end();
+      expect(await owner.getMaintenanceCensus('refresh-drain')).toMatchObject({
+        queuedContinuations: 1,
+      });
+      const expires = Math.floor(Date.now() / 1000) + 3600;
+      grant({
+        access_token: makeJwt(expires),
+        id_token: makeJwt(expires),
+        refresh_token: 'rt-old',
+        expires_in: 3600,
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(save).toEqual(expect.any(Function));
+      expect(await owner.getMaintenanceCensus('refresh-drain')).toMatchObject({
+        queuedContinuations: 1,
+        pendingWrites: 1,
+      });
+      save(null);
+      await work;
+      expect(await owner.getMaintenanceCensus('refresh-drain')).toEqual({
+        admissionClosed: true,
+        queuedContinuations: 0,
+        pendingWrites: 0,
+        complete: true,
+      });
+    });
+
+    it('settles an ordinary invalid_grant without poisoning local persistence evidence', async () => {
+      const owner = require('./LegacyAuthMaintenance').maintenance();
+      const req = buildReq(buildExpiredSession('rt-old'));
+      const res = { ...buildRes(), end: jest.fn() };
+      owner.admissionMiddleware(req, res, () => undefined);
+      openIdClient.refreshTokenGrant.mockRejectedValueOnce(new Error('invalid_grant'));
+      await expect(
+        refreshOpenIDSession(req, res, makeOpenIdUser(), 'access_token'),
+      ).rejects.toThrow('invalid_grant');
+      res.end();
+      owner.pauseAdmissions('refresh-drain');
+      expect(await owner.getMaintenanceCensus('refresh-drain')).toMatchObject({
+        queuedContinuations: 0,
+        pendingWrites: 0,
+        complete: true,
+      });
+      expect(owner.resumeAdmissions('refresh-drain')).toBe(true);
+    });
+
     it('writes the rotated refresh token to the cookie when res is writable', async () => {
       const refreshedExp = Math.floor(Date.now() / 1000) + 3600;
       openIdClient.refreshTokenGrant.mockResolvedValueOnce({
@@ -725,7 +809,7 @@ describe('OpenIDSessionRefresh', () => {
           tenantId: 'tenant-1',
           previousRefreshToken: 'rt-old',
         },
-        { upsertSession, deleteSession },
+        { upsertSession: expect.any(Function), deleteSession: expect.any(Function) },
       );
       expect(storeOpenIdSession.mock.invocationCallOrder[0]).toBeLessThan(
         setRefreshTokenCookie.mock.invocationCallOrder[0],
@@ -1004,7 +1088,7 @@ describe('OpenIDSessionRefresh', () => {
           refreshToken: 'rt-next',
           previousRefreshToken: 'rt-session-current',
         }),
-        { upsertSession, deleteSession },
+        { upsertSession: expect.any(Function), deleteSession: expect.any(Function) },
       );
     });
 

@@ -50,6 +50,41 @@ describe('importConversations content filtering', () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
+  it('holds final unlink and reports its swallowed rejection after import success', async () => {
+    const {
+      createHistoryMutationOwner,
+    } = require('../../../../packages/api/src/conversations/history');
+    const owner = createHistoryMutationOwner();
+    const history = owner.admit('conversation-import');
+    getImporter.mockReturnValue(async () => {});
+    let started, reject;
+    const entered = new Promise((resolve) => {
+      started = resolve;
+    });
+    const unlink = jest.spyOn(fs, 'unlink').mockImplementationOnce(() => {
+      started();
+      return new Promise((_resolve, no) => {
+        reject = no;
+      });
+    });
+    const result = importConversations({ filepath, requestUserId: 'user-123', history }).finally(
+      () => history.finish(),
+    );
+    try {
+      await entered;
+      owner.pauseAdmissions('a');
+      expect((await owner.getMaintenanceCensus('a')).pendingWrites).toBe(1);
+      reject(new Error('unlink failed'));
+      await expect(result).resolves.toBeUndefined();
+      expect(await owner.getMaintenanceCensus('a')).toMatchObject({
+        pendingWrites: 0,
+        complete: false,
+      });
+    } finally {
+      unlink.mockRestore();
+    }
+  });
+
   it('threads filters into the normalized builder and removes a blocked upload', async () => {
     getImporter.mockReturnValue(async (_jsonData, requestUserId, builderFactory) => {
       const builder = builderFactory(requestUserId);

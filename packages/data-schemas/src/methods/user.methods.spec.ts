@@ -418,6 +418,64 @@ describe('User Methods - Database Tests', () => {
       expect(cache.delete).toHaveBeenCalledWith(indexKey);
     });
 
+    test('deletion retains every cache write and reports a hidden failure to its observer', async () => {
+      enableAuthUserDocCache();
+      const user = await User.create({ email: 'delete-owner@example.test', provider: 'local' });
+      let release!: () => void;
+      let started!: () => void;
+      const delayed = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const entered = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      const failures: unknown[] = [];
+      let pending = 0;
+      const observer = {
+        async write<T>(action: () => Promise<T>): Promise<T> {
+          pending++;
+          try {
+            return await action();
+          } catch (error) {
+            failures.push(error);
+            throw error;
+          } finally {
+            pending--;
+          }
+        },
+      };
+      const cache = {
+        get: jest.fn().mockResolvedValue(['failed-cache', 'delayed-cache']),
+        set: jest.fn().mockResolvedValue(true),
+        delete: async (key: string) => {
+          if (key === 'failed-cache') throw new Error('fixture cache acknowledgement lost');
+          started();
+          await delayed;
+          return true;
+        },
+      };
+      const observed = createUserMethods(mongoose, { getCache: () => cache });
+      let complete = false;
+      const deletion = observed
+        .deleteUserById(user._id?.toString() ?? '', observer)
+        .then((result) => {
+          complete = true;
+          return result;
+        });
+      try {
+        await entered;
+        expect(await User.findById(user._id)).toBeNull();
+        expect(complete).toBe(false);
+        expect(pending).toBe(1);
+        expect(failures).toHaveLength(1);
+      } finally {
+        release();
+      }
+      expect(await deletion).toMatchObject({ deletedCount: 1 });
+      expect(pending).toBe(0);
+      expect(failures).toHaveLength(1);
+    });
+
     test('should return null for non-existent user', async () => {
       const fakeId = new mongoose.Types.ObjectId();
       const result = await methods.updateUser(fakeId.toString(), { name: 'Test' });

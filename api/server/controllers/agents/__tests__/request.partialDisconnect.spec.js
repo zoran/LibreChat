@@ -22,11 +22,16 @@ const mockFilterPersistableAbortContent = jest.fn((content) => content);
 const mockCheckAndIncrementPendingRequest = jest.fn();
 const mockDecrementPendingRequest = jest.fn();
 const mockGenerationJobManager = {
+  observeGenerationWrite: jest.fn((_stream, _epoch, _segment, write) => write),
+  generationRequestBinding: (...args) =>
+    require('../../../../../packages/api/src/stream/generationAdmission').generationRequestBinding(
+      ...args,
+    ),
   createJob: jest.fn(),
   emitError: jest.fn(),
   completeJob: jest.fn(),
   beginProviderExecution: jest.fn(),
-  markProviderExecutionDrained: jest.fn(),
+  settleGenerationExecution: jest.fn(),
   getResumeState: jest.fn(),
   getJobStore: jest.fn(),
   updateMetadata: jest.fn(),
@@ -142,7 +147,7 @@ describe('ResumableAgentController tenant context', () => {
     mockGenerationJobManager.emitError.mockResolvedValue(undefined);
     mockGenerationJobManager.completeJob.mockResolvedValue(undefined);
     mockGenerationJobManager.beginProviderExecution.mockResolvedValue(true);
-    mockGenerationJobManager.markProviderExecutionDrained.mockResolvedValue(true);
+    mockGenerationJobManager.settleGenerationExecution.mockResolvedValue(true);
     mockGenerationJobManager.claimGeneration.mockResolvedValue({ claimed: true });
     mockGenerationJobManager.releaseGeneration.mockResolvedValue(undefined);
     mockGenerationJobManager.hasJob.mockResolvedValue(true);

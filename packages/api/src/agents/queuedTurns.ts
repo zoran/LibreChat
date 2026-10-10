@@ -21,6 +21,7 @@ import type {
 import type { AgentContinueTriggerEnvelope, AgentTriggerEnvelope } from './triggers/envelope';
 import type { AgentTriggerEnqueueOptions } from './triggers/delivery';
 import type { AgentTriggerDeliveryFailure } from './triggers/engine';
+import type { ApplicationWorkPort } from '~/app';
 import { getAgentTriggerIdempotencyKey, parseAgentTriggerEnvelope } from './triggers/envelope';
 import { createAgentTriggerEnvelope } from './triggers/envelope';
 import { AgentTriggerExecutionError } from './triggers/host';
@@ -89,14 +90,14 @@ export interface AgentQueuedTurnSchedulerDeps {
   recoveryLimit?: number;
 }
 
-export interface AgentQueuedTurnScheduler {
+export interface AgentQueuedTurnScheduler extends ApplicationWorkPort {
   initialize: (options?: { maxIdleIntervalMs?: number }) => Promise<void>;
   stop: () => Promise<void>;
   schedule: (turn: AgentQueuedTurnRecord) => Promise<string>;
   recover: () => Promise<number>;
 }
 
-export interface AgentQueuedTurnLifecycle {
+export interface AgentQueuedTurnLifecycle extends ApplicationWorkPort {
   prepareContinue: NonNullable<AgentTriggerExecutionHostDeps['prepareContinue']>;
   settleBeforeDeadLetter: (
     rawEnvelope: unknown,
@@ -430,16 +431,22 @@ function releaseClaim(
   envelope: AgentContinueTriggerEnvelope,
   claim: AgentQueuedTurnClaim,
 ): Promise<unknown> {
-  return methods.releaseAgentQueuedTurn({
-    user: claim.user,
-    ...(claim.tenantId != null && { tenantId: claim.tenantId }),
-    conversationId: envelope.target.conversationId,
-    queuedTurnId: claim.queuedTurnId,
-    claimId: claim.claimId,
-    claimBy: claim.claimBy,
-    disposition: 'retry',
-    availableAt: new Date(),
-  });
+  return methods
+    .releaseAgentQueuedTurn({
+      user: claim.user,
+      ...(claim.tenantId != null && { tenantId: claim.tenantId }),
+      conversationId: envelope.target.conversationId,
+      queuedTurnId: claim.queuedTurnId,
+      claimId: claim.claimId,
+      claimBy: claim.claimBy,
+      disposition: 'retry',
+      availableAt: new Date(),
+    })
+    .then((result) => {
+      if (result.outcome === 'conflict')
+        throw new Error('The queued turn release fence could not be confirmed');
+      return result;
+    });
 }
 
 function deadClaim(
@@ -449,17 +456,23 @@ function deadClaim(
   code: string,
   message: string,
 ): Promise<unknown> {
-  return methods.releaseAgentQueuedTurn({
-    user: claim.user,
-    ...(claim.tenantId != null && { tenantId: claim.tenantId }),
-    conversationId: envelope.target.conversationId,
-    queuedTurnId: claim.queuedTurnId,
-    claimId: claim.claimId,
-    claimBy: claim.claimBy,
-    disposition: 'dead',
-    settledAt: new Date(),
-    failure: normalizeFailure(code, message),
-  });
+  return methods
+    .releaseAgentQueuedTurn({
+      user: claim.user,
+      ...(claim.tenantId != null && { tenantId: claim.tenantId }),
+      conversationId: envelope.target.conversationId,
+      queuedTurnId: claim.queuedTurnId,
+      claimId: claim.claimId,
+      claimBy: claim.claimBy,
+      disposition: 'dead',
+      settledAt: new Date(),
+      failure: normalizeFailure(code, message),
+    })
+    .then((result) => {
+      if (result.outcome === 'conflict')
+        throw new Error('The queued turn release fence could not be confirmed');
+      return result;
+    });
 }
 
 /** Resolves one queued message into a fresh ordinary Agent turn. The durable
@@ -762,6 +775,21 @@ function createAgentQueuedTurnScheduler({
   let loop: ReturnType<typeof createIdleRecoveryLoop> | undefined;
   let initialization: Promise<void> | undefined;
   let stopped = false;
+  let pausedBy: string | undefined;
+  let revision = 0;
+  let pending = 0;
+  let unconfirmed = false;
+  const observe = async <T>(run: () => Promise<T>): Promise<T> => {
+    pending++;
+    try {
+      return await run();
+    } catch (error) {
+      unconfirmed = true;
+      throw error;
+    } finally {
+      pending--;
+    }
+  };
   let recovery: Promise<{ repaired: number; idle: boolean }> | undefined;
 
   const publish = async (turn: AgentQueuedTurnRecord): Promise<string> => {
@@ -809,8 +837,9 @@ function createAgentQueuedTurnScheduler({
   };
 
   const schedule = async (turn: AgentQueuedTurnRecord): Promise<string> => {
+    if (pausedBy || stopped) throw new Error('Queued turn admission is paused');
     try {
-      return await publish(turn);
+      return await observe(() => publish(turn));
     } catch (error) {
       loop?.wake();
       throw error;
@@ -818,10 +847,11 @@ function createAgentQueuedTurnScheduler({
   };
 
   const recoverPass = (): Promise<{ repaired: number; idle: boolean }> => {
+    if (pausedBy || stopped) return Promise.resolve({ repaired: 0, idle: false });
     if (recovery != null) {
       return recovery;
     }
-    const task = (async () => {
+    const task = observe(async () => {
       const reconciliationNow = new Date();
       const reconciliationClaimId = randomUUID();
       const activity = { found: false };
@@ -871,11 +901,16 @@ function createAgentQueuedTurnScheduler({
               availableAt,
             }),
           );
+          if (!deferred) unconfirmed = true;
           if (deferred) {
             loop?.noteEligibleAt(availableAt);
           }
         };
         try {
+          if (pausedBy || stopped) {
+            await defer();
+            continue;
+          }
           const isIndeterminate =
             turn.terminalReceipt?.outcome === 'dead' &&
             turn.terminalReceipt.failure?.code === 'ADMISSION_INDETERMINATE';
@@ -939,6 +974,7 @@ function createAgentQueuedTurnScheduler({
             repaired += 1;
           }
         } catch (error) {
+          unconfirmed = true;
           await defer().catch(() => undefined);
           logger.warn(
             `[agentQueuedTurns] Failed to reconcile admission ${turn.queuedTurnId}: ${
@@ -948,10 +984,12 @@ function createAgentQueuedTurnScheduler({
         }
       }
       for (const turn of turns) {
+        if (pausedBy || stopped) break;
         try {
           await publish(turn);
           repaired += 1;
         } catch (error) {
+          unconfirmed = true;
           logger.warn(
             `[agentQueuedTurns] Failed to repair delivery ${turn.queuedTurnId}: ${
               error instanceof Error ? error.message : String(error)
@@ -964,7 +1002,7 @@ function createAgentQueuedTurnScheduler({
       if (deliveries.status === 'rejected') throw deliveries.reason;
       if (reconciliations.status === 'rejected') throw reconciliations.reason;
       return { repaired, idle: !activity.found && turns.length === 0 && quarantined.length === 0 };
-    })();
+    });
     recovery = task;
     void task.then(
       () => {
@@ -983,6 +1021,36 @@ function createAgentQueuedTurnScheduler({
   const recover = async (): Promise<number> => (await recoverPass()).repaired;
 
   return {
+    pauseAdmissions(requestId) {
+      if (!requestId || (pausedBy && pausedBy !== requestId)) return false;
+      pausedBy = requestId;
+      revision++;
+      return loop?.pauseAdmissions(requestId) ?? true;
+    },
+    resumeAdmissions(requestId) {
+      if (pausedBy !== requestId || stopped || unconfirmed) return false;
+      if (loop && !loop.resumeAdmissions(requestId)) return false;
+      pausedBy = undefined;
+      revision++;
+      return true;
+    },
+    async getMaintenanceCensus(requestId) {
+      const before = revision;
+      const child = loop;
+      const state = await child?.getMaintenanceCensus(requestId);
+      return {
+        admissionClosed:
+          (stopped || (!!requestId && pausedBy === requestId)) && (state?.admissionClosed ?? true),
+        queuedContinuations: pending,
+        pendingWrites: pending,
+        complete:
+          !unconfirmed &&
+          before === revision &&
+          child === loop &&
+          (pausedBy == null || pausedBy === requestId) &&
+          (state?.complete ?? true),
+      };
+    },
     schedule,
     recover,
     initialize: (options = {}) => {
@@ -995,7 +1063,7 @@ function createAgentQueuedTurnScheduler({
       const maxIdleIntervalMs =
         options.maxIdleIntervalMs ??
         Math.max(recoveryIntervalMs, DEFAULT_RECOVERY_MAX_IDLE_INTERVAL_MS);
-      const next = (async () => {
+      const next = observe(async () => {
         loop = createIdleRecoveryLoop({
           intervalMs: recoveryIntervalMs,
           maxIdleIntervalMs,
@@ -1003,11 +1071,12 @@ function createAgentQueuedTurnScheduler({
           onError: (error) =>
             logger.warn('[agentQueuedTurns] Delivery recovery pass failed', error),
         });
+        if (pausedBy) loop.pauseAdmissions(pausedBy);
         await runAsSystem(() => methods.ensureAgentQueuedTurnIndexes());
         if (!stopped) {
           await loop.start();
         }
-      })();
+      });
       initialization = next.catch((error: unknown) => {
         if (!stopped) {
           initialization = undefined;
@@ -1087,7 +1156,36 @@ export function createAgentQueuedTurnLifecycle({
     ...(recoveryIntervalMs != null && { recoveryIntervalMs }),
     ...(recoveryLimit != null && { recoveryLimit }),
   });
-  return {
+  let revision = 0;
+  let pending = 0;
+  let unconfirmed = false;
+  const observe =
+    <A extends unknown[], R>(fn: (...args: A) => R | Promise<R>) =>
+    async (...args: A): Promise<R> => {
+      pending++;
+      try {
+        return await fn(...args);
+      } catch (error) {
+        // These canonical resolver outcomes prove no owned dispatch/write remains.
+        // Unknown commit and lost/rejected release fences are deliberately excluded.
+        const definitePreparation =
+          error instanceof AgentTriggerExecutionError &&
+          error.certainty === 'definite' &&
+          [
+            'INVALID_QUEUED_TURN',
+            'PARENT_STATE_UNAVAILABLE',
+            'PARENT_NOT_READY',
+            'PARENT_NOT_FOUND',
+            'QUEUED_TURN_BLOCKED',
+            'QUEUED_TURN_PREPARATION_UNAVAILABLE',
+          ].includes(error.code ?? '');
+        if (!definitePreparation) unconfirmed = true;
+        throw error;
+      } finally {
+        pending--;
+      }
+    };
+  const lifecycle: Omit<AgentQueuedTurnLifecycle, keyof ApplicationWorkPort> = {
     prepareContinue: createAgentQueuedTurnResolver({
       methods,
       getGenerationJob,
@@ -1113,5 +1211,43 @@ export function createAgentQueuedTurnLifecycle({
         ...(getDelivery != null && { getDelivery }),
       }),
     recover: scheduler.recover,
+  };
+  return {
+    ...lifecycle,
+    pauseAdmissions: (requestId) => {
+      revision++;
+      return scheduler.pauseAdmissions(requestId);
+    },
+    resumeAdmissions: (requestId) => {
+      revision++;
+      return !unconfirmed && scheduler.resumeAdmissions(requestId);
+    },
+    async getMaintenanceCensus(requestId) {
+      const before = revision;
+      const state = await scheduler.getMaintenanceCensus(requestId);
+      return {
+        ...state,
+        queuedContinuations: state.queuedContinuations + pending,
+        pendingWrites: state.pendingWrites + pending,
+        complete: state.complete && !unconfirmed && before === revision,
+      };
+    },
+    prepareContinue: observe(async (...args: Parameters<typeof lifecycle.prepareContinue>) => {
+      const prepared = await lifecycle.prepareContinue(...args);
+      if (prepared?.status !== 'ready') return prepared;
+      return {
+        ...prepared,
+        ...(prepared.releaseOnDefiniteFailure && {
+          releaseOnDefiniteFailure: observe(prepared.releaseOnDefiniteFailure),
+        }),
+        ...(prepared.settleOnAdmission && {
+          settleOnAdmission: observe(prepared.settleOnAdmission),
+        }),
+      };
+    }),
+    settleBeforeDeadLetter: observe(lifecycle.settleBeforeDeadLetter),
+    recordExecutionAdmission: observe(lifecycle.recordExecutionAdmission),
+    verifyExecutionAdmission: observe(lifecycle.verifyExecutionAdmission),
+    cancel: observe(lifecycle.cancel),
   };
 }

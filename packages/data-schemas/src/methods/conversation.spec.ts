@@ -18,6 +18,7 @@ import type {
 } from '../types';
 import { ConversationMethods, createConversationMethods } from './conversation';
 import { tenantStorage, runAsSystem } from '~/config/tenantContext';
+import * as chatProjectMethods from './chatProject';
 import { createModels } from '../models';
 
 jest.mock('~/config/winston', () => ({
@@ -3107,7 +3108,11 @@ describe('Conversation Operations', () => {
       // Post-delete cleanup is best-effort: the conversations are already gone, so the
       // caller must still receive the deleted ids (downstream cleanup — e.g. agent
       // checkpoint pruning — depends on them, and a retry would find nothing).
-      const result = await deleteConvos('user123', { conversationId: convoId });
+      const onUncertain = jest.fn();
+      const result = await deleteConvos('user123', { conversationId: convoId }, { onUncertain });
+      expect(onUncertain).toHaveBeenCalledWith(
+        expect.objectContaining({ message: 'message cleanup failed' }),
+      );
       expect(result.deletedCount).toBe(1);
       expect(result.conversationIds).toEqual([convoId]);
       expect(result.messages.deletedCount).toBe(0);
@@ -3120,6 +3125,29 @@ describe('Conversation Operations', () => {
   });
 
   describe('archiveAllConvos', () => {
+    it('reports suppressed recovery failure without changing the archive response', async () => {
+      await Conversation.create({
+        conversationId: uuidv4(),
+        user: 'history-owner',
+        endpoint: EModelEndpoint.openAI,
+      });
+      const onUncertain = jest.fn();
+      const discovery = jest
+        .spyOn(Conversation, 'distinct')
+        .mockResolvedValueOnce([])
+        .mockRejectedValue(new Error('recovery unavailable'));
+      try {
+        expect(await archiveAllConvos('history-owner', { onUncertain })).toEqual({
+          archivedCount: 1,
+        });
+        expect(onUncertain).toHaveBeenCalledWith(
+          expect.objectContaining({ message: 'recovery unavailable' }),
+        );
+      } finally {
+        discovery.mockRestore();
+      }
+    });
+
     it('defines an index for the user-scoped ObjectId batch scan', () => {
       const indexFields = Conversation.schema.indexes().map(([fields]) => fields);
 
@@ -7636,6 +7664,60 @@ describe('Conversation Operations', () => {
       expect(refreshedProject?.conversationCount).toBe(1);
       expect(refreshedProject?.lastConversationId).toBe(conversationId);
       expect(refreshedProject?.lastConversationAt?.toISOString()).toBe(createdAt.toISOString());
+    });
+
+    it('does not finish a failed bulk import while another project refresh is still writing', async () => {
+      const projects = await ChatProject.create([
+        { user: 'user123', name: 'History A' },
+        { user: 'user123', name: 'History B' },
+      ]);
+      let complete!: (value: null) => void;
+      let started!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        started = resolve;
+      });
+      const refresh = jest
+        .spyOn(chatProjectMethods, 'refreshChatProjectStatsForUser')
+        .mockRejectedValueOnce(new Error('first stats write failed'))
+        .mockImplementationOnce(() => {
+          started();
+          return new Promise((resolve) => {
+            complete = resolve;
+          });
+        });
+      let settled = false;
+      const result = methods
+        .bulkSaveConvos(
+          projects.map((project) => ({
+            user: 'user123',
+            conversationId: uuidv4(),
+            endpoint: EModelEndpoint.openAI,
+            title: 'Imported',
+            chatProjectId: project._id!.toString(),
+          })),
+        )
+        .then(
+          () => {
+            settled = true;
+          },
+          (error: Error) => {
+            settled = true;
+            return error;
+          },
+        );
+      try {
+        await entered;
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(settled).toBe(false);
+        complete(null);
+        expect(await result).toEqual(
+          expect.objectContaining({ message: 'Failed to save conversations in bulk.' }),
+        );
+      } finally {
+        complete(null);
+        await result;
+        refresh.mockRestore();
+      }
     });
   });
 

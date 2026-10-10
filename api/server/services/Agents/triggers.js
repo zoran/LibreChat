@@ -82,6 +82,8 @@ const purgeAgentTriggerDeliveriesForUser = async (userId) => {
 };
 
 module.exports = {
+  agentTriggerMaintenance: service,
+  agentQueuedTurnMaintenance: queuedTurnLifecycle,
   initializeAgentTriggerService,
   stopAgentTriggerService,
   dispatchAgentTrigger: service.dispatch,

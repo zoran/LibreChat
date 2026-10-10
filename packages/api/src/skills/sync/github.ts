@@ -150,6 +150,8 @@ type SyncSkillFilesResult = Pick<SyncCounters, 'syncedFileCount' | 'deletedFileC
 type MaybePromise<T> = T | Promise<T>;
 
 export type GitHubSkillSyncDeps = {
+  /** Reports an unconfirmed mutation before source error sanitization. */
+  onUnconfirmedWork?: () => void;
   getConfig: () => MaybePromise<SkillSyncConfig | undefined>;
   getCredentialToken: (
     provider: SkillSyncProvider,
@@ -2028,6 +2030,36 @@ function getGithubConfig(config: SkillSyncConfig | undefined): {
 }
 
 export function createGitHubSkillSyncRunner(deps: GitHubSkillSyncDeps): GitHubSkillSyncRunner {
+  const mutation =
+    <A extends unknown[], R>(fn: (...args: A) => Promise<R>) =>
+    async (...args: A): Promise<R> => {
+      try {
+        return await fn(...args);
+      } catch (error) {
+        deps.onUnconfirmedWork?.();
+        throw error;
+      }
+    };
+  const originalDeleteSkill = deps.deleteSkill;
+  deps = {
+    ...deps,
+    upsertStatus: mutation(deps.upsertStatus),
+    tryAcquireLock: mutation(deps.tryAcquireLock),
+    refreshLock: mutation(deps.refreshLock),
+    releaseLock: mutation(deps.releaseLock),
+    createSkill: mutation(deps.createSkill),
+    updateSkill: mutation(deps.updateSkill),
+    upsertSkillFile: mutation(deps.upsertSkillFile),
+    deleteSkillFile: mutation(deps.deleteSkillFile),
+    saveBuffer: mutation(deps.saveBuffer),
+    grantPermission: mutation(deps.grantPermission),
+    ...(deps.deleteFile && { deleteFile: mutation(deps.deleteFile) }),
+    deleteSkill: mutation(async (id: string) => {
+      const result = await originalDeleteSkill(id);
+      if (!result.cleanupComplete) deps.onUnconfirmedWork?.();
+      return result;
+    }),
+  };
   const fetchFn = deps.fetchFn ?? fetch;
   const lockOwnerPrefix = deps.lockOwner ?? `${process.pid}`;
 
@@ -2128,9 +2160,10 @@ export function createGitHubSkillSyncRunner(deps: GitHubSkillSyncDeps): GitHubSk
         throw new SkillSyncError('SYNC_LOCK_LOST', 'GitHub skill sync lock was lost');
       }
     };
+    const renewals = new Set<Promise<void>>();
     const refreshTimer = setInterval(
       () => {
-        deps
+        const renewal = deps
           .refreshLock({
             provider: PROVIDER,
             lockOwner,
@@ -2139,13 +2172,16 @@ export function createGitHubSkillSyncRunner(deps: GitHubSkillSyncDeps): GitHubSk
           .then((refreshed) => {
             if (!refreshed) {
               lockLost = true;
+              deps.onUnconfirmedWork?.();
               logger.warn('[GitHubSkillSync] Failed to refresh active sync lock');
             }
           })
           .catch((error) => {
             lockLost = true;
             logger.error('[GitHubSkillSync] Failed to refresh active sync lock:', error);
-          });
+          })
+          .finally(() => renewals.delete(renewal));
+        renewals.add(renewal);
       },
       Math.max(60_000, Math.floor(LOCK_LEASE_MS / 3)),
     );
@@ -2168,6 +2204,7 @@ export function createGitHubSkillSyncRunner(deps: GitHubSkillSyncDeps): GitHubSk
       };
     } finally {
       clearInterval(refreshTimer);
+      await Promise.all(renewals);
       await deps.releaseLock({ provider: PROVIDER, lockOwner });
     }
   }

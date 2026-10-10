@@ -85,3 +85,5 @@ export * from './codeEnvRef';
 export * from './code/worker';
 export * from './code/approval';
 export * from './code/workspace';
+
+export * from './sharedState';

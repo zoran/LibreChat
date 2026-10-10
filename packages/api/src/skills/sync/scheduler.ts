@@ -1,6 +1,7 @@
 import { logger } from '@librechat/data-schemas';
 import type { SkillSyncConfig } from 'librechat-data-provider';
 import type { GitHubSkillSyncRunner } from './github';
+import type { ApplicationWorkPort } from '~/app';
 import { registerShutdownTask } from '~/app/shutdown';
 
 const NODE_TIMER_MAX_MS = 2147483647;
@@ -9,7 +10,7 @@ export const SKILL_SYNC_MAX_TIMER_INTERVAL_MINUTES: number = Math.floor(NODE_TIM
 
 type MaybePromise<T> = T | Promise<T>;
 
-export type GitHubSkillSyncScheduler = {
+export type GitHubSkillSyncScheduler = ApplicationWorkPort & {
   stop: () => void;
 };
 
@@ -33,6 +34,17 @@ export function startGitHubSkillSyncScheduler(params: {
   runner: GitHubSkillSyncRunner;
 }): GitHubSkillSyncScheduler {
   let stopped = false;
+  let pausedBy: string | undefined;
+  let pending = 0;
+  let nextAt = 0;
+  const observe = async (run: () => Promise<void>) => {
+    pending++;
+    try {
+      await run();
+    } finally {
+      pending--;
+    }
+  };
   let timer: NodeJS.Timeout | undefined;
 
   const getConfig = async (): Promise<SkillSyncConfig | undefined> => {
@@ -49,6 +61,8 @@ export function startGitHubSkillSyncScheduler(params: {
       return;
     }
     const delayMs = normalizeIntervalMinutes(config?.github?.intervalMinutes) * 60 * 1000;
+    nextAt = Date.now() + delayMs;
+    if (pausedBy) return;
     timer = setTimeout(tick, delayMs);
     timer.unref?.();
   };
@@ -56,7 +70,7 @@ export function startGitHubSkillSyncScheduler(params: {
   const runIfEnabled = async () => {
     const config = await getConfig();
     const github = config?.github;
-    if (!github?.enabled || getSources(config).length === 0) {
+    if (stopped || pausedBy || !github?.enabled || getSources(config).length === 0) {
       return config;
     }
     try {
@@ -68,14 +82,37 @@ export function startGitHubSkillSyncScheduler(params: {
   };
 
   async function tick() {
-    if (stopped) {
-      return;
-    }
-    const config = await runIfEnabled();
-    scheduleNext(config);
+    if (stopped || pausedBy) return;
+    await observe(async () => {
+      const config = await runIfEnabled();
+      scheduleNext(config);
+    });
   }
 
-  const scheduler = {
+  const scheduler: GitHubSkillSyncScheduler = {
+    pauseAdmissions(requestId) {
+      if (!requestId || (pausedBy && pausedBy !== requestId)) return false;
+      pausedBy = requestId;
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      return true;
+    },
+    resumeAdmissions(requestId) {
+      if (pausedBy !== requestId || stopped) return false;
+      pausedBy = undefined;
+      if (pending > 0) return true;
+      timer = setTimeout(tick, Math.max(0, nextAt - Date.now()));
+      timer.unref?.();
+      return true;
+    },
+    async getMaintenanceCensus(requestId) {
+      return {
+        admissionClosed: stopped || (!!requestId && pausedBy === requestId),
+        queuedContinuations: pending,
+        pendingWrites: pending,
+        complete: pausedBy == null || pausedBy === requestId,
+      };
+    },
     stop: () => {
       stopped = true;
       if (timer) {
@@ -85,15 +122,21 @@ export function startGitHubSkillSyncScheduler(params: {
     },
   };
 
-  void (async () => {
+  void observe(async () => {
     const config = await getConfig();
-    if (config?.github?.enabled && config.github.runOnStartup && getSources(config).length > 0) {
-      void params.runner.runOnce().catch((error) => {
+    if (
+      !stopped &&
+      !pausedBy &&
+      config?.github?.enabled &&
+      config.github.runOnStartup &&
+      getSources(config).length > 0
+    ) {
+      await params.runner.runOnce().catch((error) => {
         logger.error('[GitHubSkillSync] Scheduled startup run failed:', error);
       });
     }
     scheduleNext(config);
-  })();
+  });
 
   registerShutdownTask('github skill sync scheduler', () => {
     scheduler.stop();

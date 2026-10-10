@@ -1647,6 +1647,8 @@ export class GenerationPublicationFencedError extends Error {
  * Implementations can use EventEmitter, Redis Pub/Sub, etc.
  */
 export interface IEventTransport {
+  /** Actual dedicated command/subscriber and subscription readiness, when supported. */
+  isGenerationTransportReady?(): boolean;
   /**
    * Subscribe to events for a stream. `ready` resolves once the transport can receive messages.
    *

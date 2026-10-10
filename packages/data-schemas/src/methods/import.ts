@@ -50,7 +50,11 @@ export function createConversationImportMethods(
     const Message = mongoose.models.Message as Model<IMessage>;
     await runAsSystem(async () => {
       for (const conversationIds of chunkConversationIds(scope.conversationIds)) {
-        await Message.deleteMany(createImportCleanupFilter<IMessage>(scope, conversationIds));
+        const result = await Message.deleteMany(
+          createImportCleanupFilter<IMessage>(scope, conversationIds),
+        );
+        if (result?.acknowledged !== true)
+          throw new Error('Imported message cleanup was not acknowledged');
       }
     });
   }
@@ -70,7 +74,9 @@ export function createConversationImportMethods(
             affectedProjectIds.add(String(projectId));
           }
         }
-        await Conversation.deleteMany(filter);
+        const result = await Conversation.deleteMany(filter);
+        if (result?.acknowledged !== true)
+          throw new Error('Imported conversation cleanup was not acknowledged');
       }
       return [...affectedProjectIds];
     });
@@ -78,11 +84,13 @@ export function createConversationImportMethods(
     await tenantStorage.run(
       { ...context, tenantId: scope.tenantId, userId: scope.user },
       async () => {
-        await Promise.all(
+        const results = await Promise.allSettled(
           projectIds.map((projectId) =>
             refreshChatProjectStatsForUser(mongoose, scope.user, projectId),
           ),
         );
+        const failed = results.find((result) => result.status === 'rejected');
+        if (failed?.status === 'rejected') throw failed.reason;
       },
     );
   }

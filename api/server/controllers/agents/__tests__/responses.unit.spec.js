@@ -770,9 +770,11 @@ describe('createResponse controller', () => {
     expect(res.off).toHaveBeenCalledWith('close', expect.any(Function));
   });
 
-  it('covers artifact writes when provider execution fails', async () => {
+  it('retains the original rejected artifact write despite best-effort response logging', async () => {
     const providerError = new Error('provider aborted');
-    const artifactWrite = Promise.resolve(null);
+    const artifactError = new Error('artifact persistence failed');
+    const artifactWrite = Promise.reject(artifactError);
+    void artifactWrite.catch(() => undefined);
     const processStream = jest.fn().mockRejectedValue(providerError);
     const { createRun } = require('@librechat/api');
     const { createToolEndCallback } = require('~/server/controllers/agents/callbacks');
@@ -785,6 +787,7 @@ describe('createResponse controller', () => {
     await createResponse(req, res);
 
     expect(mockExecution.track).toHaveBeenCalledWith(expect.any(Promise));
+    await expect(mockExecution.track.mock.calls[0][0]).rejects.toBe(artifactError);
     expect(mockExecution.track.mock.invocationCallOrder[0]).toBeLessThan(
       mockExecution.settle.mock.invocationCallOrder[0],
     );

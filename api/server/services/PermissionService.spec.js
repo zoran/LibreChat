@@ -1,3 +1,22 @@
+// Policy fixtures isolate lifecycle; actual owner/consumer settlement is covered by maintenance suites.
+jest.mock('~/server/services/LegacyAuthMaintenance', () => ({
+  withAuthRequest: async (_req, action) => action(),
+  authTrack: async (action) =>
+    action({
+      write: async (write) => write(),
+      track: async (work) => work(),
+      markUncertain: () => {},
+    }),
+  authWrite: async (action) => action(),
+  authMutation: async (method, ...args) => method(...args),
+  authUserMutation: async (method, ...args) => method(...args),
+  authCache: (store) => store,
+  authPersistence: { write: async (action) => action() },
+  legacyAuthMaintenance: { current: () => undefined },
+  authAdmissionMiddleware: (_req, _res, next) => next(),
+  ownAuthHandler: (handler) => handler,
+  authSessionStore: (store) => store,
+}));
 const mongoose = require('mongoose');
 const { RoleBits, createModels, tenantStorage } = require('@librechat/data-schemas');
 const { MongoMemoryServer } = require('mongodb-memory-server');
@@ -2628,6 +2647,40 @@ describe('syncUserEntraGroupMemberships - $pullAll on Group.memberIds', () => {
   afterEach(() => {
     entraIdPrincipalFeatureEnabled.mockReturnValue(false);
     getUserEntraGroups.mockResolvedValue([]);
+  });
+
+  it('retains a pending sibling group write after another write fails inside best-effort sync', async () => {
+    const { getEntraGroupDetailsBatch } = require('~/server/services/GraphApiService');
+    getUserEntraGroups.mockResolvedValue(['missing-one', 'missing-two']);
+    getEntraGroupDetailsBatch.mockResolvedValue([
+      { id: 'missing-one', name: 'One' },
+      { id: 'missing-two', name: 'Two' },
+    ]);
+    let release;
+    const pending = new Promise((resolve) => {
+      release = resolve;
+    });
+    const upsert = jest
+      .spyOn(db, 'upsertGroupByExternalId')
+      .mockRejectedValueOnce(new Error('unknown mutation outcome'))
+      .mockReturnValueOnce(pending);
+    let finished = false;
+    const work = syncUserEntraGroupMemberships(user, 'fake-token').then(() => {
+      finished = true;
+    });
+    try {
+      // The first bulk update and group lookup use the admitted local synthetic Mongo fixture.
+      for (let attempt = 0; attempt < 100 && upsert.mock.calls.length < 2; attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(upsert).toHaveBeenCalledTimes(2);
+      expect(finished).toBe(false);
+    } finally {
+      release({});
+      await work;
+      upsert.mockRestore();
+      getEntraGroupDetailsBatch.mockResolvedValue([]);
+    }
   });
 
   it('should add user to matching Entra groups and remove from non-matching ones', async () => {

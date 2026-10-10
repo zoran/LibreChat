@@ -351,9 +351,10 @@ export async function fireSchedule(
     if (chatProjectId !== (schedule.chatProjectId ?? undefined)) {
       await methods
         .persistResolvedProject(schedule.id, chatProjectId, claimToken)
-        .catch((err: unknown) =>
-          logger.warn(`[schedules] could not converge stored project for ${schedule.id}`, err),
-        );
+        .catch((err: unknown) => {
+          deps.onUnconfirmedWork?.();
+          logger.warn(`[schedules] could not converge stored project for ${schedule.id}`, err);
+        });
     }
 
     if (await deps.isOutOfBalance(user)) {
@@ -380,6 +381,7 @@ export async function fireSchedule(
           BALANCE_SKIP_DISABLE_THRESHOLD,
         );
       } catch (skipError) {
+        deps.onUnconfirmedWork?.();
         logger.error(`[schedules] balance-skip bookkeeping failed for ${schedule.id}:`, skipError);
         return { fired: false, skipped: 'balance' as const };
       }
@@ -394,6 +396,7 @@ export async function fireSchedule(
     try {
       files = requestedFileIds.length ? await deps.resolveFiles(requestedFileIds, user) : [];
     } catch (fileError) {
+      deps.onUnconfirmedWork?.();
       logger.error(
         `[schedules] file resolution failed for ${schedule.id} (will retry):`,
         fileError,
@@ -605,6 +608,7 @@ export async function fireSchedule(
             ...claimedRevision,
           });
         } catch (skipError) {
+          deps.onUnconfirmedWork?.();
           // Same reasoning as the balance skip: no reconciliation path repairs a
           // half-applied skip, so leave the occurrence due rather than advancing past it.
           logger.error(
@@ -713,6 +717,7 @@ export async function fireSchedule(
       const message = error instanceof Error ? error.message : String(error);
       const ambiguous = error instanceof ScheduleFireError && error.ambiguous;
       if (ambiguous) {
+        deps.onUnconfirmedWork?.();
         // Mongo may have accepted the durable delivery, which can later start a
         // generation and call recordScheduleOutcome. Leave the run `started` (a
         // reconcilable, non-terminal state) so that completion can finalize it and
@@ -755,6 +760,7 @@ export async function fireSchedule(
         );
       }
     } catch (bookkeepingError) {
+      deps.onUnconfirmedWork?.();
       logger.error(
         `[schedules] post-enqueue bookkeeping failed for ${schedule.id} (run continues):`,
         bookkeepingError,

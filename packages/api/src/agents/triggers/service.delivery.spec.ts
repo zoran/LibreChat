@@ -982,3 +982,107 @@ describe('durable agent trigger service', () => {
     await service.stop();
   });
 });
+
+describe('trigger service maintenance composition', () => {
+  beforeEach(() => {
+    __resetShutdownStateForTests();
+    jest.useFakeTimers();
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+    __resetShutdownStateForTests();
+  });
+
+  it('inherits closure in children created after an in-flight startup and preserves accepted writes', async () => {
+    let initialized!: () => void;
+    let persisted!: (value: boolean) => void;
+    let expedited!: (value: { expedited: number; held: number }) => void;
+    const methods = deliveryMethods({
+      ensureAgentTriggerDeliveryIndexes: jest.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            initialized = resolve;
+          }),
+      ),
+      persistAgentBackgroundToolResult: jest.fn(
+        () =>
+          new Promise<boolean>((resolve) => {
+            persisted = resolve;
+          }),
+      ),
+      expediteAgentTriggerDeliveries: jest.fn(
+        () =>
+          new Promise<{ expedited: number; held: number }>((resolve) => {
+            expedited = resolve;
+          }),
+      ),
+    });
+    const service = createAgentTriggerService({ methods, mintToken: () => 'token' });
+    const startup = service.initialize({
+      address: { address: '127.0.0.1', family: 'IPv4', port: 4123 },
+    });
+    expect(service.pauseAdmissions('drain')).toBe(true);
+    expect((await service.getMaintenanceCensus('drain')).pendingWrites).toBeGreaterThan(0);
+    initialized();
+    await startup;
+    await jest.advanceTimersByTimeAsync(100_000);
+    expect(methods.claimNextAgentTriggerDelivery).not.toHaveBeenCalled();
+    expect(methods.recoverAgentTriggerUserPurges).not.toHaveBeenCalled();
+    await expect(service.enqueue(envelope())).rejects.toThrow('paused');
+    const writing = service.persistBackgroundToolResult({
+      deliveryKey: 'retained-result',
+    } as never);
+    expect((await service.getMaintenanceCensus('drain')).pendingWrites).toBeGreaterThan(0);
+    persisted(true);
+    await writing;
+    expect(expedited).toBeDefined();
+    expect((await service.getMaintenanceCensus('drain')).pendingWrites).toBeGreaterThan(0);
+    expedited({ expedited: 1, held: 0 });
+    await jest.advanceTimersByTimeAsync(0);
+    expect(await service.getMaintenanceCensus('drain')).toMatchObject({
+      complete: true,
+      pendingWrites: 0,
+      admissionClosed: true,
+    });
+    const stale = service.getMaintenanceCensus('drain');
+    expect(service.resumeAdmissions('drain')).toBe(true);
+    service.pauseAdmissions('next');
+    expect((await stale).complete).toBe(false);
+    await service.stop();
+  });
+
+  it('never converts a failed producer fence or purge into a drained census', async () => {
+    const methods = deliveryMethods({
+      renewAgentTriggerDeliveryProducerLease: jest.fn(async () => false),
+      deleteAgentTriggerDeliveriesByUser: jest.fn(async () => {
+        throw new Error('unknown purge commit');
+      }),
+    });
+    const service = createAgentTriggerService({ methods, mintToken: () => 'token' });
+    service.pauseAdmissions('drain');
+    await service.initialize({ address: { address: '127.0.0.1', family: 'IPv4', port: 4123 } });
+    expect(await service.renewProducerLease('delivery', 'source', new Date())).toBe(false);
+    await expect(service.purgeUser('user')).rejects.toThrow('unknown purge commit');
+    expect(await service.getMaintenanceCensus('drain')).toMatchObject({
+      complete: false,
+      pendingWrites: 0,
+    });
+    expect(service.resumeAdmissions('drain')).toBe(false);
+    await service.stop();
+  });
+});
+
+it('keeps definite pre-write validation rejection distinct from an unknown commit', async () => {
+  __resetShutdownStateForTests();
+  const service = createAgentTriggerService({ methods: deliveryMethods() });
+  await service.initialize({ address: { address: '127.0.0.1', family: 'IPv4', port: 4123 } });
+  await expect(service.enqueue({})).rejects.toThrow();
+  service.pauseAdmissions('drain');
+  // Await already accepted startup recovery without advancing or admitting a new scan.
+  for (let i = 0; i < 40; i++) await Promise.resolve();
+  expect(await service.getMaintenanceCensus('drain')).toMatchObject({
+    complete: true,
+    pendingWrites: 0,
+  });
+  await service.stop();
+});

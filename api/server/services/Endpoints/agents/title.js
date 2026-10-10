@@ -1,4 +1,8 @@
-const { isEnabled } = require('@librechat/api');
+const {
+  isEnabled,
+  awaitGenerationAuxiliaryWork,
+  GenerationAdmissionHeldError,
+} = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const { CacheKeys } = require('librechat-data-provider');
 const getLogStores = require('~/cache/getLogStores');
@@ -69,15 +73,7 @@ const addTitle = async (
 
   const titleCache = getLogStores(CacheKeys.GEN_TITLE);
   const key = `${req.user.id}-${convoId}`;
-  /** @type {NodeJS.Timeout} */
-  let timeoutId;
   try {
-    const timeoutPromise = new Promise((_, reject) => {
-      timeoutId = setTimeout(() => reject(new Error('Title generation timeout')), 45000);
-    }).catch((error) => {
-      logger.error('Title error:', error);
-    });
-
     let titlePromise;
     let abortController = new AbortController();
     /** Propagate a request abort (Stop) to the title generation so a cancelled
@@ -90,18 +86,11 @@ const addTitle = async (
       }
     }
     if (client && typeof client.titleConvo === 'function') {
-      titlePromise = Promise.race([
-        client
-          .titleConvo({
-            text,
-            abortController,
-            immediate,
-          })
-          .catch((error) => {
-            logger.error('Client title error:', error);
-          }),
-        timeoutPromise,
-      ]);
+      titlePromise = awaitGenerationAuxiliaryWork(
+        client.titleConvo({ text, abortController, immediate }),
+        abortController,
+        45000,
+      );
     } else {
       return;
     }
@@ -109,9 +98,6 @@ const addTitle = async (
     const generatedTitle = await titlePromise;
     if (!abortController.signal.aborted) {
       abortController.abort();
-    }
-    if (timeoutId) {
-      clearTimeout(timeoutId);
     }
 
     if (!generatedTitle) {
@@ -131,6 +117,7 @@ const addTitle = async (
         await onTitleGenerated({ conversationId: convoId, title });
       } catch (error) {
         logger.error('Error emitting generated title:', error);
+        throw new GenerationAdmissionHeldError();
       }
     }
 
@@ -183,6 +170,7 @@ const addTitle = async (
     );
   } catch (error) {
     logger.error('Error generating title:', error);
+    throw new GenerationAdmissionHeldError();
   }
 };
 

@@ -776,7 +776,8 @@ async function startRun(
         mode,
         certainty: 'definite',
         retryable: isRetryableStatus(response.status) || deferredContinue,
-        deferWithoutAttempt: deferredContinue,
+        deferWithoutAttempt:
+          deferredContinue || (response.status === 503 && errorCode(payload) === 'APP_QUIESCING'),
         code: errorCode(payload) ?? (mode === 'fire' ? 'FIRE_REJECTED' : 'CONTINUE_REJECTED'),
         status: response.status,
         ...(response.headers.get('retry-after') != null && {

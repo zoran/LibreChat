@@ -1,3 +1,17 @@
+// Policy fixtures isolate lifecycle; actual owner/consumer settlement is covered by maintenance suites.
+jest.mock('~/server/services/LegacyAuthMaintenance', () => ({
+  withAuthRequest: async (_req, action) => action(),
+  authTrack: async (action) => action(),
+  authWrite: async (action) => action(),
+  authMutation: async (method, ...args) => method(...args),
+  authUserMutation: async (method, ...args) => method(...args),
+  authCache: (store) => store,
+  authPersistence: { write: async (action) => action() },
+  legacyAuthMaintenance: { current: () => undefined },
+  authAdmissionMiddleware: (_req, _res, next) => next(),
+  ownAuthHandler: (handler) => handler,
+  authSessionStore: (store) => store,
+}));
 const { logger } = require('@librechat/data-schemas');
 const { ErrorTypes } = require('librechat-data-provider');
 const { createSocialUser, handleExistingUser } = require('./process');
@@ -85,7 +99,7 @@ describe('socialLogin', () => {
       const loginFn = socialLogin(provider, mockGetProfileDetails);
       const callback = jest.fn();
 
-      await loginFn(null, null, null, mockProfile, callback);
+      await loginFn({}, null, null, null, mockProfile, callback);
 
       expect(findUser).toHaveBeenNthCalledWith(1, { googleId: googleId });
       expect(findUser).toHaveBeenCalledTimes(1);
@@ -124,7 +138,7 @@ describe('socialLogin', () => {
       const loginFn = socialLogin(provider, mockGetProfileDetails);
       const callback = jest.fn();
 
-      await loginFn(null, null, null, mockProfile, callback);
+      await loginFn({}, null, null, null, mockProfile, callback);
 
       expect(findUser).toHaveBeenCalledWith({ facebookId: facebookId });
       expect(findUser.mock.calls[0]).toEqual([{ facebookId: facebookId }]);
@@ -163,7 +177,7 @@ describe('socialLogin', () => {
       const loginFn = socialLogin(provider, mockGetProfileDetails);
       const callback = jest.fn();
 
-      await loginFn(null, null, null, mockProfile, callback);
+      await loginFn({}, null, null, null, mockProfile, callback);
 
       expect(findUser).toHaveBeenNthCalledWith(1, { googleId: googleId });
       expect(findUser).toHaveBeenNthCalledWith(2, { email: email });
@@ -201,7 +215,7 @@ describe('socialLogin', () => {
       const loginFn = socialLogin(provider, mockGetProfileDetails);
       const callback = jest.fn();
 
-      await loginFn(null, null, null, mockProfile, callback);
+      await loginFn({}, null, null, null, mockProfile, callback);
 
       expect(updateUser).not.toHaveBeenCalled();
       expect(handleExistingUser).toHaveBeenCalled();
@@ -232,7 +246,7 @@ describe('socialLogin', () => {
       const loginFn = socialLogin(provider, mockGetProfileDetails, { existingUsersOnly: true });
       const callback = jest.fn();
 
-      await loginFn(null, null, null, mockProfile, callback);
+      await loginFn({}, null, null, null, mockProfile, callback);
 
       expect(updateUser).toHaveBeenCalledWith('admin789', { googleId });
       expect(existingUser.googleId).toBe(googleId);
@@ -265,7 +279,7 @@ describe('socialLogin', () => {
       const loginFn = socialLogin(provider, mockGetProfileDetails, { existingUsersOnly: true });
       const callback = jest.fn();
 
-      await loginFn(null, null, null, mockProfile, callback);
+      await loginFn({}, null, null, null, mockProfile, callback);
 
       expect(updateUser).not.toHaveBeenCalled();
       expect(callback).toHaveBeenCalledWith(
@@ -300,7 +314,7 @@ describe('socialLogin', () => {
       const loginFn = socialLogin(provider, mockGetProfileDetails, { existingUsersOnly: true });
       const callback = jest.fn();
 
-      await loginFn(null, null, null, mockProfile, callback);
+      await loginFn({}, null, null, null, mockProfile, callback);
 
       expect(logger.warn).toHaveBeenCalledWith(
         `[${provider}Login] Rejected admin email fallback for ${email}: stored ${provider}Id does not match`,
@@ -336,7 +350,7 @@ describe('socialLogin', () => {
       const loginFn = socialLogin(provider, mockGetProfileDetails);
       const callback = jest.fn();
 
-      await loginFn(null, null, null, mockProfile, callback);
+      await loginFn({}, null, null, null, mockProfile, callback);
 
       expect(findUser).toHaveBeenCalledTimes(2);
 
@@ -380,7 +394,7 @@ describe('socialLogin', () => {
       const loginFn = socialLogin(provider, mockGetProfileDetails);
       const callback = jest.fn();
 
-      await loginFn(null, null, null, mockProfile, callback);
+      await loginFn({}, null, null, null, mockProfile, callback);
 
       expect(callback).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -422,7 +436,7 @@ describe('socialLogin', () => {
       const loginFn = socialLogin(provider, mockGetProfileDetails);
       const callback = jest.fn();
 
-      await loginFn(null, null, null, mockProfile, callback);
+      await loginFn({}, null, null, null, mockProfile, callback);
 
       expect(resolveAppConfigForUser).toHaveBeenCalledWith(getAppConfig, existingUser);
     });
@@ -450,7 +464,7 @@ describe('socialLogin', () => {
       const loginFn = socialLogin(provider, mockGetProfileDetails);
       const callback = jest.fn();
 
-      await loginFn(null, null, null, mockProfile, callback);
+      await loginFn({}, null, null, null, mockProfile, callback);
 
       expect(resolveAppConfigForUser).not.toHaveBeenCalled();
       expect(getAppConfig).toHaveBeenCalledWith({ baseOnly: true });
@@ -487,7 +501,7 @@ describe('socialLogin', () => {
       const loginFn = socialLogin(provider, mockGetProfileDetails);
       const callback = jest.fn();
 
-      await loginFn(null, null, null, mockProfile, callback);
+      await loginFn({}, null, null, null, mockProfile, callback);
 
       expect(callback).toHaveBeenCalledWith(
         expect.objectContaining({ message: 'Email domain not allowed' }),
@@ -518,7 +532,7 @@ describe('socialLogin', () => {
       const loginFn = socialLogin(provider, mockGetProfileDetails);
       const callback = jest.fn();
 
-      await loginFn(null, 'github-refresh-token', null, mockProfile, callback);
+      await loginFn({}, null, 'github-refresh-token', null, mockProfile, callback);
 
       expect(callback).toHaveBeenCalledWith(null, existingUser);
       expect(callback).not.toHaveBeenCalledWith(null, existingUser, expect.anything());
@@ -549,7 +563,7 @@ describe('socialLogin', () => {
       const loginFn = socialLogin(provider, mockGetProfileDetails);
       const callback = jest.fn();
 
-      await loginFn(null, 'idp-refresh-token', null, mockProfile, callback);
+      await loginFn({}, null, 'idp-refresh-token', null, mockProfile, callback);
 
       expect(callback).toHaveBeenCalledWith(null, existingUser, {
         refreshToken: 'idp-refresh-token',

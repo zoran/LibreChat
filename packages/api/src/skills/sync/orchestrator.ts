@@ -1,6 +1,7 @@
 import { skillSyncConfigSchema } from 'librechat-data-provider';
 import type { SkillSyncConfig } from 'librechat-data-provider';
 import type { GitHubSkillSyncRunner } from './github';
+import type { ApplicationWorkPort } from '~/app';
 
 const REQUEST_SYNC_MIN_INTERVAL_MS = 5 * 60 * 1000;
 const REQUEST_SYNC_STALE_RUNNING_MS = 35 * 60 * 1000;
@@ -38,6 +39,7 @@ type SkillSyncTriggerLogger = {
 };
 
 export type SkillSyncTriggerRunnerFactoryInput = {
+  onUnconfirmedWork?: () => void;
   getConfig: () => MaybePromise<SkillSyncConfig | undefined>;
   loadAppConfig: () => MaybePromise<SkillSyncAppConfigLike | undefined>;
   allowServerCredentials?: boolean;
@@ -51,7 +53,9 @@ export type SkillSyncTriggerOrchestratorDeps = {
   inFlight?: Set<string>;
 };
 
-export type SkillSyncTriggerOrchestrator = {
+export type SkillSyncTriggerOrchestrator = ApplicationWorkPort & {
+  createRunner: (input: SkillSyncTriggerRunnerFactoryInput) => GitHubSkillSyncRunner;
+  attachScheduler: (scheduler: ApplicationWorkPort) => void;
   getRunnerForAdminRequest: (request: SkillSyncRequestLike) => GitHubSkillSyncRunner;
   maybeRunForRequest: (request: SkillSyncRequestLike) => Promise<boolean>;
 };
@@ -250,6 +254,37 @@ function getRequestSyncKey(
 export function createSkillSyncTriggerOrchestrator(
   deps: SkillSyncTriggerOrchestratorDeps,
 ): SkillSyncTriggerOrchestrator {
+  let pausedBy: string | undefined;
+  let revision = 0;
+  let pending = 0;
+  let unconfirmed = false;
+  let scheduler: ApplicationWorkPort | undefined;
+  function createRunner(input: SkillSyncTriggerRunnerFactoryInput): GitHubSkillSyncRunner {
+    const runner = deps.createRunner({
+      ...input,
+      onUnconfirmedWork: () => {
+        unconfirmed = true;
+        input.onUnconfirmedWork?.();
+      },
+    });
+    return {
+      getStatus: runner.getStatus,
+      runOnce: async () => {
+        if (pausedBy)
+          return {
+            status: 'skipped',
+            message: 'Skill sync admission is paused for maintenance',
+            sources: [],
+          };
+        pending++;
+        try {
+          return await runner.runOnce();
+        } finally {
+          pending--;
+        }
+      },
+    };
+  }
   const inFlight = deps.inFlight ?? new Set<string>();
   const minIntervalMs = deps.minIntervalMs ?? REQUEST_SYNC_MIN_INTERVAL_MS;
   const staleRunningMs = deps.staleRunningMs ?? REQUEST_SYNC_STALE_RUNNING_MS;
@@ -259,14 +294,15 @@ export function createSkillSyncTriggerOrchestrator(
     const config = getAdminRequestSkillSyncConfig(request.config, request.user, deps.logger, {
       allowServerCredentials,
     });
-    return deps.createRunner({
+    return createRunner({
       getConfig: async () => config,
       loadAppConfig: async () => request.config,
       allowServerCredentials,
     });
   }
 
-  async function maybeRunForRequest(request: SkillSyncRequestLike): Promise<boolean> {
+  async function runForRequest(request: SkillSyncRequestLike): Promise<boolean> {
+    if (pausedBy) return false;
     const config = getRequestSkillSyncConfig(request.config, request.user, deps.logger);
     if (!hasGitHubConfig(config)) {
       return false;
@@ -277,13 +313,13 @@ export function createSkillSyncTriggerOrchestrator(
       return false;
     }
 
-    const requestRunner = deps.createRunner({
+    const requestRunner = createRunner({
       getConfig: async () => config,
       loadAppConfig: async () => request.config,
       allowServerCredentials: Boolean(request.skillSyncAllowServerCredentials),
     });
     const status = await requestRunner.getStatus();
-    if (!shouldRunRequestSync(status, { minIntervalMs, staleRunningMs })) {
+    if (pausedBy || !shouldRunRequestSync(status, { minIntervalMs, staleRunningMs })) {
       return false;
     }
 
@@ -296,7 +332,51 @@ export function createSkillSyncTriggerOrchestrator(
   }
 
   return {
+    createRunner,
+    attachScheduler(child) {
+      if (scheduler && scheduler !== child) throw new Error('Skill scheduler is already attached');
+      scheduler = child;
+      revision++;
+      if (pausedBy) child.pauseAdmissions(pausedBy);
+    },
+    pauseAdmissions(requestId) {
+      if (!requestId || (pausedBy && pausedBy !== requestId)) return false;
+      pausedBy = requestId;
+      revision++;
+      return scheduler?.pauseAdmissions(requestId) ?? true;
+    },
+    resumeAdmissions(requestId) {
+      if (pausedBy !== requestId || unconfirmed) return false;
+      if (scheduler && !scheduler.resumeAdmissions(requestId)) return false;
+      pausedBy = undefined;
+      revision++;
+      return true;
+    },
+    async getMaintenanceCensus(requestId) {
+      const before = revision;
+      const child = scheduler;
+      const state = await child?.getMaintenanceCensus(requestId);
+      return {
+        admissionClosed: !!requestId && pausedBy === requestId && (state?.admissionClosed ?? true),
+        queuedContinuations: pending + (state?.queuedContinuations ?? 0),
+        pendingWrites: pending + (state?.pendingWrites ?? 0),
+        complete:
+          !unconfirmed &&
+          before === revision &&
+          child === scheduler &&
+          (pausedBy == null || pausedBy === requestId) &&
+          (state?.complete ?? true),
+      };
+    },
     getRunnerForAdminRequest,
-    maybeRunForRequest,
+    maybeRunForRequest: async (request) => {
+      if (pausedBy) return false;
+      pending++;
+      try {
+        return await runForRequest(request);
+      } finally {
+        pending--;
+      }
+    },
   };
 }

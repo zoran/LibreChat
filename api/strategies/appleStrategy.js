@@ -43,7 +43,7 @@ const getAppleConfig = (callbackURL) => ({
   callbackURL,
   keyID: process.env.APPLE_KEY_ID,
   privateKeyLocation: process.env.APPLE_PRIVATE_KEY_PATH,
-  passReqToCallback: false,
+  passReqToCallback: true,
 });
 
 /**

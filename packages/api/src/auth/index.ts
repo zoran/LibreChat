@@ -1,4 +1,6 @@
 export * from './domain';
+export * from './maintenance';
+export * from './sessionMaintenance';
 export * from './browser';
 export * from './openid';
 export * from './saml';

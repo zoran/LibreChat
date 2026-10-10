@@ -12,7 +12,7 @@ jest.mock('~/server/services/Config', () => ({
 }));
 
 jest.mock('@librechat/api', () => {
-  const actualApi = jest.requireActual('@librechat/api');
+  const actualApi = jest.requireActual('../../../../packages/api/src/skills/sync/orchestrator');
   return {
     createSkillSyncTriggerOrchestrator: actualApi.createSkillSyncTriggerOrchestrator,
     createGitHubSkillSyncRunner: jest.fn((deps) => {
@@ -94,6 +94,7 @@ jest.mock('~/server/utils/getFileStrategy', () => ({ getFileStrategy: mockGetFil
 
 describe('GitHub skill sync service', () => {
   beforeEach(() => {
+    jest.resetModules();
     jest.clearAllMocks();
     mockGetAppConfig.mockReset();
     mockGetStrategyFunctions.mockReset();
@@ -310,7 +311,8 @@ describe('GitHub skill sync service', () => {
     });
     const config = await mockCreatedRunners[0].deps.getConfig();
 
-    expect(runner.runOnce).toBe(mockCreatedRunners[0].runner.runOnce);
+    await runner.runOnce();
+    expect(mockCreatedRunners[0].runner.runOnce).toHaveBeenCalledTimes(1);
     expect(runner.getStatus).toBe(mockCreatedRunners[0].runner.getStatus);
     expect(mockCreatedRunners[0].deps.allowServerCredentials).toBe(true);
     expect(config.github.runOnStartup).toBe(true);
@@ -580,4 +582,14 @@ describe('GitHub skill sync service', () => {
     ).rejects.toThrow('Role skill_viewer not found');
     expect(mockGrantPermission).not.toHaveBeenCalled();
   });
+});
+
+it('reuses the scheduled owner and exposes its shared maintenance facade', () => {
+  const service = require('./sync');
+  const first = service.initializeGitHubSkillSync({});
+  const second = service.initializeGitHubSkillSync({});
+  expect(first.scheduler).toBe(second.scheduler);
+  expect(first.runner).toBe(second.runner);
+  expect(typeof service.skillSyncMaintenance.getMaintenanceCensus).toBe('function');
+  service.stopGitHubSkillSyncScheduler();
 });

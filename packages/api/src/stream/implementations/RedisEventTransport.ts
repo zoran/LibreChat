@@ -297,6 +297,14 @@ export class RedisEventTransport implements IEventTransport {
   private publisher: Redis | Cluster;
   /** Redis client for subscribing to events (separate connection required) */
   private subscriber: Redis | Cluster;
+  isGenerationTransportReady(): boolean {
+    return (
+      this.publisher.status === 'ready' &&
+      this.subscriber.status === 'ready' &&
+      [...this.channelSubscriptions.values()].every((state) => state.phase === 'active')
+    );
+  }
+
   /** Track subscribers per stream */
   private streams = new Map<string, StreamSubscribers>();
   /** Track channel subscription state: resolved promise = active, pending = in-flight */

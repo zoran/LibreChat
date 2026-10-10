@@ -6,6 +6,8 @@ jest.mock('@librechat/agents', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('../../../../packages/api/src/conversations/history'),
+  ...jest.requireActual('../../../../packages/api/src/conversations/historyHttp'),
   unescapeLaTeX: jest.fn((value) => value),
   countTokens: jest.fn().mockResolvedValue(10),
   createContentFilter: jest.fn(() => (req, res, next) => next()),
@@ -74,6 +76,7 @@ describe('PUT /:conversationId/:messageId/feedback', () => {
     const messagesRouter = require('../messages');
 
     app = express();
+    app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
     app.use(express.json());
     app.use((req, res, next) => {
       req.user = { id: 'user-1' };
@@ -83,6 +86,7 @@ describe('PUT /:conversationId/:messageId/feedback', () => {
   });
 
   beforeEach(() => {
+    if (app) app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
     jest.clearAllMocks();
     requireFeedbackEnabled.mockImplementation((req, res, next) => next());
     updateMessage.mockImplementation((userId, { messageId, feedback }) =>
@@ -95,6 +99,33 @@ describe('PUT /:conversationId/:messageId/feedback', () => {
         feedback,
       }),
     );
+  });
+
+  it('holds feedback after its HTTP response until the actual export settles', async () => {
+    const owner = require('@librechat/api').createHistoryMutationOwner();
+    app.locals.historyMaintenance = owner;
+    let complete;
+    sendFeedbackScore.mockReturnValueOnce(
+      new Promise((resolve) => {
+        complete = resolve;
+      }),
+    );
+    try {
+      const response = await request(app)
+        .put('/api/messages/conversation-1/message-1/feedback')
+        .send({ feedback: null });
+      expect(response.status).toBe(200);
+      owner.pauseAdmissions('drain');
+      expect(await owner.getMaintenanceCensus('drain')).toMatchObject({ pendingWrites: 1 });
+    } finally {
+      complete();
+      await new Promise((resolve) => setImmediate(resolve));
+      owner.resumeAdmissions('drain');
+    }
+    expect(await owner.getMaintenanceCensus(null)).toMatchObject({
+      pendingWrites: 0,
+      complete: true,
+    });
   });
 
   it('persists validated feedback and removes unknown fields', async () => {

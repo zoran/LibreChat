@@ -90,3 +90,14 @@ export { waitForGenerationSettled } from './settled';
 export type { GenerationSettledSource, GenerationSettledWaitOptions } from './settled';
 
 export type { GenerationSettlementState } from './interfaces/IJobStore';
+
+export {
+  generationRequestBinding,
+  GenerationAdmissionHeldError,
+  awaitGenerationAuxiliaryWork,
+} from './generationAdmission';
+export type {
+  GenerationAdmissionConfiguration,
+  GenerationAdmissionCensus,
+  GenerationRequestBinding,
+} from './generationAdmission';

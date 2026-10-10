@@ -1,3 +1,4 @@
+const { withAuthRequest } = require('~/server/services/LegacyAuthMaintenance');
 const { AGENT_TRIGGER_SCOPE } = require('@librechat/api');
 const { logger, runAsSystem } = require('@librechat/data-schemas');
 const { SystemRoles } = require('librechat-data-provider');
@@ -28,42 +29,43 @@ const jwtLogin = () =>
       secretOrKey: process.env.JWT_SECRET,
       passReqToCallback: true,
     },
-    async (req, payload, done) => {
-      try {
-        if (payload?.scope === AGENT_TRIGGER_SCOPE && !isAgentTriggerAdmissionRequest(req)) {
-          done(null, false, { message: 'Agent trigger token is not valid for this endpoint' });
-          return;
-        }
-        const user = await runAsSystem(() =>
-          getUserById(
-            payload?.id,
-            '-password -__v -totpSecret -backupCodes +agentTriggerDeletionStartedAt',
-          ),
-        );
-        if (user?.agentTriggerDeletionStartedAt != null) {
-          done(null, false, {
-            message: 'Account deletion is in progress',
-            code: 'ACCOUNT_DELETION_IN_PROGRESS',
-          });
-          return;
-        }
-        if (user) {
-          user.id = user._id.toString();
-          /** Absent on the full doc means local user; null skips getUserPrincipals' fallback lookup */
-          user.idOnTheSource ??= null;
-          if (!user.role) {
-            user.role = SystemRoles.USER;
-            await runAsSystem(() => updateUser(user.id, { role: user.role }));
+    (req, payload, done) =>
+      withAuthRequest(req, async () => {
+        try {
+          if (payload?.scope === AGENT_TRIGGER_SCOPE && !isAgentTriggerAdmissionRequest(req)) {
+            done(null, false, { message: 'Agent trigger token is not valid for this endpoint' });
+            return;
           }
-          done(null, user);
-        } else {
-          logger.warn('[jwtLogin] JwtStrategy => no user found: ' + payload?.id);
-          done(null, false);
+          const user = await runAsSystem(() =>
+            getUserById(
+              payload?.id,
+              '-password -__v -totpSecret -backupCodes +agentTriggerDeletionStartedAt',
+            ),
+          );
+          if (user?.agentTriggerDeletionStartedAt != null) {
+            done(null, false, {
+              message: 'Account deletion is in progress',
+              code: 'ACCOUNT_DELETION_IN_PROGRESS',
+            });
+            return;
+          }
+          if (user) {
+            user.id = user._id.toString();
+            /** Absent on the full doc means local user; null skips getUserPrincipals' fallback lookup */
+            user.idOnTheSource ??= null;
+            if (!user.role) {
+              user.role = SystemRoles.USER;
+              await runAsSystem(() => updateUser(user.id, { role: user.role }));
+            }
+            done(null, user);
+          } else {
+            logger.warn('[jwtLogin] JwtStrategy => no user found: ' + payload?.id);
+            done(null, false);
+          }
+        } catch (err) {
+          done(err, false);
         }
-      } catch (err) {
-        done(err, false);
-      }
-    },
+      }).catch(done),
   );
 
 module.exports = jwtLogin;

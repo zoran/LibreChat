@@ -1,3 +1,4 @@
+const { withAuthRequest, authUserMutation } = require('~/server/services/LegacyAuthMaintenance');
 const bcrypt = require('bcryptjs');
 const { logger } = require('@librechat/data-schemas');
 const { errorsToString } = require('librechat-data-provider');
@@ -51,13 +52,13 @@ async function passportLogin(req, email, password, done) {
       !user.emailVerified &&
       userCreatedAtTimestamp < verificationEnabledTimestamp
     ) {
-      await updateUser(user._id, { emailVerified: true });
+      await authUserMutation(updateUser, user._id, { emailVerified: true });
       user.emailVerified = true;
     }
 
     const unverifiedAllowed = isEnabled(process.env.ALLOW_UNVERIFIED_EMAIL_LOGIN);
     if (user.expiresAt && unverifiedAllowed) {
-      await updateUser(user._id, {});
+      await authUserMutation(updateUser, user._id, {});
     }
 
     if (!user.emailVerified && !unverifiedAllowed) {
@@ -86,5 +87,6 @@ module.exports = () =>
       session: false,
       passReqToCallback: true,
     },
-    passportLogin,
+    (req, email, password, done) =>
+      withAuthRequest(req, () => passportLogin(req, email, password, done)).catch(done),
   );

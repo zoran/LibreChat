@@ -324,6 +324,9 @@ const processDeleteRequest = async ({ req, files }) => {
       try {
         await db.removeAgentResourceFilesFromAllAgents({ file_ids: metadataDeletedFileIds });
       } catch (error) {
+        // A fulfilled deletion response must retain an unconfirmed metadata child.
+        // Maintenance uses the existing failed-file result instead of inferring idle.
+        metadataDeletedFileIds.forEach((fileId) => failedFileIds.add(fileId));
         logger.error('Error cleaning up orphaned agent file references', error);
       }
     }

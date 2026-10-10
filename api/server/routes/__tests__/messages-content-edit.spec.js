@@ -7,6 +7,8 @@ jest.mock('@librechat/agents', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('../../../../packages/api/src/conversations/history'),
+  ...jest.requireActual('../../../../packages/api/src/conversations/historyHttp'),
   unescapeLaTeX: jest.fn((value) => value),
   countTokens: jest.fn().mockResolvedValue(2),
   createContentFilter: jest.fn(() => (_req, _res, next) => next()),
@@ -62,6 +64,7 @@ describe('PUT /:conversationId/:messageId content edit', () => {
   beforeAll(() => {
     const messagesRouter = require('../messages');
     app = express();
+    app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
     app.use(express.json());
     app.use((req, res, next) => {
       req.user = { id: 'user-1' };
@@ -71,6 +74,7 @@ describe('PUT /:conversationId/:messageId content edit', () => {
   });
 
   beforeEach(() => {
+    if (app) app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
     jest.clearAllMocks();
     updateMessage.mockResolvedValue({ messageId: 'message-1' });
   });

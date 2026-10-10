@@ -1,3 +1,8 @@
+const {
+  authAdmissionMiddleware,
+  ownAuthHandler,
+  authPersistence,
+} = require('~/server/services/LegacyAuthMaintenance');
 // file deepcode ignore NoRateLimitingForLogin: Rate limiting is handled by the `loginLimiter` middleware
 const express = require('express');
 const passport = require('passport');
@@ -21,13 +26,17 @@ const { createOAuthHandler } = require('~/server/controllers/auth/oauth');
 const { findBalanceByUser, upsertBalanceFields } = require('~/models');
 const { getAppConfig } = require('~/server/services/Config');
 
-const setBalanceConfig = createSetBalanceConfig({
-  getAppConfig,
-  findBalanceByUser,
-  upsertBalanceFields,
-});
+const setBalanceConfig = ownAuthHandler(
+  createSetBalanceConfig({
+    observer: authPersistence,
+    getAppConfig,
+    findBalanceByUser,
+    upsertBalanceFields,
+  }),
+);
 
 const router = express.Router();
+router.use(authAdmissionMiddleware);
 
 const domains = {
   client: process.env.DOMAIN_CLIENT,

@@ -1,3 +1,17 @@
+// Policy fixtures isolate lifecycle; actual owner/consumer settlement is covered by maintenance suites.
+jest.mock('~/server/services/LegacyAuthMaintenance', () => ({
+  withAuthRequest: async (_req, action) => action(),
+  authTrack: async (action) => action(),
+  authWrite: async (action) => action(),
+  authMutation: async (method, ...args) => method(...args),
+  authUserMutation: async (method, ...args) => method(...args),
+  authCache: (store) => store,
+  authPersistence: { write: async (action) => action() },
+  legacyAuthMaintenance: { current: () => undefined },
+  authAdmissionMiddleware: (_req, _res, next) => next(),
+  ownAuthHandler: (handler) => handler,
+  authSessionStore: (store) => store,
+}));
 jest.mock(
   '@librechat/data-schemas',
   () => ({
@@ -151,8 +165,6 @@ let getUserById;
 let generateToken;
 let generateRefreshToken;
 let createSession;
-let upsertSession;
-let deleteSession;
 let createToken;
 let deleteTokens;
 let getAppConfig;
@@ -192,8 +204,6 @@ jest.isolateModules(() => {
     generateToken,
     generateRefreshToken,
     createSession,
-    upsertSession,
-    deleteSession,
     createToken,
     deleteTokens,
   } = require('~/models'));
@@ -548,7 +558,7 @@ describe('setOpenIDAuthTokens', () => {
         tenantId: 'tenant-a',
         previousRefreshToken: undefined,
       },
-      { upsertSession, deleteSession },
+      { upsertSession: expect.any(Function), deleteSession: expect.any(Function) },
     );
   });
 
@@ -564,7 +574,7 @@ describe('setOpenIDAuthTokens', () => {
         tenantId: 'tenant-a',
         previousRefreshToken: 'old-refresh-token',
       },
-      { upsertSession, deleteSession },
+      { upsertSession: expect.any(Function), deleteSession: expect.any(Function) },
     );
   });
 

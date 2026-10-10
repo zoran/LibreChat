@@ -4,11 +4,15 @@ import { GenerationJobManager } from '~/stream';
 import { executeAgentRun } from './host';
 
 jest.mock('~/stream', () => ({
+  generationRequestBinding: jest.requireActual('../../stream/generationAdmission')
+    .generationRequestBinding,
   GenerationJobManager: {
     createJob: jest.fn(),
     beginProviderExecution: jest.fn(),
     completeJob: jest.fn(),
-    markProviderExecutionDrained: jest.fn(),
+    abandonProviderExecution: jest.fn(),
+    cancelGenerationInitialization: jest.fn(),
+    settleGenerationExecution: jest.fn(),
   },
 }));
 
@@ -40,7 +44,8 @@ describe('executeAgentRun', () => {
     } as never);
     manager.beginProviderExecution.mockResolvedValue(true);
     manager.completeJob.mockResolvedValue(true);
-    manager.markProviderExecutionDrained.mockResolvedValue(true);
+    manager.cancelGenerationInitialization.mockResolvedValue(true);
+    manager.settleGenerationExecution.mockResolvedValue(true);
   });
 
   it('executes and settles from an envelope without HTTP request or response objects', async () => {
@@ -58,7 +63,7 @@ describe('executeAgentRun', () => {
 
     expect(execute).toHaveBeenCalledWith(expect.objectContaining({ runId: 'run-1' }));
     expect(manager.completeJob).toHaveBeenCalledWith('run-1', undefined, 10);
-    expect(manager.markProviderExecutionDrained).toHaveBeenCalledWith('run-1', 10, 'provider-1');
+    expect(manager.settleGenerationExecution).toHaveBeenCalledWith('run-1', 10, 'provider-1');
   });
 
   it('aborts the enrolled run when the transport closes', async () => {
@@ -162,7 +167,7 @@ describe('executeAgentRun', () => {
     expect(executionSignal?.aborted).toBe(true);
   });
 
-  it('settles even when trailing-write registration fails', async () => {
+  it('terminalizes but never confirms settlement when trailing-write registration fails', async () => {
     const failure = new Error('trailing write registration failed');
 
     await expect(
@@ -179,5 +184,6 @@ describe('executeAgentRun', () => {
     ).resolves.toBe('done');
 
     expect(manager.completeJob).toHaveBeenCalledWith('run-1', 'Remote agent execution failed', 10);
+    expect(manager.settleGenerationExecution).not.toHaveBeenCalled();
   });
 });

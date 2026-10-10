@@ -1,3 +1,8 @@
+const {
+  withAuthRequest,
+  authMutation,
+  authUserMutation,
+} = require('~/server/services/LegacyAuthMaintenance');
 const cookies = require('cookie');
 const jwt = require('jsonwebtoken');
 const crypto = require('node:crypto');
@@ -66,7 +71,7 @@ const registrationController = async (req, res) => {
      * whose account was just created that registration failed, which is not. */
     if (response.userCreated === true && req.invite?.token != null) {
       try {
-        await deleteTokens({ token: req.invite.token });
+        await authMutation(deleteTokens, { token: req.invite.token });
       } catch (error) {
         logger.error('[registrationController] Failed to consume invite after registration', error);
       }
@@ -330,7 +335,7 @@ const resetPasswordController = async (req, res) => {
     if (resetPasswordService instanceof Error) {
       return res.status(400).json(resetPasswordService);
     } else {
-      await deleteAllUserSessions({ userId: req.body.userId });
+      await authMutation(deleteAllUserSessions, { userId: req.body.userId });
       return res.status(200).json(resetPasswordService);
     }
   } catch (e) {
@@ -473,7 +478,7 @@ const refreshController = async (req, res) => {
         // Also handle case where user has mismatched openidId (e.g., after database switch)
         if (migration || user.openidId !== claims.sub) {
           const reason = migration ? 'migration' : 'openidId mismatch';
-          await updateUser(user._id.toString(), {
+          await authUserMutation(updateUser, user._id.toString(), {
             provider: 'openid',
             openidId: claims.sub,
             ...(openidIssuer ? { openidIssuer } : {}),
@@ -725,9 +730,12 @@ const graphTokenController = async (req, res) => {
 };
 
 module.exports = {
-  refreshController,
-  registrationController,
-  resetPasswordController,
-  resetPasswordRequestController,
+  refreshController: (req, res) => withAuthRequest(req, () => refreshController(req, res)),
+  registrationController: (req, res) =>
+    withAuthRequest(req, () => registrationController(req, res)),
+  resetPasswordController: (req, res) =>
+    withAuthRequest(req, () => resetPasswordController(req, res)),
+  resetPasswordRequestController: (req, res) =>
+    withAuthRequest(req, () => resetPasswordRequestController(req, res)),
   graphTokenController,
 };

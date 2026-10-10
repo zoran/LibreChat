@@ -18,6 +18,15 @@ const {
   issueCsp,
   apiNotFound,
   createMetrics,
+  createAppMaintenance,
+  expiredFileSweepMaintenance,
+  createHistoryMutationOwner,
+  initializeMaintenanceGeneration,
+  probeMaintenanceRedis,
+  probeMaintenanceDatabase,
+  cacheConfig,
+  keyvRedisClient,
+  ioredisClient,
   applyCspNonce,
   createCspPolicy,
   shellCacheHeaders,
@@ -72,10 +81,18 @@ const {
 const initializeOAuthReconnectManager = require('./services/initializeOAuthReconnectManager');
 const { capabilityContextMiddleware } = require('./middleware/roles/capabilities');
 const createValidateImageRequest = require('./middleware/validateImageRequest');
-const { initializeGitHubSkillSync } = require('./services/Skills/sync');
-const { initializeAgentTriggerService } = require('./services/Agents/triggers');
+const { initializeGitHubSkillSync, skillSyncMaintenance } = require('./services/Skills/sync');
+const {
+  initializeAgentTriggerService,
+  agentTriggerMaintenance,
+  agentQueuedTurnMaintenance,
+} = require('./services/Agents/triggers');
 const { resumeAgentEventDetachedAction } = require('./services/Agents/detachedActionResume');
-const { initializeScheduleEngine, recordExpiredScheduleApproval } = require('./services/Schedules');
+const {
+  initializeScheduleEngine,
+  recordExpiredScheduleApproval,
+  scheduleMaintenance,
+} = require('./services/Schedules');
 const { jwtLogin, ldapLogin, passportLogin } = require('~/strategies');
 const { startExpiredFileSweep } = require('./services/Files/process');
 const { checkMigrations } = require('./services/start/migration');
@@ -83,6 +100,10 @@ const optionalJwtAuth = require('./middleware/optionalJwtAuth');
 const initializeMCPs = require('./services/initializeMCPs');
 const { configureSubagentTaskRouting } = require('./services/Endpoints/agents/subagentThreadStore');
 const configureSocialLogins = require('./socialLogins');
+const {
+  legacyAuthMaintenance,
+  authAdmissionMiddleware,
+} = require('./services/LegacyAuthMaintenance');
 const createSpaFallback = require('./utils/fallback');
 const { getAppConfig } = require('./services/Config');
 const staticCache = require('./utils/staticCache');
@@ -104,31 +125,69 @@ const trusted_proxy = Number(TRUST_PROXY) || 1; /* trust first proxy by default 
 
 const app = express();
 app.locals.codeApiUploadRegistry = createCodeApiUploadRegistry();
+const historyMaintenance = createHistoryMutationOwner();
+app.locals.historyMaintenance = historyMaintenance;
 let serverReady = false;
 /** @type {import('@librechat/api').ScheduleEngineState} */
 let scheduleEngineState = 'starting';
 
-const SERVER_NOT_READY_CODE = 'SERVER_NOT_READY';
 const CHAT_START_RETRY_AFTER_SECONDS = '1';
-
-const rejectChatStartsUntilReady = (req, res, next) => {
-  if (serverReady || req.method !== 'POST' || req.path === '/abort') {
-    return next();
-  }
-
-  res.set('Retry-After', CHAT_START_RETRY_AFTER_SECONDS);
-  return res.status(503).json({
-    code: SERVER_NOT_READY_CODE,
-    error: 'Server is still starting. Please retry shortly.',
-  });
-};
+let browserMaintenance;
+const maintenance = createAppMaintenance({
+  workOwners: {
+    browser: {
+      pauseAdmissions: (id) => browserMaintenance.pauseAdmissions(id),
+      resumeAdmissions: (id) => browserMaintenance.resumeAdmissions(id),
+      getMaintenanceCensus: (id) => browserMaintenance.getMaintenanceCensus(id),
+    },
+    schedules: scheduleMaintenance,
+    triggers: agentTriggerMaintenance,
+    queuedTurns: agentQueuedTurnMaintenance,
+    skillSync: skillSyncMaintenance,
+    fileRetention: expiredFileSweepMaintenance,
+    auth: legacyAuthMaintenance,
+    history: historyMaintenance,
+  },
+  // These actual owners do not yet expose a qualified admission/settlement census.
+  unqualifiedOwners: [
+    'pre-auth limiter/ban and other authentication writes',
+    'standalone tag/share and other HTTP mutations',
+    'MCP/OAuth reconnect, search indexing, code lifecycle and remaining background owners',
+  ],
+  env: process.env,
+  requiredSharedState: cacheConfig.SHARED_STATE?.mode === 'sentinel',
+  startupReady: () => serverReady,
+  probeDatabase: () => probeMaintenanceDatabase(mongoose.connection.db.admin()),
+  probeSharedState: () =>
+    probeMaintenanceRedis({
+      required: cacheConfig.USE_REDIS,
+      cache: keyvRedisClient,
+      commands: ioredisClient,
+    }),
+  generation: {
+    closeGenerationAdmission: (requestId) =>
+      GenerationJobManager.closeGenerationAdmission(requestId),
+    reopenGenerationAdmission: (requestId) =>
+      GenerationJobManager.reopenGenerationAdmission(requestId),
+    getGenerationAdmissionCensus: () => GenerationJobManager.getGenerationAdmissionCensus(),
+    getGenerationRuntimeHealth: () => GenerationJobManager.getGenerationRuntimeHealth(),
+  },
+});
+const rejectChatStartsUntilReady = maintenance.admissionMiddleware;
 
 const rejectScheduleWritesUntilReady = createScheduleWriteGate({
   getState: () => scheduleEngineState,
   retryAfterSeconds: CHAT_START_RETRY_AFTER_SECONDS,
 });
 
-const configureGenerationStreams = () => {
+const configureGenerationStreams = async () => {
+  await initializeMaintenanceGeneration({
+    required: cacheConfig.SHARED_STATE?.mode === 'sentinel',
+    methods: agentEventMethods,
+    identity: maintenance.identity,
+    externalCensus: maintenance.externalCensus,
+    configure: (options) => GenerationJobManager.configureGenerationAdmission(options),
+  });
   const streamServices = createStreamServices();
   GenerationJobManager.configure({
     ...streamServices,
@@ -227,9 +286,9 @@ const startServer = async () => {
    * `runAsSystem` is required — `File` is tenant-isolated and strict
    * mode rejects unscoped queries. Lazy sweep in the preview endpoint
    * covers anything younger than the boot cutoff. */
-  runAsSystem(sweepOrphanedPreviews).catch((err) => {
-    logger.error('[sweepOrphanedPreviews] Background sweep failed:', err);
-  });
+  // Complete the only boot sweep before readiness or the maintenance listener.
+  // An unknown write outcome prevents startup instead of reporting an idle owner.
+  await runAsSystem(sweepOrphanedPreviews);
   const appConfig = await getAppConfig({ baseOnly: true });
   registerBackgroundTaskShutdown({
     interruptGraceMs: appConfig?.endpoints?.agents?.backgroundTasks?.shutdownInterruptGraceMs,
@@ -275,6 +334,7 @@ const startServer = async () => {
   /* Route modules build their rate limiters as they load, so they load only after the
    * startup checks have applied `rateLimits` from librechat.yaml. */
   const routes = require('./routes');
+  browserMaintenance = routes.auth.browserMaintenance;
 
   const indexPath = path.join(appConfig.paths.dist, 'index.html');
   let indexHTML = fs.readFileSync(indexPath, 'utf8');
@@ -327,15 +387,11 @@ const startServer = async () => {
 
   app.get('/health', (_req, res) => res.status(200).send('OK'));
   app.get('/livez', (_req, res) => res.status(200).send('OK'));
-  app.get('/readyz', (_req, res) => {
-    if (!serverReady) {
-      return res.status(503).send('NOT_READY');
-    }
-    return res.status(200).send('OK');
-  });
+  app.get('/readyz', maintenance.readinessHandler);
 
   /* Middleware */
   app.use(requestContextMiddleware);
+  app.use('/api', maintenance.mutationMiddleware);
   app.use('/api/agents/chat', agentStartupIngressMiddleware);
   app.use(metricsMiddleware);
   app.use(noIndex);
@@ -381,6 +437,8 @@ const startServer = async () => {
   }
 
   /* OAUTH */
+  // Capture accepted request lifetimes before session and Passport callbacks run.
+  app.use(authAdmissionMiddleware);
   app.use(passport.initialize());
   passport.use(jwtLogin());
   passport.use(passportLogin());
@@ -470,7 +528,11 @@ const startServer = async () => {
   /** Error handler (must be last - Express identifies error middleware by its 4-arg signature) */
   app.use(ErrorController);
 
-  configureGenerationStreams();
+  await configureGenerationStreams();
+  await maintenance.listen();
+  registerShutdownTask('private maintenance listener', () => maintenance.close(), {
+    priority: 110,
+  });
 
   const server = app.listen(port, host, async (err) => {
     if (err) {

@@ -1,3 +1,4 @@
+const { withAuthRequest, authMutation } = require('./LegacyAuthMaintenance');
 const jwt = require('jsonwebtoken');
 const api = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
@@ -13,7 +14,7 @@ const bridge = require('./RefreshTokenBridge');
 const flight = require('./OpenIDRefreshFlight');
 const { refreshOpenIDSession } = require('./OpenIDSessionRefresh');
 
-module.exports = api.createOpenIDRefreshRecoveryService({
+const service = api.createOpenIDRefreshRecoveryService({
   jwt,
   logger,
   findOpenIDUser: api.findOpenIDUser,
@@ -27,7 +28,7 @@ module.exports = api.createOpenIDRefreshRecoveryService({
   setOpenIDAuthTokens,
   clearOpenIDAuthTokens,
   getOpenIDAppAuthToken,
-  deleteOpenIDSession: (refreshToken) => deleteSession({ refreshToken }),
+  deleteOpenIDSession: (refreshToken) => authMutation(deleteSession, { refreshToken }),
   createRefreshTokenBridgeFlightKey: bridge.createRefreshTokenBridgeFlightKey,
   createOpenIDRefreshFlightKey: flight.createOpenIDRefreshFlightKey,
   storeRefreshTokenBridge: bridge.storeRefreshTokenBridge,
@@ -43,3 +44,14 @@ module.exports = api.createOpenIDRefreshRecoveryService({
   withOpenIDRefreshFlightLease: flight.withOpenIDRefreshFlightLease,
   bridgeGraceMs: bridge.OPENID_REFRESH_BRIDGE_GRACE_MS,
 });
+
+module.exports = {
+  ...service,
+  recoverOpenIDRefreshBridge: (input) =>
+    withAuthRequest(input.req, () => service.recoverOpenIDRefreshBridge(input)),
+  refreshOpenIDUser: (input) => withAuthRequest(input.req, () => service.refreshOpenIDUser(input)),
+  sendOpenIDAuthResponse: (input) =>
+    withAuthRequest(input.req, () => service.sendOpenIDAuthResponse(input)),
+  revokeOpenIDRefreshTokenChain: (input) =>
+    withAuthRequest(input.req, () => service.revokeOpenIDRefreshTokenChain(input)),
+};

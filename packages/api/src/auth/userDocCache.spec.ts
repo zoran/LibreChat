@@ -55,6 +55,32 @@ function makeStore() {
 }
 
 describe('auth user document cache helpers', () => {
+  it('retains sibling invalidations after a failed deletion is sanitized', async () => {
+    let release!: () => void;
+    const pending = new Promise<boolean>((resolve) => {
+      release = () => resolve(true);
+    });
+    const store = {
+      get: jest.fn().mockResolvedValue(['first', 'second']),
+      set: jest.fn(),
+      delete: jest.fn((key: string) => {
+        if (key === 'first') return Promise.reject(new Error('write outcome unknown'));
+        return key === 'second' ? pending : Promise.resolve(true);
+      }),
+    };
+    let settled = false;
+    const work = invalidateCachedAuthUserDoc(store, { userId: 'user' }).then(() => {
+      settled = true;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    try {
+      expect(store.delete).toHaveBeenCalledWith('second');
+      expect(settled).toBe(false);
+    } finally {
+      release();
+      await work;
+    }
+  });
   beforeEach(() => {
     jest.clearAllMocks();
     restoreEnv();

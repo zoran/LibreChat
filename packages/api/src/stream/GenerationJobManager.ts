@@ -39,6 +39,11 @@ import type {
   EarlyBufferRecoveryFailureReason,
   EarlyBufferRecoveryOutcome,
 } from '../types/earlyBufferRecovery';
+import type {
+  GenerationAdmissionConfiguration,
+  GenerationAdmissionCensus,
+  GenerationRequestBinding,
+} from './generationAdmission';
 import type { AgentStartupTelemetry } from '~/agents/startup';
 import type { RecoveredSteerPayload } from './SteerRecovery';
 import type { SteerContentView } from './SteeringLifecycle';
@@ -63,6 +68,7 @@ import {
   PROVIDER_DRAIN_TIMEOUT_MS,
   STEER_QUEUE_MAX_DEPTH,
 } from './interfaces/IJobStore';
+import { GenerationAdmissionCoordinator, generationRequestBinding } from './generationAdmission';
 import { isRecoveredSteerPayload, RecoveredSteerPayloadMismatchError } from './SteerRecovery';
 import { projectTerminalEvent } from './terminalProjection';
 import { assertJobStoreV2 } from './jobStoreCapabilities';
@@ -578,6 +584,8 @@ export type TerminalHostActionHandler = (
 ) => void | Promise<void>;
 
 export interface CreateGenerationJobOptions {
+  generationAdmission?: GenerationRequestBinding;
+  trustedTenantId?: string;
   startupTelemetry?: AgentStartupTelemetry;
   initialMetadata?: Partial<t.GenerationJobMetadata>;
   /** A terminal steer being handed off as this new normal turn. The store
@@ -861,6 +869,110 @@ class GenerationJobManagerClass {
 
   /** Rejects new jobs once graceful shutdown has started. */
   private shuttingDown = false;
+  private readonly durableAdmission = new GenerationAdmissionCoordinator();
+
+  configureGenerationAdmission(config: GenerationAdmissionConfiguration): void {
+    this.durableAdmission.configure(config);
+  }
+
+  generationRequestBinding: typeof generationRequestBinding = generationRequestBinding;
+
+  closeGenerationAdmission(requestId: string): boolean {
+    return this.durableAdmission.close(requestId);
+  }
+
+  reopenGenerationAdmission(requestId: string): boolean {
+    return this.durableAdmission.reopen(requestId);
+  }
+
+  async getGenerationRuntimeHealth(): Promise<boolean> {
+    if (!this.cleanupInterval) return false;
+    try {
+      await this.jobStore.getJobCount();
+      return (
+        !this.durableAdmission.required ||
+        (this._isRedis && this.eventTransport.isGenerationTransportReady?.() === true)
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  async getGenerationAdmissionCensus(): Promise<GenerationAdmissionCensus> {
+    let activeStreams = 0;
+    for (const runtime of this.runtimeState.values()) {
+      activeStreams +=
+        runtime.inFlightSnapshotEmissions.size +
+        (runtime.outstandingCoalescedReceipts ?? 0) +
+        (runtime.createdEventPublication ? 1 : 0);
+    }
+
+    return this.durableAdmission.census({
+      providerExecutions: this.openProviderExecutions.size,
+      pendingWrites:
+        this.replayEventWriteQueues.size +
+        this.tokenUsageWriteQueues.size +
+        this.runStepWriteQueues.size +
+        this.subscriberCleanupPromises.size +
+        this.fencedRuntimeRetirements.size,
+      activeStreams,
+    });
+  }
+
+  observeGenerationWrite<T>(
+    streamId: string,
+    epoch: number,
+    segment: string,
+    write: Promise<T>,
+  ): Promise<T> {
+    return this.durableAdmission.observeWrite(streamId, epoch, segment, write);
+  }
+
+  async settleGenerationExecution(
+    streamId: string,
+    epoch: number,
+    segment: string,
+    writes: readonly Promise<unknown>[] = [],
+  ): Promise<boolean> {
+    const results = await Promise.allSettled(writes);
+    if (results.some((result) => result.status === 'rejected')) return false;
+    if (!(await this.durableAdmission.writesSettled(streamId, epoch, segment))) return false;
+    if (
+      this.durableAdmission.required &&
+      (await this.durableAdmission.cancel(streamId, epoch, segment))
+    ) {
+      return this.markProviderExecutionDrained(streamId, epoch, segment);
+    }
+
+    const job = await this.jobStore.getJob(streamId);
+    if (
+      this.durableAdmission.required &&
+      (!job ||
+        job.createdAt !== epoch ||
+        job.providerExecutionId !== segment ||
+        job.status === 'running' ||
+        job.terminalPersistencePending ||
+        job.terminalHostActionPending)
+    )
+      return false;
+    await this.flushCoalescedStreamBuffers(streamId);
+    const drained = await this.markProviderExecutionDrained(streamId, epoch, segment);
+    if (!drained) return false;
+    return this.durableAdmission.settle(
+      streamId,
+      epoch,
+      segment,
+      JSON.stringify({ streamId, epoch, segment, status: job?.status, persistence: 'settled' }),
+    );
+  }
+
+  cancelGenerationInitialization(
+    streamId: string,
+    epoch: number,
+    segment: string,
+  ): Promise<boolean> {
+    return this.durableAdmission.cancel(streamId, epoch, segment);
+  }
 
   /**
    * Provider executions this process has begun and not yet drained, awaited during shutdown so
@@ -2405,6 +2517,34 @@ class GenerationJobManagerClass {
     conversationId?: string,
     options: CreateGenerationJobOptions = {},
   ): Promise<t.GenerationJob> {
+    const done = this.durableAdmission.initialize();
+    try {
+      const tenantId = options.trustedTenantId ?? getTenantId();
+      if (this.durableAdmission.required)
+        await this.durableAdmission.verifyReplay(userId, tenantId, options.generationAdmission);
+      const job = await this.createJobInternal(streamId, userId, conversationId, options);
+      await this.durableAdmission.enroll(
+        streamId,
+        job.createdAt,
+        job.metadata.providerExecutionId!,
+        userId,
+        tenantId,
+        conversationId ?? streamId,
+        job.metadata.generationProtocolVersion ?? 1,
+        options.generationAdmission,
+      );
+      return job;
+    } finally {
+      done();
+    }
+  }
+
+  private async createJobInternal(
+    streamId: string,
+    userId: string,
+    conversationId?: string,
+    options: CreateGenerationJobOptions = {},
+  ): Promise<t.GenerationJob> {
     if (this.shuttingDown) {
       throw new Error(SHUTTING_DOWN_ERROR);
     }
@@ -2440,7 +2580,7 @@ class GenerationJobManagerClass {
       throw new Error('Invalid active generation predecessor policy');
     }
 
-    const tenantId = getTenantId();
+    const tenantId = options.trustedTenantId ?? getTenantId();
     const safeTenantId = tenantId && tenantId !== SYSTEM_TENANT_ID ? tenantId : undefined;
     const creationAttemptId = randomUUID();
     const sanitizedMetadata = sanitizeJobMetadata(options.initialMetadata ?? {});
@@ -3228,7 +3368,10 @@ class GenerationJobManagerClass {
     streamId: string,
     conversationId: string,
     generationProtocolVersion?: 1 | 2,
+    binding?: GenerationRequestBinding,
   ): Promise<IdempotencyClaimResult> {
+    if (this.durableAdmission.required)
+      await this.durableAdmission.verifyReplay(userId, getTenantId(), binding);
     const value: TokenIdempotencyClaim = {
       streamId,
       conversationId,
@@ -8157,6 +8300,7 @@ class GenerationJobManagerClass {
     streamId: string,
     expectedCreatedAt: number,
     providerExecutionId: string,
+    successor = false,
   ): Promise<boolean> {
     if (providerExecutionId.length === 0 || providerExecutionId.length > 128) {
       return false;
@@ -8175,12 +8319,28 @@ class GenerationJobManagerClass {
      *  Leaving the tracker open makes shutdown wait for that record instead of tearing the
      *  transport down underneath it; the deadline still bounds the wait if it never comes. */
     this.openProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
-    const started =
+    let started =
       (await this.jobStore.beginProviderExecution?.(
         streamId,
         expectedCreatedAt,
         providerExecutionId,
       )) ?? false;
+    if (started) {
+      const job = await this.jobStore.getJob(streamId);
+      started =
+        !!job &&
+        job.createdAt === expectedCreatedAt &&
+        job.providerExecutionId === providerExecutionId &&
+        (await this.durableAdmission.authorize(
+          streamId,
+          expectedCreatedAt,
+          providerExecutionId,
+          job.userId,
+          job.tenantId,
+          job.conversationId ?? streamId,
+          successor,
+        ));
+    }
     if (!started) {
       this.closeProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
     }

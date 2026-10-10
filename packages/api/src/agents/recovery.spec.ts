@@ -231,3 +231,62 @@ describe('durable agent idle recovery', () => {
     expect(jest.getTimerCount()).toBe(0);
   });
 });
+
+describe('recovery maintenance ownership', () => {
+  beforeEach(() => jest.useFakeTimers());
+  afterEach(() => jest.useRealTimers());
+
+  it('preserves accepted scans and a wake across reversible closure', async () => {
+    let release!: (idle: boolean) => void;
+    const scan = jest.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          release = resolve;
+        }),
+    );
+    const loop = createIdleRecoveryLoop({
+      intervalMs: 10,
+      maxIdleIntervalMs: 100,
+      scan,
+      onError: jest.fn(),
+    });
+    const active = loop.start();
+    await jest.advanceTimersByTimeAsync(0);
+    expect(loop.pauseAdmissions('drain')).toBe(true);
+    loop.wake();
+    expect(loop.resumeAdmissions('foreign')).toBe(false);
+    expect(await loop.getMaintenanceCensus('drain')).toMatchObject({
+      admissionClosed: true,
+      pendingWrites: 1,
+    });
+    release(true);
+    await active;
+    await jest.advanceTimersByTimeAsync(1000);
+    expect(scan).toHaveBeenCalledTimes(1);
+    expect(await loop.getMaintenanceCensus('drain')).toMatchObject({
+      complete: true,
+      pendingWrites: 0,
+    });
+    expect(loop.resumeAdmissions('drain')).toBe(true);
+    await jest.advanceTimersByTimeAsync(0);
+    expect(scan).toHaveBeenCalledTimes(2);
+    release(true);
+    await loop.stop();
+  });
+
+  it('does not report a failed scan as drained or resume it implicitly', async () => {
+    const loop = createIdleRecoveryLoop({
+      intervalMs: 10,
+      maxIdleIntervalMs: 100,
+      scan: async () => {
+        throw new Error('unknown commit');
+      },
+      onError: jest.fn(),
+    });
+    await loop.start();
+    loop.pauseAdmissions('drain');
+    expect(await loop.getMaintenanceCensus('drain')).toMatchObject({ complete: false });
+    expect(loop.resumeAdmissions('drain')).toBe(false);
+    await loop.stop();
+  });
+});

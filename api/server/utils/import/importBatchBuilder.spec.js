@@ -85,6 +85,51 @@ describe('ImportBatchBuilder content filtering', () => {
     getFiles.mockResolvedValue([]);
   });
 
+  it.each([false, true])(
+    'retains primary failure and actual compensation completion, cleanup failed=%s',
+    async (fails) => {
+      const {
+        createHistoryMutationOwner,
+      } = require('../../../../packages/api/src/conversations/history');
+      const owner = createHistoryMutationOwner();
+      const scope = owner.admit('conversation-import');
+      const builder = createBuilder();
+      builder.history = scope;
+      const failure = new Error('message commit uncertain');
+      bulkSaveConvos.mockResolvedValueOnce({ isOk: () => true });
+      bulkSaveMessages.mockRejectedValueOnce(failure);
+      let started, complete, reject;
+      const entered = new Promise((resolve) => {
+        started = resolve;
+      });
+      deleteImportedMessages.mockImplementationOnce(() => {
+        started();
+        return new Promise((yes, no) => {
+          complete = yes;
+          reject = no;
+        });
+      });
+      const result = builder
+        .saveBatch()
+        .catch((error) => error)
+        .finally(() => scope.finish());
+      await entered;
+      owner.pauseAdmissions('a');
+      expect((await owner.getMaintenanceCensus('a')).pendingWrites).toBe(1);
+      if (fails) reject(new Error('compensation uncertain'));
+      else complete();
+      expect(await result).toBe(failure);
+      // Preserve the canonical recovery order: retain conversation ownership if message cleanup failed.
+      expect(deleteImportedConversations).toHaveBeenCalledTimes(fails ? 0 : 1);
+      expect(await owner.getMaintenanceCensus('a')).toMatchObject({
+        pendingWrites: 0,
+        queuedContinuations: 0,
+        complete: false,
+      });
+      expect(owner.resumeAdmissions('a')).toBe(false);
+    },
+  );
+
   it('marks imported user and assistant prose as user-submitted', () => {
     const builder = new ImportBatchBuilder('user-123');
     builder.startConversation(EModelEndpoint.openAI);

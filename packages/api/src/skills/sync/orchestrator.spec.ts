@@ -210,7 +210,9 @@ describe('createSkillSyncTriggerOrchestrator', () => {
     });
     const runnerConfig = await runners[0].input.getConfig();
 
-    expect(runner).toBe(runners[0].runner);
+    expect(runner.getStatus).toBe(runners[0].runner.getStatus);
+    await runner.runOnce();
+    expect(runners[0].runner.runOnce).toHaveBeenCalledTimes(1);
     expect(runners[0].input.allowServerCredentials).toBe(true);
     expect(runnerConfig?.github?.runOnStartup).toBe(true);
     expect(runnerConfig?.github?.sources[0]).toEqual(
@@ -414,5 +416,51 @@ describe('createSkillSyncTriggerOrchestrator', () => {
     expect(second).toBe(false);
     expect(runners).toHaveLength(1);
     expect(runners[0].runner.runOnce).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('skill maintenance common owner', () => {
+  it('counts an accepted run, closes all created runners and keeps uncertain writes held', async () => {
+    const active = deferred<RunnerRunResult>();
+    const { orchestrator, runners } = createHarness({ runOnce: () => active.promise });
+    const input = { getConfig: () => skillSync(), loadAppConfig: () => ({}) };
+    const first = orchestrator.createRunner(input);
+    const running = first.runOnce();
+    orchestrator.pauseAdmissions('drain');
+    expect((await orchestrator.getMaintenanceCensus('drain')).pendingWrites).toBe(1);
+    expect((await orchestrator.createRunner(input).runOnce()).status).toBe('skipped');
+    expect(runners[1].runner.runOnce).not.toHaveBeenCalled();
+    runners[0].input.onUnconfirmedWork?.();
+    active.resolve(completedRun());
+    await running;
+    expect(await orchestrator.getMaintenanceCensus('drain')).toMatchObject({
+      complete: false,
+      pendingWrites: 0,
+    });
+    expect(orchestrator.resumeAdmissions('drain')).toBe(false);
+  });
+
+  it('checks the current pause after awaiting request status and fences census revisions', async () => {
+    const status = deferred<RunnerStatus>();
+    const runner = {
+      getStatus: () => status.promise,
+      runOnce: jest.fn(async () => completedRun()),
+    };
+    const orchestrator = createSkillSyncTriggerOrchestrator({
+      createRunner: () => runner,
+      logger: { warn: jest.fn(), error: jest.fn() },
+    });
+    const active = orchestrator.maybeRunForRequest({
+      config: { skillSync: skillSync(), config: {} },
+      user: { tenantId: 't' },
+    });
+    orchestrator.pauseAdmissions('drain');
+    status.resolve(withRunnableCredentials(statusFromConfig(skillSync())));
+    await active;
+    expect(runner.runOnce).not.toHaveBeenCalled();
+    const census = orchestrator.getMaintenanceCensus('drain');
+    orchestrator.resumeAdmissions('drain');
+    orchestrator.pauseAdmissions('next');
+    expect((await census).complete).toBe(false);
   });
 });

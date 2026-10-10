@@ -1,3 +1,8 @@
+const {
+  authAdmissionMiddleware,
+  ownAuthHandler,
+  authPersistence,
+} = require('~/server/services/LegacyAuthMaintenance');
 const express = require('express');
 const { getTenantId, DEFAULT_SESSION_EXPIRY } = require('@librechat/data-schemas');
 const {
@@ -30,13 +35,17 @@ const browserMethods = require('~/models');
 const { getAppConfig } = require('~/server/services/Config');
 const middleware = require('~/server/middleware');
 
-const setBalanceConfig = createSetBalanceConfig({
-  getAppConfig,
-  findBalanceByUser,
-  upsertBalanceFields,
-});
+const setBalanceConfig = ownAuthHandler(
+  createSetBalanceConfig({
+    observer: authPersistence,
+    getAppConfig,
+    findBalanceByUser,
+    upsertBalanceFields,
+  }),
+);
 
 const router = express.Router();
+router.use(authAdmissionMiddleware);
 const browserAuth = createBrowserAuth({
   ...browserMethods,
   getAppConfig: () => getAppConfig({ baseOnly: true }),
@@ -112,25 +121,52 @@ router.post(
   resetPasswordController,
 );
 
-router.post('/2fa/enable', middleware.requireJwtAuth, twoFactorManagementLimiter, enable2FA);
-router.post('/2fa/verify', middleware.requireJwtAuth, twoFactorManagementLimiter, verify2FA);
+router.post(
+  '/2fa/enable',
+  middleware.requireJwtAuth,
+  twoFactorManagementLimiter,
+  ownAuthHandler(enable2FA),
+);
+router.post(
+  '/2fa/verify',
+  middleware.requireJwtAuth,
+  twoFactorManagementLimiter,
+  ownAuthHandler(verify2FA),
+);
 router.post(
   '/2fa/verify-temp',
   middleware.requireSameOrigin,
   middleware.setTwoFactorTempUser,
   middleware.twoFactorTempLimiter,
   middleware.checkBan,
-  verify2FAWithTempToken,
+  ownAuthHandler(verify2FAWithTempToken),
 );
-router.post('/2fa/confirm', middleware.requireJwtAuth, twoFactorManagementLimiter, confirm2FA);
-router.post('/2fa/disable', middleware.requireJwtAuth, twoFactorManagementLimiter, disable2FA);
+router.post(
+  '/2fa/confirm',
+  middleware.requireJwtAuth,
+  twoFactorManagementLimiter,
+  ownAuthHandler(confirm2FA),
+);
+router.post(
+  '/2fa/disable',
+  middleware.requireJwtAuth,
+  twoFactorManagementLimiter,
+  ownAuthHandler(disable2FA),
+);
 router.post(
   '/2fa/backup/regenerate',
   middleware.requireJwtAuth,
   twoFactorManagementLimiter,
-  regenerateBackupCodes,
+  ownAuthHandler(regenerateBackupCodes),
 );
 
 router.get('/graph-token', middleware.requireJwtAuth, graphTokenController);
 
 module.exports = router;
+
+// Private composition port; this property does not create an HTTP route.
+module.exports.browserMaintenance = Object.freeze({
+  pauseAdmissions: browserAuth.pauseAdmissions,
+  resumeAdmissions: browserAuth.resumeAdmissions,
+  getMaintenanceCensus: browserAuth.getMaintenanceCensus,
+});

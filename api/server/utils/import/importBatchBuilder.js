@@ -34,10 +34,11 @@ const { FALLBACK_MODEL_BY_ENDPOINT } = require('./defaults');
  * @param {object} [interfaceConfig] - Runtime interface config for import retention.
  * @param {object} [filters] - Source-aware content filters for submitted imports.
  * @param {object} [legacyPii] - Legacy messageFilter.pii configuration.
+ * @param {import('@librechat/api').HistoryMutationScope} [history] - Admitted history lifetime.
  * @returns {ImportBatchBuilder} - The newly created ImportBatchBuilder instance.
  */
-function createImportBatchBuilder(requestUserId, interfaceConfig, filters, legacyPii) {
-  return new ImportBatchBuilder(requestUserId, interfaceConfig, filters, legacyPii);
+function createImportBatchBuilder(requestUserId, interfaceConfig, filters, legacyPii, history) {
+  return new ImportBatchBuilder(requestUserId, interfaceConfig, filters, legacyPii, history);
 }
 
 /**
@@ -72,8 +73,10 @@ class ImportBatchBuilder {
    * @param {object} [interfaceConfig] - Runtime interface config for import retention.
    * @param {object} [filters] - Source-aware content filters for submitted imports.
    * @param {object} [legacyPii] - Legacy messageFilter.pii configuration.
+   * @param {import('@librechat/api').HistoryMutationScope} [history] - Admitted history lifetime.
    */
-  constructor(requestUserId, interfaceConfig, filters, legacyPii) {
+  constructor(requestUserId, interfaceConfig, filters, legacyPii, history) {
+    this.history = history;
     this.requestUserId = requestUserId;
     this.interfaceConfig = interfaceConfig;
     this.filters = filters;
@@ -218,16 +221,29 @@ class ImportBatchBuilder {
     const tags = this.conversations.flatMap((convo) => convo.tags);
 
     try {
+      const write = (action, confirm) =>
+        this.history ? this.history.write(action, confirm) : action();
+      const committed = (result) =>
+        result?.isOk?.() === true || result?.ok === 1 || result?.acknowledged === true;
       await executeConversationImportWrites({
-        saveConversations: () => bulkSaveConvos(this.conversations),
-        saveMessages: () => bulkSaveMessages(this.messages, true),
-        updateTagCounts: () => bulkIncrementTagCounts(this.requestUserId, tags),
-        deleteMessages: () => deleteImportedMessages(cleanupScope),
-        deleteConversations: () => deleteImportedConversations(cleanupScope),
-        onTagCountError: (error) =>
-          logger.error(`Error updating imported tag counts: ${error.message}`),
-        onCleanupError: (error, resource) =>
-          logger.error(`Error cleaning imported ${resource}: ${error.message}`),
+        saveConversations: () => write(() => bulkSaveConvos(this.conversations), committed),
+        saveMessages: () => write(() => bulkSaveMessages(this.messages, true), committed),
+        updateTagCounts: () =>
+          write(() =>
+            this.history
+              ? bulkIncrementTagCounts(this.requestUserId, tags, this.history.uncertain)
+              : bulkIncrementTagCounts(this.requestUserId, tags),
+          ),
+        deleteMessages: () => write(() => deleteImportedMessages(cleanupScope)),
+        deleteConversations: () => write(() => deleteImportedConversations(cleanupScope)),
+        onTagCountError: (error) => {
+          this.history?.uncertain();
+          logger.error(`Error updating imported tag counts: ${error.message}`);
+        },
+        onCleanupError: (error, resource) => {
+          this.history?.uncertain();
+          logger.error(`Error cleaning imported ${resource}: ${error.message}`);
+        },
       });
       logger.debug(
         `user: ${this.requestUserId} | Added ${this.conversations.length} conversations and ${this.messages.length} messages to the DB.`,

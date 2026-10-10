@@ -1,3 +1,17 @@
+// Policy fixtures isolate lifecycle; actual owner/consumer settlement is covered by maintenance suites.
+jest.mock('~/server/services/LegacyAuthMaintenance', () => ({
+  withAuthRequest: async (_req, action) => action(),
+  authTrack: async (action) => action(),
+  authWrite: async (action) => action(),
+  authMutation: async (method, ...args) => method(...args),
+  authUserMutation: async (method, ...args) => method(...args),
+  authCache: (store) => store,
+  authPersistence: { write: async (action) => action() },
+  legacyAuthMaintenance: { current: () => undefined },
+  authAdmissionMiddleware: (_req, _res, next) => next(),
+  ownAuthHandler: (handler) => handler,
+  authSessionStore: (store) => store,
+}));
 // --- Mocks ---
 jest.mock('fs');
 jest.mock('path');
@@ -219,7 +233,7 @@ describe('setupSaml', () => {
   // Helper to wrap the verify callback in a promise
   const validate = (profile, strategyName = 'saml') =>
     new Promise((resolve, reject) => {
-      verifyCallbacks.get(strategyName)(profile, (err, user, details) => {
+      verifyCallbacks.get(strategyName)({}, profile, (err, user, details) => {
         if (err) {
           reject(err);
         } else {

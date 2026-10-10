@@ -1,3 +1,8 @@
+const {
+  withAuthRequest,
+  authMutation,
+  authUserMutation,
+} = require('~/server/services/LegacyAuthMaintenance');
 const undici = require('undici');
 const { get } = require('lodash');
 const passport = require('passport');
@@ -177,7 +182,8 @@ const exchangeAccessTokenIfNeeded = async (config, accessToken, sub, fromCache =
         requested_token_use: 'on_behalf_of',
       },
     );
-    await tokensCache.set(
+    await authMutation(
+      tokensCache.set.bind(tokensCache),
       sub,
       {
         access_token: grantResponse.access_token,
@@ -364,7 +370,8 @@ async function exchangeTokenForOverage(accessToken, sub) {
     );
   }
 
-  await tokensCache.set(
+  await authMutation(
+    tokensCache.set.bind(tokensCache),
     cacheKey,
     { access_token: grantResponse.access_token },
     getTokenCacheTtlMs(grantResponse.expires_in, DEFAULT_OAUTH_TOKEN_TTL_SECONDS),
@@ -689,7 +696,7 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
     };
 
     const balanceConfig = getBalanceConfig(appConfig);
-    user = await createUser(user, balanceConfig, true, true);
+    user = await authMutation(createUser, user, balanceConfig, true, true);
   } else {
     user.provider = 'openid';
     user.openidId = userinfo.sub;
@@ -800,7 +807,8 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
     if (imageBuffer) {
       const fileStrategy = getAvatarFileStrategy(appConfig, process.env.CDN_PROVIDER);
       const { saveBuffer } = getStrategyFunctions(fileStrategy);
-      const imagePath = await saveBuffer(
+      const imagePath = await authMutation(
+        saveBuffer,
         getAvatarSaveParams(fileStrategy, {
           fileName,
           userId,
@@ -812,7 +820,7 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
     }
   }
 
-  user = await updateUser(user._id, user);
+  user = await authUserMutation(updateUser, user._id, user);
 
   logger.info(
     `[openidStrategy] login success openidId: ${user.openidId} | email: ${user.email} | username: ${user.username} `,
@@ -842,24 +850,25 @@ async function processOpenIDAuth(tokenset, existingUsersOnly = false) {
  * @param {boolean | undefined} [existingUsersOnly]
  */
 function createOpenIDCallback(existingUsersOnly) {
-  return async (tokenset, done) => {
-    try {
-      const user = await processOpenIDAuth(tokenset, existingUsersOnly);
-      done(null, user);
-    } catch (err) {
-      if (err.message === 'Email domain not allowed') {
-        return done(null, false, { message: err.message });
+  return (req, tokenset, done) =>
+    withAuthRequest(req, async () => {
+      try {
+        const user = await processOpenIDAuth(tokenset, existingUsersOnly);
+        done(null, user);
+      } catch (err) {
+        if (err.message === 'Email domain not allowed') {
+          return done(null, false, { message: err.message });
+        }
+        if (err.message === ErrorTypes.AUTH_FAILED) {
+          return done(null, false, { message: err.message });
+        }
+        if (err.message && err.message.includes('role to log in')) {
+          return done(null, false, { message: err.message });
+        }
+        logger.error('[openidStrategy] login failed', err);
+        done(err);
       }
-      if (err.message === ErrorTypes.AUTH_FAILED) {
-        return done(null, false, { message: err.message });
-      }
-      if (err.message && err.message.includes('role to log in')) {
-        return done(null, false, { message: err.message });
-      }
-      logger.error('[openidStrategy] login failed', err);
-      done(err);
-    }
-  };
+    }).catch(done);
 }
 
 /**
@@ -875,6 +884,7 @@ const setupOpenIdAdmin = (openidConfig) => {
     const openidAdminLogin = new CustomOpenIDStrategy(
       {
         config: openidConfig,
+        passReqToCallback: true,
         scope: process.env.OPENID_SCOPE,
         usePKCE: isEnabled(process.env.OPENID_USE_PKCE),
         clockTolerance: process.env.OPENID_CLOCK_TOLERANCE || 300,
@@ -943,6 +953,7 @@ async function setupOpenId() {
     const openidLogin = new CustomOpenIDStrategy(
       {
         config: openidConfig,
+        passReqToCallback: true,
         scope: process.env.OPENID_SCOPE,
         callbackURL: process.env.DOMAIN_SERVER + process.env.OPENID_CALLBACK_URL,
         clockTolerance: process.env.OPENID_CLOCK_TOLERANCE || 300,

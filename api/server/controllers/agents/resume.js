@@ -392,6 +392,7 @@ function resolveResumeValue(pendingAction, body) {
  * successful finish. Best-effort title generation for a first-turn pause.
  */
 async function finalizeResumedTurn({
+  providerExecutionId,
   req,
   client,
   job,
@@ -605,22 +606,27 @@ async function finalizeResumedTurn({
       (!convo || !convo.title || convo.title === 'New Chat')
     ) {
       try {
-        await addTitle(req, {
-          text: userMessage.text,
-          conversationId,
-          client,
-          onTitleGenerated: ({ conversationId: titleConvoId, title }) => {
-            conversation.title = title;
-            return GenerationJobManager.emitChunk(
-              streamId,
-              {
-                event: 'title',
-                data: { conversationId: titleConvoId, title },
-              },
-              { expectedCreatedAt: job.createdAt },
-            );
-          },
-        });
+        await GenerationJobManager.observeGenerationWrite(
+          streamId,
+          job.createdAt,
+          providerExecutionId,
+          addTitle(req, {
+            text: userMessage.text,
+            conversationId,
+            client,
+            onTitleGenerated: ({ conversationId: titleConvoId, title }) => {
+              conversation.title = title;
+              return GenerationJobManager.emitChunk(
+                streamId,
+                {
+                  event: 'title',
+                  data: { conversationId: titleConvoId, title },
+                },
+                { expectedCreatedAt: job.createdAt },
+              );
+            },
+          }),
+        );
       } catch (err) {
         logger.error(
           '[ResumeAgentController] Title generation failed after resume',
@@ -1902,6 +1908,7 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
         streamId,
         job.createdAt,
         providerExecutionId,
+        true,
       ))
     ) {
       throw Object.assign(new Error('Generation stopped before provider resume'), {
@@ -2042,6 +2049,7 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
     }
 
     await finalizeResumedTurn({
+      providerExecutionId,
       req,
       client,
       job,
@@ -2161,7 +2169,7 @@ const ResumeAgentController = async (req, res, next, initializeClient, addTitle)
         disposeClient(client);
       }
     } finally {
-      await GenerationJobManager.markProviderExecutionDrained?.(
+      await GenerationJobManager.settleGenerationExecution?.(
         streamId,
         job.createdAt,
         providerExecutionId,

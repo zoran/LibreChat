@@ -1170,3 +1170,47 @@ describe('createAgentTriggerExecutionHost steer adapter', () => {
     });
   });
 });
+
+describe('maintenance pre-admission deferral', () => {
+  it.each([
+    [503, 'APP_QUIESCING', true],
+    [503, 'SERVER_NOT_READY', false],
+    [500, 'APP_QUIESCING', false],
+  ] as const)(
+    'classifies only the exact maintenance response %s/%s',
+    async (status, code, deferred) => {
+      const fetcher = fetchMock(async () =>
+        response({ code }, { status, headers: { 'retry-after': '1' } }),
+      );
+      const host = createAgentTriggerExecutionHost(deps(fetcher));
+      await expect(host.dispatch(createFireEnvelope())).rejects.toMatchObject({
+        certainty: 'definite',
+        retryable: true,
+        code,
+        status,
+        deferWithoutAttempt: deferred,
+      });
+    },
+  );
+
+  it('retains prepared continuation state across maintenance rejection', async () => {
+    const releaseOnDefiniteFailure = jest.fn(async () => undefined);
+    const host = createAgentTriggerExecutionHost(
+      deps(
+        fetchMock(async () => response({ code: 'APP_QUIESCING' }, { status: 503 })),
+        {
+          prepareContinue: async () => ({
+            status: 'ready',
+            input: 'durable result',
+            parentMessageId: 'response-1',
+            releaseOnDefiniteFailure,
+          }),
+        },
+      ),
+    );
+    await expect(host.dispatch(createContinueEnvelope())).rejects.toMatchObject({
+      deferWithoutAttempt: true,
+    });
+    expect(releaseOnDefiniteFailure).not.toHaveBeenCalled();
+  });
+});

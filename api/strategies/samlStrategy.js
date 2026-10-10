@@ -1,3 +1,8 @@
+const {
+  withAuthRequest,
+  authMutation,
+  authUserMutation,
+} = require('~/server/services/LegacyAuthMaintenance');
 const fs = require('fs');
 const path = require('path');
 const passport = require('passport');
@@ -180,125 +185,129 @@ function convertToUsername(input, defaultValue = '') {
  * @returns {Function} The SAML callback function for passport.
  */
 function createSamlCallback(existingUsersOnly = false) {
-  return async (profile, done) => {
-    try {
-      const subject = resolveSamlSubject(profile, process.env.SAML_IDP_ISSUER);
-      if (subject.error) {
-        logger.warn(`[samlStrategy] Rejected SAML subject: ${subject.error}`);
-        return done(null, false, { message: ErrorTypes.AUTH_FAILED });
-      }
-      const { nameID } = subject;
-      logger.info('[samlStrategy] SAML authentication received');
-
-      const userEmail = getEmail(profile) || '';
-
-      const baseConfig = await getAppConfig({ baseOnly: true });
-      if (!isEmailDomainAllowed(userEmail, baseConfig?.registration?.allowedDomains)) {
-        logger.error(
-          '[samlStrategy] Authentication blocked because the email domain is not allowed',
-        );
-        return done(null, false, { message: 'Email domain not allowed' });
-      }
-
-      let user = await findUser({ samlId: nameID });
-      logger.info(`[samlStrategy] User ${user ? 'found' : 'not found'} by SAML identity`);
-
-      if (!user) {
-        user = await findUser({ email: userEmail });
-        logger.info(`[samlStrategy] User ${user ? 'found' : 'not found'} by SAML email claim`);
-      }
-
-      if (user && user.provider !== 'saml') {
-        logger.info(`[samlStrategy] SAML login conflicts with existing provider: ${user.provider}`);
-        return done(null, false, {
-          message: ErrorTypes.AUTH_FAILED,
-        });
-      }
-
-      if (user?.samlId && user.samlId !== nameID) {
-        logger.warn('[samlStrategy] Refused SAML login with a different NameID');
-        return done(null, false, {
-          message: ErrorTypes.AUTH_FAILED,
-        });
-      }
-
-      const appConfig = user?.tenantId
-        ? await resolveAppConfigForUser(getAppConfig, user)
-        : baseConfig;
-
-      if (!isEmailDomainAllowed(userEmail, appConfig?.registration?.allowedDomains)) {
-        logger.error('[samlStrategy] Authentication blocked by the tenant email-domain policy');
-        return done(null, false, { message: 'Email domain not allowed' });
-      }
-
-      const fullName = getFullName(profile);
-
-      const username = convertToUsername(
-        getUserName(profile) || getGivenName(profile) || getEmail(profile),
-      );
-
-      if (!user) {
-        if (existingUsersOnly) {
-          logger.error('[samlStrategy] Admin auth blocked because the user does not exist');
-          return done(null, false, { message: 'User does not exist' });
-        }
-
-        user = {
-          provider: 'saml',
-          samlId: nameID,
-          username,
-          email: userEmail,
-          emailVerified: true,
-          name: fullName,
-        };
-        const balanceConfig = getBalanceConfig(appConfig);
-        user = await createUser(user, balanceConfig, true, true);
-      } else {
-        user = await claimSamlIdentity(user._id, nameID, {
-          username,
-          name: fullName,
-        });
-        if (!user) {
-          logger.warn('[samlStrategy] Refused a concurrent SAML identity binding');
+  return (req, profile, done) =>
+    withAuthRequest(req, async () => {
+      try {
+        const subject = resolveSamlSubject(profile, process.env.SAML_IDP_ISSUER);
+        if (subject.error) {
+          logger.warn(`[samlStrategy] Rejected SAML subject: ${subject.error}`);
           return done(null, false, { message: ErrorTypes.AUTH_FAILED });
         }
-      }
+        const { nameID } = subject;
+        logger.info('[samlStrategy] SAML authentication received');
 
-      const picture = getPicture(profile);
-      if (picture && !user.avatar?.includes('manual=true')) {
-        const userId = user._id.toString();
-        const imageBuffer = await resizeIdentityProviderAvatar(picture, userId);
-        if (imageBuffer) {
-          let fileName;
-          if (crypto) {
-            fileName = (await hashToken(nameID)) + '.png';
-          } else {
-            fileName = userId + '.png';
+        const userEmail = getEmail(profile) || '';
+
+        const baseConfig = await getAppConfig({ baseOnly: true });
+        if (!isEmailDomainAllowed(userEmail, baseConfig?.registration?.allowedDomains)) {
+          logger.error(
+            '[samlStrategy] Authentication blocked because the email domain is not allowed',
+          );
+          return done(null, false, { message: 'Email domain not allowed' });
+        }
+
+        let user = await findUser({ samlId: nameID });
+        logger.info(`[samlStrategy] User ${user ? 'found' : 'not found'} by SAML identity`);
+
+        if (!user) {
+          user = await findUser({ email: userEmail });
+          logger.info(`[samlStrategy] User ${user ? 'found' : 'not found'} by SAML email claim`);
+        }
+
+        if (user && user.provider !== 'saml') {
+          logger.info(
+            `[samlStrategy] SAML login conflicts with existing provider: ${user.provider}`,
+          );
+          return done(null, false, {
+            message: ErrorTypes.AUTH_FAILED,
+          });
+        }
+
+        if (user?.samlId && user.samlId !== nameID) {
+          logger.warn('[samlStrategy] Refused SAML login with a different NameID');
+          return done(null, false, {
+            message: ErrorTypes.AUTH_FAILED,
+          });
+        }
+
+        const appConfig = user?.tenantId
+          ? await resolveAppConfigForUser(getAppConfig, user)
+          : baseConfig;
+
+        if (!isEmailDomainAllowed(userEmail, appConfig?.registration?.allowedDomains)) {
+          logger.error('[samlStrategy] Authentication blocked by the tenant email-domain policy');
+          return done(null, false, { message: 'Email domain not allowed' });
+        }
+
+        const fullName = getFullName(profile);
+
+        const username = convertToUsername(
+          getUserName(profile) || getGivenName(profile) || getEmail(profile),
+        );
+
+        if (!user) {
+          if (existingUsersOnly) {
+            logger.error('[samlStrategy] Admin auth blocked because the user does not exist');
+            return done(null, false, { message: 'User does not exist' });
           }
 
-          const fileStrategy = getAvatarFileStrategy(appConfig, process.env.CDN_PROVIDER);
-          const { saveBuffer } = getStrategyFunctions(fileStrategy);
-          const imagePath = await saveBuffer(
-            getAvatarSaveParams(fileStrategy, {
-              fileName,
-              userId,
-              buffer: imageBuffer,
-              tenantId: user.tenantId,
-            }),
-          );
-          user.avatar = imagePath ?? '';
-          user = await updateUser(user._id, user);
+          user = {
+            provider: 'saml',
+            samlId: nameID,
+            username,
+            email: userEmail,
+            emailVerified: true,
+            name: fullName,
+          };
+          const balanceConfig = getBalanceConfig(appConfig);
+          user = await authMutation(createUser, user, balanceConfig, true, true);
+        } else {
+          user = await authUserMutation(claimSamlIdentity, user._id, nameID, {
+            username,
+            name: fullName,
+          });
+          if (!user) {
+            logger.warn('[samlStrategy] Refused a concurrent SAML identity binding');
+            return done(null, false, { message: ErrorTypes.AUTH_FAILED });
+          }
         }
+
+        const picture = getPicture(profile);
+        if (picture && !user.avatar?.includes('manual=true')) {
+          const userId = user._id.toString();
+          const imageBuffer = await resizeIdentityProviderAvatar(picture, userId);
+          if (imageBuffer) {
+            let fileName;
+            if (crypto) {
+              fileName = (await hashToken(nameID)) + '.png';
+            } else {
+              fileName = userId + '.png';
+            }
+
+            const fileStrategy = getAvatarFileStrategy(appConfig, process.env.CDN_PROVIDER);
+            const { saveBuffer } = getStrategyFunctions(fileStrategy);
+            const imagePath = await authMutation(
+              saveBuffer,
+              getAvatarSaveParams(fileStrategy, {
+                fileName,
+                userId,
+                buffer: imageBuffer,
+                tenantId: user.tenantId,
+              }),
+            );
+            user.avatar = imagePath ?? '';
+            user = await authUserMutation(updateUser, user._id, user);
+          }
+        }
+
+        logger.info(`[samlStrategy] Login success for user: ${user._id}`);
+
+        done(null, user);
+      } catch (err) {
+        logger.error('[samlStrategy] Login failed', err);
+        done(err);
       }
-
-      logger.info(`[samlStrategy] Login success for user: ${user._id}`);
-
-      done(null, user);
-    } catch (err) {
-      logger.error('[samlStrategy] Login failed', err);
-      done(err);
-    }
-  };
+    }).catch(done);
 }
 
 /**
@@ -311,6 +320,7 @@ function getBaseSamlConfig() {
     throw new Error('SAML_NAME_ID_FORMAT must provide a stable, non-transient identifier');
   }
   return {
+    passReqToCallback: true,
     entryPoint: process.env.SAML_ENTRY_POINT,
     issuer: process.env.SAML_ISSUER,
     idpCert: getCertificateContent(process.env.SAML_CERT),

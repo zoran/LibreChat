@@ -1,6 +1,7 @@
 import { createHash } from 'crypto';
 import { logger } from '@librechat/data-schemas';
 import { AUTH_USER_DOC_BY_ID_PREFIX, CacheKeys } from 'librechat-data-provider';
+import type { AuthPersistenceObserver } from '@librechat/data-schemas';
 import type { IUser } from '@librechat/data-schemas';
 import { cacheConfig } from '~/cache/cacheConfig';
 
@@ -138,12 +139,13 @@ async function rememberUserCacheKey(
   userId: string,
   cacheKey: string,
   ttlMs: number,
+  observer?: AuthPersistenceObserver,
 ): Promise<void> {
   const indexKey = buildAuthUserDocReverseIndexKey(userId);
   const existing = await store.get<string[]>(indexKey);
   const keys = Array.isArray(existing) ? existing.filter((value) => value !== cacheKey) : [];
   keys.push(cacheKey);
-  await store.set(indexKey, keys.slice(-20), ttlMs);
+  await observeWrite(observer, () => store.set(indexKey, keys.slice(-20), ttlMs));
 }
 
 export async function getCachedAuthUserDoc(
@@ -168,21 +170,24 @@ export async function setCachedAuthUserDoc(
   store: AuthUserDocCacheStore,
   cacheKey: string,
   user: Partial<IUser>,
+  observer?: AuthPersistenceObserver,
 ): Promise<void> {
   try {
     const sanitized = sanitizeUserForCache(user);
-    await store.set(
-      cacheKey,
-      {
-        version: AUTH_USER_DOC_CACHE_VERSION,
-        cachedAt: Date.now(),
-        user: sanitized,
-      } satisfies CachedAuthUserDoc,
-      AUTH_USER_DOC_CACHE_TTL_MS,
+    await observeWrite(observer, () =>
+      store.set(
+        cacheKey,
+        {
+          version: AUTH_USER_DOC_CACHE_VERSION,
+          cachedAt: Date.now(),
+          user: sanitized,
+        } satisfies CachedAuthUserDoc,
+        AUTH_USER_DOC_CACHE_TTL_MS,
+      ),
     );
     const userId = getUserId(sanitized);
     if (userId) {
-      await rememberUserCacheKey(store, userId, cacheKey, AUTH_USER_DOC_CACHE_TTL_MS);
+      await rememberUserCacheKey(store, userId, cacheKey, AUTH_USER_DOC_CACHE_TTL_MS, observer);
     }
   } catch (error) {
     logger.warn('[authUserDocCache] Cache write failed', {
@@ -194,6 +199,7 @@ export async function setCachedAuthUserDoc(
 export async function invalidateCachedAuthUserDoc(
   store: AuthUserDocCacheStore | undefined,
   input: { userId?: string; cacheKey?: string },
+  observer?: AuthPersistenceObserver,
 ): Promise<void> {
   if (!store) {
     return;
@@ -211,12 +217,23 @@ export async function invalidateCachedAuthUserDoc(
           keys.add(key);
         }
       }
-      await store.delete(indexKey);
+      await observeWrite(observer, () => store.delete(indexKey));
     }
-    await Promise.all([...keys].map((key) => store.delete(key)));
+    const outcomes = await Promise.allSettled(
+      [...keys].map((key) => observeWrite(observer, () => store.delete(key))),
+    );
+    const failure = outcomes.find((outcome) => outcome.status === 'rejected');
+    if (failure?.status === 'rejected') throw failure.reason;
   } catch (error) {
     logger.warn('[authUserDocCache] Cache invalidation failed', {
       error: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+function observeWrite<T>(
+  observer: AuthPersistenceObserver | undefined,
+  action: () => Promise<T>,
+): Promise<T> {
+  return observer ? observer.write(action) : action();
 }

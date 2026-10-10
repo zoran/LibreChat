@@ -1,3 +1,4 @@
+const { authMutation } = require('./LegacyAuthMaintenance');
 const {
   createRefreshTokenBridgeIdentity,
   createRefreshTokenBridgeService,
@@ -12,7 +13,11 @@ const {
 const db = require('~/models');
 
 module.exports = createRefreshTokenBridgeService({
-  db,
+  db: {
+    ...db,
+    deleteRefreshTokenBridges: (...args) => authMutation(db.deleteRefreshTokenBridges, ...args),
+    upsertRefreshTokenBridge: (...args) => authMutation(db.upsertRefreshTokenBridge, ...args),
+  },
   logger,
   encrypt: encryptV2,
   decrypt: decryptV2,

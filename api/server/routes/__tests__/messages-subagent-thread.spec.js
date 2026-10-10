@@ -6,6 +6,8 @@ const mockIsSubagentThreadWriteBlocked = jest.fn();
 jest.mock('@librechat/agents', () => ({ sleep: jest.fn() }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('../../../../packages/api/src/conversations/history'),
+  ...jest.requireActual('../../../../packages/api/src/conversations/historyHttp'),
   withoutTraceRefs: jest.fn((message) => message),
   createContentFilter: jest.fn(() => (_req, _res, next) => next()),
   unescapeLaTeX: jest.fn((value) => value),
@@ -75,6 +77,7 @@ describe('message mutation policy for durable subagent threads', () => {
   beforeAll(() => {
     const messagesRouter = require('../messages');
     app = express();
+    app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
     app.use(express.json());
     app.use((req, _res, next) => {
       req.user = { id: 'owner-user', tenantId: 'tenant-a' };
@@ -84,6 +87,7 @@ describe('message mutation policy for durable subagent threads', () => {
   });
 
   beforeEach(() => {
+    if (app) app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
     jest.clearAllMocks();
     mockIsSubagentThreadWriteBlocked.mockResolvedValue(true);
     db.getMessage.mockResolvedValue({

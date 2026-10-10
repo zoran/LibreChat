@@ -8,7 +8,9 @@ import {
 } from 'librechat-data-provider';
 import type { Model, Types } from 'mongoose';
 import type { IAclEntry, CacheStore, IPrompt, IPromptGroup, IPromptGroupDocument } from '~/types';
+import type { AuthPersistenceObserver } from './authPersistence';
 import { getTenantId, scopedCacheKey, SYSTEM_TENANT_ID } from '~/config/tenantContext';
+import { observeAuthPersistence } from './authPersistence';
 import { isValidObjectIdString } from '~/utils/objectId';
 import { escapeRegExp } from '~/utils/string';
 import logger from '~/config/winston';
@@ -149,7 +151,7 @@ export interface PromptMethods {
     publiclyAccessibleIds: Types.ObjectId[];
     ownedPromptGroupIds: Types.ObjectId[];
   }>;
-  invalidatePromptGroupAccessContext(): Promise<void>;
+  invalidatePromptGroupAccessContext(observer?: AuthPersistenceObserver): Promise<void>;
   deletePrompt(params: {
     promptId: string | Types.ObjectId;
     groupId: string | Types.ObjectId;
@@ -905,7 +907,9 @@ export function createPromptMethods(
    * neither operation succeeds, reads bypass this tenant's cache and the mutation
    * rejects instead of allowing the old authorization era to remain authoritative.
    */
-  async function invalidatePromptGroupAccessContext(): Promise<void> {
+  async function invalidatePromptGroupAccessContext(
+    observer?: AuthPersistenceObserver,
+  ): Promise<void> {
     const generationKey = scopedCacheKey(ACCESS_GENERATION_KEY);
     for (const [cacheKey, pending] of pendingAccessLookups) {
       if (pending.generationKey !== generationKey) {
@@ -921,7 +925,9 @@ export function createPromptMethods(
     let markerRemoved = false;
     if (cache.delete) {
       try {
-        const deleteResult = await cache.delete(generationKey);
+        const deleteResult = await observeAuthPersistence(observer, async () =>
+          cache.delete!(generationKey),
+        );
         markerRemoved = deleteResult !== false;
         if (!markerRemoved) {
           logger.warn('The previous prompt group access generation was not removed');
@@ -939,10 +945,12 @@ export function createPromptMethods(
        * Keep the marker longer than derived entries so normal expiry does not
        * orphan a warm cache era and force avoidable access-query rebuilds.
        */
-      const setResult = await cache.set(generationKey, randomUUID(), Time.ONE_DAY);
-      if (setResult === false) {
-        throw new Error('Prompt group access generation write failed');
-      }
+      await observeAuthPersistence(observer, async () => {
+        const setResult = await cache.set(generationKey, randomUUID(), Time.ONE_DAY);
+        if (setResult === false) {
+          throw new Error('Prompt group access generation write failed');
+        }
+      });
       bypassedAccessGenerationKeys.delete(generationKey);
     } catch (error) {
       if (markerRemoved) {

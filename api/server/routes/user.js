@@ -1,3 +1,4 @@
+const { ownAuthHandler } = require('~/server/services/LegacyAuthMaintenance');
 const express = require('express');
 const { createUserPreferencesHandler } = require('@librechat/api');
 const {
@@ -33,7 +34,7 @@ router.get('/terms', requireJwtAuth, getTermsStatusController);
 router.post('/terms/accept', requireJwtAuth, acceptTermsController);
 router.post('/plugins', requireJwtAuth, updateUserPluginsController);
 router.delete('/delete', requireJwtAuth, canDeleteAccount, configMiddleware, deleteUserController);
-router.post('/verify', verifyEmailSubmissionLimiter, verifyEmailController);
-router.post('/verify/resend', verifyEmailLimiter, resendVerificationController);
+router.post('/verify', verifyEmailSubmissionLimiter, ownAuthHandler(verifyEmailController));
+router.post('/verify/resend', verifyEmailLimiter, ownAuthHandler(resendVerificationController));
 
 module.exports = router;

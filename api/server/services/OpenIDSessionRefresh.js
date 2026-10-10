@@ -1,3 +1,4 @@
+const { withAuthRequest, authMutation, authWrite, authTrack } = require('./LegacyAuthMaintenance');
 const jwt = require('jsonwebtoken');
 const cookies = require('cookie');
 const crypto = require('node:crypto');
@@ -9,11 +10,14 @@ const { getOpenIdConfig } = require('~/strategies/openidStrategy');
 const bridge = require('./RefreshTokenBridge');
 const flight = require('./OpenIDRefreshFlight');
 
-module.exports = api.createOpenIDSessionRefreshService({
+const service = api.createOpenIDSessionRefreshService({
   jwt,
   cookies,
   crypto,
-  openIdClient,
+  openIdClient: {
+    refreshTokenGrant: (...args) => authTrack(() => openIdClient.refreshTokenGrant(...args)),
+  },
+  observeWrite: authWrite,
   logger,
   defaultRefreshTokenExpiry: DEFAULT_REFRESH_TOKEN_EXPIRY,
   isEnabled: api.isEnabled,
@@ -28,8 +32,8 @@ module.exports = api.createOpenIDSessionRefreshService({
   setOpenIDMarkerCookies: api.setOpenIDMarkerCookies,
   storeOpenIdSession: api.storeOpenIdSession,
   normalizeExpiresIn: api.normalizeExpiresIn,
-  upsertSession,
-  deleteSession,
+  upsertSession: (...args) => authMutation(upsertSession, ...args),
+  deleteSession: (...args) => authMutation(deleteSession, ...args),
   getOpenIdConfig,
   OPENID_REFRESH_BRIDGE_GRACE_MS: bridge.OPENID_REFRESH_BRIDGE_GRACE_MS,
   storeRefreshTokenBridge: bridge.storeRefreshTokenBridge,
@@ -45,3 +49,13 @@ module.exports = api.createOpenIDSessionRefreshService({
   waitForOpenIDRefreshFlight: flight.waitForOpenIDRefreshFlight,
   withOpenIDRefreshFlightLease: flight.withOpenIDRefreshFlightLease,
 });
+
+module.exports = {
+  ...service,
+  refreshOpenIDSession: (req, ...args) =>
+    withAuthRequest(req, () => service.refreshOpenIDSession(req, ...args)),
+  createOpenIDSessionTokenProvider: (input) => {
+    const provider = service.createOpenIDSessionTokenProvider(input);
+    return (options) => withAuthRequest(input.req, () => provider(options));
+  },
+};

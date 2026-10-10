@@ -1,3 +1,4 @@
+const { trackHistoryWrite, isHistoryMessageResult } = require('@librechat/api');
 const crypto = require('crypto');
 const { sendEvent } = require('@librechat/api');
 const { getResponseSender, Constants } = require('librechat-data-provider');
@@ -42,15 +43,20 @@ const denyRequest = async (req, res, errorMessage) => {
   const shouldSaveMessage = _convoId && parentMessageId && parentMessageId !== Constants.NO_PARENT;
 
   if (shouldSaveMessage) {
-    await saveMessage(
-      {
-        userId: req?.user?.id,
-        isTemporary: req?.resolvedConversation?.isTemporary ?? req?.body?.isTemporary,
-        expiredAt: req?.resolvedConversation?.expiredAt,
-        interfaceConfig: req?.config?.interfaceConfig,
-      },
-      { ...userMessage, user: req.user.id },
-      { context: `api/server/middleware/denyRequest.js - ${responseText}` },
+    await trackHistoryWrite(
+      req,
+      () =>
+        saveMessage(
+          {
+            userId: req?.user?.id,
+            isTemporary: req?.resolvedConversation?.isTemporary ?? req?.body?.isTemporary,
+            expiredAt: req?.resolvedConversation?.expiredAt,
+            interfaceConfig: req?.config?.interfaceConfig,
+          },
+          { ...userMessage, user: req.user.id },
+          { context: `api/server/middleware/denyRequest.js - ${responseText}` },
+        ),
+      isHistoryMessageResult,
     );
   }
 

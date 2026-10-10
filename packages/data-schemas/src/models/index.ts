@@ -2,6 +2,7 @@ import { createAgentQueuedTurnModel, createAgentQueuedTurnSequenceModel } from '
 import { createAgentTriggerLaneSequenceModel } from './triggerLaneSequence';
 import { createScheduleModel, createScheduleRunModel } from './schedule';
 import { getTenantIndexMigrationHint } from '~/migrations/tenantIndexes';
+import { createGenerationAdmissionModel } from './generationAdmission';
 import { createSkillSyncCredentialModel } from './skillSyncCredential';
 import { createOpenIDRefreshFlightModel } from './openidRefreshFlight';
 import { createAgentTriggerUserPurgeModel } from './triggerUserPurge';
@@ -96,6 +97,7 @@ export function createModels(mongoose: typeof import('mongoose')): {
   Schedule: ReturnType<typeof createScheduleModel>;
   ScheduleRun: ReturnType<typeof createScheduleRunModel>;
   RefreshTokenBridge: ReturnType<typeof createRefreshTokenBridgeModel>;
+  GenerationAdmission: ReturnType<typeof createGenerationAdmissionModel>;
   OpenIDRefreshFlight: ReturnType<typeof createOpenIDRefreshFlightModel>;
 } {
   const models = {
@@ -145,6 +147,7 @@ export function createModels(mongoose: typeof import('mongoose')): {
     Schedule: createScheduleModel(mongoose),
     ScheduleRun: createScheduleRunModel(mongoose),
     RefreshTokenBridge: createRefreshTokenBridgeModel(mongoose),
+    GenerationAdmission: createGenerationAdmissionModel(mongoose),
     OpenIDRefreshFlight: createOpenIDRefreshFlightModel(mongoose),
   };
   /**

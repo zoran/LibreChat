@@ -1,22 +1,24 @@
 import IoRedis from 'ioredis';
 import calculateSlot from 'cluster-key-slot';
 import { logger } from '@librechat/data-schemas';
-import { createClient, createCluster } from '@keyv/redis';
+import { createClient, createCluster, createSentinel } from '@keyv/redis';
+import type { RedisClientType, RedisClusterType, RedisSentinelType } from '@redis/client';
 import type { ScanOptions } from '@redis/client/dist/lib/commands/SCAN';
-import type { RedisClientType, RedisClusterType } from '@redis/client';
 import type { Redis, Cluster } from 'ioredis';
 import type { ReadonlyRecoveryHandler } from './recovery';
 import { createReadonlyRecovery, isReadonlyReplicaError } from './recovery';
 import { startRedisHeartbeat } from './heartbeat';
 import { cacheConfig } from './cacheConfig';
 
+const sentinel =
+  cacheConfig.SHARED_STATE?.mode === 'sentinel' ? cacheConfig.SHARED_STATE : undefined;
 const urls = cacheConfig.REDIS_URI?.split(',').map((uri) => new URL(uri)) || [];
 const username = urls?.[0]?.username || cacheConfig.REDIS_USERNAME;
 const password = urls?.[0]?.password || cacheConfig.REDIS_PASSWORD;
 const ca = cacheConfig.REDIS_CA;
 const protocols = new Set(urls.map((url) => url.protocol));
-const useTls = urls[0]?.protocol === 'rediss:';
-const isRedisCluster = urls.length !== 1 || cacheConfig.USE_REDIS_CLUSTER;
+const useTls = !!sentinel || urls[0]?.protocol === 'rediss:';
+const isRedisCluster = !sentinel && (urls.length !== 1 || cacheConfig.USE_REDIS_CLUSTER);
 
 if (cacheConfig.USE_REDIS && protocols.size > 1) {
   throw new Error('All REDIS_URI entries must use the same protocol');
@@ -77,39 +79,57 @@ if (cacheConfig.USE_REDIS) {
     keepAlive: cacheConfig.REDIS_KEEP_ALIVE,
   };
 
-  ioredisClient = !isRedisCluster
-    ? new IoRedis(cacheConfig.REDIS_URI!, redisOptions)
-    : new IoRedis.Cluster(
-        urls.map((url) => ({ host: url.hostname, port: parseInt(url.port, 10) || 6379 })),
-        {
-          ...(cacheConfig.REDIS_USE_ALTERNATIVE_DNS_LOOKUP
-            ? {
-                dnsLookup: (
-                  address: string,
-                  callback: (err: Error | null, address: string) => void,
-                ) => callback(null, address),
-              }
-            : {}),
-          redisOptions,
-          clusterRetryStrategy: (times: number) => {
-            if (
-              cacheConfig.REDIS_RETRY_MAX_ATTEMPTS > 0 &&
-              times > cacheConfig.REDIS_RETRY_MAX_ATTEMPTS
-            ) {
-              logger.error(
-                `ioredis cluster giving up after ${cacheConfig.REDIS_RETRY_MAX_ATTEMPTS} reconnection attempts`,
-              );
-              return null;
+  if (sentinel) {
+    ioredisClient = new IoRedis({
+      ...redisOptions,
+      sentinels: sentinel.endpoints,
+      name: sentinel.name,
+      role: 'master',
+      username: sentinel.username,
+      password: sentinel.password,
+      sentinelUsername: sentinel.sentinelUsername,
+      sentinelPassword: sentinel.sentinelPassword,
+      enableTLSForSentinelMode: true,
+      tls: { ca: ca ?? undefined, rejectUnauthorized: true },
+      sentinelTLS: { ca: cacheConfig.REDIS_SENTINEL_CA ?? undefined, rejectUnauthorized: true },
+      enableOfflineQueue: false,
+      autoResendUnfulfilledCommands: false,
+    });
+  } else if (!isRedisCluster) {
+    ioredisClient = new IoRedis(cacheConfig.REDIS_URI!, redisOptions);
+  } else {
+    ioredisClient = new IoRedis.Cluster(
+      urls.map((url) => ({ host: url.hostname, port: parseInt(url.port, 10) || 6379 })),
+      {
+        ...(cacheConfig.REDIS_USE_ALTERNATIVE_DNS_LOOKUP
+          ? {
+              dnsLookup: (
+                address: string,
+                callback: (err: Error | null, address: string) => void,
+              ) => callback(null, address),
             }
-            const base = Math.min(Math.pow(2, times) * 100, cacheConfig.REDIS_RETRY_MAX_DELAY);
-            const jitter = Math.floor(Math.random() * Math.min(base, 1000));
-            const delay = Math.min(base + jitter, cacheConfig.REDIS_RETRY_MAX_DELAY);
-            logger.info(`ioredis cluster reconnecting... attempt ${times}, delay ${delay}ms`);
-            return delay;
-          },
-          enableOfflineQueue: cacheConfig.REDIS_ENABLE_OFFLINE_QUEUE,
+          : {}),
+        redisOptions,
+        clusterRetryStrategy: (times: number) => {
+          if (
+            cacheConfig.REDIS_RETRY_MAX_ATTEMPTS > 0 &&
+            times > cacheConfig.REDIS_RETRY_MAX_ATTEMPTS
+          ) {
+            logger.error(
+              `ioredis cluster giving up after ${cacheConfig.REDIS_RETRY_MAX_ATTEMPTS} reconnection attempts`,
+            );
+            return null;
+          }
+          const base = Math.min(Math.pow(2, times) * 100, cacheConfig.REDIS_RETRY_MAX_DELAY);
+          const jitter = Math.floor(Math.random() * Math.min(base, 1000));
+          const delay = Math.min(base + jitter, cacheConfig.REDIS_RETRY_MAX_DELAY);
+          logger.info(`ioredis cluster reconnecting... attempt ${times}, delay ${delay}ms`);
+          return delay;
         },
-      );
+        enableOfflineQueue: cacheConfig.REDIS_ENABLE_OFFLINE_QUEUE,
+      },
+    );
+  }
 
   ioredisClient.on('error', (err) => {
     logger.error('ioredis client error:', err);
@@ -142,7 +162,35 @@ if (cacheConfig.USE_REDIS) {
   }
 }
 
-let keyvRedisClient: RedisClientType | RedisClusterType | null = null;
+export type SentinelClient = RedisSentinelType & {
+  disconnect(): Promise<void>;
+  scanIterator(options?: ScanOptions): AsyncGenerator<string[]>;
+};
+export type SharedRedisClient = (RedisClientType | RedisClusterType | SentinelClient) & {
+  scanIterator(options?: ScanOptions): AsyncGenerator<string[]>;
+};
+
+/** Hold one primary lease for a complete scan; never mix cursors across failover nodes. */
+export function withSentinelScan(client: RedisSentinelType): SentinelClient {
+  return Object.assign(client, {
+    disconnect: () => client.destroy(),
+    async *scanIterator(options?: ScanOptions) {
+      const primary = await client.acquire();
+      try {
+        let cursor = '0';
+        do {
+          const page = await primary.scan(cursor, options);
+          cursor = page.cursor;
+          yield page.keys;
+        } while (cursor !== '0');
+      } finally {
+        await primary.release();
+      }
+    },
+  });
+}
+
+let keyvRedisClient: SharedRedisClient | null = null;
 let recoverKeyvRedisClient: ReadonlyRecoveryHandler | undefined;
 
 /**
@@ -157,7 +205,7 @@ function handleKeyvRedisError(error: unknown): boolean {
 type RedisEvalOptions = { keys: string[]; arguments: string[] };
 
 async function runKeyvRedisScript(
-  client: RedisClientType | RedisClusterType,
+  client: SharedRedisClient,
   script: string,
   options: RedisEvalOptions,
 ): Promise<unknown> {
@@ -231,34 +279,70 @@ if (cacheConfig.USE_REDIS) {
       : {}),
   };
 
-  keyvRedisClient = !isRedisCluster
-    ? createClient({ url: cacheConfig.REDIS_URI, ...redisOptions })
-    : createCluster({
-        rootNodes: urls.map((url) => ({ url: url.href })),
-        defaults: redisOptions,
-      });
+  const selectedClient = (() => {
+    if (sentinel) {
+      return withSentinelScan(
+        createSentinel({
+          name: sentinel.name,
+          sentinelRootNodes: sentinel.endpoints,
+          replicaPoolSize: 0,
+          nodeClientOptions: {
+            username: sentinel.username,
+            password: sentinel.password,
+            socket: {
+              tls: true,
+              ca: ca ?? undefined,
+              rejectUnauthorized: true,
+              connectTimeout: cacheConfig.REDIS_CONNECT_TIMEOUT,
+            },
+            disableOfflineQueue: true,
+          },
+          sentinelClientOptions: {
+            username: sentinel.sentinelUsername,
+            password: sentinel.sentinelPassword,
+            socket: {
+              tls: true,
+              ca: cacheConfig.REDIS_SENTINEL_CA ?? undefined,
+              rejectUnauthorized: true,
+              connectTimeout: cacheConfig.REDIS_CONNECT_TIMEOUT,
+            },
+            disableOfflineQueue: true,
+          },
+        }),
+      );
+    }
+    if (!isRedisCluster) {
+      return createClient({ url: cacheConfig.REDIS_URI, ...redisOptions });
+    }
+    return createCluster({
+      rootNodes: urls.map((url) => ({ url: url.href })),
+      defaults: redisOptions,
+    });
+  })();
 
-  // Add scanIterator method to cluster client for API consistency with standalone client
-  if (!('scanIterator' in keyvRedisClient)) {
-    const clusterClient = keyvRedisClient as RedisClusterType;
-    (keyvRedisClient as unknown as RedisClientType).scanIterator = async function* (
-      options?: ScanOptions,
-    ) {
-      const masters = clusterClient.masters;
-      for (const master of masters) {
-        const nodeClient = await clusterClient.nodeClient(master);
-        for await (const page of nodeClient.scanIterator(options)) {
-          yield page;
+  if ('masters' in selectedClient) {
+    keyvRedisClient = Object.assign(selectedClient, {
+      async *scanIterator(options?: ScanOptions) {
+        for (const master of selectedClient.masters) {
+          const node = await selectedClient.nodeClient(master);
+          yield* node.scanIterator(options);
         }
-      }
-    };
+      },
+    });
+  } else if ('getSentinelNode' in selectedClient) {
+    keyvRedisClient = selectedClient;
+  } else {
+    const scan = selectedClient.scanIterator;
+    keyvRedisClient = Object.assign(selectedClient, {
+      scanIterator: (options?: ScanOptions) => scan.call(selectedClient, options),
+    });
   }
 
   keyvRedisClient.setMaxListeners(cacheConfig.REDIS_MAX_LISTENERS);
 
-  if (!isRedisCluster) {
+  if (!('masters' in keyvRedisClient)) {
     recoverKeyvRedisClient = createReadonlyRecovery({
-      client: keyvRedisClient as RedisClientType,
+      client: keyvRedisClient,
       minIntervalMs: cacheConfig.REDIS_READONLY_RECOVERY_INTERVAL,
     });
   }

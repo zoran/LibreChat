@@ -1,3 +1,17 @@
+// Policy fixtures isolate lifecycle; actual owner/consumer settlement is covered by maintenance suites.
+jest.mock('~/server/services/LegacyAuthMaintenance', () => ({
+  withAuthRequest: async (_req, action) => action(),
+  authTrack: async (action) => action(),
+  authWrite: async (action) => action(),
+  authMutation: async (method, ...args) => method(...args),
+  authUserMutation: async (method, ...args) => method(...args),
+  authCache: (store) => store,
+  authPersistence: { write: async (action) => action() },
+  legacyAuthMaintenance: { current: () => undefined },
+  authAdmissionMiddleware: (_req, _res, next) => next(),
+  ownAuthHandler: (handler) => handler,
+  authSessionStore: (store) => store,
+}));
 const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 const { isEnabled } = require('@librechat/api');
@@ -240,6 +254,7 @@ describe('Apple Login Strategy', () => {
       // Invoke the verify callback with correct arguments
       await new Promise((resolve) => {
         appleStrategyInstance._verify(
+          {},
           fakeAccessToken,
           fakeRefreshToken,
           tokenset.id_token,
@@ -285,6 +300,7 @@ describe('Apple Login Strategy', () => {
       // Invoke the verify callback with correct arguments
       await new Promise((resolve) => {
         appleStrategyInstance._verify(
+          {},
           fakeAccessToken,
           fakeRefreshToken,
           tokenset.id_token,
@@ -315,6 +331,7 @@ describe('Apple Login Strategy', () => {
       // Invoke the verify callback with missing id_token
       await new Promise((resolve) => {
         appleStrategyInstance._verify(
+          {},
           fakeAccessToken,
           fakeRefreshToken,
           null, // idToken is missing
@@ -342,6 +359,7 @@ describe('Apple Login Strategy', () => {
       // Invoke the verify callback with correct arguments
       await new Promise((resolve) => {
         appleStrategyInstance._verify(
+          {},
           fakeAccessToken,
           fakeRefreshToken,
           tokenset.id_token,
@@ -376,6 +394,7 @@ describe('Apple Login Strategy', () => {
       // Invoke the verify callback with correct arguments
       await new Promise((resolve) => {
         appleStrategyInstance._verify(
+          {},
           fakeAccessToken,
           fakeRefreshToken,
           tokenset.id_token,

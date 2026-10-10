@@ -1,6 +1,7 @@
 import { readFileSync, existsSync } from 'fs';
 import { logger } from '@librechat/data-schemas';
-import { Time, CacheKeys } from 'librechat-data-provider';
+import { Time, CacheKeys, parseSharedState } from 'librechat-data-provider';
+import type { SharedState } from 'librechat-data-provider';
 import { math, isEnabled } from '~/utils';
 
 // To ensure that different deployments do not interfere with each other's cache, we use a prefix for the Redis keys.
@@ -12,8 +13,9 @@ if (REDIS_KEY_PREFIX_VAR && REDIS_KEY_PREFIX) {
   throw new Error('Only either REDIS_KEY_PREFIX_VAR or REDIS_KEY_PREFIX can be set.');
 }
 
+const SHARED_STATE: SharedState = parseSharedState(process.env);
 const USE_REDIS = isEnabled(process.env.USE_REDIS);
-if (USE_REDIS && !process.env.REDIS_URI) {
+if (USE_REDIS && SHARED_STATE.mode !== 'sentinel' && !process.env.REDIS_URI) {
   throw new Error('USE_REDIS is enabled but REDIS_URI is not set.');
 }
 
@@ -48,6 +50,15 @@ if (FORCED_IN_MEMORY_CACHE_NAMESPACES.length > 0) {
   }
 }
 
+if (
+  SHARED_STATE.mode === 'sentinel' &&
+  FORCED_IN_MEMORY_CACHE_NAMESPACES.some(
+    (key) => key !== CacheKeys.CONFIG_STORE && key !== CacheKeys.APP_CONFIG,
+  )
+) {
+  throw new Error('Shared-state namespaces cannot use local storage');
+}
+
 // Violation scores expire after this long without new violations; every violation write
 // restarts the countdown. Non-positive values disable expiry, restoring the legacy
 // accumulate-forever behavior.
@@ -76,7 +87,23 @@ const getRedisCA = (): string | null => {
   }
 };
 
+const sentinel = SHARED_STATE.mode === 'sentinel' ? SHARED_STATE : undefined;
+/** Selected trust is mandatory: never substitute system trust for an unreadable configured CA. */
+function requiredCA(path: string): string {
+  try {
+    const value = readFileSync(path, 'utf8');
+    if (!value.trim()) {
+      throw new Error();
+    }
+    return value;
+  } catch {
+    throw new Error('Shared-state CA could not be loaded');
+  }
+}
+
 const cacheConfig: {
+  SHARED_STATE: typeof SHARED_STATE;
+  REDIS_SENTINEL_CA: string | null;
   FORCED_IN_MEMORY_CACHE_NAMESPACES: string[];
   USE_REDIS: boolean;
   USE_REDIS_STREAMS: boolean;
@@ -162,13 +189,15 @@ const cacheConfig: {
    */
   MCP_REGISTRY_CACHE_TTL: number;
 } = {
+  SHARED_STATE,
+  REDIS_SENTINEL_CA: sentinel ? requiredCA(sentinel.sentinelCaPath) : null,
   FORCED_IN_MEMORY_CACHE_NAMESPACES,
   USE_REDIS,
   USE_REDIS_STREAMS,
   REDIS_URI: process.env.REDIS_URI,
   REDIS_USERNAME: process.env.REDIS_USERNAME,
   REDIS_PASSWORD: process.env.REDIS_PASSWORD,
-  REDIS_CA: getRedisCA(),
+  REDIS_CA: sentinel ? requiredCA(sentinel.caPath) : getRedisCA(),
   REDIS_KEY_PREFIX: process.env[REDIS_KEY_PREFIX_VAR ?? ''] || REDIS_KEY_PREFIX || '',
   GLOBAL_PREFIX_SEPARATOR: '::',
   REDIS_MAX_LISTENERS: math(process.env.REDIS_MAX_LISTENERS, 40),

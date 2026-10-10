@@ -10,6 +10,7 @@ const mockSaveConvo = jest.fn();
 
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
+  ...jest.requireActual('../../../../../packages/api/src/stream/generationAdmission'),
   isEnabled: (val) => val === true || val === 'true',
   sanitizeTitle: (title) => title,
 }));
@@ -41,6 +42,39 @@ describe('agents addTitle', () => {
     mockCacheStore.clear();
   });
 
+  it('reports failed persistence to the lifetime owner without exposing the database error', async () => {
+    mockSaveConvo.mockRejectedValueOnce(new Error('private database detail'));
+    await expect(
+      addTitle(makeReq(), { text: 'hello', client: makeClient(), conversationId: 'cid' }),
+    ).rejects.toMatchObject({ code: 'GENERATION_ADMISSION_HELD' });
+  });
+  it('keeps an abort-ignoring title provider pending after the deadline until it truly settles', async () => {
+    jest.useFakeTimers();
+    let resolve;
+    const client = makeClient();
+    client.titleConvo.mockImplementation(
+      () =>
+        new Promise((done) => {
+          resolve = done;
+        }),
+    );
+    let settled = false;
+    const pending = addTitle(makeReq(), { text: 'hello', client, conversationId: 'cid' }).then(
+      () => {
+        settled = true;
+      },
+    );
+    try {
+      await jest.advanceTimersByTimeAsync(45001);
+      expect(client.titleConvo.mock.calls[0][0].abortController.signal.aborted).toBe(true);
+      expect(settled).toBe(false);
+      resolve('Late title');
+      await pending;
+      expect(mockSaveConvo).not.toHaveBeenCalled();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
   it('uses the explicit conversationId for the cache key and saveConvo (immediate mode)', async () => {
     const client = makeClient('My Title');
 

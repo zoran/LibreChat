@@ -230,6 +230,8 @@ export interface ScheduleEngineDeps {
   getJobStatus: (conversationId: string) => Promise<JobState | null>;
   /** True once graceful shutdown began; fires step aside instead of dispatching. */
   isShuttingDown?: () => boolean;
+  /** Retains uncertainty when best-effort bookkeeping cannot prove settlement. */
+  onUnconfirmedWork?: () => void;
   /**
    * Aborts the loopback generation for a scheduled occurrence, identity-guarded so
    * it never signals/clobbers a replacement turn that reused the conversationId.

@@ -8,10 +8,12 @@ import type {
   IUser,
 } from '@librechat/data-schemas';
 import type { NextFunction, Request as ServerRequest, Response as ServerResponse } from 'express';
+import type { AuthPersistenceObserver } from '@librechat/data-schemas';
 import type { BalanceUpdateFields } from '~/types';
 import { getBalanceConfig } from '~/app/config';
 
 export interface BalanceMiddlewareOptions {
+  observer?: AuthPersistenceObserver;
   getAppConfig: (options?: {
     role?: string;
     userId?: string;
@@ -119,11 +121,13 @@ export function createSetBalanceConfig({
   getAppConfig,
   findBalanceByUser,
   upsertBalanceFields,
+  observer,
 }: BalanceMiddlewareOptions): (
   req: ServerRequest,
   res: ServerResponse,
   next: NextFunction,
 ) => Promise<void> {
+  const write = <T>(action: () => Promise<T>) => (observer ? observer.write(action) : action());
   return async (req: ServerRequest, res: ServerResponse, next: NextFunction): Promise<void> => {
     try {
       const balanceLocals = res.locals as BalanceLocals;
@@ -157,13 +161,15 @@ export function createSetBalanceConfig({
 
         if (userBalanceRecord == null) {
           const { tokenCredits, ...syncFields } = updateFields;
-          balanceLocals.balanceData = await upsertBalanceFields(userId, syncFields, {
-            tokenCredits,
-          });
+          balanceLocals.balanceData = await write(() =>
+            upsertBalanceFields(userId, syncFields, {
+              tokenCredits,
+            }),
+          );
           return;
         }
 
-        balanceLocals.balanceData = await upsertBalanceFields(userId, updateFields);
+        balanceLocals.balanceData = await write(() => upsertBalanceFields(userId, updateFields));
       });
 
       next();

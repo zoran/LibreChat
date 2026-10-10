@@ -670,14 +670,12 @@ const executeResponse = async (envelope, { req, res }) => {
     isPrincipalActive: db.isSubagentOwnerAdmissible,
     beforeSettle: (execution) => {
       if (!artifactWritesCovered && artifactPromises.length > 0) {
-        execution.track(
-          waitForAgentExecutionWrites(artifactPromises).catch((artifactError) => {
-            logger.warn(
-              '[Responses API] Error processing artifacts:',
-              getSafeErrorMetadata(artifactError),
-            );
-          }),
-        );
+        execution.track(waitForAgentExecutionWrites(artifactPromises)).catch((artifactError) => {
+          logger.warn(
+            '[Responses API] Error processing artifacts:',
+            getSafeErrorMetadata(artifactError),
+          );
+        });
       }
     },
     onSettlementError: (error) => {
@@ -1362,36 +1360,38 @@ const executeResponse = async (envelope, { req, res }) => {
         // Record token usage against balance
         const balanceConfig = getBalanceConfig(appConfig);
         const transactionsConfig = getTransactionsConfig(appConfig);
-        execution.track(
-          recordCollectedUsage(
-            {
-              spendTokens: db.spendTokens,
-              spendStructuredTokens: db.spendStructuredTokens,
-              pricing: {
-                getMultiplier: db.getMultiplier,
-                getCacheMultiplier: db.getCacheMultiplier,
+        execution
+          .track(
+            recordCollectedUsage(
+              {
+                spendTokens: db.spendTokens,
+                spendStructuredTokens: db.spendStructuredTokens,
+                pricing: {
+                  getMultiplier: db.getMultiplier,
+                  getCacheMultiplier: db.getCacheMultiplier,
+                },
+                bulkWriteOps: {
+                  insertMany: db.bulkInsertTransactions,
+                  updateBalance: db.updateBalance,
+                },
               },
-              bulkWriteOps: {
-                insertMany: db.bulkInsertTransactions,
-                updateBalance: db.updateBalance,
+              {
+                user: userId,
+                conversationId,
+                collectedUsage,
+                context: 'message',
+                messageId: responseId,
+                balance: balanceConfig,
+                transactions: transactionsConfig,
+                model: primaryConfig.model || agent.model_parameters?.model,
+                endpointTokenConfig: primaryConfig.endpointTokenConfig,
+                resolveEndpointTokenConfig,
               },
-            },
-            {
-              user: userId,
-              conversationId,
-              collectedUsage,
-              context: 'message',
-              messageId: responseId,
-              balance: balanceConfig,
-              transactions: transactionsConfig,
-              model: primaryConfig.model || agent.model_parameters?.model,
-              endpointTokenConfig: primaryConfig.endpointTokenConfig,
-              resolveEndpointTokenConfig,
-            },
-          ).catch((err) => {
+            ),
+          )
+          .catch((err) => {
             logger.error('[Responses API] Error recording usage:', getSafeErrorMetadata(err));
-          }),
-        );
+          });
 
         const usage = buildResponsesUsage(collectedUsage);
 
@@ -1408,20 +1408,24 @@ const executeResponse = async (envelope, { req, res }) => {
         if (request.store === true) {
           try {
             // Save conversation
-            await saveConversation(req, conversationId, agentId, agent, codeEnvironmentDecision);
+            await execution.track(
+              saveConversation(req, conversationId, agentId, agent, codeEnvironmentDecision),
+            );
 
             // Save input messages
-            await saveInputMessages(req, conversationId, inputMessages, agentId);
+            await execution.track(saveInputMessages(req, conversationId, inputMessages, agentId));
 
             // Build response for saving (use tracker with buildResponse for streaming)
             const finalResponse = buildResponse(context, tracker, 'completed');
-            await saveResponseOutput(
-              req,
-              conversationId,
-              responseId,
-              finalResponse,
-              agentId,
-              tracker.usage.outputTokens,
+            await execution.track(
+              saveResponseOutput(
+                req,
+                conversationId,
+                responseId,
+                finalResponse,
+                agentId,
+                tracker.usage.outputTokens,
+              ),
             );
 
             logger.debug(
@@ -1435,14 +1439,12 @@ const executeResponse = async (envelope, { req, res }) => {
 
         // The HTTP response is complete, while destructive cleanup still waits for artifacts.
         if (artifactPromises.length > 0) {
-          execution.track(
-            waitForAgentExecutionWrites(artifactPromises).catch((artifactError) => {
-              logger.warn(
-                '[Responses API] Error processing artifacts:',
-                getSafeErrorMetadata(artifactError),
-              );
-            }),
-          );
+          execution.track(waitForAgentExecutionWrites(artifactPromises)).catch((artifactError) => {
+            logger.warn(
+              '[Responses API] Error processing artifacts:',
+              getSafeErrorMetadata(artifactError),
+            );
+          });
           artifactWritesCovered = true;
         }
       } else {
@@ -1594,40 +1596,42 @@ const executeResponse = async (envelope, { req, res }) => {
         // Record token usage against balance
         const balanceConfig = getBalanceConfig(appConfig);
         const transactionsConfig = getTransactionsConfig(appConfig);
-        execution.track(
-          recordCollectedUsage(
-            {
-              spendTokens: db.spendTokens,
-              spendStructuredTokens: db.spendStructuredTokens,
-              pricing: {
-                getMultiplier: db.getMultiplier,
-                getCacheMultiplier: db.getCacheMultiplier,
+        execution
+          .track(
+            recordCollectedUsage(
+              {
+                spendTokens: db.spendTokens,
+                spendStructuredTokens: db.spendStructuredTokens,
+                pricing: {
+                  getMultiplier: db.getMultiplier,
+                  getCacheMultiplier: db.getCacheMultiplier,
+                },
+                bulkWriteOps: {
+                  insertMany: db.bulkInsertTransactions,
+                  updateBalance: db.updateBalance,
+                },
               },
-              bulkWriteOps: {
-                insertMany: db.bulkInsertTransactions,
-                updateBalance: db.updateBalance,
+              {
+                user: userId,
+                conversationId,
+                collectedUsage,
+                context: 'message',
+                messageId: responseId,
+                balance: balanceConfig,
+                transactions: transactionsConfig,
+                model: primaryConfig.model || agent.model_parameters?.model,
+                endpointTokenConfig: primaryConfig.endpointTokenConfig,
+                resolveEndpointTokenConfig,
               },
-            },
-            {
-              user: userId,
-              conversationId,
-              collectedUsage,
-              context: 'message',
-              messageId: responseId,
-              balance: balanceConfig,
-              transactions: transactionsConfig,
-              model: primaryConfig.model || agent.model_parameters?.model,
-              endpointTokenConfig: primaryConfig.endpointTokenConfig,
-              resolveEndpointTokenConfig,
-            },
-          ).catch((err) => {
+            ),
+          )
+          .catch((err) => {
             logger.error('[Responses API] Error recording usage:', getSafeErrorMetadata(err));
-          }),
-        );
+          });
 
         if (artifactPromises.length > 0) {
           try {
-            await waitForAgentExecutionWrites(artifactPromises);
+            await execution.track(waitForAgentExecutionWrites(artifactPromises));
           } catch (artifactError) {
             logger.warn(
               '[Responses API] Error processing artifacts:',
@@ -1645,17 +1649,21 @@ const executeResponse = async (envelope, { req, res }) => {
 
         if (request.store === true) {
           try {
-            await saveConversation(req, conversationId, agentId, agent, codeEnvironmentDecision);
+            await execution.track(
+              saveConversation(req, conversationId, agentId, agent, codeEnvironmentDecision),
+            );
 
-            await saveInputMessages(req, conversationId, inputMessages, agentId);
+            await execution.track(saveInputMessages(req, conversationId, inputMessages, agentId));
 
-            await saveResponseOutput(
-              req,
-              conversationId,
-              responseId,
-              response,
-              agentId,
-              aggregator.usage.outputTokens,
+            await execution.track(
+              saveResponseOutput(
+                req,
+                conversationId,
+                responseId,
+                response,
+                agentId,
+                aggregator.usage.outputTokens,
+              ),
             );
 
             logger.debug(

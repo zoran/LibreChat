@@ -3,7 +3,9 @@ import { AsyncLocalStorage } from 'async_hooks';
 import { CacheKeys, PrincipalType, SystemRoles } from 'librechat-data-provider';
 import type { TPrincipalSearchResult } from 'librechat-data-provider';
 import type { Model, ClientSession, FilterQuery } from 'mongoose';
+import type { AuthContinuationObserver, AuthPersistenceObserver } from './authPersistence';
 import type { CacheStore, IGroup, IRole, IUser } from '~/types';
+import { observeAuthPersistence } from './authPersistence';
 import { isValidObjectIdString } from '~/utils/objectId';
 import { scopedCacheKey } from '~/config/tenantContext';
 import { escapeRegExp } from '~/utils/string';
@@ -15,7 +17,7 @@ export interface UserGroupDeps {
    * Notified after membership caches are invalidated so access caches derived from
    * memberships (e.g. prompt group access IDs) drop their stale entries too.
    */
-  onMemberGroupsInvalidated?: () => void | Promise<void>;
+  onMemberGroupsInvalidated?: (observer?: AuthPersistenceObserver) => void | Promise<void>;
 }
 
 type PendingGroupLookup = { promise: Promise<Types.ObjectId[]>; markStale: () => void };
@@ -35,6 +37,8 @@ type DeferredInvalidation = {
   /** ALS snapshot (tenant scoping) captured where the mutation ran. */
   run: (invalidate: () => Promise<void>) => Promise<void>;
   invalidate: () => Promise<void>;
+  observer?: AuthContinuationObserver;
+  finish: () => void;
 };
 
 /** One queue and one set of lifecycle hooks per session, so many mutations in one
@@ -42,13 +46,39 @@ type DeferredInvalidation = {
 const sessionInvalidations = new WeakMap<ClientSession, DeferredInvalidation[]>();
 const hookedSessions = new WeakSet<ClientSession>();
 
-async function drainSessionInvalidations(session: ClientSession): Promise<void> {
-  const queue = sessionInvalidations.get(session);
+async function drainSessionInvalidations(
+  session: ClientSession,
+  queue: DeferredInvalidation[] | undefined,
+): Promise<void> {
   if (!queue) {
     return;
   }
+  if (sessionInvalidations.get(session) !== queue) {
+    for (const entry of queue) entry.observer?.markUncertain();
+    return;
+  }
   sessionInvalidations.delete(session);
-  await Promise.all(queue.map((entry) => entry.run(entry.invalidate).catch(() => undefined)));
+  await Promise.all(
+    queue.map(async (entry) => {
+      try {
+        await entry.run(entry.invalidate);
+      } catch {
+        entry.observer?.markUncertain();
+      } finally {
+        entry.finish();
+      }
+    }),
+  );
+}
+
+/** Release a cancelled queue, preserving any already-recorded uncertain write outcome. */
+function discardSessionInvalidations(session: ClientSession, uncertain: boolean): void {
+  const queue = sessionInvalidations.get(session);
+  sessionInvalidations.delete(session);
+  for (const entry of queue ?? []) {
+    if (uncertain) entry.observer?.markUncertain();
+    entry.finish();
+  }
 }
 
 function hookSessionLifecycle(session: ClientSession): void {
@@ -61,23 +91,43 @@ function hookSessionLifecycle(session: ClientSession): void {
   session.commitTransaction = async (
     ...args: Parameters<ClientSession['commitTransaction']>
   ): Promise<void> => {
-    await commitTransaction(...args);
-    await drainSessionInvalidations(session);
+    const queue = sessionInvalidations.get(session);
+    try {
+      await commitTransaction(...args);
+    } catch (error) {
+      // Keep the queue for a supported retry. A later abort cannot erase this uncertainty.
+      for (const entry of queue ?? []) entry.observer?.markUncertain();
+      throw error;
+    }
+    await drainSessionInvalidations(session, queue);
   };
 
   const abortTransaction = session.abortTransaction.bind(session);
   session.abortTransaction = async (
     ...args: Parameters<ClientSession['abortTransaction']>
   ): Promise<void> => {
+    const queue = sessionInvalidations.get(session);
     try {
       await abortTransaction(...args);
+    } catch (error) {
+      for (const entry of queue ?? []) entry.observer?.markUncertain();
+      throw error;
     } finally {
-      sessionInvalidations.delete(session);
+      if (sessionInvalidations.get(session) === queue) {
+        discardSessionInvalidations(session, false);
+      }
     }
   };
 
+  const startTransaction = session.startTransaction.bind(session);
+  session.startTransaction = (...args: Parameters<ClientSession['startTransaction']>): void => {
+    startTransaction(...args);
+    // Successful session reuse must not replay callbacks from an unproven prior transaction.
+    discardSessionInvalidations(session, true);
+  };
+
   session.once('ended', () => {
-    sessionInvalidations.delete(session);
+    discardSessionInvalidations(session, true);
   });
 }
 
@@ -90,11 +140,28 @@ function hookSessionLifecycle(session: ClientSession): void {
 export function runAfterTransaction(
   session: ClientSession | undefined,
   invalidate: () => Promise<void>,
+  observer?: AuthContinuationObserver,
 ): Promise<void> {
   if (!session?.inTransaction()) {
     return invalidate();
   }
-  const deferred: DeferredInvalidation = { run: AsyncLocalStorage.snapshot(), invalidate };
+  let finish = () => {};
+  if (observer) {
+    // Register before returning to the caller that will eventually commit/abort this session.
+    const retained = observer.track(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    void retained.catch(() => observer.markUncertain());
+  }
+  const deferred: DeferredInvalidation = {
+    run: AsyncLocalStorage.snapshot(),
+    invalidate,
+    observer,
+    finish,
+  };
   const queue = sessionInvalidations.get(session);
   if (queue) {
     queue.push(deferred);
@@ -201,6 +268,7 @@ export function createUserGroupMethods(
     source: 'entra' | 'local',
     updateData: Partial<IGroup>,
     session?: ClientSession,
+    observer?: AuthContinuationObserver,
   ) => Promise<IGroup | null>;
   addUserToGroup: (
     userId: string | Types.ObjectId,
@@ -226,6 +294,7 @@ export function createUserGroupMethods(
     filter: Record<string, unknown>,
     update: Record<string, unknown>,
     options?: { session?: ClientSession },
+    observer?: AuthContinuationObserver,
   ) => Promise<import('mongoose').UpdateWriteOpResult>;
   getUserGroups: (userId: string | Types.ObjectId, session?: ClientSession) => Promise<IGroup[]>;
   getUserPrincipals: (
@@ -437,7 +506,11 @@ export function createUserGroupMethods(
     }
   }
 
-  async function dropMemberKeys(cache: CacheStore, cacheKeys: Set<string>): Promise<void> {
+  async function dropMemberKeys(
+    cache: CacheStore,
+    cacheKeys: Set<string>,
+    observer?: AuthPersistenceObserver,
+  ): Promise<void> {
     for (const cacheKey of cacheKeys) {
       const pending = pendingGroupLookups.get(cacheKey);
       if (pending) {
@@ -446,7 +519,11 @@ export function createUserGroupMethods(
       }
     }
     try {
-      await Promise.all([...cacheKeys].map((cacheKey) => cache.delete?.(cacheKey)));
+      await Promise.all(
+        [...cacheKeys].map((cacheKey) =>
+          observeAuthPersistence(observer, async () => cache.delete?.(cacheKey)),
+        ),
+      );
     } catch {
       /** Cache failures must not block membership updates. */
     }
@@ -458,15 +535,25 @@ export function createUserGroupMethods(
    * A delayed second pass evicts such rewrites on stores shared across processes,
    * independent of build locking; the store supplies the delay budget.
    */
-  function scheduleSecondInvalidation(cache: CacheStore, secondPass: () => Promise<void>): void {
+  function scheduleSecondInvalidation(
+    cache: CacheStore,
+    secondPass: () => Promise<void>,
+    observer?: AuthContinuationObserver,
+  ): void {
     if (!cache.crossProcess) {
       return;
     }
     const graceMs = Math.max(cache.staleEvictionDelayMs ?? DEFAULT_STALE_EVICTION_DELAY_MS, 0);
-    const timer = setTimeout(() => {
-      secondPass().catch(() => undefined);
-    }, graceMs);
-    timer.unref?.();
+    const schedule = () =>
+      new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          void secondPass().then(resolve, reject);
+        }, graceMs);
+        timer.unref?.();
+      });
+    // Retain the grace interval as well as its eventual writes, without delaying the caller.
+    const retained = observer ? observer.track(schedule) : schedule();
+    void retained.catch(() => observer?.markUncertain());
   }
 
   /**
@@ -483,20 +570,24 @@ export function createUserGroupMethods(
    * and cache its derived IDs under the freshly bumped generation, surviving
    * the membership eviction that should have prevented them.
    */
-  const notifyMemberGroupsInvalidated = async (): Promise<void> => {
+  const notifyMemberGroupsInvalidated = async (
+    observer?: AuthContinuationObserver,
+  ): Promise<void> => {
     try {
-      await deps.onMemberGroupsInvalidated?.();
+      await deps.onMemberGroupsInvalidated?.(observer);
     } catch {
+      observer?.markUncertain();
       /** Dependent cache invalidation must not block membership updates. */
     }
   };
 
   async function invalidateMemberGroupsCache(
     memberIds: Array<string | Types.ObjectId | undefined | null>,
+    observer?: AuthContinuationObserver,
   ): Promise<void> {
     const cache = getPrincipalsCache();
     if (!cache?.delete) {
-      await notifyMemberGroupsInvalidated();
+      await notifyMemberGroupsInvalidated(observer);
       return;
     }
     const cacheKeys = new Set<string>();
@@ -512,21 +603,21 @@ export function createUserGroupMethods(
       return;
     }
     if (cacheKeys.size > INVALIDATION_CLEAR_THRESHOLD && cache.clear) {
-      return clearMemberGroupsCache();
+      return clearMemberGroupsCache(observer);
     }
     const evict = async (): Promise<void> => {
-      await dropMemberKeys(cache, cacheKeys);
-      await notifyMemberGroupsInvalidated();
+      await dropMemberKeys(cache, cacheKeys, observer);
+      await notifyMemberGroupsInvalidated(observer);
     };
     await evict();
-    scheduleSecondInvalidation(cache, evict);
+    scheduleSecondInvalidation(cache, evict, observer);
   }
 
   /** Clears the whole membership cache when affected members cannot be enumerated. */
-  async function clearMemberGroupsCache(): Promise<void> {
+  async function clearMemberGroupsCache(observer?: AuthContinuationObserver): Promise<void> {
     const cache = getPrincipalsCache();
     if (!cache?.clear) {
-      await notifyMemberGroupsInvalidated();
+      await notifyMemberGroupsInvalidated(observer);
       return;
     }
     const clearAll = async (): Promise<void> => {
@@ -535,14 +626,14 @@ export function createUserGroupMethods(
       }
       pendingGroupLookups.clear();
       try {
-        await cache.clear?.();
+        await observeAuthPersistence(observer, async () => cache.clear?.());
       } catch {
         /** Cache failures must not block membership updates. */
       }
-      await notifyMemberGroupsInvalidated();
+      await notifyMemberGroupsInvalidated(observer);
     };
     await clearAll();
-    scheduleSecondInvalidation(cache, clearAll);
+    scheduleSecondInvalidation(cache, clearAll, observer);
   }
 
   /**
@@ -702,6 +793,7 @@ export function createUserGroupMethods(
     source: 'entra' | 'local',
     updateData: Partial<IGroup>,
     session?: ClientSession,
+    observer?: AuthContinuationObserver,
   ): Promise<IGroup | null> {
     const Group = mongoose.models.Group as Model<IGroup>;
     const options = {
@@ -719,11 +811,14 @@ export function createUserGroupMethods(
       { $set: updateData },
       { ...options, new: false },
     ).lean<IGroup>();
-    await runAfterTransaction(session, () =>
-      invalidateMemberGroupsCache([
-        ...(previous?.memberIds ?? []),
-        ...(updateData.memberIds ?? []),
-      ]),
+    await runAfterTransaction(
+      session,
+      () =>
+        invalidateMemberGroupsCache(
+          [...(previous?.memberIds ?? []), ...(updateData.memberIds ?? [])],
+          observer,
+        ),
+      observer,
     );
     return await findGroupByExternalId(idOnTheSource, source, {}, session);
   }
@@ -1287,6 +1382,7 @@ export function createUserGroupMethods(
     filter: Record<string, unknown>,
     update: Record<string, unknown>,
     options?: { session?: ClientSession },
+    observer?: AuthContinuationObserver,
   ): Promise<import('mongoose').UpdateWriteOpResult> {
     const Group = mongoose.models.Group as Model<IGroup>;
     const result = await Group.updateMany(filter, update, options || {});
@@ -1295,9 +1391,13 @@ export function createUserGroupMethods(
     }
     const { memberIds, indeterminate } = collectMemberIdsFromGroupUpdate(update);
     if (indeterminate) {
-      await runAfterTransaction(options?.session, () => clearMemberGroupsCache());
+      await runAfterTransaction(options?.session, () => clearMemberGroupsCache(observer), observer);
     } else if (memberIds.length > 0) {
-      await runAfterTransaction(options?.session, () => invalidateMemberGroupsCache(memberIds));
+      await runAfterTransaction(
+        options?.session,
+        () => invalidateMemberGroupsCache(memberIds, observer),
+        observer,
+      );
     }
     return result;
   }

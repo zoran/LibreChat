@@ -767,6 +767,10 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     );
   }
   const clientRequestId = rawClientRequestId;
+  const durableRequestBinding = GenerationJobManager.generationRequestBinding(
+    clientRequestId,
+    req.body,
+  );
   const rawOverrideUserMessageId = req.body?.overrideUserMessageId;
   const rawOverrideConversationId = req.body?.overrideConvoId;
   if (
@@ -1074,6 +1078,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         streamId,
         conversationId,
         generationProtocolVersion,
+        durableRequestBinding,
       );
     } catch (err) {
       logger.error(
@@ -1596,6 +1601,8 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           req._agentEventTriggerProjection,
         );
     const job = await GenerationJobManager.createJob(streamId, userId, conversationId, {
+      generationAdmission: durableRequestBinding,
+      trustedTenantId: tenantId,
       startupTelemetry,
       ...(recoveredSteerId && { recoveredSteerId }),
       ...(recoveredSteerPayload && { recoveredSteerPayload }),
@@ -2006,7 +2013,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         }
         client = null;
         if (providerExecutionId) {
-          await GenerationJobManager.markProviderExecutionDrained?.(
+          await GenerationJobManager.settleGenerationExecution?.(
             streamId,
             jobCreatedAt,
             providerExecutionId,
@@ -2294,63 +2301,73 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           liveResponseMessageId = respMsgId;
 
           // Store userMessage and responseMessageId upfront for resume capability
-          GenerationJobManager.updateMetadata(
+          GenerationJobManager.observeGenerationWrite(
             streamId,
-            {
-              responseMessageId: respMsgId,
-              userMessage: {
-                messageId: userMsg.messageId,
-                parentMessageId: userMsg.parentMessageId,
-                conversationId: userMsg.conversationId,
-                text: userMsg.text,
-                quotes: userMsg.quotes,
-                // Persist the turn's uploaded files here (authoritative job metadata) so a
-                // HITL resume sources them from the job, not the user DB row — which the
-                // approval prompt can race (the row save may still be in flight when a fast
-                // /resume reads it). Without this an approved tool run can rebuild without the
-                // paused turn's files.
-                ...(Array.isArray(req.body?.files) &&
-                  req.body.files.length > 0 && { files: req.body.files }),
-                // Skill selections aren't on `userMsg` yet at onStart (BaseClient adds them
-                // later), so source them from the request — otherwise this update overwrites
-                // the preliminary metadata and a HITL-resumed turn loses its skill pills.
-                ...(Array.isArray(req.body?.manualSkills) &&
-                  req.body.manualSkills.length > 0 && { manualSkills: req.body.manualSkills }),
-                ...(Array.isArray(req.body?.alwaysAppliedSkills) &&
-                  req.body.alwaysAppliedSkills.length > 0 && {
-                    alwaysAppliedSkills: req.body.alwaysAppliedSkills,
-                  }),
-              },
-            },
             jobCreatedAt,
+            providerExecutionId,
+            GenerationJobManager.updateMetadata(
+              streamId,
+              {
+                responseMessageId: respMsgId,
+                userMessage: {
+                  messageId: userMsg.messageId,
+                  parentMessageId: userMsg.parentMessageId,
+                  conversationId: userMsg.conversationId,
+                  text: userMsg.text,
+                  quotes: userMsg.quotes,
+                  // Persist the turn's uploaded files here (authoritative job metadata) so a
+                  // HITL resume sources them from the job, not the user DB row — which the
+                  // approval prompt can race (the row save may still be in flight when a fast
+                  // /resume reads it). Without this an approved tool run can rebuild without the
+                  // paused turn's files.
+                  ...(Array.isArray(req.body?.files) &&
+                    req.body.files.length > 0 && { files: req.body.files }),
+                  // Skill selections aren't on `userMsg` yet at onStart (BaseClient adds them
+                  // later), so source them from the request — otherwise this update overwrites
+                  // the preliminary metadata and a HITL-resumed turn loses its skill pills.
+                  ...(Array.isArray(req.body?.manualSkills) &&
+                    req.body.manualSkills.length > 0 && { manualSkills: req.body.manualSkills }),
+                  ...(Array.isArray(req.body?.alwaysAppliedSkills) &&
+                    req.body.alwaysAppliedSkills.length > 0 && {
+                      alwaysAppliedSkills: req.body.alwaysAppliedSkills,
+                    }),
+                },
+              },
+              jobCreatedAt,
+            ),
           ).catch((err) => {
             logger.error('[ResumableAgentController] Failed to persist start metadata', err);
           });
 
-          GenerationJobManager.emitChunk(
+          GenerationJobManager.observeGenerationWrite(
             streamId,
-            {
-              created: true,
-              // Skill selections aren't on `userMessage` yet at onStart (BaseClient adds
-              // them later), so attach them from the request — this is the message
-              // `trackUserMessage` persists as the authoritative job.metadata.userMessage,
-              // and it's what the live client renders the user bubble from.
-              message: {
-                ...userMessage,
-                // Carry files so trackUserMessage (the authoritative writer) persists them on
-                // job.metadata.userMessage for a HITL resume (see the updateMetadata above).
-                ...(Array.isArray(req.body?.files) &&
-                  req.body.files.length > 0 && { files: req.body.files }),
-                ...(Array.isArray(req.body?.manualSkills) &&
-                  req.body.manualSkills.length > 0 && { manualSkills: req.body.manualSkills }),
-                ...(Array.isArray(req.body?.alwaysAppliedSkills) &&
-                  req.body.alwaysAppliedSkills.length > 0 && {
-                    alwaysAppliedSkills: req.body.alwaysAppliedSkills,
-                  }),
-              },
+            jobCreatedAt,
+            providerExecutionId,
+            GenerationJobManager.emitChunk(
               streamId,
-            },
-            { expectedCreatedAt: jobCreatedAt },
+              {
+                created: true,
+                // Skill selections aren't on `userMessage` yet at onStart (BaseClient adds
+                // them later), so attach them from the request — this is the message
+                // `trackUserMessage` persists as the authoritative job.metadata.userMessage,
+                // and it's what the live client renders the user bubble from.
+                message: {
+                  ...userMessage,
+                  // Carry files so trackUserMessage (the authoritative writer) persists them on
+                  // job.metadata.userMessage for a HITL resume (see the updateMetadata above).
+                  ...(Array.isArray(req.body?.files) &&
+                    req.body.files.length > 0 && { files: req.body.files }),
+                  ...(Array.isArray(req.body?.manualSkills) &&
+                    req.body.manualSkills.length > 0 && { manualSkills: req.body.manualSkills }),
+                  ...(Array.isArray(req.body?.alwaysAppliedSkills) &&
+                    req.body.alwaysAppliedSkills.length > 0 && {
+                      alwaysAppliedSkills: req.body.alwaysAppliedSkills,
+                    }),
+                },
+                streamId,
+              },
+              { expectedCreatedAt: jobCreatedAt },
+            ),
           ).catch((err) => {
             logger.error('[ResumableAgentController] Failed to queue created event', err);
           });
@@ -2657,16 +2674,21 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         }
 
         if (titleEligible && titleTiming === 'immediate') {
-          immediateTitlePromise = addTitle(req, {
-            text: text || getAttachmentTitleText(req.body.files),
-            conversationId,
-            client,
-            immediate: true,
-            convoReady,
-            signal: titleAbortController.signal,
-            discardSignal: titleDiscardController.signal,
-            onTitleGenerated: emitTitleEvent,
-          }).catch((err) => {
+          immediateTitlePromise = GenerationJobManager.observeGenerationWrite(
+            streamId,
+            jobCreatedAt,
+            providerExecutionId,
+            addTitle(req, {
+              text: text || getAttachmentTitleText(req.body.files),
+              conversationId,
+              client,
+              immediate: true,
+              convoReady,
+              signal: titleAbortController.signal,
+              discardSignal: titleDiscardController.signal,
+              onTitleGenerated: emitTitleEvent,
+            }),
+          ).catch((err) => {
             logger.error('[ResumableAgentController] Error in immediate title generation', err);
           });
         }
@@ -3182,11 +3204,16 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             disposeClient(client);
           }
         } else if (shouldGenerateTitle) {
-          trailingWritePromise = addTitle(req, {
-            text: text || getAttachmentTitleText(req.body.files),
-            response: { ...response },
-            client,
-          })
+          trailingWritePromise = GenerationJobManager.observeGenerationWrite(
+            streamId,
+            jobCreatedAt,
+            providerExecutionId,
+            addTitle(req, {
+              text: text || getAttachmentTitleText(req.body.files),
+              response: { ...response },
+              client,
+            }),
+          )
             .catch((err) => {
               logger.error('[ResumableAgentController] Error in title generation', err);
             })
@@ -3373,12 +3400,12 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         }
       })
       .finally(async () => {
-        await Promise.allSettled([immediateTitlePromise, trailingWritePromise].filter(Boolean));
         if (providerExecutionId) {
-          await GenerationJobManager.markProviderExecutionDrained?.(
+          await GenerationJobManager.settleGenerationExecution?.(
             streamId,
             jobCreatedAt,
             providerExecutionId,
+            [immediateTitlePromise, trailingWritePromise].filter(Boolean),
           );
         }
         await releaseEventChildLease?.();
@@ -3525,7 +3552,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
       disposeClient(client);
     }
     if (jobCreatedAt != null && providerExecutionId) {
-      await GenerationJobManager.markProviderExecutionDrained?.(
+      await GenerationJobManager.settleGenerationExecution?.(
         streamId,
         jobCreatedAt,
         providerExecutionId,

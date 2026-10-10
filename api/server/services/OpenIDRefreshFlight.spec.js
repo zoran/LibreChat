@@ -1,3 +1,9 @@
+jest.mock('./LegacyAuthMaintenance', () => ({
+  withAuthRequest: async (_req, action) => action(),
+  authTrack: async (action) => action(),
+  authWrite: async (action) => action(),
+  authMutation: async (method, ...args) => method(...args),
+}));
 jest.mock('@librechat/data-schemas', () => ({
   logger: {
     warn: jest.fn(),

@@ -1,6 +1,6 @@
 const rateLimit = require('express-rate-limit');
 const { ViolationTypes } = require('librechat-data-provider');
-const { limiterCache, removePorts } = require('@librechat/api');
+const { limiterCache, removePorts, getHistoryMutationScope } = require('@librechat/api');
 const logViolation = require('~/cache/logViolation');
 
 const getEnvironmentVariables = () => {
@@ -38,17 +38,26 @@ const createForkHandler = (ip = true) => {
     forkUserWindowInMinutes,
   } = getEnvironmentVariables();
 
-  return async (req, res) => {
-    const type = ViolationTypes.FILE_UPLOAD_LIMIT;
-    const errorMessage = {
-      type,
-      max: ip ? forkIpMax : forkUserMax,
-      limiter: ip ? 'ip' : 'user',
-      windowInMinutes: ip ? forkIpWindowInMinutes : forkUserWindowInMinutes,
-    };
+  return async (req, res, next) => {
+    const scope = getHistoryMutationScope(req);
+    const release = scope?.hold('continuation');
+    try {
+      const type = ViolationTypes.FILE_UPLOAD_LIMIT;
+      const errorMessage = {
+        type,
+        max: ip ? forkIpMax : forkUserMax,
+        limiter: ip ? 'ip' : 'user',
+        windowInMinutes: ip ? forkIpWindowInMinutes : forkUserWindowInMinutes,
+      };
 
-    await logViolation(req, res, type, errorMessage, forkViolationScore);
-    res.status(429).json({ message: 'Too many requests. Try again later' });
+      await logViolation(req, res, type, errorMessage, forkViolationScore);
+      res.status(429).json({ message: 'Too many requests. Try again later' });
+    } catch (error) {
+      scope?.uncertain();
+      next(error);
+    } finally {
+      release?.();
+    }
   };
 };
 

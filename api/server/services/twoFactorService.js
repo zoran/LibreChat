@@ -1,3 +1,4 @@
+const { authUserMutation } = require('~/server/services/LegacyAuthMaintenance');
 const { webcrypto, timingSafeEqual } = require('node:crypto');
 const { hashBackupCode, decryptV3, decryptV2 } = require('@librechat/data-schemas');
 const { updateUser } = require('~/models');
@@ -202,7 +203,7 @@ const verifyBackupCode = async ({ user, backupCode, persist = true }) => {
         ? { ...codeObj, used: true, usedAt: new Date() }
         : codeObj,
     );
-    await updateUser(user._id, { backupCodes: updatedBackupCodes });
+    await authUserMutation(updateUser, user._id, { backupCodes: updatedBackupCodes });
   }
   return true;
 };

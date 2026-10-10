@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { context, ROOT_CONTEXT } from '@opentelemetry/api';
 import { logger, runAsSystem } from '@librechat/data-schemas';
 import type { AgentTriggerExecutionResult } from './host';
+import type { ApplicationWorkPort } from '~/app';
 import { createAgentTriggerBatchEnvelope } from './batch';
 import { AgentTriggerDispatchError } from './dispatch';
 import { AgentTriggerExecutionError } from './host';
@@ -223,7 +224,7 @@ interface ClaimPassResult {
   claimFailed?: boolean;
 }
 
-export interface AgentTriggerDeliveryEngine {
+export interface AgentTriggerDeliveryEngine extends ApplicationWorkPort {
   start: () => void;
   /** Registers a future eligibility time so the idle poll never sleeps past it. */
   noteEligibleAt: (at: Date) => void;
@@ -372,19 +373,54 @@ export function createAgentTriggerDeliveryEngine(
   let timer: NodeJS.Timeout | undefined;
   let activeClaim: Promise<ClaimPassResult> | undefined;
 
-  const processDelivery = async (delivery: AgentTriggerDeliveryRecord): Promise<void> => {
-    const userId = String(delivery.user);
-    if (cancelledUsers.has(userId)) {
-      await deps.store.release({
+  let maintenanceRequest: string | null = null;
+  let maintenanceRevision = 0;
+  let unconfirmedOwnership = false;
+  let pendingWrites = 0;
+  // A false fence is not proof that this process's durable obligation settled.
+  async function ownedWrite<T extends boolean | 'expedited'>(write: () => Promise<T>): Promise<T> {
+    pendingWrites++;
+    try {
+      const result = await write();
+      if (!result) unconfirmedOwnership = true;
+      return result;
+    } finally {
+      pendingWrites--;
+    }
+  }
+  const releaseForMaintenance = (delivery: AgentTriggerDeliveryRecord) =>
+    ownedWrite(() =>
+      deps.store.release({
         id: delivery.id,
         workerId,
         claimToken: delivery.claimToken,
         availableAt: now(),
-      });
+      }),
+    );
+
+  const processDelivery = async (delivery: AgentTriggerDeliveryRecord): Promise<void> => {
+    const userId = String(delivery.user);
+    if (maintenanceRequest !== null) {
+      await releaseForMaintenance(delivery);
+      return;
+    }
+    if (cancelledUsers.has(userId)) {
+      await ownedWrite(() =>
+        deps.store.release({
+          id: delivery.id,
+          workerId,
+          claimToken: delivery.claimToken,
+          availableAt: now(),
+        }),
+      );
       return;
     }
 
     const block = await deps.store.findEarlierUnsettled(delivery);
+    if (maintenanceRequest !== null) {
+      await releaseForMaintenance(delivery);
+      return;
+    }
     if (block != null) {
       const recheckAt =
         now().getTime() +
@@ -392,12 +428,14 @@ export function createAgentTriggerDeliveryEngine(
       const nextCheck =
         block.leaseUntil == null ? Math.max(recheckAt, block.availableAt.getTime()) : recheckAt;
       noteEligibleAt(new Date(nextCheck));
-      await deps.store.release({
-        id: delivery.id,
-        workerId,
-        claimToken: delivery.claimToken,
-        availableAt: new Date(nextCheck),
-      });
+      await ownedWrite(() =>
+        deps.store.release({
+          id: delivery.id,
+          workerId,
+          claimToken: delivery.claimToken,
+          availableAt: new Date(nextCheck),
+        }),
+      );
       return;
     }
 
@@ -413,25 +451,29 @@ export function createAgentTriggerDeliveryEngine(
           deliveryKey: delivery.deliveryKey,
           error: error instanceof Error ? error.message : String(error),
         });
-        await deps.store.release({
+        await ownedWrite(() =>
+          deps.store.release({
+            id: delivery.id,
+            workerId,
+            claimToken: delivery.claimToken,
+            availableAt: now(),
+          }),
+        );
+        return;
+      }
+      const deadLettered = await ownedWrite(() =>
+        deps.store.dead({
           id: delivery.id,
           workerId,
           claimToken: delivery.claimToken,
-          availableAt: now(),
-        });
-        return;
-      }
-      const deadLettered = await deps.store.dead({
-        id: delivery.id,
-        workerId,
-        claimToken: delivery.claimToken,
-        attempt: delivery.attempts,
-        error: recorded,
-        settledAt: now(),
-        ...(recorded.retryable && {
-          receiptRetryAt: new Date(now().getTime() + retryCapMs),
+          attempt: delivery.attempts,
+          error: recorded,
+          settledAt: now(),
+          ...(recorded.retryable && {
+            receiptRetryAt: new Date(now().getTime() + retryCapMs),
+          }),
         }),
-      });
+      );
       if (deadLettered) {
         logger.error('[agent-triggers] delivery dead-lettered after exhausting retries', {
           deliveryKey: delivery.deliveryKey,
@@ -443,22 +485,26 @@ export function createAgentTriggerDeliveryEngine(
     }
 
     if (stopped) {
-      await deps.store.release({
-        id: delivery.id,
-        workerId,
-        claimToken: delivery.claimToken,
-        availableAt: now(),
-      });
+      await ownedWrite(() =>
+        deps.store.release({
+          id: delivery.id,
+          workerId,
+          claimToken: delivery.claimToken,
+          availableAt: now(),
+        }),
+      );
       return;
     }
 
     if (cancelledUsers.has(userId)) {
-      await deps.store.release({
-        id: delivery.id,
-        workerId,
-        claimToken: delivery.claimToken,
-        availableAt: now(),
-      });
+      await ownedWrite(() =>
+        deps.store.release({
+          id: delivery.id,
+          workerId,
+          claimToken: delivery.claimToken,
+          availableAt: now(),
+        }),
+      );
       return;
     }
 
@@ -480,7 +526,13 @@ export function createAgentTriggerDeliveryEngine(
     try {
       let result: AgentTriggerExecutionResult;
       try {
+        if (maintenanceRequest !== null) {
+          throw new AgentTriggerDeliveryDeferredError('Application maintenance');
+        }
         const members = await deps.store.getBatch(delivery);
+        if (maintenanceRequest !== null) {
+          throw new AgentTriggerDeliveryDeferredError('Application maintenance');
+        }
         const dispatchEnvelope =
           members.length === 0
             ? delivery.envelope
@@ -509,13 +561,15 @@ export function createAgentTriggerDeliveryEngine(
           }
           const availableAt = new Date(attemptedAt.getTime() + delayMs);
           noteEligibleAt(availableAt);
-          const deferred = await deps.store.defer({
-            id: delivery.id,
-            workerId,
-            claimToken: delivery.claimToken,
-            attempt,
-            availableAt,
-          });
+          const deferred = await ownedWrite(() =>
+            deps.store.defer({
+              id: delivery.id,
+              workerId,
+              claimToken: delivery.claimToken,
+              attempt,
+              availableAt,
+            }),
+          );
           if (deferred) {
             let reason = 'pre_dispatch';
             if (deletionCancelled || deletionRejected) {
@@ -543,25 +597,29 @@ export function createAgentTriggerDeliveryEngine(
                   ? settlementError.message
                   : String(settlementError),
             });
-            await deps.store.release({
+            await ownedWrite(() =>
+              deps.store.release({
+                id: delivery.id,
+                workerId,
+                claimToken: delivery.claimToken,
+                availableAt: attemptedAt,
+              }),
+            );
+            return;
+          }
+          const deadLettered = await ownedWrite(() =>
+            deps.store.dead({
               id: delivery.id,
               workerId,
               claimToken: delivery.claimToken,
-              availableAt: attemptedAt,
-            });
-            return;
-          }
-          const deadLettered = await deps.store.dead({
-            id: delivery.id,
-            workerId,
-            claimToken: delivery.claimToken,
-            attempt,
-            error: recorded,
-            settledAt: attemptedAt,
-            ...(recorded.retryable && {
-              receiptRetryAt: new Date(attemptedAt.getTime() + retryCapMs),
+              attempt,
+              error: recorded,
+              settledAt: attemptedAt,
+              ...(recorded.retryable && {
+                receiptRetryAt: new Date(attemptedAt.getTime() + retryCapMs),
+              }),
             }),
-          });
+          );
           if (deadLettered) {
             logger.error('[agent-triggers] delivery dead-lettered', {
               deliveryKey: delivery.deliveryKey,
@@ -574,14 +632,16 @@ export function createAgentTriggerDeliveryEngine(
         }
         const availableAt = retryAt(error, attempt, attemptedAt, retryBaseMs, retryCapMs, random);
         noteEligibleAt(availableAt);
-        const retrying = await deps.store.retry({
-          id: delivery.id,
-          workerId,
-          claimToken: delivery.claimToken,
-          attempt,
-          error: recorded,
-          availableAt,
-        });
+        const retrying = await ownedWrite(() =>
+          deps.store.retry({
+            id: delivery.id,
+            workerId,
+            claimToken: delivery.claimToken,
+            attempt,
+            error: recorded,
+            availableAt,
+          }),
+        );
         if (retrying) {
           logger.warn('[agent-triggers] delivery scheduled for retry', {
             deliveryKey: delivery.deliveryKey,
@@ -597,16 +657,18 @@ export function createAgentTriggerDeliveryEngine(
       const settledAt = now();
       try {
         const handling = startedHandling(delivery, result, settledAt);
-        await deps.store.complete({
-          id: delivery.id,
-          workerId,
-          claimToken: delivery.claimToken,
-          attempt,
-          result,
-          settledAt,
-          ...(delivery.awaitTerminalHandling === true && { awaitTerminalHandling: true }),
-          ...(handling != null && { handling }),
-        });
+        await ownedWrite(() =>
+          deps.store.complete({
+            id: delivery.id,
+            workerId,
+            claimToken: delivery.claimToken,
+            attempt,
+            result,
+            settledAt,
+            ...(delivery.awaitTerminalHandling === true && { awaitTerminalHandling: true }),
+            ...(handling != null && { handling }),
+          }),
+        );
       } catch (error) {
         const recorded: AgentTriggerDeliveryFailure = {
           code: 'RESULT_PERSISTENCE_FAILED',
@@ -617,14 +679,16 @@ export function createAgentTriggerDeliveryEngine(
         };
         const availableAt = retryAt(error, attempt, settledAt, retryBaseMs, retryCapMs, random);
         noteEligibleAt(availableAt);
-        const retrying = await deps.store.retry({
-          id: delivery.id,
-          workerId,
-          claimToken: delivery.claimToken,
-          attempt,
-          error: recorded,
-          availableAt,
-        });
+        const retrying = await ownedWrite(() =>
+          deps.store.retry({
+            id: delivery.id,
+            workerId,
+            claimToken: delivery.claimToken,
+            attempt,
+            error: recorded,
+            availableAt,
+          }),
+        );
         if (retrying) {
           logger.warn(
             '[agent-triggers] accepted delivery result could not be persisted; retrying',
@@ -652,7 +716,7 @@ export function createAgentTriggerDeliveryEngine(
   };
 
   const runClaimPass = async (): Promise<ClaimPassResult> => {
-    if (stopped) {
+    if (stopped || maintenanceRequest !== null) {
       return { count: 0, processing: [] };
     }
     const openSlots = concurrency - processing.size;
@@ -668,11 +732,12 @@ export function createAgentTriggerDeliveryEngine(
       }
       deliveries.push(first);
     } catch (error) {
+      unconfirmedOwnership = true;
       logger.error('[agent-triggers] delivery claim failed:', error);
       return { count: 0, processing: [], claimFailed: true };
     }
 
-    if (openSlots > 1) {
+    if (openSlots > 1 && maintenanceRequest === null) {
       const claimed = await Promise.allSettled(
         Array.from({ length: openSlots - 1 }, () => claimOne()),
       );
@@ -680,6 +745,7 @@ export function createAgentTriggerDeliveryEngine(
         if (result.status === 'fulfilled' && result.value != null) {
           deliveries.push(result.value);
         } else if (result.status === 'rejected') {
+          unconfirmedOwnership = true;
           logger.error('[agent-triggers] delivery claim failed:', result.reason);
         }
       }
@@ -689,6 +755,7 @@ export function createAgentTriggerDeliveryEngine(
     for (const delivery of deliveries) {
       const userId = String(delivery.user);
       const task = runAsSystem(() => processDelivery(delivery)).catch((error) => {
+        unconfirmedOwnership = true;
         logger.error('[agent-triggers] delivery processing failed:', error);
       });
       const tracked = task.finally(() => {
@@ -698,7 +765,7 @@ export function createAgentTriggerDeliveryEngine(
         if (userProcessing?.size === 0) {
           processingByUser.delete(userId);
         }
-        if (started && !stopped) {
+        if (started && !stopped && maintenanceRequest === null) {
           queueMicrotask(wake);
         }
       });
@@ -730,7 +797,7 @@ export function createAgentTriggerDeliveryEngine(
       })
       .finally(() => {
         activeClaim = undefined;
-        if (repumpRequested && !stopped) {
+        if (repumpRequested && !stopped && maintenanceRequest === null) {
           repumpRequested = false;
           queueMicrotask(wake);
         }
@@ -782,6 +849,10 @@ export function createAgentTriggerDeliveryEngine(
     if (stopped) {
       return;
     }
+    if (maintenanceRequest !== null) {
+      repumpRequested = true;
+      return;
+    }
     idleStreak = 0;
     if (started) {
       schedule();
@@ -790,7 +861,7 @@ export function createAgentTriggerDeliveryEngine(
   }
 
   const schedule = () => {
-    if (stopped) {
+    if (stopped || maintenanceRequest !== null) {
       return;
     }
     if (timer != null) {
@@ -804,7 +875,7 @@ export function createAgentTriggerDeliveryEngine(
      * request handlers, and each tick reschedules from its own callback. */
     timer = context.with(ROOT_CONTEXT, () =>
       setTimeout(async () => {
-        if (stopped) {
+        if (stopped || maintenanceRequest !== null) {
           return;
         }
         const nowMs = now().getTime();
@@ -821,6 +892,44 @@ export function createAgentTriggerDeliveryEngine(
   };
 
   return {
+    pauseAdmissions: (requestId) => {
+      if (
+        !/^[A-Za-z0-9_-]{1,128}$/.test(requestId) ||
+        stopped ||
+        (maintenanceRequest !== null && maintenanceRequest !== requestId)
+      )
+        return false;
+      if (maintenanceRequest === requestId) return true;
+      maintenanceRequest = requestId;
+      maintenanceRevision++;
+      if (timer != null) clearTimeout(timer);
+      timer = undefined;
+      return true;
+    },
+    resumeAdmissions: (requestId) => {
+      if (maintenanceRequest !== requestId || stopped || unconfirmedOwnership) return false;
+      maintenanceRequest = null;
+      maintenanceRevision++;
+      repumpRequested = false;
+      if (started) wake();
+      return true;
+    },
+    getMaintenanceCensus: async (requestId) => {
+      const revision = maintenanceRevision;
+      const matches = requestId === maintenanceRequest;
+      await Promise.resolve();
+      return {
+        admissionClosed: maintenanceRequest !== null,
+        queuedContinuations: processing.size + Number(activeClaim != null),
+        pendingWrites,
+        complete:
+          matches &&
+          requestId === maintenanceRequest &&
+          revision === maintenanceRevision &&
+          !stopped &&
+          !unconfirmedOwnership,
+      };
+    },
     start: () => {
       if (started || stopped) {
         return;

@@ -1,3 +1,4 @@
+const { trackHistoryWrite, isHistoryMessageResult } = require('@librechat/api');
 const crypto = require('crypto');
 const { logger } = require('@librechat/data-schemas');
 const { parseConvo } = require('librechat-data-provider');
@@ -47,17 +48,22 @@ const sendError = async (req, res, options, callback) => {
   }
 
   if (shouldSaveMessage) {
-    await saveMessage(
-      {
-        userId: req?.user?.id,
-        isTemporary: req?.resolvedConversation?.isTemporary ?? req?.body?.isTemporary,
-        expiredAt: req?.resolvedConversation?.expiredAt,
-        interfaceConfig: req?.config?.interfaceConfig,
-      },
-      { ...errorMessage, user },
-      {
-        context: 'api/server/utils/streamResponse.js - sendError',
-      },
+    await trackHistoryWrite(
+      req,
+      () =>
+        saveMessage(
+          {
+            userId: req?.user?.id,
+            isTemporary: req?.resolvedConversation?.isTemporary ?? req?.body?.isTemporary,
+            expiredAt: req?.resolvedConversation?.expiredAt,
+            interfaceConfig: req?.config?.interfaceConfig,
+          },
+          { ...errorMessage, user },
+          {
+            context: 'api/server/utils/streamResponse.js - sendError',
+          },
+        ),
+      isHistoryMessageResult,
     );
   }
 

@@ -1,3 +1,17 @@
+// Policy fixtures isolate lifecycle; actual owner/consumer settlement is covered by maintenance suites.
+jest.mock('~/server/services/LegacyAuthMaintenance', () => ({
+  withAuthRequest: async (_req, action) => action(),
+  authTrack: async (action) => action(),
+  authWrite: async (action) => action(),
+  authMutation: async (method, ...args) => method(...args),
+  authUserMutation: async (method, ...args) => method(...args),
+  authCache: (store) => store,
+  authPersistence: { write: async (action) => action() },
+  legacyAuthMaintenance: { current: () => undefined },
+  authAdmissionMiddleware: (_req, _res, next) => next(),
+  ownAuthHandler: (handler) => handler,
+  authSessionStore: (store) => store,
+}));
 const { SystemRoles } = require('librechat-data-provider');
 
 // --- Capture JwtStrategy inputs ---
@@ -628,6 +642,7 @@ describe('openIdJwtStrategy – auth user document cache', () => {
       mockAuthUserDocCacheStore,
       'auth-user-doc-key',
       expect.objectContaining({ id: 'user-abc' }),
+      expect.objectContaining({ write: expect.any(Function) }),
     );
     expect(invalidateCachedAuthUserDoc).not.toHaveBeenCalled();
   });
@@ -662,6 +677,7 @@ describe('openIdJwtStrategy – auth user document cache', () => {
       mockAuthUserDocCacheStore,
       'auth-user-doc-key',
       expect.objectContaining({ id: 'tenant-b-user', tenantId: 'tenant-b' }),
+      expect.objectContaining({ write: expect.any(Function) }),
     );
   });
 
@@ -726,10 +742,11 @@ describe('openIdJwtStrategy – auth user document cache', () => {
 
     expect(updateUser).toHaveBeenCalledWith('user-abc', { role: SystemRoles.USER });
     expect(setCachedAuthUserDoc).not.toHaveBeenCalled();
-    expect(invalidateCachedAuthUserDoc).toHaveBeenCalledWith(mockAuthUserDocCacheStore, {
-      userId: 'user-abc',
-      cacheKey: 'auth-user-doc-key',
-    });
+    expect(invalidateCachedAuthUserDoc).toHaveBeenCalledWith(
+      mockAuthUserDocCacheStore,
+      { userId: 'user-abc', cacheKey: 'auth-user-doc-key' },
+      expect.objectContaining({ write: expect.any(Function) }),
+    );
   });
 });
 

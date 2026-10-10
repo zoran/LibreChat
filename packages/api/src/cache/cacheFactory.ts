@@ -94,8 +94,9 @@ export const standardCache = (namespace: string, ttl?: number, fallbackStore?: o
       return existing;
     }
     try {
-      const keyvRedis = new KeyvRedis(keyvRedisClient);
-      const cache = new Keyv(keyvRedis, { namespace, ttl });
+      const required = cacheConfig.SHARED_STATE?.mode === 'sentinel';
+      const keyvRedis = new KeyvRedis(keyvRedisClient, { throwOnErrors: required });
+      const cache = new Keyv(keyvRedis, { namespace, ttl, throwOnErrors: required });
       keyvRedis.namespace = cacheConfig.REDIS_KEY_PREFIX;
       keyvRedis.keyPrefixSeparator = cacheConfig.GLOBAL_PREFIX_SEPARATOR;
 
@@ -118,6 +119,12 @@ export const standardCache = (namespace: string, ttl?: number, fallbackStore?: o
       logger.error(`Failed to create Redis cache for namespace ${namespace}:`, err);
       throw err;
     }
+  }
+  if (
+    cacheConfig.SHARED_STATE?.mode === 'sentinel' &&
+    !cacheConfig.FORCED_IN_MEMORY_CACHE_NAMESPACES.includes(namespace)
+  ) {
+    throw new Error('Shared-state client unavailable');
   }
   if (fallbackStore) {
     return new Keyv({ store: fallbackStore, namespace, ttl });
@@ -214,6 +221,9 @@ export const limiterCache = (prefix: string): RedisStore | undefined => {
     return new RedisStore({ sendCommand, prefix });
   } catch (err) {
     logger.error(`Failed to create Redis rate limiter for prefix ${prefix}:`, err);
+    if (cacheConfig.SHARED_STATE?.mode === 'sentinel') {
+      throw err;
+    }
     return undefined;
   }
 };

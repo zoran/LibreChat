@@ -1,4 +1,6 @@
+import type { AuthPersistenceObserver } from './authPersistence';
 import type * as t from '~/types/session';
+import { observeAuthPersistence } from './authPersistence';
 import { createIndexesWithRetry } from '~/utils/retry';
 import { signPayload, hashToken } from '~/crypto';
 import logger from '~/config/winston';
@@ -24,7 +26,11 @@ export function createSessionMethods(mongoose: typeof import('mongoose')): {
   ) => Promise<t.ISession | null>;
   SessionError: typeof SessionError;
   deleteSession: (params: t.DeleteSessionParams) => Promise<{ deletedCount?: number }>;
-  createSession: (userId: string, options?: t.CreateSessionOptions) => Promise<t.SessionResult>;
+  createSession: (
+    userId: string,
+    options?: t.CreateSessionOptions,
+    observer?: AuthPersistenceObserver,
+  ) => Promise<t.SessionResult>;
   upsertSession: (
     userId: string,
     refreshToken: string,
@@ -37,7 +43,10 @@ export function createSessionMethods(mongoose: typeof import('mongoose')): {
     options?: t.UpdateExpirationOptions,
   ) => Promise<t.ISession>;
   countActiveSessions: (userId: string) => Promise<number>;
-  generateRefreshToken: (session: t.ISession) => Promise<string>;
+  generateRefreshToken: (
+    session: t.ISession,
+    observer?: AuthPersistenceObserver,
+  ) => Promise<string>;
   deleteAllUserSessions: (
     userId: string | { userId: string },
     options?: t.DeleteAllSessionsOptions,
@@ -45,13 +54,18 @@ export function createSessionMethods(mongoose: typeof import('mongoose')): {
 } {
   let sessionIndexesPromise: Promise<void> | null = null;
 
-  function ensureSessionIndexes(): Promise<void> {
-    if (!sessionIndexesPromise) {
-      sessionIndexesPromise = createIndexesWithRetry(mongoose.models.Session).catch((error) => {
-        sessionIndexesPromise = null;
-        throw error;
-      });
+  function ensureSessionIndexes(observer?: AuthPersistenceObserver): Promise<void> {
+    if (sessionIndexesPromise) {
+      const initialization = sessionIndexesPromise;
+      // Joining a mutation started by another caller must retain its real outcome as well.
+      return observeAuthPersistence(observer, () => initialization);
     }
+    sessionIndexesPromise = observeAuthPersistence(observer, () =>
+      createIndexesWithRetry(mongoose.models.Session),
+    ).catch((error) => {
+      sessionIndexesPromise = null;
+      throw error;
+    });
     return sessionIndexesPromise;
   }
 
@@ -61,6 +75,7 @@ export function createSessionMethods(mongoose: typeof import('mongoose')): {
   async function createSession(
     userId: string,
     options: t.CreateSessionOptions = {},
+    observer?: AuthPersistenceObserver,
   ): Promise<t.SessionResult> {
     if (!userId) {
       throw new SessionError('User ID is required', 'INVALID_USER_ID');
@@ -69,13 +84,13 @@ export function createSessionMethods(mongoose: typeof import('mongoose')): {
     const expiresIn = options.expiresIn ?? DEFAULT_REFRESH_TOKEN_EXPIRY;
 
     try {
-      await ensureSessionIndexes();
+      await ensureSessionIndexes(observer);
       const Session = mongoose.models.Session;
       const currentSession = new Session({
         user: userId,
         expiration: options.expiration || new Date(Date.now() + expiresIn),
       });
-      const refreshToken = await generateRefreshToken(currentSession);
+      const refreshToken = await generateRefreshToken(currentSession, observer);
 
       return { session: currentSession, refreshToken };
     } catch (error) {
@@ -283,7 +298,10 @@ export function createSessionMethods(mongoose: typeof import('mongoose')): {
   /**
    * Generates a refresh token for a session
    */
-  async function generateRefreshToken(session: t.ISession): Promise<string> {
+  async function generateRefreshToken(
+    session: t.ISession,
+    observer?: AuthPersistenceObserver,
+  ): Promise<string> {
     if (!session || !session.user) {
       throw new SessionError('Invalid session object', 'INVALID_SESSION');
     }
@@ -307,7 +325,7 @@ export function createSessionMethods(mongoose: typeof import('mongoose')): {
       });
 
       session.refreshTokenHash = await hashToken(refreshToken);
-      await session.save();
+      await observeAuthPersistence(observer, async () => session.save());
 
       return refreshToken;
     } catch (error) {

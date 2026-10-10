@@ -1422,6 +1422,7 @@ describe('refreshController – OpenID path', () => {
         openidId: baseClaims.sub,
         openidIssuer: baseClaims.iss,
       }),
+      expect.objectContaining({ write: expect.any(Function) }),
     );
     expect(res.status).toHaveBeenCalledWith(200);
   });

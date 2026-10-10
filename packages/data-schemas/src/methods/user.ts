@@ -6,7 +6,9 @@ import {
   type StatefulCodeEnvironment,
 } from 'librechat-data-provider';
 import type { IUser, BalanceConfig, CreateUserRequest, UserDeleteResult } from '~/types';
+import type { AuthPersistenceObserver } from './authPersistence';
 import type { CacheStore } from '~/types';
+import { observeAuthPersistence, settleAuthPersistence } from './authPersistence';
 import { escapeRegExp } from '~/utils/string';
 import { signPayload } from '~/crypto';
 
@@ -47,11 +49,16 @@ export function createUserMethods(
     returnUser?: boolean,
     session?: mongoose.ClientSession,
   ) => Promise<mongoose.Types.ObjectId | Partial<IUser>>;
-  updateUser: (userId: string, updateData: Partial<IUser>) => Promise<IUser | null>;
+  updateUser: (
+    userId: string,
+    updateData: Partial<IUser>,
+    observer?: AuthPersistenceObserver,
+  ) => Promise<IUser | null>;
   claimSamlIdentity: (
     userId: string,
     samlId: string,
     profileData: Pick<Partial<IUser>, 'username' | 'name'>,
+    observer?: AuthPersistenceObserver,
   ) => Promise<IUser | null>;
   acceptTerms: (userId: string) => Promise<IUser | null>;
   searchUsers: ({
@@ -141,7 +148,7 @@ export function createUserMethods(
   renewSubagentAdmission: (userId: string, token: string, fencedUntil: Date) => Promise<boolean>;
   releaseSubagentAdmission: (userId: string, token: string) => Promise<void>;
   isSubagentOwnerAdmissible: (userId: string) => Promise<boolean>;
-  deleteUserById: (userId: string) => Promise<UserDeleteResult>;
+  deleteUserById: (userId: string, observer?: AuthPersistenceObserver) => Promise<UserDeleteResult>;
   updateUserPlugins: (
     userId: string,
     plugins: string[] | undefined,
@@ -292,17 +299,23 @@ export function createUserMethods(
   /**
    * Update a user with new data without overwriting existing properties.
    */
-  async function updateUser(userId: string, updateData: Partial<IUser>): Promise<IUser | null> {
+  async function updateUser(
+    userId: string,
+    updateData: Partial<IUser>,
+    observer?: AuthPersistenceObserver,
+  ): Promise<IUser | null> {
     const User = mongoose.models.User;
     const updateOperation = {
       $set: updateData,
       $unset: { expiresAt: '' }, // Remove the expiresAt field to prevent TTL
     };
-    const updated = await User.findByIdAndUpdate(userId, updateOperation, {
-      new: true,
-      runValidators: true,
-    }).lean<IUser>();
-    await invalidateAuthUserDocCache(userId);
+    const updated = await observeAuthPersistence(observer, async () =>
+      User.findByIdAndUpdate(userId, updateOperation, {
+        new: true,
+        runValidators: true,
+      }).lean<IUser>(),
+    );
+    await invalidateAuthUserDocCache(userId, observer);
     return updated;
   }
 
@@ -311,27 +324,33 @@ export function createUserMethods(
     userId: string,
     samlId: string,
     profileData: Pick<Partial<IUser>, 'username' | 'name'>,
+    observer?: AuthPersistenceObserver,
   ): Promise<IUser | null> {
     const User = mongoose.models.User;
-    const updated = await User.findOneAndUpdate(
-      {
-        _id: userId,
-        provider: 'saml',
-        $or: [{ samlId }, { samlId: { $exists: false } }, { samlId: null }, { samlId: '' }],
-      },
-      {
-        $set: { ...profileData, samlId },
-        $unset: { expiresAt: '' },
-      },
-      { new: true, runValidators: true },
-    ).lean<IUser>();
+    const updated = await observeAuthPersistence(observer, async () =>
+      User.findOneAndUpdate(
+        {
+          _id: userId,
+          provider: 'saml',
+          $or: [{ samlId }, { samlId: { $exists: false } }, { samlId: null }, { samlId: '' }],
+        },
+        {
+          $set: { ...profileData, samlId },
+          $unset: { expiresAt: '' },
+        },
+        { new: true, runValidators: true },
+      ).lean<IUser>(),
+    );
     if (updated) {
-      await invalidateAuthUserDocCache(userId);
+      await invalidateAuthUserDocCache(userId, observer);
     }
     return updated;
   }
 
-  async function invalidateAuthUserDocCache(userId: string): Promise<void> {
+  async function invalidateAuthUserDocCache(
+    userId: string,
+    observer?: AuthPersistenceObserver,
+  ): Promise<void> {
     if (!isAuthUserDocCacheEnabled()) {
       return;
     }
@@ -343,11 +362,13 @@ export function createUserMethods(
       const indexKey = `${AUTH_USER_DOC_BY_ID_PREFIX}:${userId}`;
       const cachedKeys = await cache.get(indexKey);
       if (Array.isArray(cachedKeys)) {
-        await Promise.all(
-          cachedKeys.map((key) => (typeof key === 'string' ? cache.delete?.(key) : undefined)),
+        await settleAuthPersistence(
+          cachedKeys
+            .filter((key): key is string => typeof key === 'string')
+            .map((key) => observeAuthPersistence(observer, async () => cache.delete?.(key))),
         );
       }
-      await cache.delete(indexKey);
+      await observeAuthPersistence(observer, async () => cache.delete?.(indexKey));
     } catch {
       // Cache invalidation must not make a user update fail.
     }
@@ -414,14 +435,19 @@ export function createUserMethods(
   /**
    * Delete a user by their unique ID.
    */
-  async function deleteUserById(userId: string): Promise<UserDeleteResult> {
+  async function deleteUserById(
+    userId: string,
+    observer?: AuthPersistenceObserver,
+  ): Promise<UserDeleteResult> {
     try {
       const User = mongoose.models.User;
-      const result = await User.deleteOne({ _id: userId });
+      const result = await observeAuthPersistence(observer, async () =>
+        User.deleteOne({ _id: userId }),
+      );
       if (result.deletedCount === 0) {
         return { deletedCount: 0, message: 'No user found with that ID.' };
       }
-      await invalidateAuthUserDocCache(userId);
+      await invalidateAuthUserDocCache(userId, observer);
       return { deletedCount: result.deletedCount, message: 'User was deleted successfully.' };
     } catch (error: unknown) {
       const errorMessage = error instanceof Error ? error.message : 'Unknown error';

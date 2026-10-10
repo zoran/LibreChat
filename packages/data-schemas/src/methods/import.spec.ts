@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import { CONVERSATION_IMPORT_CLEANUP_CHUNK_SIZE, createConversationImportMethods } from './import';
 import { runAsSystem, tenantStorage } from '~/config/tenantContext';
+import * as chatProjectMethods from './chatProject';
 import { createModels } from '~/models';
 import { createMethods } from './index';
 
@@ -155,9 +156,9 @@ describe('conversation import cleanup methods', () => {
   });
 
   it('chunks every cleanup query while retaining its exact owner and tenant scope', async () => {
-    const deleteMessages = jest.fn().mockResolvedValue(undefined);
+    const deleteMessages = jest.fn().mockResolvedValue({ acknowledged: true });
     const findProjects = jest.fn().mockResolvedValue([]);
-    const deleteConversations = jest.fn().mockResolvedValue(undefined);
+    const deleteConversations = jest.fn().mockResolvedValue({ acknowledged: true });
     const cleanupMongoose = {
       models: {
         Message: { deleteMany: deleteMessages },
@@ -187,4 +188,75 @@ describe('conversation import cleanup methods', () => {
       ).toBe(true);
     }
   });
+
+  it('waits for every project-stat cleanup when one parallel write rejects', async () => {
+    const cleanupMongoose = {
+      models: {
+        Conversation: {
+          distinct: jest.fn().mockResolvedValue(['project-a', 'project-b']),
+          deleteMany: jest.fn().mockResolvedValue({ acknowledged: true }),
+        },
+      },
+    } as unknown as typeof mongoose;
+    const methods = createConversationImportMethods(cleanupMongoose);
+    const failure = new Error('project stats uncertain');
+    let complete!: (value: null) => void;
+    let started!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const refresh = jest
+      .spyOn(chatProjectMethods, 'refreshChatProjectStatsForUser')
+      .mockRejectedValueOnce(failure)
+      .mockImplementationOnce(() => {
+        started();
+        return new Promise((resolve) => {
+          complete = resolve;
+        });
+      });
+    let settled = false;
+    const result = methods
+      .deleteImportedConversations({
+        user: 'owner-a',
+        tenantId: 'tenant-a',
+        conversationIds: ['generated'],
+      })
+      .then(
+        () => {
+          settled = true;
+        },
+        (error: Error) => {
+          settled = true;
+          return error;
+        },
+      );
+    try {
+      await entered;
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(settled).toBe(false);
+      complete(null);
+      expect(await result).toBe(failure);
+    } finally {
+      complete(null);
+      await result;
+      refresh.mockRestore();
+    }
+  });
+
+  it.each(['deleteImportedMessages', 'deleteImportedConversations'] as const)(
+    'rejects unacknowledged %s compensation',
+    async (method) => {
+      const deleteMany = jest.fn().mockResolvedValue({ acknowledged: false });
+      const cleanupMongoose = {
+        models: {
+          Message: { deleteMany },
+          Conversation: { distinct: jest.fn().mockResolvedValue([]), deleteMany },
+        },
+      } as unknown as typeof mongoose;
+      const methods = createConversationImportMethods(cleanupMongoose);
+      await expect(
+        methods[method]({ user: 'owner-a', conversationIds: ['generated'] }),
+      ).rejects.toThrow('was not acknowledged');
+    },
+  );
 });

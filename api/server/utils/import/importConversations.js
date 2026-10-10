@@ -8,10 +8,11 @@ const maxFileSize = resolveImportMaxFileSize();
 
 /**
  * Job definition for importing a conversation.
- * @param {{ filepath: string, requestUserId: string, userRole?: string, interfaceConfig?: object, filters?: object, legacyPii?: object }} job
+ * @param {{ filepath: string, requestUserId: string, userRole?: string, interfaceConfig?: object, filters?: object, legacyPii?: object, history?: import('@librechat/api').HistoryMutationScope }} job
  */
 const importConversations = async (job) => {
-  const { filepath, requestUserId, userRole, interfaceConfig, filters, legacyPii } = job;
+  const { filepath, requestUserId, userRole, interfaceConfig, filters, legacyPii, history } = job;
+  if (typeof filepath !== 'string') throw new Error('Import file is required');
   try {
     logger.debug(`user: ${requestUserId} | Importing conversation(s) from file...`);
 
@@ -28,10 +29,14 @@ const importConversations = async (job) => {
     await importer(
       jsonData,
       requestUserId,
-      (userId) =>
-        legacyPii == null
+      (userId) => {
+        if (history) {
+          return createImportBatchBuilder(userId, interfaceConfig, filters, legacyPii, history);
+        }
+        return legacyPii == null
           ? createImportBatchBuilder(userId, interfaceConfig, filters)
-          : createImportBatchBuilder(userId, interfaceConfig, filters, legacyPii),
+          : createImportBatchBuilder(userId, interfaceConfig, filters, legacyPii);
+      },
       userRole,
     );
     logger.debug(`user: ${requestUserId} | Finished importing conversations`);
@@ -40,7 +45,8 @@ const importConversations = async (job) => {
     throw error; // throw error all the way up so request does not return success
   } finally {
     try {
-      await fs.unlink(filepath);
+      if (history) await history.write(() => fs.unlink(filepath));
+      else await fs.unlink(filepath);
     } catch (error) {
       logger.error(`user: ${requestUserId} | Failed to delete file: ${filepath}`, error);
     }

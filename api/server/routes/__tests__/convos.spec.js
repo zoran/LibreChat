@@ -1,3 +1,6 @@
+jest.mock('~/server/utils/import/importBatchBuilder', () => ({
+  createImportBatchBuilder: jest.fn(),
+}));
 const express = require('express');
 const request = require('supertest');
 
@@ -26,6 +29,8 @@ const checkpointNamespace = (id) =>
 jest.mock('@librechat/agents', () => require(MOCKS).agents());
 jest.mock('@librechat/api', () =>
   require(MOCKS).api({
+    ...jest.requireActual('../../../../packages/api/src/conversations/history'),
+    ...jest.requireActual('../../../../packages/api/src/conversations/historyHttp'),
     createContentFilter: jest.fn((options) => (req, res, next) => {
       const extracted = [...options.extract(req)];
       if (JSON.stringify(extracted).includes('BLOCK-CONTROL')) {
@@ -48,7 +53,10 @@ jest.mock('~/server/middleware', () => require(MOCKS).middlewarePassthrough());
 jest.mock('~/server/utils/import/fork', () => require(MOCKS).forkUtils());
 jest.mock('~/server/utils/import', () => require(MOCKS).importUtils());
 jest.mock('~/cache/getLogStores', () => require(MOCKS).logStores());
-jest.mock('~/server/routes/files/multer', () => require(MOCKS).multerSetup());
+jest.mock('~/server/routes/files/multer', () => ({
+  ...require(MOCKS).multerSetup(),
+  createStorage: () => require(MOCKS).multerSetup().storage,
+}));
 jest.mock('multer', () => require(MOCKS).multerLib());
 jest.mock('~/server/services/Endpoints/azureAssistants', () => require(MOCKS).assistantEndpoint());
 jest.mock('~/server/services/Endpoints/assistants', () => require(MOCKS).assistantEndpoint());
@@ -80,6 +88,7 @@ describe('Convos Routes', () => {
     convosRouter = require('../convos');
 
     app = express();
+    app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
     app.use(express.json());
 
     /** Mock authenticated user */
@@ -118,6 +127,7 @@ describe('Convos Routes', () => {
   });
 
   beforeEach(() => {
+    if (app) app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
     jest.clearAllMocks();
     moderatedTexts.length = 0;
     generationJobManager.getCleanupJob.mockResolvedValue(null);
@@ -245,6 +255,10 @@ describe('Convos Routes', () => {
       expect(response.status).toBe(201);
       expect(importConversations).toHaveBeenCalledWith({
         filepath: '/tmp/test-file.json',
+        history: expect.objectContaining({
+          write: expect.any(Function),
+          uncertain: expect.any(Function),
+        }),
         requestUserId: 'test-user-123',
         userRole: 'USER',
         interfaceConfig: undefined,
@@ -685,7 +699,10 @@ describe('Convos Routes', () => {
       expect(deleteToolCalls).toHaveBeenCalledTimes(1);
 
       /** Verify deleteAllSharedLinksWithCleanup was called with correct userId */
-      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith('test-user-123');
+      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith(
+        'test-user-123',
+        expect.any(Function),
+      );
       expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledTimes(1);
     });
 
@@ -705,7 +722,10 @@ describe('Convos Routes', () => {
       const response = await request(app).delete('/api/convos/all');
 
       expect(response.status).toBe(201);
-      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith('test-user-123');
+      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith(
+        'test-user-123',
+        expect.any(Function),
+      );
     });
 
     it('should return 500 if deleteConvos fails', async () => {
@@ -767,12 +787,16 @@ describe('Convos Routes', () => {
       let response = await request(app).delete('/api/convos/all');
 
       expect(response.status).toBe(201);
-      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith('test-user-123');
+      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith(
+        'test-user-123',
+        expect.any(Function),
+      );
 
       jest.clearAllMocks();
 
       /** Second user (simulate different user by modifying middleware) */
       const app2 = express();
+      app2.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
       app2.use(express.json());
       app2.use((req, res, next) => {
         req.user = { id: 'test-user-456' };
@@ -787,7 +811,10 @@ describe('Convos Routes', () => {
       response = await request(app2).delete('/api/convos/all');
 
       expect(response.status).toBe(201);
-      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith('test-user-456');
+      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith(
+        'test-user-456',
+        expect.any(Function),
+      );
     });
 
     it('should execute deletions in correct sequence', async () => {
@@ -836,7 +863,10 @@ describe('Convos Routes', () => {
       expect(response.status).toBe(201);
 
       /** Verify that shared links cleanup was called for the same user */
-      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith('test-user-123');
+      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith(
+        'test-user-123',
+        expect.any(Function),
+      );
 
       /** Verify no shared links remain for deleted conversations */
       expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledAfter(deleteConvos);
@@ -1561,6 +1591,7 @@ describe('Convos Routes', () => {
       expect(deleteConvoSharedLinksWithCleanup).toHaveBeenCalledWith(
         'test-user-123',
         mockConversationId,
+        expect.any(Function),
       );
     });
 
@@ -1602,6 +1633,7 @@ describe('Convos Routes', () => {
       expect(deleteConvoSharedLinksWithCleanup).toHaveBeenCalledWith(
         'test-user-123',
         mockConversationId,
+        expect.any(Function),
       );
     });
 
@@ -1730,6 +1762,7 @@ describe('Convos Routes', () => {
       expect(deleteConvoSharedLinksWithCleanup).toHaveBeenCalledWith(
         'test-user-123',
         mockConversationId,
+        expect.any(Function),
       );
 
       /** Verify it was called after the conversation was deleted */

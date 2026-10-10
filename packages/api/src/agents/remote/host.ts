@@ -1,5 +1,6 @@
 import type { AgentExecutionEnrollment } from './lifecycle';
 import type { AgentRunEnvelope } from '../envelope';
+import { generationRequestBinding } from '~/stream';
 import { enrollAgentExecution } from './lifecycle';
 
 /** Transport connection observed by the execution host for cancellation only. */
@@ -52,6 +53,8 @@ export async function executeAgentRun<Result>({
   try {
     execution = await enrollAgentExecution({
       runId,
+      requestFingerprint: generationRequestBinding(runId, envelope.payload)?.requestFingerprint,
+      tenantId: envelope.principal.tenantId,
       userId: envelope.principal.userId,
       conversationId,
       agentId,
@@ -73,7 +76,9 @@ export async function executeAgentRun<Result>({
     removeCloseListener();
     if (execution != null) {
       try {
-        await beforeSettle?.(execution, executionError);
+        await execution.track(
+          Promise.resolve().then(() => beforeSettle?.(execution!, executionError)),
+        );
       } catch (error) {
         executionError ??= error;
       }

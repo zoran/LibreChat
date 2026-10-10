@@ -47,6 +47,7 @@ const mockJobStore = {
 };
 
 const mockGenerationJobManager = {
+  observeGenerationWrite: jest.fn((_stream, _epoch, _segment, write) => write),
   detachedAgentEventActionStoreMode: 'distributed',
   supportsDetachedAgentEventActions: true,
   getJob: jest.fn(),
@@ -65,7 +66,7 @@ const mockGenerationJobManager = {
   completeJob: jest.fn(),
   abortJob: jest.fn(),
   beginProviderExecution: jest.fn(),
-  markProviderExecutionDrained: jest.fn(),
+  settleGenerationExecution: jest.fn(),
   failPausePersistence: jest.fn(),
   expireApproval: jest.fn(),
   approvals: {
@@ -373,7 +374,7 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
     mockGenerationJobManager.completeJob.mockResolvedValue(true);
     mockGenerationJobManager.abortJob.mockResolvedValue({ success: true });
     mockGenerationJobManager.beginProviderExecution.mockResolvedValue(true);
-    mockGenerationJobManager.markProviderExecutionDrained.mockResolvedValue(true);
+    mockGenerationJobManager.settleGenerationExecution.mockResolvedValue(true);
     mockGenerationJobManager.failPausePersistence.mockResolvedValue(true);
     mockGenerationJobManager.isRedis = true;
     mockGenerationJobManager.detachedAgentEventActionStoreMode = 'distributed';
@@ -2215,14 +2216,15 @@ describe('ResumeAgentController (POST /agents/chat/resume)', () => {
         CONVO_ID,
         1000,
         resumePatch.providerExecutionId,
+        true,
       );
-      expect(mockGenerationJobManager.markProviderExecutionDrained).toHaveBeenCalledWith(
+      expect(mockGenerationJobManager.settleGenerationExecution).toHaveBeenCalledWith(
         CONVO_ID,
         1000,
         resumePatch.providerExecutionId,
       );
       expect(mockCleanupMCPRequestContextForReq.mock.invocationCallOrder[0]).toBeLessThan(
-        mockGenerationJobManager.markProviderExecutionDrained.mock.invocationCallOrder[0],
+        mockGenerationJobManager.settleGenerationExecution.mock.invocationCallOrder[0],
       );
       expect(
         mockGenerationJobManager.beginProviderExecution.mock.invocationCallOrder[0],

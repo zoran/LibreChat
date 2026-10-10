@@ -1,3 +1,11 @@
+const {
+  authWrite,
+  authTrack,
+  authMutation,
+  authUserMutation,
+  authPersistence,
+  legacyAuthMaintenance,
+} = require('./LegacyAuthMaintenance');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { webcrypto } = require('node:crypto');
@@ -113,12 +121,12 @@ const findEmailVerificationToken = async (user) => {
 
 const deleteEmailVerificationTokens = (user) =>
   Promise.all([
-    deleteTokens({
+    authMutation(deleteTokens, {
       userId: user._id,
       email: user.email,
       type: AuthTokenTypes.EMAIL_VERIFICATION,
     }),
-    deleteTokens({
+    authMutation(deleteTokens, {
       userId: user._id,
       email: user.email,
       identifier: null,
@@ -225,7 +233,7 @@ const logoutUser = async (req, refreshToken) => {
 
     if (session) {
       try {
-        await deleteSession({ sessionId: session._id });
+        await authWrite(() => deleteSession({ sessionId: session._id }));
       } catch (deleteErr) {
         logger.error('[logoutUser] Failed to delete session.', deleteErr);
         return { status: 500, message: 'Failed to delete session.' };
@@ -233,7 +241,14 @@ const logoutUser = async (req, refreshToken) => {
     }
 
     try {
-      req.session.destroy();
+      if (req.session) {
+        await authWrite(
+          () =>
+            new Promise((resolve, reject) => {
+              req.session.destroy((error) => (error ? reject(error) : resolve()));
+            }),
+        );
+      }
     } catch (destroyErr) {
       logger.debug('[logoutUser] Failed to destroy session.', destroyErr);
     }
@@ -266,7 +281,7 @@ const sendVerificationEmail = async (user) => {
   const verificationLink = `${
     domains.client
   }/verify?token=${verifyToken}&email=${encodeURIComponent(email)}`;
-  await sendEmail({
+  await authMutation(sendEmail, {
     email,
     subject: 'Verify your email',
     payload: {
@@ -278,7 +293,7 @@ const sendVerificationEmail = async (user) => {
     template: 'verifyEmail.handlebars',
   });
 
-  await createToken({
+  await authMutation(createToken, {
     userId: user._id,
     email,
     type: AuthTokenTypes.EMAIL_VERIFICATION,
@@ -348,19 +363,21 @@ const verifyEmail = async (req) => {
   }
 
   if (user.emailVerified) {
-    await deleteTokens(getEmailVerificationTokenDeleteQuery(emailVerificationData));
+    await authMutation(deleteTokens, getEmailVerificationTokenDeleteQuery(emailVerificationData));
     logger.info(`[verifyEmail] Email already verified [Email: ${decodedEmail}]`);
     return { message: 'Email verification was successful', status: 'success' };
   }
 
-  const updatedUser = await updateUser(emailVerificationData.userId, { emailVerified: true });
+  const updatedUser = await authUserMutation(updateUser, emailVerificationData.userId, {
+    emailVerified: true,
+  });
 
   if (!updatedUser) {
     logger.warn(`[verifyEmail] [User update failed] [Email: ${decodedEmail}]`);
     return new Error(invalidEmailVerificationMessage);
   }
 
-  await deleteTokens(getEmailVerificationTokenDeleteQuery(emailVerificationData));
+  await authMutation(deleteTokens, getEmailVerificationTokenDeleteQuery(emailVerificationData));
   logger.info(`[verifyEmail] Email verification successful [Email: ${decodedEmail}]`);
   return { message: 'Email verification was successful', status: 'success' };
 };
@@ -431,7 +448,13 @@ const registerUser = async (user, additionalData = {}) => {
     const emailEnabled = checkEmailConfig();
     const disableTTL = isEnabled(process.env.ALLOW_UNVERIFIED_EMAIL_LOGIN);
 
-    const newUser = await createUser(newUserData, appConfig.balance, disableTTL, true);
+    const newUser = await authMutation(
+      createUser,
+      newUserData,
+      appConfig.balance,
+      disableTTL,
+      true,
+    );
     newUserId = newUser._id;
     if (emailEnabled && !newUser.emailVerified) {
       await sendVerificationEmail({
@@ -440,7 +463,7 @@ const registerUser = async (user, additionalData = {}) => {
         name,
       });
     } else {
-      await updateUser(newUserId, { emailVerified: true });
+      await authUserMutation(updateUser, newUserId, { emailVerified: true });
     }
 
     /** `userCreated` separates this from the identical 200 returned when the email is
@@ -450,7 +473,7 @@ const registerUser = async (user, additionalData = {}) => {
   } catch (err) {
     logger.error('[registerUser] Error in registering user:', err);
     if (newUserId) {
-      const result = await deleteUserById(newUserId);
+      const result = await authUserMutation(deleteUserById, newUserId);
       logger.warn(
         `[registerUser] [Email: ${email}] [Temporary User deleted: ${JSON.stringify(result)}]`,
       );
@@ -518,13 +541,13 @@ const requestPasswordReset = async (req) => {
   }
 
   await Promise.all([
-    deleteTokens({ userId: user._id, type: AuthTokenTypes.PASSWORD_RESET }),
-    deleteTokens({ userId: user._id, email: null, identifier: null, type: null }),
+    authMutation(deleteTokens, { userId: user._id, type: AuthTokenTypes.PASSWORD_RESET }),
+    authMutation(deleteTokens, { userId: user._id, email: null, identifier: null, type: null }),
   ]);
 
   const [resetToken, hash] = createTokenHash();
 
-  await createToken({
+  await authMutation(createToken, {
     userId: user._id,
     type: AuthTokenTypes.PASSWORD_RESET,
     token: hash,
@@ -535,7 +558,7 @@ const requestPasswordReset = async (req) => {
   const link = `${domains.client}/reset-password?token=${resetToken}&userId=${user._id}`;
 
   if (emailEnabled) {
-    await sendEmail({
+    await authMutation(sendEmail, {
       email: user.email,
       subject: 'Password Reset Request',
       payload: {
@@ -583,10 +606,10 @@ const resetPassword = async (userId, token, password) => {
   }
 
   const hash = bcrypt.hashSync(password, 10);
-  const user = await updateUser(userId, { password: hash });
+  const user = await authUserMutation(updateUser, userId, { password: hash });
 
   if (checkEmailConfig()) {
-    await sendEmail({
+    await authMutation(sendEmail, {
       email: user.email,
       subject: 'Password Reset Successfully',
       payload: {
@@ -598,7 +621,7 @@ const resetPassword = async (userId, token, password) => {
     });
   }
 
-  await deleteTokens(getPasswordResetTokenDeleteQuery(passwordResetToken));
+  await authMutation(deleteTokens, getPasswordResetTokenDeleteQuery(passwordResetToken));
   logger.info(`[resetPassword] Password reset successful. [Email: ${user.email}]`);
   return { message: 'Password reset was successful' };
 };
@@ -706,9 +729,16 @@ const setAuthTokens = async (userId, res, _session = null, req = null) => {
 
     if (session && session._id && session.expiration != null) {
       refreshTokenExpires = session.expiration.getTime();
-      refreshToken = await generateRefreshToken(session);
+      refreshToken = await generateRefreshToken(
+        session,
+        ...(legacyAuthMaintenance.current() ? [authPersistence] : []),
+      );
     } else {
-      const result = await createSession(userId, { expiresIn });
+      const result = await createSession(
+        userId,
+        { expiresIn },
+        ...(legacyAuthMaintenance.current() ? [authPersistence] : []),
+      );
       session = result.session;
       refreshToken = result.refreshToken;
       refreshTokenExpires = session.expiration.getTime();
@@ -946,7 +976,10 @@ const setOpenIDAuthTokens = (
 const storeOpenIDSession = async (userId, refreshToken, tenantId, previousRefreshToken) => {
   return storeOpenIdSession(
     { userId, refreshToken, tenantId, previousRefreshToken },
-    { upsertSession, deleteSession },
+    {
+      upsertSession: (...args) => authWrite(() => upsertSession(...args)),
+      deleteSession: (...args) => authWrite(() => deleteSession(...args)),
+    },
   );
 };
 
@@ -975,7 +1008,7 @@ const resendVerificationEmail = async (req) => {
       domains.client
     }/verify?token=${verifyToken}&email=${encodeURIComponent(user.email)}`;
 
-    await sendEmail({
+    await authMutation(sendEmail, {
       email: user.email,
       subject: 'Verify your email',
       payload: {
@@ -987,7 +1020,7 @@ const resendVerificationEmail = async (req) => {
       template: 'verifyEmail.handlebars',
     });
 
-    await createToken({
+    await authMutation(createToken, {
       userId: user._id,
       email: user.email,
       type: AuthTokenTypes.EMAIL_VERIFICATION,
@@ -1013,15 +1046,15 @@ const resendVerificationEmail = async (req) => {
 
 module.exports = {
   logoutUser,
-  verifyEmail,
-  registerUser,
+  verifyEmail: (...args) => authTrack(() => verifyEmail(...args)),
+  registerUser: (...args) => authTrack(() => registerUser(...args)),
   setAuthTokens,
-  resetPassword,
+  resetPassword: (...args) => authTrack(() => resetPassword(...args)),
   clearOpenIDAuthTokens,
   getOpenIDAppAuthToken,
   setOpenIDAuthTokens,
   storeOpenIDSession,
   setCloudFrontAuthCookies,
-  requestPasswordReset,
-  resendVerificationEmail,
+  requestPasswordReset: (...args) => authTrack(() => requestPasswordReset(...args)),
+  resendVerificationEmail: (...args) => authTrack(() => resendVerificationEmail(...args)),
 };

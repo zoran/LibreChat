@@ -1,3 +1,7 @@
+const { authTrack } = require('./LegacyAuthMaintenance');
+// Capture the accepted operation before group owners defer transaction/cache continuations.
+const authGroupMutation = (method, ...args) =>
+  authTrack((operation) => operation.write(() => method(...args, operation)));
 const mongoose = require('mongoose');
 const { AccessControlService, isEnabled, ensureDirectoryPrincipalUser } = require('@librechat/api');
 const {
@@ -550,7 +554,8 @@ const performEntraGroupMembershipSync = async (user, accessToken, session = null
     );
 
     // Step 2: Try to add user to existing groups (fast operation)
-    const addResult = await db.bulkUpdateGroups(
+    const addResult = await authGroupMutation(
+      db.bulkUpdateGroups,
       {
         idOnTheSource: { $in: allGroupIds },
         source: 'entra',
@@ -590,7 +595,8 @@ const performEntraGroupMembershipSync = async (user, accessToken, session = null
         // Step 5: Upsert missing groups (race-safe by design)
         // Use upsertGroupByExternalId for each group to handle concurrent creates gracefully
         const upsertPromises = groupDetails.map((group) =>
-          db.upsertGroupByExternalId(
+          authGroupMutation(
+            db.upsertGroupByExternalId,
             group.id,
             'entra',
             {
@@ -602,10 +608,13 @@ const performEntraGroupMembershipSync = async (user, accessToken, session = null
           ),
         );
 
-        await Promise.all(upsertPromises);
+        const outcomes = await Promise.allSettled(upsertPromises);
+        const failed = outcomes.find((outcome) => outcome.status === 'rejected');
+        if (failed) throw failed.reason;
 
         // Step 6: Add user to all newly created/upserted groups
-        await db.bulkUpdateGroups(
+        await authGroupMutation(
+          db.bulkUpdateGroups,
           {
             idOnTheSource: { $in: missingGroupIds },
             source: 'entra',
@@ -630,7 +639,8 @@ const performEntraGroupMembershipSync = async (user, accessToken, session = null
     }
 
     // Step 7: Remove user from Entra groups they're no longer member of
-    const removeResult = await db.bulkUpdateGroups(
+    const removeResult = await authGroupMutation(
+      db.bulkUpdateGroups,
       {
         source: 'entra',
         memberIds: user.idOnTheSource,

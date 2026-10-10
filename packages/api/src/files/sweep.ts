@@ -5,6 +5,36 @@ import {
   defaultAssistantsVersion,
 } from 'librechat-data-provider';
 import type { AppConfig } from '@librechat/data-schemas';
+import type { ApplicationWorkPort } from '~/app';
+
+/* The file owner retains actual leader/query/deletion promises through settlement.
+ * A timer tick during maintenance is not accepted work. Uncertain remote mutations
+ * remain an explicit drain blocker; a rejected promise is not proof of no write. */
+let sweepPausedBy: string | null = null;
+let pendingSweeps = 0;
+let pendingLeaderChecks = 0;
+let sweepWritesUncertain = false;
+
+export const expiredFileSweepMaintenance: ApplicationWorkPort = {
+  pauseAdmissions(requestId) {
+    if (!requestId || (sweepPausedBy !== null && sweepPausedBy !== requestId)) return false;
+    sweepPausedBy = requestId;
+    return true;
+  },
+  resumeAdmissions(requestId) {
+    if (sweepPausedBy !== requestId || sweepWritesUncertain) return false;
+    sweepPausedBy = null;
+    return true;
+  },
+  async getMaintenanceCensus(requestId) {
+    return {
+      admissionClosed: requestId !== null && sweepPausedBy === requestId,
+      queuedContinuations: pendingLeaderChecks,
+      pendingWrites: pendingSweeps,
+      complete: !sweepWritesUncertain && (sweepPausedBy === null || sweepPausedBy === requestId),
+    };
+  },
+};
 
 const DEFAULT_FILE_RETENTION_SWEEP_INTERVAL_MS = 60 * 60 * 1000;
 const DEFAULT_FILE_RETENTION_MAX_ATTEMPTS = 10;
@@ -266,6 +296,19 @@ export async function resolveExpiredFileSweepConfig({
 }
 
 export async function sweepExpiredFiles(
+  options: ExpiredFileSweepOptions | undefined,
+  dependencies: SweepDependencies,
+): Promise<ExpiredFileSweepResult> {
+  if (sweepPausedBy !== null) throw new Error('FILE_SWEEP_QUIESCING');
+  pendingSweeps++;
+  try {
+    return await performExpiredFileSweep(options, dependencies);
+  } finally {
+    pendingSweeps--;
+  }
+}
+
+async function performExpiredFileSweep(
   { appConfig, limit = 100, loadAppConfig }: ExpiredFileSweepOptions | undefined = {},
   {
     getExpiredFiles,
@@ -299,6 +342,7 @@ export async function sweepExpiredFiles(
        * each get a distinct one. */
       attempts = await incrementFileDeletionAttempts(file.file_id);
     } catch (error) {
+      sweepWritesUncertain = true;
       logger.error(
         `[sweepExpiredFiles] Error recording failed deletion of expired file ${file.file_id}:`,
         error,
@@ -321,6 +365,7 @@ export async function sweepExpiredFiles(
         new Date(sweepStartedAt + getExpiredFileRetryDelay(attempts, maxAttempts)),
       );
     } catch (error) {
+      sweepWritesUncertain = true;
       logger.error(`[sweepExpiredFiles] Error deferring expired file ${file.file_id}:`, error);
     }
   };
@@ -342,6 +387,7 @@ export async function sweepExpiredFiles(
       const req = createExpiredFileSweepRequest({ appConfig: resolvedAppConfig, file, userId });
       const { deletedFileIds, failedFileIds } = await processDeleteRequest({ req, files: [file] });
       if (failedFileIds.includes(file.file_id)) {
+        sweepWritesUncertain = true;
         await recordFailure(file);
         continue;
       }
@@ -349,12 +395,14 @@ export async function sweepExpiredFiles(
       if (deletedFileIds.includes(file.file_id)) {
         deleted++;
       } else {
+        sweepWritesUncertain = true;
         logger.error(
           `[sweepExpiredFiles] Delete request finished without resolving expired file ${file.file_id}`,
         );
         await recordFailure(file);
       }
     } catch (error) {
+      sweepWritesUncertain = true;
       logger.error(`[sweepExpiredFiles] Error deleting expired file ${file.file_id}:`, error);
       await recordFailure(file);
     }
@@ -406,19 +454,21 @@ export function startExpiredFileSweep(
 
   let isSweeping = false;
   const runSweep = async () => {
-    if (isSweeping) {
+    if (isSweeping || sweepPausedBy !== null) {
       return;
     }
 
     isSweeping = true;
+    pendingLeaderChecks++;
     try {
-      if (!(await isLeader())) {
+      if (!(await isLeader()) || sweepPausedBy !== null) {
         return;
       }
       await runAsSystem(() => sweepExpiredFiles(options));
     } catch (error) {
       logger.error('[sweepExpiredFiles] Background sweep failed:', error);
     } finally {
+      pendingLeaderChecks--;
       isSweeping = false;
     }
   };

@@ -1,3 +1,4 @@
+const { withAuthRequest } = require('~/server/services/LegacyAuthMaintenance');
 const cookies = require('cookie');
 const { isEnabled, math, clearCloudFrontCookies } = require('@librechat/api');
 const { logger, DEFAULT_REFRESH_TOKEN_EXPIRY } = require('@librechat/data-schemas');
@@ -184,5 +185,5 @@ const logoutController = async (req, res) => {
 };
 
 module.exports = {
-  logoutController,
+  logoutController: (req, res) => withAuthRequest(req, () => logoutController(req, res)),
 };

@@ -1,14 +1,14 @@
 /* eslint jest/expect-expect: ["warn", { "assertFunctionNames": ["expect", "testRedisOperations"] }] */
-import type { RedisClientType, RedisClusterType } from '@redis/client';
 import type { Redis, Cluster } from 'ioredis';
+import type { SharedRedisClient } from '../redisClients';
 import { closeRedisClients } from './redisClients.helper';
 
-type RedisClient = RedisClientType | RedisClusterType | Redis | Cluster;
+type RedisClient = SharedRedisClient | Redis | Cluster;
 
 describe('redisClients Integration Tests', () => {
   let originalEnv: NodeJS.ProcessEnv;
   let ioredisClient: Redis | Cluster | null = null;
-  let keyvRedisClient: RedisClientType | RedisClusterType | null = null;
+  let keyvRedisClient: SharedRedisClient | null = null;
 
   // Helper function to test set/get/delete operations
   const testRedisOperations = async (

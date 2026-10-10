@@ -51,6 +51,8 @@ jest.mock('@librechat/api', () => {
   };
 
   return {
+    ...jest.requireActual('../../../../packages/api/src/conversations/history'),
+    ...jest.requireActual('../../../../packages/api/src/conversations/historyHttp'),
     /** The real helper, without loading the rest of the package this suite mocks around. */
     withoutTraceRefs: jest.requireActual('../../../../packages/api/src/langfuse/trace.ts')
       .withoutTraceRefs,
@@ -251,6 +253,7 @@ describe('message route conversation ownership filters', () => {
     storedMessageFilterOptions = createContentFilter.mock.calls[0][0];
 
     app = express();
+    app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
     app.use(express.json());
     app.use((req, res, next) => {
       req.user = { id: authenticatedUserId };
@@ -260,6 +263,7 @@ describe('message route conversation ownership filters', () => {
   });
 
   beforeEach(() => {
+    if (app) app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
     jest.clearAllMocks();
     canReadActiveJobConversation.mockResolvedValue(false);
     prepareMessageRequestValidation.mockImplementation((req, res, next) => {

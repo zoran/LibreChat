@@ -36,6 +36,7 @@ const PUBLICATION_WAIT_TIMEOUT_MS = 10_000;
 const PUBLICATION_WAIT_INTERVAL_MS = 250;
 
 interface OpenIDSessionRefreshDeps {
+  observeWrite?: <T>(action: () => Promise<T>) => Promise<T>;
   jwt: {
     decode: (token: string) => (Partial<OpenIDClaims> & { exp?: number }) | string | null;
     verify: (token: string, secret: string) => { id?: string; refreshTokenHash?: string } | string;
@@ -773,15 +774,18 @@ export function createOpenIDSessionRefreshService(
       return;
     }
     const save = req.session.save.bind(req.session);
-    await new Promise<void>((resolve, reject) => {
-      save((err?: Error | null) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve();
-        }
-      });
-    });
+    await (deps.observeWrite ?? ((action) => action()))(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          save((err?: Error | null) => {
+            if (err) {
+              reject(err);
+            } else {
+              resolve();
+            }
+          });
+        }),
+    );
   }
 
   /**

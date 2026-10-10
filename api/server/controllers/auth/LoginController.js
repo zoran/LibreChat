@@ -1,3 +1,4 @@
+const { withAuthRequest } = require('~/server/services/LegacyAuthMaintenance');
 const { logger } = require('@librechat/data-schemas');
 const { generate2FATempToken } = require('~/server/services/twoFactorService');
 const { setAuthTokens } = require('~/server/services/AuthService');
@@ -26,5 +27,5 @@ const loginController = async (req, res) => {
 };
 
 module.exports = {
-  loginController,
+  loginController: (req, res) => withAuthRequest(req, () => loginController(req, res)),
 };

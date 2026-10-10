@@ -7,6 +7,8 @@ export * from './utils';
 export { createModels } from './models';
 export {
   createMethods,
+  createGenerationAdmissionMethods,
+  GenerationAdmissionStorageError,
   CLIENT_MESSAGE_SELECT,
   SUBAGENT_TRANSCRIPT_SOURCE_BYTE_LIMIT,
   RoleConflictError,

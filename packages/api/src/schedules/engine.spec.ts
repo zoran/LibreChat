@@ -854,3 +854,55 @@ describe('reconciliation preserves the intended outcome', () => {
     );
   });
 });
+
+describe('schedule engine maintenance ownership', () => {
+  it.each([true, false])(
+    'releases a claim returned after pause and retains an unconfirmed fence (%s)',
+    async (released) => {
+      const methods = makeMethods(makeClaimedSchedule());
+      let returnClaim!: (value: FireableSchedule) => void;
+      methods.claimDueSchedule.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            returnClaim = resolve;
+          }),
+      );
+      methods.releaseLease.mockResolvedValue(released);
+      const engine = startScheduleEngine(makeDeps(methods));
+      const active = engine.runTick();
+      for (let i = 0; i < 10 && !returnClaim; i++) await Promise.resolve();
+      expect(returnClaim).toBeDefined();
+      engine.pauseAdmissions('drain');
+      expect((await engine.getMaintenanceCensus('drain')).pendingWrites).toBeGreaterThan(0);
+      returnClaim(makeClaimedSchedule());
+      await active;
+      expect(methods.releaseLease).toHaveBeenCalledWith('sched-1', 'ct-1');
+      expect(await engine.runTick()).toBe(0);
+      expect((await engine.getMaintenanceCensus('drain')).complete).toBe(released);
+      engine.stop();
+    },
+  );
+
+  it('keeps startup reconciliation visible until its accepted write finishes', async () => {
+    const methods = makeMethods(makeClaimedSchedule());
+    let release!: () => void;
+    methods.markRunsReconciled.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = () => resolve(undefined);
+        }),
+    );
+    const engine = startScheduleEngine(makeDeps(methods));
+    for (let i = 0; i < 20 && !release; i++) await Promise.resolve();
+    expect(release).toBeDefined();
+    engine.pauseAdmissions('drain');
+    expect((await engine.getMaintenanceCensus('drain')).pendingWrites).toBeGreaterThan(0);
+    release();
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+    expect(await engine.getMaintenanceCensus('drain')).toMatchObject({
+      complete: true,
+      pendingWrites: 0,
+    });
+    engine.stop();
+  });
+});

@@ -1047,3 +1047,38 @@ it('does not enqueue when Run Now is cancelled during final claim validation', a
   expect(deps.enqueueTrigger).not.toHaveBeenCalled();
   expect(methods.recordRunOutcome).not.toHaveBeenCalled();
 });
+
+describe('maintenance visibility of swallowed schedule persistence failures', () => {
+  it('keeps a successfully enqueued fire successful but reports unknown trailing bookkeeping', async () => {
+    const { methods } = makeMethods();
+    methods.setRunFireDetails.mockRejectedValueOnce(new Error('commit reply lost'));
+    const onUnconfirmedWork = jest.fn();
+    const result = await fireSchedule(
+      makeDeps(methods, { onUnconfirmedWork }),
+      makeSchedule(),
+      LIMITS,
+      new Date(),
+    );
+    expect(result.fired).toBe(true);
+    expect(onUnconfirmedWork).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains an ambiguous enqueue instead of reporting clean maintenance settlement', async () => {
+    const { methods, runs } = makeMethods();
+    const onUnconfirmedWork = jest.fn();
+    const result = await fireSchedule(
+      makeDeps(methods, {
+        onUnconfirmedWork,
+        enqueueTrigger: async () => {
+          throw new Error('unknown commit');
+        },
+      }),
+      makeSchedule(),
+      LIMITS,
+      new Date(),
+    );
+    expect(result.fired).toBe(false);
+    expect(onUnconfirmedWork).toHaveBeenCalledTimes(1);
+    expect([...runs.values()].some((run) => run.status === 'started')).toBe(true);
+  });
+});

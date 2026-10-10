@@ -81,6 +81,11 @@ async function recordExpiredScheduleApproval(streamId, job) {
 }
 
 module.exports = {
+  scheduleMaintenance: {
+    pauseAdmissions: invoke('pauseAdmissions'),
+    resumeAdmissions: invoke('resumeAdmissions'),
+    getMaintenanceCensus: invoke('getMaintenanceCensus'),
+  },
   getLimits: invoke('getLimits'),
   fireScheduleNow: invoke('fireScheduleNow'),
   recordScheduleOutcome: invoke('recordScheduleOutcome'),
@@ -108,5 +113,5 @@ module.exports = {
   },
   // Identity-fenced delete for a retained job whose run has since been settled
   // inline; reconciliation only reaches jobs whose run is still active.
-  clearScheduledJob: (...args) => getService().engineDeps.clearReconciledJob(...args),
+  clearScheduledJob: invoke('clearScheduledJob'),
 };

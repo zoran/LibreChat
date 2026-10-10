@@ -1310,3 +1310,129 @@ describe('Agent queued-turn delivery scheduling', () => {
     );
   });
 });
+
+describe('queued-turn maintenance ownership', () => {
+  it('inherits closure during index initialization without starting scans', async () => {
+    let release!: () => void;
+    const methods = {
+      ensureAgentQueuedTurnIndexes: jest.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            release = resolve;
+          }),
+      ),
+      findQueuedTurnsNeedingDelivery: jest.fn(async () => []),
+      claimQueuedTurnsForAdmissionReconciliation: jest.fn(async () => []),
+    };
+    const scheduler = createAgentQueuedTurnScheduler({
+      methods: methods as unknown as AgentQueuedTurnMethods,
+      enqueue: jest.fn(),
+      getGenerationAdmissionEvidence: async () => null,
+    });
+    const active = scheduler.initialize();
+    scheduler.pauseAdmissions('drain');
+    expect((await scheduler.getMaintenanceCensus('drain')).pendingWrites).toBeGreaterThan(0);
+    release();
+    await active;
+    expect(methods.findQueuedTurnsNeedingDelivery).not.toHaveBeenCalled();
+    expect(await scheduler.getMaintenanceCensus('drain')).toMatchObject({
+      complete: true,
+      pendingWrites: 0,
+      admissionClosed: true,
+    });
+    expect(scheduler.resumeAdmissions('drain')).toBe(true);
+    await scheduler.stop();
+  });
+
+  it('tracks the complete accepted publication and retains failed receipt uncertainty', async () => {
+    const row = { ...claim(), status: 'queued' as const };
+    let release!: () => void;
+    const methods = {
+      reserveAgentQueuedTurnDelivery: jest.fn(async () => ({ outcome: 'reserved', turn: row })),
+      markQueuedTurnScheduled: jest.fn(
+        () =>
+          new Promise<void>((resolve) => {
+            release = resolve;
+          }),
+      ),
+    };
+    const scheduler = createAgentQueuedTurnScheduler({
+      methods: methods as unknown as AgentQueuedTurnMethods,
+      enqueue: async (envelope) => ({
+        deliveryKey: getAgentTriggerIdempotencyKey(envelope as AgentContinueTriggerEnvelope),
+      }),
+      getGenerationAdmissionEvidence: async () => null,
+    });
+    const active = scheduler.schedule(row);
+    for (let i = 0; i < 10 && !release; i++) await Promise.resolve();
+    expect(release).toBeDefined();
+    scheduler.pauseAdmissions('drain');
+    await expect(scheduler.schedule(row)).rejects.toThrow('paused');
+    expect((await scheduler.getMaintenanceCensus('drain')).pendingWrites).toBeGreaterThan(0);
+    // An absent/malformed acknowledged receipt is not settlement evidence.
+    release();
+    await expect(active).rejects.toThrow();
+    expect(await scheduler.getMaintenanceCensus('drain')).toMatchObject({
+      complete: false,
+      pendingWrites: 0,
+    });
+    expect(scheduler.resumeAdmissions('drain')).toBe(false);
+    await scheduler.stop();
+  });
+});
+
+describe('queued-turn post-preparation settlement', () => {
+  it('counts the later release callback and keeps an unconfirmed fence held', async () => {
+    const base = resolverMethods();
+    let settle!: (
+      result: Awaited<ReturnType<AgentQueuedTurnMethods['releaseAgentQueuedTurn']>>,
+    ) => void;
+    const lifecycle = createAgentQueuedTurnLifecycle({
+      methods: {
+        ...base.methods,
+        releaseAgentQueuedTurn: () =>
+          new Promise((resolve) => {
+            settle = resolve;
+          }),
+      },
+      getGenerationJob: async () => null,
+      getGenerationAdmissionEvidence: async () => null,
+      enqueue: jest.fn(),
+      now: () => NOW,
+      claimBy: 'worker-1',
+    });
+    const prepared = await lifecycle.prepareContinue(envelope(), { idempotencyKey: 'trigger-1' });
+    if (prepared?.status !== 'ready') throw new Error('Expected prepared continuation');
+    lifecycle.pauseAdmissions('drain');
+    const release = prepared.releaseOnDefiniteFailure?.();
+    expect((await lifecycle.getMaintenanceCensus('drain')).pendingWrites).toBeGreaterThan(0);
+    settle({ outcome: 'conflict', turn: null });
+    await expect(release).rejects.toThrow('release fence');
+    expect(await lifecycle.getMaintenanceCensus('drain')).toMatchObject({
+      complete: false,
+      pendingWrites: 0,
+    });
+    expect(lifecycle.resumeAdmissions('drain')).toBe(false);
+    await lifecycle.stop();
+  });
+
+  it('does not invent unresolved work for a proven pre-claim parent deferral', async () => {
+    const { methods, spies } = resolverMethods();
+    const lifecycle = createAgentQueuedTurnLifecycle({
+      methods,
+      getGenerationJob: async () => ({ status: 'running' }),
+      getGenerationAdmissionEvidence: async () => null,
+      enqueue: jest.fn(),
+    });
+    await expect(
+      lifecycle.prepareContinue(envelope(), { idempotencyKey: 'trigger-1' }),
+    ).rejects.toMatchObject({ code: 'PARENT_NOT_READY' });
+    lifecycle.pauseAdmissions('drain');
+    expect(spies.claimNextAgentQueuedTurn).not.toHaveBeenCalled();
+    expect(await lifecycle.getMaintenanceCensus('drain')).toMatchObject({
+      complete: true,
+      pendingWrites: 0,
+    });
+    await lifecycle.stop();
+  });
+});

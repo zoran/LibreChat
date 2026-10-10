@@ -534,9 +534,13 @@ export interface ConversationMethods {
     options?: {
       beforeDelete?: (conversationIds: string[]) => Promise<void>;
       allowEmpty?: boolean;
+      onUncertain?: (error: unknown) => void;
     },
   ): Promise<DeleteResult & { messages: DeleteResult; conversationIds: string[] }>;
-  archiveAllConvos(user: string): Promise<{ archivedCount: number }>;
+  archiveAllConvos(
+    user: string,
+    options?: { onUncertain?: (error: unknown) => void },
+  ): Promise<{ archivedCount: number }>;
 }
 
 export interface ConversationMethodDeps
@@ -2861,11 +2865,13 @@ export function createConversationMethods(
       });
 
       const result = await tenantSafeBulkWrite(Conversation, bulkOps);
-      await Promise.all(
+      const stats = await Promise.allSettled(
         [...affectedProjectStats.values()].map(({ user, projectId }) =>
           refreshChatProjectStatsForUser(mongoose, user, projectId),
         ),
       );
+      const failedStats = stats.find((result) => result.status === 'rejected');
+      if (failedStats?.status === 'rejected') throw failedStats.reason;
       return result;
     } catch (error) {
       logger.error('[bulkSaveConvos] Error saving conversations in bulk', error);
@@ -3248,6 +3254,7 @@ export function createConversationMethods(
       /** Idempotent destructive-recovery mode. An empty selection is success, while
        * query, cascade, reconciliation, and deletion failures still propagate. */
       allowEmpty?: boolean;
+      onUncertain?: (error: unknown) => void;
     },
   ) {
     try {
@@ -3341,7 +3348,7 @@ export function createConversationMethods(
             tagDecrements.push(tag);
           }
         }
-        await decrementTagCounts(mongoose, user, tagDecrements);
+        await decrementTagCounts(mongoose, user, tagDecrements, options?.onUncertain);
 
         const waveProjectIds = new Set(
           wave
@@ -3352,6 +3359,7 @@ export function createConversationMethods(
           try {
             await refreshChatProjectStatsInBatches(mongoose, user, waveProjectIds);
           } catch (error) {
+            options?.onUncertain?.(error);
             logger.error('[deleteConvos] Conversations deleted but stats refresh failed', error);
           }
         }
@@ -3379,6 +3387,7 @@ export function createConversationMethods(
           try {
             await deps?.eraseAgentTriggerDeliveryConversationResults?.(user, waveIds);
           } catch (error) {
+            options?.onUncertain?.(error);
             logger.error('[deleteConvos] Receipt erasure deferred to durable cleanup', error);
           }
         }
@@ -3415,6 +3424,7 @@ export function createConversationMethods(
         try {
           await deps?.eraseAgentTriggerDeliveryConversationResults?.(user, recoveryConversationIds);
         } catch (error) {
+          options?.onUncertain?.(error);
           logger.error('[deleteConvos] Receipt erasure deferred to durable cleanup', error);
         }
       }
@@ -3434,6 +3444,7 @@ export function createConversationMethods(
           user,
         });
       } catch (error) {
+        options?.onUncertain?.(error);
         logger.error('[deleteConvos] Conversations deleted but message cleanup failed', error);
       }
 
@@ -3452,7 +3463,10 @@ export function createConversationMethods(
    * retention-expired conversations are left alone: they are already hidden from the
    * chat list, so archiving them would only resurrect them in the archived view.
    */
-  async function archiveAllConvos(user: string) {
+  async function archiveAllConvos(
+    user: string,
+    options?: { onUncertain?: (error: unknown) => void },
+  ) {
     const Conversation = mongoose.models.Conversation as Model<IConversation>;
     const projectIds = new Set<string>();
     /** One stamp for the whole sweep so the archived view groups the run together
@@ -3522,6 +3536,9 @@ export function createConversationMethods(
           { timestamps: false },
         );
         const batchArchivedCount = result.modifiedCount ?? 0;
+        if (result.acknowledged !== true) {
+          options?.onUncertain?.(new Error('Conversation archive was not acknowledged'));
+        }
         archivedCount += batchArchivedCount;
 
         if (batchArchivedCount > 0) {
@@ -3559,6 +3576,7 @@ export function createConversationMethods(
             projectIds.add(projectId);
           }
         } catch (error) {
+          options?.onUncertain?.(error);
           logger.error(
             '[archiveAllConvos] Conversations archived but project recovery failed',
             error,
@@ -3569,6 +3587,7 @@ export function createConversationMethods(
         try {
           await refreshChatProjectStatsInBatches(mongoose, user, projectIds);
         } catch (error) {
+          options?.onUncertain?.(error);
           logger.error('[archiveAllConvos] Conversations archived but stats refresh failed', error);
         }
       }

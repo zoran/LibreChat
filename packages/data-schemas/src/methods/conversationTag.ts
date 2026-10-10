@@ -32,6 +32,7 @@ export async function decrementTagCounts(
   mongoose: typeof import('mongoose'),
   user: string,
   tags: string[],
+  onUncertain?: (error: unknown) => void,
 ): Promise<void> {
   if (!tags.length) {
     return;
@@ -72,8 +73,12 @@ export async function decrementTagCounts(
       },
     ]);
 
-    await tenantSafeBulkWrite(ConversationTag, bulkOps);
+    const result = await tenantSafeBulkWrite(ConversationTag, bulkOps);
+    if (onUncertain && result?.isOk?.() !== true) {
+      onUncertain(new Error('Tag count decrement was not acknowledged'));
+    }
   } catch (error) {
+    onUncertain?.(error);
     logger.error('[decrementTagCounts] Error decrementing tag counts', error);
   }
 }
@@ -158,7 +163,11 @@ export function createConversationTagMethods(mongoose: typeof import('mongoose')
     | null
   >;
   deleteConversationTags: (filter: Record<string, unknown>) => Promise<number>;
-  bulkIncrementTagCounts: (user: string, tags: string[]) => Promise<void>;
+  bulkIncrementTagCounts: (
+    user: string,
+    tags: string[],
+    onUncertain?: (error: unknown) => void,
+  ) => Promise<void>;
   updateTagsForConversation: (
     user: string,
     conversationId: string,
@@ -473,7 +482,11 @@ export function createConversationTagMethods(mongoose: typeof import('mongoose')
   /**
    * Increments tag counts for existing tags only.
    */
-  async function bulkIncrementTagCounts(user: string, tags: string[]): Promise<void> {
+  async function bulkIncrementTagCounts(
+    user: string,
+    tags: string[],
+    onUncertain?: (error: unknown) => void,
+  ): Promise<void> {
     if (!tags || tags.length === 0) {
       return;
     }
@@ -493,12 +506,16 @@ export function createConversationTagMethods(mongoose: typeof import('mongoose')
       }));
 
       const result = await tenantSafeBulkWrite(ConversationTag, bulkOps);
+      if (onUncertain && result?.isOk?.() !== true) {
+        onUncertain(new Error('Tag count increment was not acknowledged'));
+      }
       if (result && result.modifiedCount > 0) {
         logger.debug(
           `user: ${user} | Incremented tag counts - modified ${result.modifiedCount} tags`,
         );
       }
     } catch (error) {
+      onUncertain?.(error);
       logger.error('[bulkIncrementTagCounts] Error incrementing tag counts', error);
     }
   }

@@ -96,7 +96,11 @@ describe('shutdown wiring', () => {
     // fireScheduleNow dispatches with engineDeps directly (not the engine's
     // per-pass wrapper), so the shutdown gate must live on the base deps or a
     // manual Run Now POSTs into a closing listener.
-    expect(service.engineDeps.isShuttingDown).toBe(isShutdownInProgress);
+    expect(service.engineDeps.isShuttingDown?.()).toBe(isShutdownInProgress());
+    expect(service.pauseAdmissions('maintenance')).toBe(true);
+    expect(service.engineDeps.isShuttingDown?.()).toBe(true);
+    expect(service.resumeAdmissions('maintenance')).toBe(true);
+    expect(service.engineDeps.isShuttingDown?.()).toBe(isShutdownInProgress());
   });
 });
 
@@ -2168,5 +2172,24 @@ describe('provider-drained schedule aborts', () => {
       awaitProviderDrain: true,
     });
     expect(deleteJob).toHaveBeenCalledWith('c1', 7);
+  });
+});
+
+describe('schedule service maintenance census', () => {
+  it('keeps accepted settlement open while run-now is closed and fences census revisions', async () => {
+    const service = makeService(jest.fn(async (_userId: string) => []));
+    service.pauseAdmissions('drain');
+    await expect(service.fireScheduleNow({} as never, {} as never)).rejects.toThrow('paused');
+    const census = service.getMaintenanceCensus('drain');
+    service.resumeAdmissions('drain');
+    service.pauseAdmissions('next');
+    expect((await census).complete).toBe(false);
+    // The service still accepts restoration writes during closure.
+    await service.restoreUserSchedulesFromDeletion('user', 'delete-token');
+    expect(await service.getMaintenanceCensus('next')).toMatchObject({
+      admissionClosed: true,
+      complete: true,
+      pendingWrites: 0,
+    });
   });
 });

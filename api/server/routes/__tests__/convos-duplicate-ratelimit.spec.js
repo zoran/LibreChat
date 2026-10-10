@@ -1,3 +1,6 @@
+jest.mock('~/server/utils/import/importBatchBuilder', () => ({
+  createImportBatchBuilder: jest.fn(),
+}));
 const express = require('express');
 const request = require('supertest');
 
@@ -7,6 +10,8 @@ jest.mock('~/server/services/Config/app', () => ({ getAppConfig: jest.fn() }));
 jest.mock('@librechat/agents', () => require(MOCKS).agents());
 jest.mock('@librechat/api', () =>
   require(MOCKS).api({
+    ...jest.requireActual('../../../../packages/api/src/conversations/history'),
+    ...jest.requireActual('../../../../packages/api/src/conversations/historyHttp'),
     limiterCache: jest.fn(() => undefined),
     createContentFilter: jest.fn(() => (req, res, next) => next()),
     inspectContent: jest.fn(() => null),
@@ -43,7 +48,10 @@ jest.mock('~/server/middleware', () => {
 
 jest.mock('~/server/utils/import/fork', () => require(MOCKS).forkUtils());
 jest.mock('~/server/utils/import', () => require(MOCKS).importUtils());
-jest.mock('~/server/routes/files/multer', () => require(MOCKS).multerSetup());
+jest.mock('~/server/routes/files/multer', () => ({
+  ...require(MOCKS).multerSetup(),
+  createStorage: () => require(MOCKS).multerSetup().storage,
+}));
 jest.mock('multer', () => require(MOCKS).multerLib());
 jest.mock('~/server/services/Endpoints/azureAssistants', () => require(MOCKS).assistantEndpoint());
 jest.mock('~/server/services/Endpoints/assistants', () => require(MOCKS).assistantEndpoint());
@@ -57,6 +65,7 @@ jest.mock('~/server/services/Endpoints/agents/backgroundCompletion', () => ({
 describe('POST /api/convos/duplicate - Rate Limiting', () => {
   let app;
   let duplicateConversation;
+  let logViolation;
   const savedEnv = {};
 
   beforeAll(() => {
@@ -81,8 +90,10 @@ describe('POST /api/convos/duplicate - Rate Limiting', () => {
     jest.isolateModules(() => {
       const convosRouter = require('../convos');
       ({ duplicateConversation } = require('~/server/utils/import/fork'));
+      logViolation = require('~/cache/logViolation');
 
       app = express();
+      app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
       app.use(express.json());
       app.use((req, res, next) => {
         req.user = { id: 'rate-limit-test-user' };
@@ -98,6 +109,8 @@ describe('POST /api/convos/duplicate - Rate Limiting', () => {
 
   describe('user limit', () => {
     beforeEach(() => {
+      if (app)
+        app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
       process.env.FORK_USER_MAX = '2';
       process.env.FORK_USER_WINDOW = '1';
       process.env.FORK_IP_MAX = '100';
@@ -120,6 +133,39 @@ describe('POST /api/convos/duplicate - Rate Limiting', () => {
         .send({ conversationId: 'conv-123' });
       expect(res.status).toBe(429);
       expect(res.body.message).toMatch(/too many/i);
+    });
+
+    it('keeps the actual detached rejection handler admitted during violation persistence', async () => {
+      for (let i = 0; i < 2; i++) {
+        await request(app).post('/api/convos/duplicate').send({ conversationId: 'conv-123' });
+      }
+      let started, complete;
+      const entered = new Promise((resolve) => {
+        started = resolve;
+      });
+      logViolation.mockImplementationOnce(() => {
+        started();
+        return new Promise((resolve) => {
+          complete = resolve;
+        });
+      });
+      const rejected = request(app)
+        .post('/api/convos/duplicate')
+        .send({ conversationId: 'conv-123' })
+        .then((r) => r);
+      await entered;
+      // The limiter's own promise has returned; only its detached handler remains.
+      await new Promise((resolve) => setImmediate(resolve));
+      const owner = app.locals.historyMaintenance;
+      owner.pauseAdmissions('a');
+      expect((await owner.getMaintenanceCensus('a')).queuedContinuations).toBe(1);
+      complete();
+      expect((await rejected).status).toBe(429);
+      expect(await owner.getMaintenanceCensus('a')).toMatchObject({
+        pendingWrites: 0,
+        queuedContinuations: 0,
+        complete: true,
+      });
     });
   });
 

@@ -18,6 +18,7 @@ import type { SerializableJobData } from '../stream/interfaces/IJobStore';
 import type { AgentCheckpointGeneration } from '../agents/checkpointer';
 import type { BalanceUpdateFields } from '../types/balance';
 import type { GetAppConfigOptions } from '../app/service';
+import type { ApplicationWorkPort } from '~/app';
 import {
   resolveScheduleProjectId,
   DEFAULT_SCHEDULE_LIMITS,
@@ -186,7 +187,8 @@ export interface SchedulesServiceDeps {
   getTriggerDelivery: ScheduleEngineDeps['getTriggerDelivery'];
 }
 
-export interface SchedulesService {
+export interface SchedulesService extends ApplicationWorkPort {
+  clearScheduledJob: ScheduleEngineDeps['clearReconciledJob'];
   getLimits: (user?: ScheduleUserContext) => Promise<ScheduleLimits>;
   engineDeps: ScheduleEngineDeps;
   fireScheduleNow: (
@@ -330,6 +332,27 @@ export function createSchedulesService(
   deps: SchedulesServiceDeps,
   timings?: ScheduleServiceTimings,
 ): SchedulesService {
+  let pausedBy: string | undefined;
+  let revision = 0;
+  let pending = 0;
+  let unconfirmed = false;
+  const onUnconfirmedWork = () => {
+    unconfirmed = true;
+  };
+  const observe =
+    <A extends unknown[], R>(fn: (...args: A) => Promise<R>, admission = false) =>
+    async (...args: A): Promise<R> => {
+      if (admission && pausedBy) throw new Error('Schedule admission is paused for maintenance');
+      pending++;
+      try {
+        return await fn(...args);
+      } catch (error) {
+        unconfirmed = true;
+        throw error;
+      } finally {
+        pending--;
+      }
+    };
   const { methods } = deps;
 
   // Fail LOUDLY at construction, not per-fire. The JS adapter (api/server/services/
@@ -475,7 +498,8 @@ export function createSchedulesService(
     // On the BASE deps, not only the engine's per-pass wrapper: fireScheduleNow
     // (manual Run Now) dispatches with these deps directly, and its POST must be
     // gated by the same coordinator signal as the engine tick's.
-    isShuttingDown: isShutdownInProgress,
+    isShuttingDown: () => !!pausedBy || isShutdownInProgress(),
+    onUnconfirmedWork,
     getUserContext: async (userId) => {
       const user = await deps.findUserById(userId);
       if (user == null) {
@@ -569,7 +593,10 @@ export function createSchedulesService(
       // lapses later and resolveFiles drops the reaped file (droppedFileIds records it).
       await methods
         .extendFilesTTL(fileIds, SCHEDULE_FILE_HOLD, { user: user.id, tenantId: user.tenantId })
-        .catch((err) => logger.warn('[schedules] attachment hold renewal failed:', err));
+        .catch((err) => {
+          onUnconfirmedWork();
+          logger.warn('[schedules] attachment hold renewal failed:', err);
+        });
       const files = await methods.getFiles(
         { file_id: { $in: fileIds }, user: user.id },
         null,
@@ -727,11 +754,10 @@ export function createSchedulesService(
       // proof still holds and the existing owner-death backstop remains valid.
       canInferOwnerDeathFromMissingJob: isTopologySafeToArm(),
     });
+    if (pausedBy) erasureSweep.pauseAdmissions(pausedBy);
   }
 
-  async function initializeScheduleEngine(): Promise<
-    ReturnType<typeof startScheduleEngine> | undefined
-  > {
+  async function initializeEngine(): Promise<ReturnType<typeof startScheduleEngine> | undefined> {
     if (engine != null) {
       return engine;
     }
@@ -766,6 +792,7 @@ export function createSchedulesService(
     try {
       await runAsSystem(() => methods.ensureScheduleIndexes());
     } catch (err) {
+      onUnconfirmedWork();
       logger.error(
         '[schedules] index creation failed — scheduler NOT started (fires need the unique idempotency index):',
         err,
@@ -773,15 +800,24 @@ export function createSchedulesService(
       startErasureFallback();
       return undefined;
     }
-    engine = startScheduleEngine(engineDeps);
+    engine = startScheduleEngine(engineDeps, pausedBy);
     if (erasureSweep != null) {
       // A later successful arm supersedes the fallback: the engine's reconcile pass
       // owns erasure from here.
       erasureSweep.stop();
-      erasureSweep = undefined;
+      // Retain the stopped sweep until its already accepted writes settle.
     }
     return engine;
   }
+
+  let initialization: Promise<ReturnType<typeof startScheduleEngine> | undefined> | undefined;
+  const initializeScheduleEngine = () => {
+    if (initialization) return initialization;
+    initialization = observe(initializeEngine)().finally(() => {
+      initialization = undefined;
+    });
+    return initialization;
+  };
 
   /**
    * The clustered entrypoint's ONLY schedule maintenance. The fallback erases soft-deleted
@@ -827,15 +863,21 @@ export function createSchedulesService(
         signal: options?.signal,
       });
     } catch (err) {
+      onUnconfirmedWork();
       const released =
         claimToken != null
-          ? await methods.releaseLease(schedule.id, claimToken).catch(() => false)
+          ? await methods.releaseLease(schedule.id, claimToken).catch(() => {
+              onUnconfirmedWork();
+              return false;
+            })
           : false;
       if (!released && leased.leaseBy != null) {
         // An owner edit during the failed preflight rotates the token while preserving
         // this unique holder. Clear only that holder; a takeover has a different value
         // and is therefore never stripped by this exception safety net.
-        await methods.releaseLeaseByHolder(schedule.id, leased.leaseBy).catch(() => undefined);
+        await methods.releaseLeaseByHolder(schedule.id, leased.leaseBy).catch(() => {
+          onUnconfirmedWork();
+        });
       }
       throw err;
     }
@@ -952,6 +994,7 @@ export function createSchedulesService(
         logger.info(
           `[schedules] deferring terminal settlement for ${scheduleId}: interactive Stop persistence is still unacknowledged`,
         );
+        onUnconfirmedWork();
         return false;
       }
       mcp = observed;
@@ -979,6 +1022,7 @@ export function createSchedulesService(
           jobCreatedAt,
         );
       } catch (err) {
+        onUnconfirmedWork();
         logger.error('[schedules] failed to retain terminal outcome evidence:', err);
         return false;
       }
@@ -1012,6 +1056,7 @@ export function createSchedulesService(
         // guarded no-op for live schedules (the erase filters on `deleting: true`).
         if (status !== 'requires_action') {
           await methods.eraseScheduleIfDrained(scheduleId).catch((err) => {
+            onUnconfirmedWork();
             logger.warn(`[schedules] erase-on-settle failed for ${scheduleId}:`, err);
           });
         }
@@ -1021,6 +1066,7 @@ export function createSchedulesService(
             { preserveForScheduleReconcile: false },
             jobCreatedAt,
           ).catch((err) => {
+            onUnconfirmedWork();
             logger.warn('[schedules] failed to release terminal outcome evidence:', err);
           });
 
@@ -1028,7 +1074,10 @@ export function createSchedulesService(
           // In that case the manager's normal drain-time cleanup has already passed;
           // reap the exact terminal job after the Mongo outcome becomes durable.
           const store = GenerationJobManager.getJobStore();
-          const job = await store?.getJob(streamId).catch(() => null);
+          const job = await store?.getJob(streamId).catch(() => {
+            onUnconfirmedWork();
+            return null;
+          });
           if (
             job?.createdAt === jobCreatedAt &&
             job.providerDrained !== false &&
@@ -1038,18 +1087,21 @@ export function createSchedulesService(
             job.preserveForScheduleReconcile !== true
           ) {
             await store?.deleteJob(streamId, jobCreatedAt).catch((err) => {
+              onUnconfirmedWork();
               logger.warn('[schedules] failed to clear settled generation evidence:', err);
             });
           }
         }
         return true;
       } catch (err) {
+        if (attempt === OUTCOME_RETRY_ATTEMPTS) onUnconfirmedWork();
         logger.error(
           `[schedules] failed to record run outcome (attempt ${attempt}/${OUTCOME_RETRY_ATTEMPTS}):`,
           err,
         );
       }
     }
+    onUnconfirmedWork();
     return false;
   }
 
@@ -1095,7 +1147,10 @@ export function createSchedulesService(
       status: settle.status,
       conversationId: settle.conversationId,
       error: settle.error,
-    }).catch((err) => logger.warn('[schedules] post-acknowledgement settlement failed:', err));
+    }).catch((err) => {
+      onUnconfirmedWork();
+      logger.warn('[schedules] post-acknowledgement settlement failed:', err);
+    });
   }
 
   async function isScheduleLive(
@@ -1352,6 +1407,7 @@ export function createSchedulesService(
       try {
         await methods.requestRunAbort(run.scheduleId, run.scheduledFor, 'deletion');
       } catch (err) {
+        onUnconfirmedWork();
         logger.warn('[schedules] failed to record abort request; abort withheld:', err);
         return false;
       }
@@ -1363,6 +1419,7 @@ export function createSchedulesService(
         { preserve },
       )
       .catch((err) => {
+        onUnconfirmedWork();
         logger.warn('[schedules] failed to abort run job on quiesce:', err);
         return false;
       });
@@ -1388,7 +1445,10 @@ export function createSchedulesService(
         scheduleId: run.scheduleId,
         scheduledFor: run.scheduledFor,
       })
-      .catch((err) => logger.warn('[schedules] failed to clear deleted run evidence:', err));
+      .catch((err) => {
+        onUnconfirmedWork();
+        logger.warn('[schedules] failed to clear deleted run evidence:', err);
+      });
     return true;
   }
 
@@ -1436,12 +1496,14 @@ export function createSchedulesService(
     // must not cost the aborts below.
     const checkpointer = hasPausedRun
       ? await resolveOwnerCheckpointer(schedule.user).catch((err) => {
+          onUnconfirmedWork();
           logger.warn(`[schedules] checkpointer lookup failed for delete ${scheduleId}:`, err);
           return undefined;
         })
       : undefined;
     const stores = hasPausedRun
       ? await checkpointStorageConfigs(userId, schedule.tenantId, checkpointer).catch((err) => {
+          onUnconfirmedWork();
           logger.warn(
             `[schedules] checkpoint storage lookup failed for delete ${scheduleId}:`,
             err,
@@ -1589,9 +1651,9 @@ export function createSchedulesService(
         const ownsConversation = fresh.known && (fresh.job == null || freshIsThisGeneration);
         if (ownsConversation) {
           for (const { storage, generation } of captured) {
-            await deleteAgentCheckpoint(run.conversationId, storage, generation).catch(
-              () => undefined,
-            );
+            await deleteAgentCheckpoint(run.conversationId, storage, generation).catch(() => {
+              onUnconfirmedWork();
+            });
           }
         }
       }
@@ -1616,6 +1678,7 @@ export function createSchedulesService(
       }
     }
     const erased = await methods.eraseScheduleIfDrained(scheduleId).catch((err) => {
+      onUnconfirmedWork();
       logger.warn(`[schedules] erase failed for ${scheduleId}:`, err);
       return false;
     });
@@ -1720,6 +1783,7 @@ export function createSchedulesService(
           })
           .then(() => true)
           .catch((err) => {
+            onUnconfirmedWork();
             logger.warn('[schedules] failed to settle run on quiesce:', err);
             return false;
           });
@@ -1790,22 +1854,68 @@ export function createSchedulesService(
     await methods.restoreUserSchedulesFromDeletion(userId, token);
   }
 
+  const children = () =>
+    [engine, erasureSweep].filter((child): child is NonNullable<typeof child> => child != null);
   return {
+    pauseAdmissions(requestId) {
+      if (!requestId || (pausedBy && pausedBy !== requestId)) return false;
+      pausedBy = requestId;
+      revision++;
+      const results = children().map((child) => child.pauseAdmissions(requestId));
+      return results.every(Boolean);
+    },
+    resumeAdmissions(requestId) {
+      if (pausedBy !== requestId || unconfirmed) return false;
+      const current = children();
+      for (const child of current) {
+        if (!child.resumeAdmissions(requestId)) {
+          current.forEach((owner) => owner.pauseAdmissions(requestId));
+          return false;
+        }
+      }
+      pausedBy = undefined;
+      revision++;
+      return true;
+    },
+    async getMaintenanceCensus(requestId) {
+      const before = revision;
+      const current = children();
+      const states = await Promise.all(
+        current.map((child) => child.getMaintenanceCensus(requestId)),
+      );
+      const unchanged =
+        before === revision &&
+        current.length === children().length &&
+        current.every((child, index) => child === children()[index]);
+      return {
+        admissionClosed:
+          !!requestId && pausedBy === requestId && states.every((state) => state.admissionClosed),
+        queuedContinuations:
+          pending + states.reduce((sum, state) => sum + state.queuedContinuations, 0),
+        pendingWrites: pending + states.reduce((sum, state) => sum + state.pendingWrites, 0),
+        complete:
+          unchanged &&
+          !unconfirmed &&
+          (pausedBy == null || pausedBy === requestId) &&
+          states.every((state) => state.complete),
+      };
+    },
+    clearScheduledJob: observe(engineDeps.clearReconciledJob),
     getLimits,
     engineDeps,
-    fireScheduleNow,
-    recordScheduleOutcome,
-    recordMCPToolAuthFailure,
-    beginScheduledStop,
-    acknowledgeScheduledStopPersistence,
-    claimScheduleResume,
-    releaseScheduleResumeClaim,
-    finalizeScheduleResumeClaim,
-    releaseScheduleResumeFence,
+    fireScheduleNow: observe(fireScheduleNow, true),
+    recordScheduleOutcome: observe(recordScheduleOutcome),
+    recordMCPToolAuthFailure: observe(recordMCPToolAuthFailure),
+    beginScheduledStop: observe(beginScheduledStop),
+    acknowledgeScheduledStopPersistence: observe(acknowledgeScheduledStopPersistence),
+    claimScheduleResume: observe(claimScheduleResume, true),
+    releaseScheduleResumeClaim: observe(releaseScheduleResumeClaim),
+    finalizeScheduleResumeClaim: observe(finalizeScheduleResumeClaim),
+    releaseScheduleResumeFence: observe(releaseScheduleResumeFence),
     isScheduleLive,
-    deleteScheduleForOwner,
-    quiesceUserSchedules,
-    restoreUserSchedulesFromDeletion,
+    deleteScheduleForOwner: observe(deleteScheduleForOwner),
+    quiesceUserSchedules: observe(quiesceUserSchedules),
+    restoreUserSchedulesFromDeletion: observe(restoreUserSchedulesFromDeletion),
     initializeScheduleEngine,
     initializeScheduleErasureSweep,
   };

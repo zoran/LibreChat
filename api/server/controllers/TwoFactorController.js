@@ -1,3 +1,4 @@
+const { authUserMutation } = require('~/server/services/LegacyAuthMaintenance');
 const { encryptV3, logger } = require('@librechat/data-schemas');
 const {
   verifyOTPOrBackupCode,
@@ -43,7 +44,7 @@ const enable2FA = async (req, res) => {
     const { plainCodes, codeObjects } = await generateBackupCodes();
     const encryptedSecret = encryptV3(secret);
 
-    const user = await updateUser(userId, {
+    const user = await authUserMutation(updateUser, userId, {
       pendingTotpSecret: encryptedSecret,
       pendingBackupCodes: codeObjects,
     });
@@ -119,7 +120,7 @@ const confirm2FA = async (req, res) => {
       if (user.pendingBackupCodes?.length) {
         update.backupCodes = user.pendingBackupCodes;
       }
-      await updateUser(userId, update);
+      await authUserMutation(updateUser, userId, update);
       return res.status(200).json();
     }
     return res.status(400).json({ message: 'Invalid token.' });
@@ -151,7 +152,7 @@ const disable2FA = async (req, res) => {
         return res.status(result.status ?? 400).json({ message: msg });
       }
     }
-    await updateUser(userId, {
+    await authUserMutation(updateUser, userId, {
       totpSecret: null,
       backupCodes: [],
       twoFactorEnabled: false,
@@ -190,7 +191,7 @@ const regenerateBackupCodes = async (req, res) => {
     }
 
     const { plainCodes, codeObjects } = await generateBackupCodes();
-    await updateUser(userId, { backupCodes: codeObjects });
+    await authUserMutation(updateUser, userId, { backupCodes: codeObjects });
     return res.status(200).json({
       backupCodes: plainCodes,
       backupCodesHash: codeObjects,

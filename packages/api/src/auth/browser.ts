@@ -7,6 +7,7 @@ import type {
 } from '@librechat/data-schemas';
 import type { Request, RequestHandler, Response } from 'express';
 import type { Store } from 'express-rate-limit';
+import type { ApplicationWorkPort } from '~/app';
 
 export const BROWSER_COOKIE = '__Host-librechat-browser';
 const cookieOptions = { httpOnly: true, secure: true, sameSite: 'strict', path: '/' } as const;
@@ -45,12 +46,42 @@ function failure(res: Response, status: number, code: string): void {
 }
 
 /** Mount after the existing cookie-parser owner. Legacy auth falls through; storage/signing are injected. */
-export function createBrowserAuth(deps: BrowserAuthDependencies): {
+export function createBrowserAuth(deps: BrowserAuthDependencies): ApplicationWorkPort & {
   bootstrap: RequestHandler;
   refresh: RequestHandler;
   forget: RequestHandler;
   reset: RequestHandler;
 } {
+  let maintenanceRequest: string | null = null;
+  let revision = 0;
+  let active = 0;
+  let pendingWrites = 0;
+  let uncertainWrites = false;
+  async function write<T>(action: () => Promise<T>): Promise<T> {
+    pendingWrites++;
+    try {
+      return await action();
+    } catch (error) {
+      uncertainWrites = true;
+      throw error;
+    } finally {
+      pendingWrites--;
+    }
+  }
+  const own =
+    (handler: RequestHandler): RequestHandler =>
+    async (req, res, next) => {
+      if (maintenanceRequest !== null) {
+        failure(res, 503, 'APP_QUIESCING');
+        return;
+      }
+      active++;
+      try {
+        await handler(req, res, next);
+      } finally {
+        active--;
+      }
+    };
   const configs = new WeakMap<Request, AppConfig>();
   const loadConfig = async (req: Request) => {
     let config = configs.get(req);
@@ -101,9 +132,8 @@ export function createBrowserAuth(deps: BrowserAuthDependencies): {
     try {
       const config = await loadConfig(req);
       const seconds = config.registration?.browserSession?.maxAgeSeconds ?? 15_552_000;
-      const identity = await deps.enrollBrowserIdentity(
-        new Date(Date.now() + seconds * 1000),
-        config.balance,
+      const identity = await write(() =>
+        deps.enrollBrowserIdentity(new Date(Date.now() + seconds * 1000), config.balance),
       );
       const token = await deps.mintToken(identity.user);
       res.cookie(BROWSER_COOKIE, identity.credential, {
@@ -144,13 +174,20 @@ export function createBrowserAuth(deps: BrowserAuthDependencies): {
         await sendIdentity(res, identity);
         return;
       }
-      return limiter(req, res, (error) => {
-        if (error) {
-          next(error);
-          return;
-        }
-        void enroll(req, res, next);
-      });
+      let enrollment: Promise<unknown> | undefined;
+      // express-rate-limit awaits its store before invoking next/denial. Its next
+      // callback does not join enrollment, so retain that actual child explicitly.
+      await write(async () =>
+        limiter(req, res, (error) => {
+          if (error) {
+            uncertainWrites = true;
+            next(error);
+            return;
+          }
+          enrollment = Promise.resolve(enroll(req, res, next));
+        }),
+      );
+      await enrollment;
     } catch {
       failure(res, 503, 'BROWSER_SESSION_UNAVAILABLE');
     }
@@ -191,7 +228,7 @@ export function createBrowserAuth(deps: BrowserAuthDependencies): {
       return;
     }
     try {
-      await deps.revokeBrowserIdentity(credential);
+      await write(() => deps.revokeBrowserIdentity(credential));
       res.clearCookie(BROWSER_COOKIE, cookieOptions);
       next();
     } catch {
@@ -220,5 +257,43 @@ export function createBrowserAuth(deps: BrowserAuthDependencies): {
     });
   };
 
-  return { bootstrap, refresh, forget, reset };
+  return {
+    bootstrap: own(bootstrap),
+    refresh: own(refresh),
+    forget: own(forget),
+    reset: own(reset),
+    pauseAdmissions: (requestId) => {
+      if (
+        typeof requestId !== 'string' ||
+        !/^[A-Za-z0-9_-]{1,128}$/.test(requestId) ||
+        (maintenanceRequest !== null && maintenanceRequest !== requestId)
+      )
+        return false;
+      if (maintenanceRequest === requestId) return true;
+      maintenanceRequest = requestId;
+      revision++;
+      return true;
+    },
+    resumeAdmissions: (requestId) => {
+      if (maintenanceRequest !== requestId || uncertainWrites) return false;
+      maintenanceRequest = null;
+      revision++;
+      return true;
+    },
+    getMaintenanceCensus: async (requestId) => {
+      const sampledRevision = revision;
+      const matches = requestId === maintenanceRequest;
+      await Promise.resolve();
+      return {
+        admissionClosed: maintenanceRequest !== null,
+        queuedContinuations: active,
+        pendingWrites,
+        complete:
+          matches &&
+          requestId === maintenanceRequest &&
+          sampledRevision === revision &&
+          !uncertainWrites,
+      };
+    },
+  };
 }

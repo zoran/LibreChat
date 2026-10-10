@@ -84,3 +84,27 @@ describe('startGitHubSkillSyncScheduler', () => {
     scheduler.stop();
   });
 });
+
+it('keeps startup work visible and observes closure before a delayed config can launch', async () => {
+  let configured!: (value: SkillSyncConfig) => void;
+  const run = runner();
+  const scheduler = startGitHubSkillSyncScheduler({
+    getConfig: () =>
+      new Promise((resolve) => {
+        configured = resolve;
+      }),
+    runner: run,
+  });
+  scheduler.pauseAdmissions('drain');
+  expect((await scheduler.getMaintenanceCensus('drain')).pendingWrites).toBe(1);
+  configured({
+    github: { enabled: true, intervalMinutes: 60, sources: [source], runOnStartup: true },
+  });
+  await flushPromises();
+  expect(run.runOnce).not.toHaveBeenCalled();
+  expect(await scheduler.getMaintenanceCensus('drain')).toMatchObject({
+    complete: true,
+    pendingWrites: 0,
+  });
+  scheduler.stop();
+});

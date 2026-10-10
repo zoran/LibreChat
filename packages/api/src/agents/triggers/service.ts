@@ -26,15 +26,16 @@ import type {
 } from './host';
 import type { AgentTriggerEnqueueOptions, PreparedAgentTriggerDelivery } from './delivery';
 import type { BoundAddress } from '../../app/origin';
+import type { ApplicationWorkPort } from '~/app';
 import { AgentTriggerDeliveryDeferredError, createAgentTriggerDeliveryEngine } from './engine';
+import { AgentTriggerExecutionError, createAgentTriggerExecutionHost } from './host';
+import { AgentTriggerDeliveryError, prepareAgentTriggerDelivery } from './delivery';
 import { BACKGROUND_TOOL_COMPLETION_SOURCE } from '../backgroundCompletionWakeup';
+import { AgentTriggerEnvelopeError, parseAgentTriggerEnvelope } from './envelope';
 import { isShutdownInProgress, registerShutdownTask } from '../../app/shutdown';
 import { SUBAGENT_COMPLETION_SOURCE } from '../subagentCompletionWakeup';
 import { generateAgentTriggerToken } from '../../crypto/jwt';
-import { prepareAgentTriggerDelivery } from './delivery';
 import { selfOriginFromAddress } from '../../app/origin';
-import { createAgentTriggerExecutionHost } from './host';
-import { parseAgentTriggerEnvelope } from './envelope';
 import { createIdleRecoveryLoop } from '../recovery';
 import { WAITING_RETRY_CAP_MS } from './backoff';
 
@@ -190,7 +191,7 @@ export interface AgentTriggerDeliveryPersistence {
   deleteAgentTriggerDeliveriesByUser: (userId: string) => Promise<void>;
 }
 
-export interface AgentTriggerService {
+export interface AgentTriggerService extends ApplicationWorkPort {
   initialize: (options?: AgentTriggerServiceOptions) => Promise<void>;
   stop: () => Promise<void>;
   dispatch: (
@@ -350,6 +351,39 @@ export function createAgentTriggerService(deps: AgentTriggerServiceDeps = {}): A
   if (!Number.isSafeInteger(purgeRecoveryLimit) || purgeRecoveryLimit <= 0) {
     throw new TypeError('purgeRecoveryLimit must be a positive integer');
   }
+  let pausedBy: string | undefined;
+  let revision = 0;
+  let pending = 0;
+  let unconfirmed = false;
+  const observe =
+    <A extends unknown[], R>(
+      fn: (...args: A) => Promise<R>,
+      admission = false,
+      requireTrue = false,
+    ) =>
+    async (...args: A): Promise<R> => {
+      if (admission && pausedBy)
+        throw new AgentTriggerServiceUnavailableError(
+          'Agent trigger admission is paused for maintenance',
+        );
+      pending++;
+      try {
+        const result = await fn(...args);
+        if (requireTrue && result === false) unconfirmed = true;
+        return result;
+      } catch (error) {
+        const definite =
+          admission &&
+          (error instanceof AgentTriggerDeliveryError ||
+            error instanceof AgentTriggerEnvelopeError ||
+            error instanceof AgentTriggerServiceUnavailableError ||
+            (error instanceof AgentTriggerExecutionError && error.certainty === 'definite'));
+        if (!definite) unconfirmed = true;
+        throw error;
+      } finally {
+        pending--;
+      }
+    };
   let boundOrigin: string | undefined;
   let backgroundCompletionResultBatchSize = 8;
   let completionWaitMaxIntervalMs = WAITING_RETRY_CAP_MS;
@@ -463,6 +497,7 @@ export function createAgentTriggerService(deps: AgentTriggerServiceDeps = {}): A
         return await run();
       } catch (error) {
         failed = true;
+        unconfirmed = true;
         logger.error(
           `[agent-triggers] durable delivery maintenance step failed (${label}):`,
           error,
@@ -488,6 +523,7 @@ export function createAgentTriggerService(deps: AgentTriggerServiceDeps = {}): A
           (count) => ({ succeeded: true as const, count }),
           (error) => {
             failed = true;
+            unconfirmed = true;
             logger.error(
               '[agent-triggers] durable delivery maintenance step failed (batch receipts):',
               error,
@@ -548,6 +584,7 @@ export function createAgentTriggerService(deps: AgentTriggerServiceDeps = {}): A
       );
     })
       .catch((error) => {
+        unconfirmed = true;
         logger.error('[agent-triggers] durable delivery maintenance failed:', error);
         return false;
       })
@@ -574,22 +611,24 @@ export function createAgentTriggerService(deps: AgentTriggerServiceDeps = {}): A
     if (expedite == null || !deliveryReady || stopping) {
       return;
     }
-    void runAsSystem(() =>
-      expedite({
-        ...('user' in input
-          ? {
-              user: input.user,
-              conversationId: input.conversationId,
-              ...(input.taskIds != null && { taskIds: input.taskIds }),
-            }
-          : { deliveryKeys: input.deliveryKeys }),
-        sourceIds:
-          'user' in input && input.taskIds != null
-            ? [SUBAGENT_COMPLETION_SOURCE]
-            : COMPLETION_WAKEUP_SOURCES,
-        now: new Date(),
-      }),
-    )
+    void observe(() =>
+      runAsSystem(() =>
+        expedite({
+          ...('user' in input
+            ? {
+                user: input.user,
+                conversationId: input.conversationId,
+                ...(input.taskIds != null && { taskIds: input.taskIds }),
+              }
+            : { deliveryKeys: input.deliveryKeys }),
+          sourceIds:
+            'user' in input && input.taskIds != null
+              ? [SUBAGENT_COMPLETION_SOURCE]
+              : COMPLETION_WAKEUP_SOURCES,
+          now: new Date(),
+        }),
+      ),
+    )()
       .then(() => deliveryEngine?.wake())
       .catch((error) =>
         logger.warn('[agent-triggers] failed to expedite waiting completion deliveries:', error),
@@ -616,7 +655,7 @@ export function createAgentTriggerService(deps: AgentTriggerServiceDeps = {}): A
     });
   }
 
-  return {
+  const service: Omit<AgentTriggerService, keyof ApplicationWorkPort> = {
     initialize: (options = {}) => {
       backgroundCompletionResultBatchSize = options.completionResultBatchSize ?? 8;
       completionWaitMaxIntervalMs =
@@ -647,6 +686,7 @@ export function createAgentTriggerService(deps: AgentTriggerServiceDeps = {}): A
           onError: (error) =>
             logger.error('[agent-triggers] durable delivery maintenance failed:', error),
         });
+        if (pausedBy) purgeRecoveryLoop.pauseAdmissions(pausedBy);
         await methods.ensureAgentTriggerDeliveryIndexes();
         if (stopping || isShutdownInProgress()) {
           throw new AgentTriggerServiceUnavailableError(
@@ -670,6 +710,7 @@ export function createAgentTriggerService(deps: AgentTriggerServiceDeps = {}): A
             }),
           },
         );
+        if (pausedBy) deliveryEngine.pauseAdmissions(pausedBy);
         deliveryReady = true;
         deliveryEngine.start();
         /** Deliveries waiting on a parent resume that parent's conversation, so a
@@ -842,5 +883,71 @@ export function createAgentTriggerService(deps: AgentTriggerServiceDeps = {}): A
         );
         purgeRecoveryLoop?.wake();
       }),
+  };
+  const children = () =>
+    [deliveryEngine, purgeRecoveryLoop].filter(
+      (child): child is NonNullable<typeof child> => child != null,
+    );
+  return {
+    ...service,
+    pauseAdmissions(requestId) {
+      if (!requestId || (pausedBy && pausedBy !== requestId)) return false;
+      pausedBy = requestId;
+      revision++;
+      const results = children().map((child) => child.pauseAdmissions(requestId));
+      return results.every(Boolean);
+    },
+    resumeAdmissions(requestId) {
+      if (pausedBy !== requestId || stopping || unconfirmed) return false;
+      const current = children();
+      for (const child of current) {
+        if (!child.resumeAdmissions(requestId)) {
+          current.forEach((owner) => owner.pauseAdmissions(requestId));
+          return false;
+        }
+      }
+      pausedBy = undefined;
+      revision++;
+      return true;
+    },
+    async getMaintenanceCensus(requestId) {
+      const before = revision;
+      const current = children();
+      const states = await Promise.all(
+        current.map((child) => child.getMaintenanceCensus(requestId)),
+      );
+      return {
+        admissionClosed:
+          (stopping || (!!requestId && pausedBy === requestId)) &&
+          states.every((state) => state.admissionClosed),
+        queuedContinuations:
+          pending + states.reduce((sum, state) => sum + state.queuedContinuations, 0),
+        pendingWrites: pending + states.reduce((sum, state) => sum + state.pendingWrites, 0),
+        complete:
+          deps.methods != null &&
+          before === revision &&
+          current.length === children().length &&
+          current.every((child, index) => child === children()[index]) &&
+          !unconfirmed &&
+          (pausedBy == null || pausedBy === requestId) &&
+          states.every((state) => state.complete),
+      };
+    },
+    initialize: observe(service.initialize),
+    dispatch: observe(service.dispatch, true),
+    enqueue: observe(service.enqueue, true),
+    requeue: observe(service.requeue, true),
+    retire: observe(service.retire),
+    renewProducerLease: observe(service.renewProducerLease, false, true),
+    persistBackgroundToolResult: observe(service.persistBackgroundToolResult, false, true),
+    releaseBackgroundToolResultClaims: observe(
+      service.releaseBackgroundToolResultClaims,
+      false,
+      true,
+    ),
+    drainUser: observe(service.drainUser),
+    prepareUserPurge: observe(service.prepareUserPurge),
+    cancelUserPurge: observe(service.cancelUserPurge),
+    purgeUser: observe(service.purgeUser),
   };
 }

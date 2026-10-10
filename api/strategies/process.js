@@ -1,3 +1,4 @@
+const { authMutation, authUserMutation } = require('~/server/services/LegacyAuthMaintenance');
 const { getBalanceConfig } = require('@librechat/api');
 const { FileSources } = require('librechat-data-provider');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
@@ -38,7 +39,11 @@ const handleExistingUser = async (oldUser, avatarUrl, appConfig, email) => {
       input: avatarUrl,
     });
     const { processAvatar } = getStrategyFunctions(fileStrategy);
-    updatedAvatar = await processAvatar({ buffer: resizedBuffer, userId, manual: 'false' });
+    updatedAvatar = await authMutation(processAvatar, {
+      buffer: resizedBuffer,
+      userId,
+      manual: 'false',
+    });
   }
 
   if (updatedAvatar) {
@@ -51,7 +56,7 @@ const handleExistingUser = async (oldUser, avatarUrl, appConfig, email) => {
   }
 
   if (Object.keys(updates).length > 0) {
-    await updateUser(oldUser._id, updates);
+    await authUserMutation(updateUser, oldUser._id, updates);
   }
 };
 
@@ -98,7 +103,7 @@ const createSocialUser = async ({
   };
 
   const balanceConfig = getBalanceConfig(appConfig);
-  const newUserId = await createUser(update, balanceConfig);
+  const newUserId = await authMutation(createUser, update, balanceConfig);
   const fileStrategy = appConfig?.fileStrategy ?? process.env.CDN_PROVIDER;
   const isLocal = fileStrategy === FileSources.local;
 
@@ -108,12 +113,12 @@ const createSocialUser = async ({
       input: avatarUrl,
     });
     const { processAvatar } = getStrategyFunctions(fileStrategy);
-    const avatar = await processAvatar({
+    const avatar = await authMutation(processAvatar, {
       buffer: resizedBuffer,
       userId: newUserId,
       manual: 'false',
     });
-    await updateUser(newUserId, { avatar });
+    await authUserMutation(updateUser, newUserId, { avatar });
   }
 
   return await getUserById(newUserId);

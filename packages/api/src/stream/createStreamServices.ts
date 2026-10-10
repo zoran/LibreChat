@@ -53,7 +53,8 @@ export interface StreamServices {
  *
  * Automatically detects Redis from cacheConfig.USE_REDIS_STREAMS and uses
  * the existing ioredisClient. Falls back to in-memory if Redis
- * is not configured or not available.
+ * is not configured or not available in legacy mode. Selected Sentinel mode rejects
+ * missing clients and construction errors without substituting local state.
  *
  * USE_REDIS_STREAMS defaults to USE_REDIS if not explicitly set,
  * allowing users to disable Redis for streams while keeping it for other caches.
@@ -75,6 +76,11 @@ export function createStreamServices(config: StreamServicesConfig = {}): StreamS
   const redisClient = config.redisClient ?? ioredisClient;
   const { redisSubscriber, inMemoryOptions } = config;
 
+  const required = cacheConfig.SHARED_STATE?.mode === 'sentinel';
+  if (required && (!useRedis || !redisClient)) {
+    throw new Error('Shared-state stream client unavailable');
+  }
+  let ownedSubscriber: Redis | Cluster | undefined;
   // Check if we should and can use Redis
   if (useRedis && redisClient) {
     try {
@@ -84,10 +90,14 @@ export function createStreamServices(config: StreamServicesConfig = {}): StreamS
 
       if (!subscriber && 'duplicate' in redisClient) {
         subscriber = createIoRedisSubscriber(redisClient, '[StreamServices] subscriber');
+        ownedSubscriber = subscriber;
         logger.info('[StreamServices] Duplicated Redis client for subscriber');
       }
 
       if (!subscriber) {
+        if (required) {
+          throw new Error('Shared-state subscriber unavailable');
+        }
         logger.warn('[StreamServices] No subscriber client available, falling back to in-memory');
         return createInMemoryServices(inMemoryOptions);
       }
@@ -103,6 +113,10 @@ export function createStreamServices(config: StreamServicesConfig = {}): StreamS
         isRedis: true,
       };
     } catch (err) {
+      if (required) {
+        ownedSubscriber?.disconnect();
+        throw err;
+      }
       logger.error(
         '[StreamServices] Failed to create Redis services, falling back to in-memory:',
         err,

@@ -22,6 +22,8 @@ export interface AgentExecutionEnrollmentParams {
   conversationId: string;
   agentId: string;
   protocol: 'chat.completions' | 'responses';
+  requestFingerprint?: string;
+  tenantId?: string;
   isPrincipalActive: (userId: string) => Promise<boolean>;
 }
 
@@ -130,7 +132,9 @@ export class AgentExecutionEnrollment {
       terminalError = settleError;
     }
 
-    await Promise.allSettled(this.trailingWrites);
+    const trailingResults = await Promise.allSettled(this.trailingWrites);
+    const trailingFailed = trailingResults.some((result) => result.status === 'rejected');
+    if (trailingFailed) terminalError ??= new Error(REMOTE_EXECUTION_ERROR);
 
     /** A failed terminal write is not allowed to become a drained running job. Retry
      * after trailing persistence settles; if another terminal owner won meanwhile,
@@ -158,6 +162,15 @@ export class AgentExecutionEnrollment {
       }
     }
 
+    if (trailingFailed) terminalError ??= new Error(REMOTE_EXECUTION_ERROR);
+    if (!this.providerStarted && terminalError == null) {
+      const cancelled = await this.manager.cancelGenerationInitialization(
+        this.runId,
+        this.createdAt,
+        this.providerExecutionId,
+      );
+      if (!cancelled) terminalError = new Error('Agent admission cancellation was not confirmed');
+    }
     let drainError: unknown;
     if (this.providerStarted && terminalError != null) {
       /** Provider work and trailing writes have settled, but terminalization gave up, so no
@@ -168,7 +181,7 @@ export class AgentExecutionEnrollment {
     }
     if (this.providerStarted && terminalError == null) {
       try {
-        const drained = await this.manager.markProviderExecutionDrained(
+        const drained = await this.manager.settleGenerationExecution(
           this.runId,
           this.createdAt,
           this.providerExecutionId,
@@ -195,6 +208,11 @@ async function retireRejectedEnrollment(
   job: GenerationJob,
 ): Promise<void> {
   await manager.completeJob(job.streamId, ACCOUNT_DELETION_ERROR, job.createdAt);
+  await manager.cancelGenerationInitialization(
+    job.streamId,
+    job.createdAt,
+    job.metadata.providerExecutionId!,
+  );
 }
 
 export async function enrollAgentExecution(
@@ -203,6 +221,10 @@ export async function enrollAgentExecution(
 ): Promise<AgentExecutionEnrollment> {
   const { runId, userId, conversationId, agentId, protocol, isPrincipalActive } = params;
   const job = await deps.manager.createJob(runId, userId, conversationId, {
+    generationAdmission: params.requestFingerprint
+      ? { clientRequestId: runId, requestFingerprint: params.requestFingerprint }
+      : undefined,
+    trustedTenantId: params.tenantId,
     initialMetadata: {
       agent_id: agentId,
       endpoint: protocol,
