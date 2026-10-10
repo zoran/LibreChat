@@ -1,4 +1,7 @@
 {
+  "com_maintenance_title": "Maintenance in progress",
+  "com_maintenance_message": "The application is unavailable during maintenance. Requests in progress may be interrupted.",
+  "com_maintenance_recovery": "The application will become available automatically when maintenance is complete.",
   "com_ui_background_tasks": "Background tasks",
   "com_ui_background_tasks_cancel_disabled": "Stopping background tools is not enabled on this server",
   "com_ui_background_tasks_checked": "Checked background tasks",

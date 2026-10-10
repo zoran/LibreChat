@@ -1,4 +1,7 @@
 {
+  "com_maintenance_title": "Wartungsarbeiten",
+  "com_maintenance_message": "Die Bedienung ist während der Wartung gesperrt. Laufende Anfragen können unterbrochen werden.",
+  "com_maintenance_recovery": "Sobald die Wartung abgeschlossen ist, wird die Bedienung automatisch wieder freigegeben.",
   "chat_direction_left_to_right": "Links nach Rechts",
   "chat_direction_right_to_left": "Rechts nach Links",
   "com_a11y_ai_composing": "Die KI erstellt noch ihre Antwort.\n",

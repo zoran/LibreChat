@@ -79,6 +79,7 @@ afterEach(() => {
     buildDate: null,
   });
   delete process.env.APP_TITLE;
+  delete process.env.MAINTENANCE_STATUS_ENABLED;
   delete process.env.CHECK_BALANCE;
   delete process.env.START_BALANCE;
   delete process.env.SANDPACK_BUNDLER_URL;
@@ -120,6 +121,18 @@ afterEach(() => {
 });
 
 describe('GET /api/config', () => {
+  it.each([undefined, 'false', 'true'])(
+    'exposes only the configured entry status capability (%s)',
+    async (enabled) => {
+      if (enabled != null) process.env.MAINTENANCE_STATUS_ENABLED = enabled;
+      mockGetAppConfig.mockResolvedValue(baseAppConfig);
+      for (const user of [null, mockUser]) {
+        const response = await request(createApp(user)).get('/api/config');
+        expect(response.statusCode).toBe(200);
+        expect(response.body.maintenanceStatusEnabled).toBe(enabled === 'true');
+      }
+    },
+  );
   describe('unauthenticated (no req.user)', () => {
     it('should call getAppConfig with baseOnly when no tenant context', async () => {
       mockGetAppConfig.mockResolvedValue(baseAppConfig);

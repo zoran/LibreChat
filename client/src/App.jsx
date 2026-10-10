@@ -6,6 +6,7 @@ import * as RadixToast from '@radix-ui/react-toast';
 import { HTML5Backend } from 'react-dnd-html5-backend';
 import { QueryClient, QueryClientProvider, QueryCache } from '@tanstack/react-query';
 import { Toast, ThemeProvider, ToastProvider, useInputModality } from '@librechat/client';
+import MaintenanceNotice from '~/components/System/MaintenanceNotice';
 import { ScreenshotProvider, useApiErrorBoundary } from './hooks';
 import WakeLockManager from '~/components/System/WakeLockManager';
 import QueryDevtoolsGate from '~/components/QueryDevtoolsGate';
@@ -64,6 +65,7 @@ const App = () => {
             <RadixToast.Provider>
               <ToastProvider>
                 <DndProvider backend={HTML5Backend}>
+                  <MaintenanceNotice />
                   {/* Location updates commit in the caller's own task instead
                       of React's transition lane. A transition keeps the
                       OUTGOING route painted until the incoming one finishes

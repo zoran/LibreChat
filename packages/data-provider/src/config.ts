@@ -2513,6 +2513,8 @@ export type StartupConfigContext = 'share';
 export type EndpointsDropParamsMap = Record<string, string[] | Record<string, string[]>>;
 
 export type TStartupConfig = {
+  /** The public entry owns /maintenance/status independently of application availability. */
+  maintenanceStatusEnabled?: boolean;
   /** Optional browser identity; never enables registration or administrative login. */
   browserSessionEnabled?: boolean;
   appTitle: string;
