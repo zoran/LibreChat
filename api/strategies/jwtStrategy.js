@@ -1,4 +1,4 @@
-const { withAuthRequest } = require('~/server/services/LegacyAuthMaintenance');
+const { withAuthRequest, authUserMutation } = require('~/server/services/LegacyAuthMaintenance');
 const { AGENT_TRIGGER_SCOPE } = require('@librechat/api');
 const { logger, runAsSystem } = require('@librechat/data-schemas');
 const { SystemRoles } = require('librechat-data-provider');
@@ -55,7 +55,7 @@ const jwtLogin = () =>
             user.idOnTheSource ??= null;
             if (!user.role) {
               user.role = SystemRoles.USER;
-              await runAsSystem(() => updateUser(user.id, { role: user.role }));
+              await runAsSystem(() => authUserMutation(updateUser, user.id, { role: user.role }));
             }
             done(null, user);
           } else {

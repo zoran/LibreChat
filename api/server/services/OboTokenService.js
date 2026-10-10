@@ -13,6 +13,7 @@ const {
 } = require('@librechat/api');
 const { getOpenIdConfig } = require('~/strategies/openidStrategy');
 const getLogStores = require('~/cache/getLogStores');
+const { authTrack, authCache } = require('./LegacyAuthMaintenance');
 
 const RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
 const RETRYABLE_ERROR_CODES = new Set(['ETIMEDOUT', 'ECONNRESET', 'EAI_AGAIN', 'ENOTFOUND']);
@@ -138,7 +139,11 @@ async function performOboExchange({ user, accessToken, scopes, config, tokensCac
     scope: scopes,
   };
 
-  await tokensCache.set(cacheKey, tokenResponse, getSkewedTokenCacheTtlMs(expiresAt, now));
+  await authCache(tokensCache).set(
+    cacheKey,
+    tokenResponse,
+    getSkewedTokenCacheTtlMs(expiresAt, now),
+  );
 
   logger.debug(
     `[OboTokenService] Successfully obtained and cached OBO token for user: ${user.openidId}`,
@@ -239,7 +244,7 @@ async function exchangeOboToken(user, accessToken, scopes, fromCache = true, ide
 }
 
 module.exports = {
-  exchangeOboToken,
+  exchangeOboToken: (...args) => authTrack(() => exchangeOboToken(...args)),
   __internals: {
     buildOboCacheKey,
   },

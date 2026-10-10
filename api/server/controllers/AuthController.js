@@ -243,13 +243,9 @@ const assertReusableOpenIDSessionGeneration = async (openidTokens) =>
 const withOpenIDResponseDelivery = async ({ res, openidTokens, context }, operation) => {
   let delivery;
   let responseSent = false;
-  let releaseStarted = false;
-  let listenersArmed = false;
+  let responseCompleted;
+  let onResponseCompleted;
   const releaseDelivery = async () => {
-    if (!delivery || releaseStarted) {
-      return;
-    }
-    releaseStarted = true;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
         await releaseOpenIDRefreshFlightDelivery(delivery);
@@ -287,25 +283,32 @@ const withOpenIDResponseDelivery = async ({ res, openidTokens, context }, operat
     const sendAuthorized = async (send) => {
       if (delivery) {
         await assertOpenIDRefreshFlightDeliveryAvailable(delivery);
-        if (!listenersArmed && typeof res.once === 'function') {
-          listenersArmed = true;
-          res.once('finish', () => void releaseDelivery());
-          res.once('close', () => void releaseDelivery());
+        if (!responseCompleted && typeof res.once === 'function') {
+          responseCompleted = new Promise((resolve) => {
+            onResponseCompleted = resolve;
+            res.once('finish', resolve);
+            res.once('close', resolve);
+            // The peer may have closed while token preparation was still pending.
+            if (res.destroyed || res.writableFinished) resolve();
+          });
         }
       } else {
         await assertReusableOpenIDSessionGeneration(openidTokens);
       }
       const response = send();
       responseSent = true;
-      if (delivery && typeof res.once !== 'function') {
-        await releaseDelivery();
-      }
       return response;
     };
 
     return await operation(sendAuthorized);
   } finally {
-    if (delivery && !responseSent) {
+    if (delivery) {
+      // Keep the request continuation through response completion and every release retry.
+      if (responseSent && responseCompleted) await responseCompleted;
+      if (onResponseCompleted) {
+        res.off?.('finish', onResponseCompleted);
+        res.off?.('close', onResponseCompleted);
+      }
       await releaseDelivery();
     }
   }
@@ -737,5 +740,5 @@ module.exports = {
     withAuthRequest(req, () => resetPasswordController(req, res)),
   resetPasswordRequestController: (req, res) =>
     withAuthRequest(req, () => resetPasswordRequestController(req, res)),
-  graphTokenController,
+  graphTokenController: (req, res) => withAuthRequest(req, () => graphTokenController(req, res)),
 };
