@@ -1,3 +1,4 @@
+import { Server } from 'node:http';
 import { Readable } from 'node:stream';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { GenerationMaintenanceCensus } from './maintenance';
@@ -204,14 +205,49 @@ describe('private maintenance composition', () => {
       jest.useRealTimers();
     }
   });
-  it('keeps legacy opt-out and rejects missing selected identity/token', async () => {
+  it('keeps local opt-out and rejects missing shared runtime identity', async () => {
     const f = fixture();
     expect(() => createAppMaintenance({ ...f.deps, env: {} })).toThrow(
-      'Invalid private maintenance',
+      'Invalid application runtime identity',
     );
     const legacy = createAppMaintenance({ ...f.deps, env: {}, requiredSharedState: false });
     expect(await legacy.ready()).toBe(true);
     expect(f.deps.probeDatabase).not.toHaveBeenCalled();
+  });
+  it('starts shared state without private control while preserving dependency health', async () => {
+    const f = fixture();
+    const shared = createAppMaintenance({
+      ...f.deps,
+      env: { POD_UID: f.deps.env.POD_UID, BUILD_COMMIT: f.deps.env.BUILD_COMMIT },
+    });
+    const listen = jest.spyOn(Server.prototype, 'listen').mockImplementation(() => {
+      throw new Error('Unexpected private listener');
+    });
+    try {
+      await shared.listen();
+      expect(listen).not.toHaveBeenCalled();
+      expect((await http({ ...f, app: shared }, 'GET', '/status')).status).toBe(403);
+      expect(shared.identity.podUid).toBe(f.deps.env.POD_UID);
+      expect(await shared.ready()).toBe(true);
+      f.deps.probeDatabase.mockResolvedValueOnce(false);
+      expect(await shared.ready()).toBe(false);
+      f.deps.probeSharedState.mockResolvedValueOnce(false);
+      expect(await shared.ready()).toBe(false);
+      f.owner.getGenerationRuntimeHealth.mockResolvedValueOnce(false);
+      expect(await shared.ready()).toBe(false);
+    } finally {
+      listen.mockRestore();
+      await shared.close();
+    }
+  });
+  it('still rejects an explicitly invalid private control credential', () => {
+    const f = fixture();
+    expect(() =>
+      createAppMaintenance({
+        ...f.deps,
+        env: { ...f.deps.env, LIBRECHAT_MAINTENANCE_TOKEN: '' },
+      }),
+    ).toThrow('Invalid private maintenance configuration');
   });
   it('preserves existing stream/history and abort middleware paths', () => {
     const f = fixture();

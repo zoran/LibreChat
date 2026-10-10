@@ -142,16 +142,21 @@ async function readRequest(req: IncomingMessage): Promise<unknown> {
 /** Private process-local lifecycle composition. It never owns or fabricates provider records. */
 export function createAppMaintenance(deps: MaintenanceDependencies): AppMaintenance {
   const token = deps.env.LIBRECHAT_MAINTENANCE_TOKEN;
-  const enabled = deps.requiredSharedState || token !== undefined;
+  const controlEnabled = token !== undefined;
   const source = deps.env.BUILD_COMMIT ?? '';
   const podUid = deps.env.POD_UID ?? '';
   const port = Number(deps.env.LIBRECHAT_MAINTENANCE_PORT ?? '3091');
   if (
-    enabled &&
+    (controlEnabled || deps.requiredSharedState) &&
+    (!/^[a-f0-9]{40}$/.test(source) ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(podUid))
+  ) {
+    throw new Error('Invalid application runtime identity');
+  }
+  if (
+    controlEnabled &&
     (!token ||
       !/^[A-Za-z0-9_-]{32,256}$/.test(token) ||
-      !/^[a-f0-9]{40}$/.test(source) ||
-      !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(podUid) ||
       !Number.isSafeInteger(port) ||
       port < 1 ||
       port > 65535)
@@ -245,7 +250,7 @@ export function createAppMaintenance(deps: MaintenanceDependencies): AppMaintena
     ) {
       return false;
     }
-    if (!enabled) {
+    if (!controlEnabled && !deps.requiredSharedState) {
       return true;
     }
     const sampledRevision = revision;
@@ -350,7 +355,7 @@ export function createAppMaintenance(deps: MaintenanceDependencies): AppMaintena
   }
   const handler = (req: IncomingMessage, res: ServerResponse): void => {
     void (async () => {
-      if (!enabled || !loopback(req.socket.remoteAddress)) {
+      if (!controlEnabled || !loopback(req.socket.remoteAddress)) {
         reply(res, 403, { code: 'FORBIDDEN' });
         return;
       }
@@ -446,7 +451,7 @@ export function createAppMaintenance(deps: MaintenanceDependencies): AppMaintena
     admissionMiddleware,
     mutationMiddleware,
     async listen(): Promise<void> {
-      if (!enabled || listener) {
+      if (!controlEnabled || listener) {
         return;
       }
       const server = createServer(handler);
