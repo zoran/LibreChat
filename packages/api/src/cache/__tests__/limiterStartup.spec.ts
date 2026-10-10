@@ -2,13 +2,16 @@ import { EventEmitter } from 'events';
 import type { RedisStore } from 'rate-limit-redis';
 
 const makeIoClient = () => {
+  const { Command } = jest.requireActual<typeof import('ioredis')>('ioredis');
   const client = Object.assign(new EventEmitter(), {
     status: 'connecting',
-    call: jest.fn(async (command: string) => {
+    commands: [] as InstanceType<typeof Command>[],
+    call: jest.fn(async (command: string, ...args: string[]) => {
       if (client.status !== 'ready') {
         throw new Error("Stream isn't writeable and enableOfflineQueue options is false");
       }
-      return command === 'SCRIPT' ? 'loaded-script-sha' : [1, 60_000];
+      client.commands.push(new Command(command, args, { keyPrefix: 'test::' }));
+      return command.toLowerCase() === 'script' ? 'loaded-script-sha' : [1, 60_000];
     }),
   });
   return client;
@@ -115,6 +118,27 @@ describe('Sentinel limiter startup', () => {
       expect(mockIoClient.call).not.toHaveBeenCalled();
     },
   );
+
+  it('preserves the global namespace through actual ioredis limiter command serialization', async () => {
+    const { limiterCache } = await import('../cacheFactory');
+    const store = limiterCache('wire')!;
+    store.init({ windowMs: 60_000 } as Parameters<RedisStore['init']>[0]);
+    mockIoClient.status = 'ready';
+    mockIoClient.emit('ready');
+    await store.increment('user');
+    await store.get('user');
+    await store.decrement('user');
+    await store.resetKey('user');
+    const keyedCommands = mockIoClient.commands.filter(
+      (command) => command.name.toLowerCase() !== 'script',
+    );
+    expect(keyedCommands.map((command) => command.getKeys())).toEqual([
+      ['test::wire:user'],
+      ['test::wire:user'],
+      ['test::wire:user'],
+      ['test::wire:user'],
+    ]);
+  });
 
   it('does not wait again when the first limiter is created after an earlier successful connection', async () => {
     await import('../redisClients');

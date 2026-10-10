@@ -64,13 +64,8 @@ describe('limiterCache', () => {
     // SET operation
     await testStore!.sendCommand('SET', testKey, '1', 'EX', '60');
 
-    // Verify the key was created WITHOUT prefix using ioredis
-    // Note: Using call method since get method seems to have issues in test environment
-    // Type assertion for ioredis call method
-    type RedisClientWithCall = typeof ioredisClient & {
-      call: (command: string, key: string) => Promise<string | null>;
-    };
-    const directValue = await (ioredisClient as RedisClientWithCall).call('GET', testKey);
+    // The limiter and normal client must address the same globally prefixed key.
+    const directValue = await ioredisClient!.get(testKey);
 
     expect(directValue).toBe('1');
 
@@ -83,7 +78,7 @@ describe('limiterCache', () => {
     expect(incremented).toBe(2);
 
     // Verify increment worked with ioredis
-    const incrementedValue = await (ioredisClient as RedisClientWithCall).call('GET', testKey);
+    const incrementedValue = await ioredisClient!.get(testKey);
     expect(incrementedValue).toBe('2');
 
     // TTL operation

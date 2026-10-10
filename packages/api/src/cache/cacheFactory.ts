@@ -222,7 +222,8 @@ export const limiterCache = (
         const command = async () => {
           await waitForInitialIoRedisReady();
           return observeRedisOperation('ioredis', RedisUseCases.RATE_LIMIT, args[0], () =>
-            redisClient.call(args[0], ...args.slice(1)),
+            // ioredis recognizes keys for prefixing only with lowercase command names.
+            redisClient.call(args[0].toLowerCase(), ...args.slice(1)),
           );
         };
         return await (observer ? observer.write(command) : command());
