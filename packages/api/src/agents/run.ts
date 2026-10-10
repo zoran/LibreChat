@@ -2308,7 +2308,7 @@ export async function createRun({
   RunConfig,
   'tokenCounter' | 'customHandlers' | 'indexTokenCountMap' | 'initialSessions'
 >): Promise<Run<IState>> {
-  assertCompleteAssistantHistorySingleton(agents);
+  const completeAssistantHistory = assertCompleteAssistantHistorySingleton(agents);
   const resolvedRunId = runId ?? randomUUID();
   const runFilesActive =
     runFiles?.activate(
@@ -2644,7 +2644,11 @@ export async function createRun({
   };
   const prebuiltGraphInputs = new Map<string, AgentInputs>();
   const visitedConfigIds = new Set<string>();
-  const pendingConfigs: Array<RunAgent | null | undefined> = [...agents];
+  // The admitted complete-history singleton has no isolated graph inputs. Prebuilding
+  // its root as a child would incorrectly trip the graph-origin capability guard.
+  const pendingConfigs: Array<RunAgent | null | undefined> = completeAssistantHistory
+    ? []
+    : [...agents];
   for (let index = 0; index < pendingConfigs.length; index++) {
     const config = pendingConfigs[index];
     if (!config?.id || visitedConfigIds.has(config.id)) {

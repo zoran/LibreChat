@@ -1,5 +1,10 @@
 /** Singleton admission and semantic identity at their actual run/compatibility owners. */
-import { assertCompleteAssistantHistorySingleton, shouldReplayReasoningContent } from './run';
+import { Run } from '@librechat/agents';
+import {
+  assertCompleteAssistantHistorySingleton,
+  createRun,
+  shouldReplayReasoningContent,
+} from './run';
 import { createInitializedAgentContextFingerprint } from './compatibility';
 
 type RunAgent = NonNullable<Parameters<typeof assertCompleteAssistantHistorySingleton>[0][number]>;
@@ -35,6 +40,32 @@ const lazy = (flag?: boolean, id = 'lazy'): LazyAgent => ({
 });
 
 describe('complete assistant history admission', () => {
+  it('constructs the actual singleton run without converting its root into a subagent', async () => {
+    const agent = root(true);
+    Object.assign(agent.model_parameters, { preserveAssistantHistory: true });
+    const boundary = new Error('SDK boundary reached');
+    const sdk = jest.spyOn(Run, 'create').mockRejectedValue(boundary);
+    try {
+      await expect(
+        createRun({ agents: [agent], signal: new AbortController().signal }),
+      ).rejects.toBe(boundary);
+      expect(sdk).toHaveBeenCalledTimes(1);
+      expect(sdk).toHaveBeenCalledWith(
+        expect.objectContaining({
+          graphConfig: expect.objectContaining({
+            agents: [
+              expect.objectContaining({
+                agentId: 'root',
+                clientOptions: expect.objectContaining({ preserveAssistantHistory: true }),
+              }),
+            ],
+          }),
+        }),
+      );
+    } finally {
+      sdk.mockRestore();
+    }
+  });
   it('admits a singleton and preserves the legacy absent/false path', () => {
     expect(assertCompleteAssistantHistorySingleton([root(true)])).toBe(true);
     expect(shouldReplayReasoningContent(root(true))).toBe(true);
