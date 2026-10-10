@@ -147,7 +147,7 @@ describe('global tool cache write lock', () => {
       expect.stringContaining("redis.call('GET', KEYS[1])"),
       expect.objectContaining({
         keys: [
-          `tools:global:write-fence:{${CacheKeys.TOOL_CACHE}:tools:global}`,
+          `${CacheKeys.TOOL_CACHE}:tools:global:write-fence:{${CacheKeys.TOOL_CACHE}:tools:global}`,
           `${CacheKeys.TOOL_CACHE}:tools:global`,
         ],
       }),
@@ -168,7 +168,7 @@ describe('global tool cache write lock', () => {
           expect.stringContaining("redis.call('PSETEX', KEYS[2]"),
           expect.objectContaining({
             keys: [
-              `tools:global:write-fence:{${CacheKeys.TOOL_CACHE}:tools:global}`,
+              `${CacheKeys.TOOL_CACHE}:tools:global:write-fence:{${CacheKeys.TOOL_CACHE}:tools:global}`,
               `${CacheKeys.TOOL_CACHE}:tools:global`,
             ],
             arguments: [
@@ -339,7 +339,7 @@ describe('global tool cache write lock', () => {
       expect.stringContaining("redis.call('EXISTS', KEYS[2])"),
       expect.objectContaining({
         keys: [
-          `tools:mcp:write-fence:{user-1:server-1}`,
+          `${CacheKeys.TOOL_CACHE}:tools:mcp:write-fence:{user-1:server-1}`,
           `${CacheKeys.TOOL_CACHE}:tools:metadata:mcp:user-legacy-fence:{user-1:server-1}`,
           `${CacheKeys.TOOL_CACHE}:tools:metadata:mcp:user-generation:{user-1:server-1}`,
           `${CacheKeys.TOOL_CACHE}:tools:mcp:user:{user-1:server-1}:v2:config-current`,
