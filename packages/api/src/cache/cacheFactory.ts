@@ -15,7 +15,12 @@ import session, { MemoryStore } from 'express-session';
 import { Time, CacheKeys } from 'librechat-data-provider';
 import { RedisStore as ConnectRedis } from 'connect-redis';
 import type { SendCommandFn } from 'rate-limit-redis';
-import { keyvRedisClient, ioredisClient, handleKeyvRedisError } from './redisClients';
+import {
+  keyvRedisClient,
+  ioredisClient,
+  handleKeyvRedisError,
+  waitForInitialIoRedisReady,
+} from './redisClients';
 import { batchDeleteKeys, scanKeys } from './redisUtils';
 import {
   instrumentIORedisClient,
@@ -214,10 +219,12 @@ export const limiterCache = (
         throw new Error('Redis client not available');
       }
       try {
-        const command = () =>
-          observeRedisOperation('ioredis', RedisUseCases.RATE_LIMIT, args[0], () =>
+        const command = async () => {
+          await waitForInitialIoRedisReady();
+          return observeRedisOperation('ioredis', RedisUseCases.RATE_LIMIT, args[0], () =>
             redisClient.call(args[0], ...args.slice(1)),
           );
+        };
         return await (observer ? observer.write(command) : command());
       } catch (err) {
         logger.error('Redis command execution failed:', err);

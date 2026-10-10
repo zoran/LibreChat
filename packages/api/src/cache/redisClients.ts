@@ -43,6 +43,49 @@ async function waitForKeyvRedisClient(): Promise<void> {
 }
 
 let ioredisClient: Redis | Cluster | null = null;
+let initialIoRedisReady: Promise<void> | undefined;
+
+/** Wait once for Sentinel startup; later disconnects must still reject without queuing writes. */
+function waitForInitialIoRedisReady(): Promise<void> {
+  if (!sentinel || !ioredisClient) {
+    return Promise.resolve();
+  }
+  if (initialIoRedisReady) {
+    return initialIoRedisReady;
+  }
+  const client = ioredisClient;
+  initialIoRedisReady = new Promise<void>((resolve, reject) => {
+    if (client.status === 'ready') {
+      resolve();
+      return;
+    }
+    if (client.status === 'end') {
+      reject(new Error('Redis initial connection ended'));
+      return;
+    }
+    const finish = (error?: Error) => {
+      clearTimeout(timer);
+      client.off('ready', ready);
+      client.off('end', ended);
+      if (error) {
+        reject(error);
+      } else {
+        resolve();
+      }
+    };
+    const ready = () => finish();
+    const ended = () => finish(new Error('Redis initial connection ended'));
+    const timer = setTimeout(
+      () => finish(new Error('Redis initial connection timed out')),
+      cacheConfig.REDIS_CONNECT_TIMEOUT,
+    );
+    timer.unref();
+    client.once('ready', ready);
+    client.once('end', ended);
+  });
+  return initialIoRedisReady;
+}
+
 if (cacheConfig.USE_REDIS) {
   const redisOptions: Record<string, unknown> = {
     username: username,
@@ -140,6 +183,8 @@ if (cacheConfig.USE_REDIS) {
   });
 
   ioredisClient.on('ready', () => {
+    // Remember initial readiness even if the first limiter is constructed after a disconnect.
+    initialIoRedisReady ??= Promise.resolve();
     logger.info('ioredis client ready');
   });
 
@@ -379,6 +424,7 @@ export {
   ioredisClient,
   keyvRedisClient,
   keyvRedisClientReady,
+  waitForInitialIoRedisReady,
   waitForKeyvRedisClient,
   evalKeyvRedisScript,
   handleKeyvRedisError,
