@@ -11,6 +11,7 @@ jest.mock('~/models', () => ({ findUser: jest.fn(), updateUser: jest.fn() }));
 jest.mock('~/server/services/AuthService', () => ({ setAuthTokens: jest.fn() }));
 jest.mock('~/server/services/twoFactorService', () => ({ generate2FATempToken: jest.fn() }));
 
+const { EventEmitter } = require('node:events');
 const passport = require('passport');
 const { findUser, updateUser } = require('~/models');
 const { setAuthTokens } = require('~/server/services/AuthService');
@@ -49,13 +50,13 @@ test('admitted login retains strategy writes and session creation across pause a
     }),
   );
   const req = { body: { email: 'test@example.com', password: 'test-password' }, headers: {} };
-  const res = {
+  const res = Object.assign(new EventEmitter(), {
     end: jest.fn(),
     setHeader: jest.fn(),
     status: jest.fn(),
     send: jest.fn(),
     json: jest.fn(),
-  };
+  });
   res.status.mockReturnValue(res);
   res.send.mockImplementation(() => res.end());
   res.json.mockImplementation(() => res.end());

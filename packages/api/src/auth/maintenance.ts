@@ -107,6 +107,8 @@ export function createAuthMaintenance(): AuthMaintenance {
     requests.set(req, root.operation);
     // Install BEFORE express-session. Its final set/touch/destroy must finish before this call.
     // This is only the root's terminal signal: actual accepted promises/callbacks still hold it.
+    // A closed HTTP peer ends this root, never an accepted callback or continuation.
+    res.once('close', root.complete);
     const end = res.end;
     res.end = function (this: Response, ...args: Parameters<Response['end']>) {
       try {
@@ -173,4 +175,57 @@ export function createAuthMaintenance(): AuthMaintenance {
     },
   };
   return owner;
+}
+
+interface CacheErrorSource {
+  on?: (event: 'error', listener: () => void) => unknown;
+  off?: (event: 'error', listener: () => void) => unknown;
+}
+const cacheWrites = new WeakMap<
+  CacheErrorSource,
+  {
+    owners: Map<AuthMaintenance, number>;
+    failed: () => void;
+  }
+>();
+
+/** Keyv can emit an error and resolve false; DELETE false alone can also mean an absent key. */
+export function observeAuthCacheWrite<T>(
+  owner: AuthMaintenance,
+  cache: CacheErrorSource,
+  method: 'set' | 'delete',
+  action: () => Promise<T>,
+): Promise<T> {
+  return owner.run(undefined, (operation) =>
+    operation.write(async () => {
+      let active = cacheWrites.get(cache);
+      if (cache.on && cache.off) {
+        if (!active) {
+          const owners = new Map<AuthMaintenance, number>();
+          active = {
+            owners,
+            failed: () => owners.forEach((_count, current) => current.markUncertain()),
+          };
+          cacheWrites.set(cache, active);
+          cache.on('error', active.failed);
+        }
+        active.owners.set(owner, (active.owners.get(owner) ?? 0) + 1);
+      }
+      try {
+        const result = await action();
+        if (method === 'set' && result === false) operation.markUncertain();
+        return result;
+      } finally {
+        if (active) {
+          const remaining = (active.owners.get(owner) ?? 1) - 1;
+          if (remaining > 0) active.owners.set(owner, remaining);
+          else active.owners.delete(owner);
+          if (active.owners.size === 0) {
+            cache.off?.('error', active.failed);
+            cacheWrites.delete(cache);
+          }
+        }
+      }
+    }),
+  );
 }

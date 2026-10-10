@@ -1,5 +1,6 @@
 import { Socket } from 'node:net';
 import session from 'express-session';
+import { EventEmitter } from 'node:events';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { createAuthSessionStore } from './sessionMaintenance';
 import { createAuthMaintenance } from './maintenance';
@@ -80,7 +81,7 @@ test('a store callback restores its accepted context and retains child writes af
   });
   const observed = createAuthSessionStore(store, owner);
   const req = {};
-  const res = { end: jest.fn() };
+  const res = Object.assign(new EventEmitter(), { end: jest.fn() });
   let childWork!: Promise<void>;
   const delivered = jest.fn(() => {
     expect(owner.current()).toBe(owner.forRequest(req));

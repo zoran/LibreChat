@@ -1,5 +1,9 @@
 /** Legacy auth composition only; identity, tenant policy and storage remain with their owners. */
-const { createAuthMaintenance, createAuthSessionStore } = require('@librechat/api');
+const {
+  createAuthMaintenance,
+  createAuthSessionStore,
+  observeAuthCacheWrite,
+} = require('@librechat/api');
 const legacyAuthMaintenance = createAuthMaintenance();
 const authWrite = (action) =>
   legacyAuthMaintenance.run(undefined, (operation) => operation.write(action));
@@ -18,8 +22,10 @@ module.exports = {
   authPersistence,
   authCache: (store) => ({
     get: (...args) => store.get(...args),
-    set: (...args) => authWrite(() => store.set(...args)),
-    delete: (...args) => authWrite(() => store.delete(...args)),
+    set: (...args) =>
+      observeAuthCacheWrite(legacyAuthMaintenance, store, 'set', () => store.set(...args)),
+    delete: (...args) =>
+      observeAuthCacheWrite(legacyAuthMaintenance, store, 'delete', () => store.delete(...args)),
   }),
   withAuthRequest: (req, action) => legacyAuthMaintenance.run(req, action),
   authSessionStore: (store) => createAuthSessionStore(store, legacyAuthMaintenance),

@@ -1,3 +1,4 @@
+const { withAuthRequest, authCache } = require('~/server/services/LegacyAuthMaintenance');
 const { Keyv } = require('keyv');
 const uap = require('ua-parser-js');
 const { logger } = require('@librechat/data-schemas');
@@ -87,8 +88,8 @@ const checkBan = async (req, res, next = () => {}) => {
       return next();
     }
 
-    req.ip = removePorts(req);
-    const banIp = getBanIp(req);
+    const ip = removePorts(req);
+    const banIp = getBanIp({ ip, _isAgentTrigger: req._isAgentTrigger });
     let userId = req.user?.id ?? req.user?._id?.toString() ?? null;
 
     if (!userId && req?.body?.email) {
@@ -143,10 +144,10 @@ const checkBan = async (req, res, next = () => {}) => {
     if (timeLeft <= 0) {
       const cleanups = [];
       if (ipBan) {
-        cleanups.push(banLogs.delete(banIp));
+        cleanups.push(authCache(banLogs).delete(banIp));
       }
       if (userBan) {
-        cleanups.push(banLogs.delete(userId));
+        cleanups.push(authCache(banLogs).delete(userId));
       }
       await Promise.all(cleanups);
       return next();
@@ -154,10 +155,10 @@ const checkBan = async (req, res, next = () => {}) => {
 
     const cacheWrites = [];
     if (ipKey) {
-      cacheWrites.push(banCache.set(ipKey, banData, timeLeft));
+      cacheWrites.push(authCache(banCache).set(ipKey, banData, timeLeft));
     }
     if (userKey) {
-      cacheWrites.push(banCache.set(userKey, banData, timeLeft));
+      cacheWrites.push(authCache(banCache).set(userKey, banData, timeLeft));
     }
     await Promise.all(cacheWrites).catch((err) =>
       logger.warn('[checkBan] Failed to write ban cache:', err),
@@ -171,4 +172,4 @@ const checkBan = async (req, res, next = () => {}) => {
   }
 };
 
-module.exports = checkBan;
+module.exports = (req, res, next) => withAuthRequest(req, () => checkBan(req, res, next));

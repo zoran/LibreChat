@@ -104,4 +104,55 @@ describe('limiterCache', () => {
     // Test error handling
     await expect(testStore!.sendCommand('INVALID_COMMAND')).rejects.toThrow();
   });
+
+  test('owns constructor scripts and actual limiter commands before callers can sanitize failures', async () => {
+    const { createAuthMaintenance } = await import('../../../auth/maintenance');
+    const { limiterCache } = await import('../../cacheFactory');
+    const owner = createAuthMaintenance();
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const observed: Promise<unknown>[] = [];
+    const observer = {
+      write<T>(action: () => Promise<T>): Promise<T> {
+        const result = owner.run(undefined, (operation) =>
+          operation.write(async () => {
+            await blocked;
+            return action();
+          }),
+        );
+        observed.push(result);
+        return result;
+      },
+    };
+    const store = limiterCache('observed-auth-limiter', observer)!;
+    store.init({ windowMs: 60_000 } as Parameters<RedisStore['init']>[0]);
+    owner.pauseAdmissions('scripts');
+    expect(await owner.getMaintenanceCensus('scripts')).toMatchObject({ pendingWrites: 2 });
+    release();
+    await Promise.all(observed);
+    expect(await owner.getMaintenanceCensus('scripts')).toEqual({
+      admissionClosed: true,
+      queuedContinuations: 0,
+      pendingWrites: 0,
+      complete: true,
+    });
+    expect(owner.resumeAdmissions('scripts')).toBe(true);
+    expect((await store.increment('accepted-user')).totalHits).toBe(1);
+    expect((await store.increment('accepted-user')).totalHits).toBe(2);
+    await store.decrement('accepted-user');
+    expect((await store.get('accepted-user'))?.totalHits).toBe(1);
+    await store.resetKey('accepted-user');
+    // The caller may suppress the error; the actual observer must still retain uncertainty.
+    await store.sendCommand('INVALID_COMMAND').catch(() => undefined);
+    owner.pauseAdmissions('failed-command');
+    expect(await owner.getMaintenanceCensus('failed-command')).toEqual({
+      admissionClosed: true,
+      queuedContinuations: 0,
+      pendingWrites: 0,
+      complete: false,
+    });
+    expect(owner.resumeAdmissions('failed-command')).toBe(false);
+  });
 });

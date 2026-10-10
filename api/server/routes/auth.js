@@ -51,14 +51,16 @@ const browserAuth = createBrowserAuth({
   getAppConfig: () => getAppConfig({ baseOnly: true }),
   getTenantId,
   origin: process.env.DOMAIN_CLIENT,
-  store: limiterCache('browser_enrollment_limiter'),
+  store: limiterCache('browser_enrollment_limiter', authPersistence),
   mintToken: (user) =>
     browserMethods.generateToken(user, math(process.env.SESSION_EXPIRY, DEFAULT_SESSION_EXPIRY)),
 });
-const twoFactorManagementLimiter = createTwoFactorManagementLimiter({
-  getAppConfig: () => getAppConfig({ baseOnly: true }),
-  store: limiterCache('two_factor_management_user_limiter'),
-});
+const twoFactorManagementLimiter = ownAuthHandler(
+  createTwoFactorManagementLimiter({
+    getAppConfig: () => getAppConfig({ baseOnly: true }),
+    store: limiterCache('two_factor_management_user_limiter', authPersistence),
+  }),
+);
 const getCloudFrontAuthCookieRefreshResult = (req, res) => {
   const warmedResult = req.cloudFrontAuthCookieRefreshResult;
   if (warmedResult && (warmedResult.attempted || !warmedResult.enabled)) {

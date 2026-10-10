@@ -1,4 +1,5 @@
-const { isEnabled, trackHistoryWrite } = require('@librechat/api');
+const { isEnabled } = require('@librechat/api');
+const { withAuthRequest, authCache } = require('~/server/services/LegacyAuthMaintenance');
 const { ViolationTypes } = require('librechat-data-provider');
 const getLogStores = require('./getLogStores');
 const banViolation = require('./banViolation');
@@ -23,11 +24,7 @@ const logViolation = async (req, res, type, errorMessage, score = 1) => {
 
   const userViolations = (await violationLogs.get(key)) ?? 0;
   const violationCount = +userViolations + +score;
-  await trackHistoryWrite(
-    req,
-    () => violationLogs.set(key, violationCount),
-    (result) => result !== false,
-  );
+  await authCache(violationLogs).set(key, violationCount);
 
   errorMessage.user_id = userId;
   errorMessage.prev_count = userViolations;
@@ -38,11 +35,7 @@ const logViolation = async (req, res, type, errorMessage, score = 1) => {
   const userLogs = (await logs.get(key)) ?? [];
   userLogs.push(errorMessage);
   delete errorMessage.user_id;
-  await trackHistoryWrite(
-    req,
-    () => logs.set(key, userLogs),
-    (result) => result !== false,
-  );
+  await authCache(logs).set(key, userLogs);
 };
 
-module.exports = logViolation;
+module.exports = (req, res, ...args) => withAuthRequest(req, () => logViolation(req, res, ...args));

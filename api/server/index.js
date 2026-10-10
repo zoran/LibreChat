@@ -150,7 +150,7 @@ const maintenance = createAppMaintenance({
   },
   // These actual owners do not yet expose a qualified admission/settlement census.
   unqualifiedOwners: [
-    'pre-auth limiter/ban and other authentication writes',
+    'remaining authentication writes',
     'standalone tag/share and other HTTP mutations',
     'MCP/OAuth reconnect, search indexing, code lifecycle and remaining background owners',
   ],

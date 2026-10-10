@@ -10,6 +10,7 @@ import { Keyv } from 'keyv';
 import createMemoryStore from 'memorystore';
 import { RedisStore } from 'rate-limit-redis';
 import { logger } from '@librechat/data-schemas';
+import type { AuthPersistenceObserver } from '@librechat/data-schemas';
 import session, { MemoryStore } from 'express-session';
 import { Time, CacheKeys } from 'librechat-data-provider';
 import { RedisStore as ConnectRedis } from 'connect-redis';
@@ -191,7 +192,10 @@ export const sessionCache = (namespace: string, ttl?: number): MemoryStore | Con
  * @param prefix - The key prefix for rate limiting.
  * @returns RedisStore instance or undefined if Redis is not used.
  */
-export const limiterCache = (prefix: string): RedisStore | undefined => {
+export const limiterCache = (
+  prefix: string,
+  observer?: AuthPersistenceObserver,
+): RedisStore | undefined => {
   if (!prefix) {
     throw new Error('prefix is required');
   }
@@ -210,9 +214,11 @@ export const limiterCache = (prefix: string): RedisStore | undefined => {
         throw new Error('Redis client not available');
       }
       try {
-        return await observeRedisOperation('ioredis', RedisUseCases.RATE_LIMIT, args[0], () =>
-          redisClient.call(args[0], ...args.slice(1)),
-        );
+        const command = () =>
+          observeRedisOperation('ioredis', RedisUseCases.RATE_LIMIT, args[0], () =>
+            redisClient.call(args[0], ...args.slice(1)),
+          );
+        return await (observer ? observer.write(command) : command());
       } catch (err) {
         logger.error('Redis command execution failed:', err);
         throw err;

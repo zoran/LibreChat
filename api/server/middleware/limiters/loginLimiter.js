@@ -1,3 +1,4 @@
+const { ownAuthHandler, authPersistence } = require('~/server/services/LegacyAuthMaintenance');
 const rateLimit = require('express-rate-limit');
 const { ErrorTypes, ViolationTypes } = require('librechat-data-provider');
 const { limiterCache, removePorts } = require('@librechat/api');
@@ -31,11 +32,11 @@ const handler = async (req, res) => {
 const limiterOptions = {
   windowMs,
   max,
-  handler,
+  handler: ownAuthHandler(handler),
   keyGenerator: removePorts,
-  store: limiterCache('login_limiter'),
+  store: limiterCache('login_limiter', authPersistence),
 };
 
 const loginLimiter = rateLimit(limiterOptions);
 
-module.exports = loginLimiter;
+module.exports = Object.assign(ownAuthHandler(loginLimiter), loginLimiter);

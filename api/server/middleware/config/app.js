@@ -1,6 +1,7 @@
 const { logger } = require('@librechat/data-schemas');
 const { getAppConfigOptionsFromUser } = require('@librechat/api');
 const { getAppConfig } = require('~/server/services/Config');
+const { withAuthRequest } = require('~/server/services/LegacyAuthMaintenance');
 
 const configMiddleware = async (req, res, next) => {
   try {
@@ -24,4 +25,4 @@ const configMiddleware = async (req, res, next) => {
   }
 };
 
-module.exports = configMiddleware;
+module.exports = (req, res, next) => withAuthRequest(req, () => configMiddleware(req, res, next));

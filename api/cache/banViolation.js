@@ -1,3 +1,8 @@
+const {
+  withAuthRequest,
+  authMutation,
+  authCache,
+} = require('~/server/services/LegacyAuthMaintenance');
 const { logger } = require('@librechat/data-schemas');
 const { ViolationTypes } = require('librechat-data-provider');
 const { isEnabled, math, removePorts, getBanIp } = require('@librechat/api');
@@ -45,7 +50,7 @@ const banViolation = async (req, res, errorMessage) => {
     return;
   }
 
-  await deleteAllUserSessions({ userId: user_id });
+  await authMutation(deleteAllUserSessions, { userId: user_id });
 
   /** Clear OpenID session tokens if present */
   if (req.session?.openidTokens) {
@@ -64,18 +69,16 @@ const banViolation = async (req, res, errorMessage) => {
     return;
   }
 
-  req.ip = removePorts(req);
-  const banIp = getBanIp(req);
+  const ip = removePorts(req);
+  const banIp = getBanIp({ ip, _isAgentTrigger: req._isAgentTrigger });
   logger.info(
-    `[BAN] Banning user ${user_id} ${req.ip ? `@ ${req.ip} ` : ''}for ${
-      duration / 1000 / 60
-    } minutes`,
+    `[BAN] Banning user ${user_id} ${ip ? `@ ${ip} ` : ''}for ${duration / 1000 / 60} minutes`,
   );
 
   const expiresAt = Date.now() + duration;
-  await banLogs.set(user_id, { type, violation_count, duration, expiresAt });
+  await authCache(banLogs).set(user_id, { type, violation_count, duration, expiresAt });
   if (banIp) {
-    await banLogs.set(banIp, { type, user_id, violation_count, duration, expiresAt });
+    await authCache(banLogs).set(banIp, { type, user_id, violation_count, duration, expiresAt });
   }
 
   errorMessage.ban = true;
@@ -84,4 +87,5 @@ const banViolation = async (req, res, errorMessage) => {
   return;
 };
 
-module.exports = banViolation;
+module.exports = (req, res, errorMessage) =>
+  withAuthRequest(req, () => banViolation(req, res, errorMessage));

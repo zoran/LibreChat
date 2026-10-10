@@ -1,3 +1,4 @@
+const { ownAuthHandler, authPersistence } = require('~/server/services/LegacyAuthMaintenance');
 const jwt = require('jsonwebtoken');
 const { createHash } = require('crypto');
 const rateLimit = require('express-rate-limit');
@@ -72,21 +73,23 @@ const createHandler = (limiter) => async (req, res) => {
 const ipLimiterOptions = {
   windowMs,
   max,
-  handler: createHandler('ip'),
+  handler: ownAuthHandler(createHandler('ip')),
   keyGenerator: removePorts,
-  store: limiterCache('two_factor_temp_limiter'),
+  store: limiterCache('two_factor_temp_limiter', authPersistence),
 };
 
 const userLimiterOptions = {
   windowMs,
   max,
-  handler: createHandler('user'),
+  handler: ownAuthHandler(createHandler('user')),
   keyGenerator: getUserLimiterKey,
-  store: limiterCache('two_factor_temp_user_limiter'),
+  store: limiterCache('two_factor_temp_user_limiter', authPersistence),
 };
 
-const twoFactorTempIpLimiter = rateLimit(ipLimiterOptions);
-const twoFactorTempUserLimiter = rateLimit(userLimiterOptions);
+const ipLimiter = rateLimit(ipLimiterOptions);
+const twoFactorTempIpLimiter = Object.assign(ownAuthHandler(ipLimiter), ipLimiter);
+const userLimiter = rateLimit(userLimiterOptions);
+const twoFactorTempUserLimiter = Object.assign(ownAuthHandler(userLimiter), userLimiter);
 
 const twoFactorTempLimiter = (req, res, next) => {
   twoFactorTempIpLimiter(req, res, (err) => {

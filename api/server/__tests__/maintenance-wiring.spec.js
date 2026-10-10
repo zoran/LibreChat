@@ -55,7 +55,7 @@ test('wires all actual work facades, late browser load, and the same external ce
   expect(deps.workOwners.auth).toBe(context.legacyAuthMaintenance);
   expect(deps.workOwners.history).toBe(context.historyMaintenance);
   expect(deps.unqualifiedOwners.join(' ')).toMatch(
-    /limiter\/ban.*standalone tag\/share.*background/,
+    /authentication.*standalone tag\/share.*background/,
   );
   const initialize = jest.fn();
   const begin = source.indexOf('  await initializeMaintenanceGeneration({');
