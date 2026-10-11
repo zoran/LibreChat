@@ -7,13 +7,19 @@ const {
   getTermsStatusController,
   acceptTermsController,
   verifyEmailController,
+  requestEmailChangeController,
+  confirmEmailChangeController,
   deleteUserController,
   getUserController,
 } = require('~/server/controllers/UserController');
 const {
   verifyEmailLimiter,
+  emailChangeLimiter,
+  emailChangeSubmissionLimiter,
+  emailChangeSubmissionIpLimiter,
   verifyEmailSubmissionLimiter,
   configMiddleware,
+  strictConfigMiddleware,
   canDeleteAccount,
   requireJwtAuth,
 } = require('~/server/middleware');
@@ -34,6 +40,19 @@ router.get('/terms', requireJwtAuth, getTermsStatusController);
 router.post('/terms/accept', requireJwtAuth, acceptTermsController);
 router.post('/plugins', requireJwtAuth, updateUserPluginsController);
 router.delete('/delete', requireJwtAuth, canDeleteAccount, configMiddleware, deleteUserController);
+router.post(
+  '/email/change',
+  requireJwtAuth,
+  emailChangeLimiter,
+  strictConfigMiddleware,
+  ownAuthHandler(requestEmailChangeController),
+);
+router.post(
+  '/email/verify',
+  emailChangeSubmissionIpLimiter,
+  emailChangeSubmissionLimiter,
+  ownAuthHandler(confirmEmailChangeController),
+);
 router.post('/verify', verifyEmailSubmissionLimiter, ownAuthHandler(verifyEmailController));
 router.post('/verify/resend', verifyEmailLimiter, ownAuthHandler(resendVerificationController));
 

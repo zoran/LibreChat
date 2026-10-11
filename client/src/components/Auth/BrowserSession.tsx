@@ -47,8 +47,8 @@ export default function BrowserSession({
     }
   };
   return (
-    <main className="flex min-h-screen items-center justify-center bg-surface-primary p-6">
-      <section className="w-full max-w-md space-y-4 text-text-primary" aria-live="polite">
+    <main className="bg-surface-primary flex min-h-screen items-center justify-center p-6">
+      <section className="text-text-primary w-full max-w-md space-y-4" aria-live="polite">
         <h1 className="text-xl font-semibold">{localize('com_auth_browser_title')}</h1>
         {busy ? (
           <Spinner />

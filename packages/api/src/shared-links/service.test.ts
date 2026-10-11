@@ -1,4 +1,3 @@
-import { createHistoryMutationOwner, isHistoryDeleteResult } from '../conversations/history';
 jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
   logger: { error: jest.fn(), info: jest.fn(), warn: jest.fn(), debug: jest.fn() },
@@ -6,7 +5,7 @@ jest.mock('@librechat/data-schemas', () => ({
 
 import mongoose, { Types, Model } from 'mongoose';
 import { MongoMemoryServer } from 'mongodb-memory-server';
-import { createModels, createMethods } from '@librechat/data-schemas';
+import { createModels, createMethods, logger } from '@librechat/data-schemas';
 import { PrincipalType, AccessRoleIds } from 'librechat-data-provider';
 import type { IAclEntry, ISharedLink } from '@librechat/data-schemas';
 import {
@@ -356,29 +355,22 @@ describe('deleteSharedLinkWithCleanup', () => {
 });
 
 describe('deleteConvoSharedLinksWithCleanup', () => {
-  test('retains the actual detached ACL promise and its failed outcome', async () => {
-    await createTestLink({ conversationId: 'history-cleanup' });
-    const owner = createHistoryMutationOwner();
-    const scope = owner.admit('conversation-delete')!;
+  test('logs a late ACL failure after deleting the conversation links', async () => {
+    await createTestLink({ conversationId: 'cleanup-conversation' });
     let reject!: (error: Error) => void;
     const pending = new Promise<never>((_resolve, no) => {
       reject = no;
     });
     const remove = jest.spyOn(AclEntry, 'deleteMany').mockReturnValueOnce(pending as never);
-    const children: Promise<unknown>[] = [];
     try {
-      await deleteConvoSharedLinksWithCleanup(userId, 'history-cleanup', (promise) => {
-        children.push(scope.write(() => promise, isHistoryDeleteResult).catch(() => {}));
-      });
-      scope.finish();
-      owner.pauseAdmissions('a');
-      expect((await owner.getMaintenanceCensus('a')).pendingWrites).toBe(1);
+      const result = await deleteConvoSharedLinksWithCleanup(userId, 'cleanup-conversation');
+      expect(result.deletedCount).toBe(1);
       reject(new Error('ACL acknowledgment lost'));
-      await Promise.all(children);
-      expect(await owner.getMaintenanceCensus('a')).toMatchObject({
-        pendingWrites: 0,
-        complete: false,
-      });
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(logger.error).toHaveBeenCalledWith(
+        '[deleteConvoSharedLinksWithCleanup] ACL cleanup failed',
+        { conversationId: 'cleanup-conversation', error: 'ACL acknowledgment lost' },
+      );
     } finally {
       remove.mockRestore();
     }

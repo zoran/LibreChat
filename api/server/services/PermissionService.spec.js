@@ -10,6 +10,7 @@ jest.mock('~/server/services/LegacyAuthMaintenance', () => ({
   authWrite: async (action) => action(),
   authMutation: async (method, ...args) => method(...args),
   authUserMutation: async (method, ...args) => method(...args),
+  authUserUpdate: async (method, ...args) => method(...args),
   authCache: (store) => store,
   authPersistence: { write: async (action) => action() },
   legacyAuthMaintenance: { current: () => undefined },

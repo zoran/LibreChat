@@ -29,8 +29,6 @@ const checkpointNamespace = (id) =>
 jest.mock('@librechat/agents', () => require(MOCKS).agents());
 jest.mock('@librechat/api', () =>
   require(MOCKS).api({
-    ...jest.requireActual('../../../../packages/api/src/conversations/history'),
-    ...jest.requireActual('../../../../packages/api/src/conversations/historyHttp'),
     createContentFilter: jest.fn((options) => (req, res, next) => {
       const extracted = [...options.extract(req)];
       if (JSON.stringify(extracted).includes('BLOCK-CONTROL')) {
@@ -48,6 +46,7 @@ jest.mock('@librechat/api', () =>
 jest.mock('@librechat/data-schemas', () => require(MOCKS).dataSchemas());
 jest.mock('librechat-data-provider', () => require(MOCKS).dataProvider());
 jest.mock('~/models', () => require(MOCKS).sharedModels());
+jest.mock('~/server/services/Config', () => require(MOCKS).appConfig());
 jest.mock('~/server/middleware/requireJwtAuth', () => require(MOCKS).requireJwtAuth());
 jest.mock('~/server/middleware', () => require(MOCKS).middlewarePassthrough());
 jest.mock('~/server/utils/import/fork', () => require(MOCKS).forkUtils());
@@ -76,6 +75,8 @@ describe('Convos Routes', () => {
     deleteMessages,
     getConvo,
     saveConvo,
+    markConvoSeen,
+    markConvoUnread,
   } = require('~/models');
   const {
     deleteOwnedAgentCheckpoints,
@@ -88,7 +89,6 @@ describe('Convos Routes', () => {
     convosRouter = require('../convos');
 
     app = express();
-    app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
     app.use(express.json());
 
     /** Mock authenticated user */
@@ -127,7 +127,6 @@ describe('Convos Routes', () => {
   });
 
   beforeEach(() => {
-    if (app) app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
     jest.clearAllMocks();
     moderatedTexts.length = 0;
     generationJobManager.getCleanupJob.mockResolvedValue(null);
@@ -244,6 +243,21 @@ describe('Convos Routes', () => {
     });
   });
 
+  describe('GET /:conversationId/pull-request', () => {
+    it('is registered and reaches the pull request handler', async () => {
+      const response = await request(app).get('/api/convos/ordinary/pull-request');
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ pullRequest: null });
+    });
+
+    it('does not fall through to the conversation read', async () => {
+      await request(app).get('/api/convos/ordinary/pull-request');
+
+      expect(getConvo).not.toHaveBeenCalled();
+    });
+  });
+
   describe('POST /import', () => {
     const { importConversations } = require('~/server/utils/import');
 
@@ -255,10 +269,6 @@ describe('Convos Routes', () => {
       expect(response.status).toBe(201);
       expect(importConversations).toHaveBeenCalledWith({
         filepath: '/tmp/test-file.json',
-        history: expect.objectContaining({
-          write: expect.any(Function),
-          uncertain: expect.any(Function),
-        }),
         requestUserId: 'test-user-123',
         userRole: 'USER',
         interfaceConfig: undefined,
@@ -699,10 +709,7 @@ describe('Convos Routes', () => {
       expect(deleteToolCalls).toHaveBeenCalledTimes(1);
 
       /** Verify deleteAllSharedLinksWithCleanup was called with correct userId */
-      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith(
-        'test-user-123',
-        expect.any(Function),
-      );
+      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith('test-user-123');
       expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledTimes(1);
     });
 
@@ -722,10 +729,7 @@ describe('Convos Routes', () => {
       const response = await request(app).delete('/api/convos/all');
 
       expect(response.status).toBe(201);
-      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith(
-        'test-user-123',
-        expect.any(Function),
-      );
+      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith('test-user-123');
     });
 
     it('should return 500 if deleteConvos fails', async () => {
@@ -787,16 +791,12 @@ describe('Convos Routes', () => {
       let response = await request(app).delete('/api/convos/all');
 
       expect(response.status).toBe(201);
-      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith(
-        'test-user-123',
-        expect.any(Function),
-      );
+      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith('test-user-123');
 
       jest.clearAllMocks();
 
       /** Second user (simulate different user by modifying middleware) */
       const app2 = express();
-      app2.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
       app2.use(express.json());
       app2.use((req, res, next) => {
         req.user = { id: 'test-user-456' };
@@ -811,10 +811,7 @@ describe('Convos Routes', () => {
       response = await request(app2).delete('/api/convos/all');
 
       expect(response.status).toBe(201);
-      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith(
-        'test-user-456',
-        expect.any(Function),
-      );
+      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith('test-user-456');
     });
 
     it('should execute deletions in correct sequence', async () => {
@@ -863,10 +860,7 @@ describe('Convos Routes', () => {
       expect(response.status).toBe(201);
 
       /** Verify that shared links cleanup was called for the same user */
-      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith(
-        'test-user-123',
-        expect.any(Function),
-      );
+      expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledWith('test-user-123');
 
       /** Verify no shared links remain for deleted conversations */
       expect(deleteAllSharedLinksWithCleanup).toHaveBeenCalledAfter(deleteConvos);
@@ -1591,7 +1585,6 @@ describe('Convos Routes', () => {
       expect(deleteConvoSharedLinksWithCleanup).toHaveBeenCalledWith(
         'test-user-123',
         mockConversationId,
-        expect.any(Function),
       );
     });
 
@@ -1633,7 +1626,6 @@ describe('Convos Routes', () => {
       expect(deleteConvoSharedLinksWithCleanup).toHaveBeenCalledWith(
         'test-user-123',
         mockConversationId,
-        expect.any(Function),
       );
     });
 
@@ -1762,7 +1754,6 @@ describe('Convos Routes', () => {
       expect(deleteConvoSharedLinksWithCleanup).toHaveBeenCalledWith(
         'test-user-123',
         mockConversationId,
-        expect.any(Function),
       );
 
       /** Verify it was called after the conversation was deleted */
@@ -1909,6 +1900,119 @@ describe('Convos Routes', () => {
     });
   });
 
+  describe('GET / list facets', () => {
+    const { getConvosByCursor } = require('~/models');
+    const { getAppConfig } = require('~/server/services/Config');
+
+    beforeEach(() => {
+      getConvosByCursor.mockResolvedValue({ conversations: [], nextCursor: null });
+    });
+
+    it('forwards the date cutoffs as dates', async () => {
+      const response = await request(app)
+        .get('/api/convos')
+        .query({ updatedAfter: '2026-09-01T00:00:00.000Z' });
+
+      expect(response.status).toBe(200);
+      const [, options] = getConvosByCursor.mock.calls.at(-1);
+      expect(options.updatedAfter).toBeInstanceOf(Date);
+      expect(options.updatedAfter.toISOString()).toBe('2026-09-01T00:00:00.000Z');
+    });
+
+    it('forwards repeated endpoint params as one list', async () => {
+      const response = await request(app)
+        .get('/api/convos')
+        .query('endpoints=openAI&endpoints=agents');
+
+      expect(response.status).toBe(200);
+      expect(getConvosByCursor).toHaveBeenCalledWith(
+        'test-user-123',
+        expect.objectContaining({ endpoints: ['openAI', 'agents'] }),
+      );
+    });
+
+    it('forwards the attachment flag only when it is on', async () => {
+      await request(app).get('/api/convos').query({ hasFiles: 'true' });
+      expect(getConvosByCursor).toHaveBeenLastCalledWith(
+        'test-user-123',
+        expect.objectContaining({ hasFiles: true }),
+      );
+
+      await request(app).get('/api/convos').query({ hasFiles: 'false' });
+      const [, options] = getConvosByCursor.mock.calls.at(-1);
+      expect(options.hasFiles).toBeUndefined();
+    });
+
+    /** Dropping a filter the caller sent would answer with conversations they asked
+     *  to exclude, which is worse than refusing the request. */
+    it('refuses a malformed cutoff instead of listing unfiltered', async () => {
+      const response = await request(app)
+        .get('/api/convos')
+        .query({ updatedAfter: 'last tuesday' });
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toMatch(/updatedAfter/);
+      expect(getConvosByCursor).not.toHaveBeenCalled();
+    });
+
+    it('refuses a mistyped flag instead of listing unfiltered', async () => {
+      const response = await request(app).get('/api/convos').query({ hasFiles: 'tru' });
+
+      expect(response.status).toBe(400);
+      expect(response.body.error).toMatch(/hasFiles/);
+      expect(getConvosByCursor).not.toHaveBeenCalled();
+    });
+
+    /** The limits are deployment-level, so the list reads the base config instead of
+     *  resolving the caller's merged config on every sidebar request. */
+    it('enforces the endpoint limit the deployment configures', async () => {
+      const query = 'endpoints=openAI&endpoints=agents&endpoints=google';
+
+      const withinDefault = await request(app).get('/api/convos').query(query);
+      expect(withinDefault.status).toBe(200);
+
+      getAppConfig.mockResolvedValueOnce({
+        conversationList: { maxEndpointFilters: 2, maxEndpointNameLength: 128 },
+      });
+      const overConfigured = await request(app).get('/api/convos').query(query);
+      expect(overConfigured.status).toBe(400);
+      expect(overConfigured.body.error).toMatch(/at most 2 names/);
+    });
+
+    it('answers the route error when an endpoint filter cannot read its limits', async () => {
+      getAppConfig.mockRejectedValueOnce(new Error('config unavailable'));
+
+      const response = await request(app).get('/api/convos').query({ endpoints: 'openAI' });
+
+      expect(response.status).toBe(500);
+      expect(response.body.error).toBe('Error fetching conversations');
+      expect(getConvosByCursor).not.toHaveBeenCalled();
+    });
+
+    it('forwards the shared flag only when it is on', async () => {
+      await request(app).get('/api/convos').query({ sharedOnly: 'true' });
+      expect(getConvosByCursor).toHaveBeenLastCalledWith(
+        'test-user-123',
+        expect.objectContaining({ sharedOnly: true }),
+      );
+
+      await request(app).get('/api/convos').query({ sharedOnly: 'false' });
+      const [, options] = getConvosByCursor.mock.calls.at(-1);
+      expect(options.sharedOnly).toBeUndefined();
+    });
+
+    it('sends no facet keys when the request carries none', async () => {
+      await request(app).get('/api/convos');
+
+      const [, options] = getConvosByCursor.mock.calls.at(-1);
+      expect(options.updatedAfter).toBeUndefined();
+      expect(options.createdAfter).toBeUndefined();
+      expect(options.endpoints).toBeUndefined();
+      expect(options.hasFiles).toBeUndefined();
+      expect(options.sharedOnly).toBeUndefined();
+    });
+  });
+
   describe('GET / sort normalization', () => {
     const { getConvosByCursor } = require('~/models');
 
@@ -1939,6 +2043,67 @@ describe('Convos Routes', () => {
       expect(getConvosByCursor).toHaveBeenCalledWith(
         'test-user-123',
         expect.objectContaining({ sortBy: 'updatedAt', sortDirection: 'desc' }),
+      );
+    });
+  });
+
+  describe('POST /seen', () => {
+    /* The handler's own validation and error mapping live in `packages/api` and are covered
+       against the real implementation there; what matters here is that the route reaches it
+       with the authenticated user. */
+    it('routes to the handler for the authenticated user', async () => {
+      markConvoSeen.mockResolvedValue({ modified: true });
+
+      const response = await request(app)
+        .post('/api/convos/seen')
+        .send({ arg: { conversationId: 'conv-seen-1' } });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ modified: true });
+      expect(markConvoSeen).toHaveBeenCalledWith('test-user-123', 'conv-seen-1');
+    });
+  });
+
+  describe('POST /unread', () => {
+    it('routes to the handler for the authenticated user', async () => {
+      markConvoUnread.mockResolvedValue({ modified: true });
+
+      const response = await request(app)
+        .post('/api/convos/unread')
+        .send({ arg: { conversationId: 'conv-unread-1' } });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ modified: true });
+      expect(markConvoUnread).toHaveBeenCalledWith('test-user-123', 'conv-unread-1');
+    });
+  });
+
+  describe('POST /update running chat rename', () => {
+    it('delegates rename semantics to the injected TypeScript handler', async () => {
+      const { renameConversationHandler, renameHandlerInputs } = require(MOCKS);
+      const arg = { conversationId: 'running-rename', title: 'Renamed' };
+      saveConvo.mockResolvedValueOnce(arg);
+      renameConversationHandler.mockImplementationOnce(async (req, res) => {
+        await renameHandlerInputs.at(-1).saveConvo(req, arg);
+        res.status(204).end();
+      });
+      expect((await request(app).post('/api/convos/update').send({ arg })).status).toBe(204);
+      expect(renameConversationHandler).toHaveBeenCalledWith(
+        expect.objectContaining({
+          body: { arg },
+          user: expect.objectContaining({ id: 'test-user-123' }),
+        }),
+        expect.anything(),
+        expect.anything(),
+      );
+      expect(saveConvo).toHaveBeenCalledWith(expect.objectContaining({ body: { arg } }), arg);
+      expect(renameHandlerInputs.at(-1)).toEqual(
+        expect.objectContaining({
+          saveConvo: expect.any(Function),
+          getConvo,
+          getActiveRunIds: expect.any(Function),
+          logger: expect.anything(),
+        }),
       );
     });
   });
@@ -1976,6 +2141,7 @@ describe('Convos Routes', () => {
           context: `POST /api/convos/archive ${mockConversationId}`,
           preserveUpdatedAt: true,
           noUpsert: true,
+          appendMessageIds: [],
         },
       );
     });
@@ -2009,6 +2175,7 @@ describe('Convos Routes', () => {
           context: `POST /api/convos/archive ${mockConversationId}`,
           preserveUpdatedAt: true,
           noUpsert: true,
+          appendMessageIds: [],
         },
       );
     });

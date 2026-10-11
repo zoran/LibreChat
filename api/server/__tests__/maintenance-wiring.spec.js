@@ -20,7 +20,6 @@ test('wires all actual work facades, late browser load, and the same external ce
     skillSyncMaintenance: facade(),
     expiredFileSweepMaintenance: facade(),
     legacyAuthMaintenance: facade(),
-    historyMaintenance: facade(),
     createAppMaintenance: jest.fn(() => ({ externalCensus: jest.fn(), identity: {} })),
   };
   const start = source.indexOf('let browserMaintenance;');
@@ -48,12 +47,14 @@ test('wires all actual work facades, late browser load, and the same external ce
     'skillSync',
     'fileRetention',
     'auth',
-    'history',
   ]);
   expect(deps.workOwners.skillSync).toBe(context.skillSyncMaintenance);
   expect(deps.workOwners.fileRetention).toBe(context.expiredFileSweepMaintenance);
   expect(deps.workOwners.auth).toBe(context.legacyAuthMaintenance);
-  expect(deps.workOwners.history).toBe(context.historyMaintenance);
+  expect(deps.workOwners).not.toHaveProperty('history');
+  expect(deps.unqualifiedOwners).toContain(
+    'history request completion is not exhaustively measured',
+  );
   expect(deps.unqualifiedOwners.join(' ')).toMatch(
     /authentication.*standalone tag\/share.*background/,
   );
@@ -75,22 +76,11 @@ test('wires all actual work facades, late browser load, and the same external ce
   );
 });
 
-test('establishes auth admission before Passport and session setup and injects one history owner', () => {
+test('establishes auth admission before Passport and session setup', () => {
   const admission = source.indexOf('app.use(authAdmissionMiddleware);');
   expect(admission).toBeGreaterThan(0);
   expect(admission).toBeLessThan(source.indexOf('app.use(passport.initialize());'));
   expect(admission).toBeLessThan(source.indexOf('await configureSocialLogins(app, appConfig);'));
-  const start = source.indexOf('const historyMaintenance = createHistoryMutationOwner();');
-  const owner = {};
-  const app = { locals: {} };
-  const createHistoryMutationOwner = jest.fn(() => owner);
-  vm.runInNewContext(source.slice(start, source.indexOf('let serverReady', start)), {
-    app,
-    createHistoryMutationOwner,
-  });
-  expect(createHistoryMutationOwner).toHaveBeenCalledTimes(1);
-  expect(app.locals.historyMaintenance).toBe(owner);
-  expect(start).toBeLessThan(source.indexOf("const routes = require('./routes')"));
 });
 
 test('joins the actual orphan-preview boot write before further startup', async () => {

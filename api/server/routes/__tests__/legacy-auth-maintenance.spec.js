@@ -1,5 +1,6 @@
 /** Actual Passport-local -> middleware -> controller lifecycle, with deferred storage ports. */
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   ...jest.requireActual('../../../../packages/api/src/auth/maintenance.ts'),
   ...jest.requireActual('../../../../packages/api/src/auth/sessionMaintenance.ts'),
   isEnabled: () => false,
@@ -7,7 +8,12 @@ jest.mock('@librechat/api', () => ({
   comparePassword: jest.fn(async () => true),
 }));
 jest.mock('passport', () => new (jest.requireActual('passport').Passport)());
-jest.mock('~/models', () => ({ findUser: jest.fn(), updateUser: jest.fn() }));
+jest.mock('~/models', () => ({
+  findUser: jest.fn(),
+  updateUser: jest.fn(),
+  getUserById: jest.fn(async () => ({ credentialsChangedAt: undefined })),
+  deleteAllUserSessions: jest.fn(async () => ({ acknowledged: true })),
+}));
 jest.mock('~/server/services/AuthService', () => ({ setAuthTokens: jest.fn() }));
 jest.mock('~/server/services/twoFactorService', () => ({ generate2FATempToken: jest.fn() }));
 

@@ -9,6 +9,8 @@ const authWrite = (action) =>
   legacyAuthMaintenance.run(undefined, (operation) => operation.write(action));
 const authTrack = (action) => legacyAuthMaintenance.run(undefined, action);
 const authPersistence = Object.freeze({ write: authWrite });
+const authUserMutation = (method, ...args) =>
+  authWrite(() => method(...args, ...(legacyAuthMaintenance.current() ? [authPersistence] : [])));
 
 module.exports = {
   legacyAuthMaintenance,
@@ -16,8 +18,9 @@ module.exports = {
   ownAuthHandler: legacyAuthMaintenance.own,
   authWrite,
   authMutation: (method, ...args) => authWrite(() => method(...args)),
-  authUserMutation: (method, ...args) =>
-    authWrite(() => method(...args, ...(legacyAuthMaintenance.current() ? [authPersistence] : []))),
+  authUserMutation,
+  authUserUpdate: (method, userId, update, expectedState, options) =>
+    authUserMutation(method, userId, update, expectedState, options),
   authTrack,
   authPersistence,
   authCache: (store) => ({

@@ -7,6 +7,7 @@ const { getImporter } = require('./importers');
 const importConversations = require('./importConversations');
 
 jest.mock('~/models', () => ({
+  initializeMessageBudget: jest.fn(),
   bulkIncrementTagCounts: jest.fn(),
   bulkSaveConvos: jest.fn(),
   bulkSaveMessages: jest.fn(),
@@ -50,12 +51,9 @@ describe('importConversations content filtering', () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
-  it('holds final unlink and reports its swallowed rejection after import success', async () => {
-    const {
-      createHistoryMutationOwner,
-    } = require('../../../../packages/api/src/conversations/history');
-    const owner = createHistoryMutationOwner();
-    const history = owner.admit('conversation-import');
+  it('awaits final unlink and logs its failure after a successful import', async () => {
+    const { logger } = require('@librechat/data-schemas');
+    const logged = jest.spyOn(logger, 'error').mockImplementation(() => {});
     getImporter.mockReturnValue(async () => {});
     let started, reject;
     const entered = new Promise((resolve) => {
@@ -67,21 +65,23 @@ describe('importConversations content filtering', () => {
         reject = no;
       });
     });
-    const result = importConversations({ filepath, requestUserId: 'user-123', history }).finally(
-      () => history.finish(),
-    );
+    let settled = false;
+    const result = importConversations({ filepath, requestUserId: 'user-123' }).then(() => {
+      settled = true;
+    });
     try {
       await entered;
-      owner.pauseAdmissions('a');
-      expect((await owner.getMaintenanceCensus('a')).pendingWrites).toBe(1);
-      reject(new Error('unlink failed'));
+      expect(settled).toBe(false);
+      const error = new Error('unlink failed');
+      reject(error);
       await expect(result).resolves.toBeUndefined();
-      expect(await owner.getMaintenanceCensus('a')).toMatchObject({
-        pendingWrites: 0,
-        complete: false,
-      });
+      expect(logged).toHaveBeenCalledWith(
+        `user: user-123 | Failed to delete file: ${filepath}`,
+        error,
+      );
     } finally {
       unlink.mockRestore();
+      logged.mockRestore();
     }
   });
 

@@ -21,6 +21,7 @@ import {
   handleKeyvRedisError,
   waitForInitialIoRedisReady,
 } from './redisClients';
+import { createClusterSafeSendCommand } from './limiterSendCommand';
 import { batchDeleteKeys, scanKeys } from './redisUtils';
 import {
   instrumentIORedisClient,
@@ -90,9 +91,17 @@ async function clearRedisNamespace(namespace: string): Promise<void> {
  * @param namespace - The cache namespace.
  * @param ttl - Time to live for cache entries.
  * @param fallbackStore - Optional fallback store if Redis is not used.
+ * @param options.throwOnErrors - Rejects failed Redis operations instead of resolving them as a
+ *   miss or a no-op delete, for callers that must know an eviction did not happen. The first
+ *   caller's value wins for a shared namespace and TTL.
  * @returns Cache instance.
  */
-export const standardCache = (namespace: string, ttl?: number, fallbackStore?: object): Keyv => {
+export const standardCache = (
+  namespace: string,
+  ttl?: number,
+  fallbackStore?: object,
+  options: { throwOnErrors?: boolean } = {},
+): Keyv => {
   if (keyvRedisClient && !cacheConfig.FORCED_IN_MEMORY_CACHE_NAMESPACES?.includes(namespace)) {
     const byTtl = redisCacheMap.get(namespace);
     const existing = byTtl?.get(ttl);
@@ -100,9 +109,10 @@ export const standardCache = (namespace: string, ttl?: number, fallbackStore?: o
       return existing;
     }
     try {
-      const required = cacheConfig.SHARED_STATE?.mode === 'sentinel';
-      const keyvRedis = new KeyvRedis(keyvRedisClient, { throwOnErrors: required });
-      const cache = new Keyv(keyvRedis, { namespace, ttl, throwOnErrors: required });
+      const throwOnErrors =
+        cacheConfig.SHARED_STATE?.mode === 'sentinel' || options.throwOnErrors === true;
+      const keyvRedis = new KeyvRedis(keyvRedisClient, { throwOnErrors });
+      const cache = new Keyv(keyvRedis, { namespace, ttl, throwOnErrors });
       keyvRedis.namespace = cacheConfig.REDIS_KEY_PREFIX;
       keyvRedis.keyPrefixSeparator = cacheConfig.GLOBAL_PREFIX_SEPARATOR;
 
@@ -207,32 +217,40 @@ export const limiterCache = (
   if (!cacheConfig.USE_REDIS) {
     return undefined;
   }
-  // Note: The `prefix` is applied by RedisStore internally to its key operations.
-  // The global REDIS_KEY_PREFIX is applied by ioredisClient's keyPrefix setting.
-  // Combined key format: `{REDIS_KEY_PREFIX}::{prefix}{identifier}`
+  // rate-limit-redis supplies uppercase command names to `call()`. In the
+  // pinned ioredis version, dynamic-command key metadata is case-sensitive,
+  // so those calls bypass the configured keyPrefix, including EVALSHA keys.
+  // Include the deployment prefix here exactly once.
   prefix = prefix.endsWith(':') ? prefix : `${prefix}:`;
+  const deploymentPrefix = cacheConfig.REDIS_KEY_PREFIX
+    ? `${cacheConfig.REDIS_KEY_PREFIX}${cacheConfig.GLOBAL_PREFIX_SEPARATOR}`
+    : '';
+  const limiterPrefix = `${deploymentPrefix}${prefix}`;
 
   try {
-    const sendCommand: SendCommandFn = (async (...args: string[]) => {
+    const executeCommand = (async (...args: string[]) => {
       const redisClient = ioredisClient;
       if (redisClient == null) {
         throw new Error('Redis client not available');
       }
+      return await observeRedisOperation('ioredis', RedisUseCases.RATE_LIMIT, args[0], () =>
+        redisClient.call(args[0], ...args.slice(1)),
+      );
+    }) as SendCommandFn;
+    const clusterSafeCommand = createClusterSafeSendCommand(executeCommand);
+    const sendCommand: SendCommandFn = async (...args: string[]) => {
       try {
         const command = async () => {
           await waitForInitialIoRedisReady();
-          return observeRedisOperation('ioredis', RedisUseCases.RATE_LIMIT, args[0], () =>
-            // ioredis recognizes keys for prefixing only with lowercase command names.
-            redisClient.call(args[0].toLowerCase(), ...args.slice(1)),
-          );
+          return clusterSafeCommand(...args);
         };
         return await (observer ? observer.write(command) : command());
       } catch (err) {
         logger.error('Redis command execution failed:', err);
         throw err;
       }
-    }) as SendCommandFn;
-    return new RedisStore({ sendCommand, prefix });
+    };
+    return new RedisStore({ sendCommand, prefix: limiterPrefix });
   } catch (err) {
     logger.error(`Failed to create Redis rate limiter for prefix ${prefix}:`, err);
     if (cacheConfig.SHARED_STATE?.mode === 'sentinel') {

@@ -2,7 +2,6 @@
 const mongoose = require('mongoose');
 const request = require('supertest');
 const express = require('express');
-const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const { MongoMemoryServer } = require('mongodb-memory-server');
 const schemas = require('@librechat/data-schemas');
@@ -20,6 +19,9 @@ jest.mock('@librechat/api', () => ({
   ...jest.requireActual('../../../../packages/api/src/auth/maintenance.ts'),
   ...jest.requireActual('../../../../packages/api/src/auth/sessionMaintenance.ts'),
   checkEmailConfig: jest.fn(() => false),
+}));
+jest.mock('~/server/services/Config/app', () => ({
+  getAppConfig: async () => ({ registration: {}, balance: { enabled: true, startBalance: 50 } }),
 }));
 jest.mock('~/server/services/Config', () => ({
   getAppConfig: async () => ({ registration: {}, balance: { enabled: true, startBalance: 50 } }),
@@ -54,6 +56,12 @@ jest.mock('~/server/middleware', () => {
       'requireJwtAuth',
       'setTwoFactorTempUser',
       'twoFactorTempLimiter',
+      'twoFactorSetupLimiter',
+      'blockRetiredSetupToken',
+      'setTwoFactorAcknowledgementTempUser',
+      'setTwoFactorFinalizationTempUser',
+      'passkeyLimiter',
+      'passkeyStepUpLimiter',
     ].map((name) => [name, next]),
   );
 });
@@ -87,6 +95,7 @@ beforeAll(async () => {
   Token = mongoose.models.Token || mongoose.model('Token', schemas.tokenSchema);
   Balance = mongoose.models.Balance || mongoose.model('Balance', schemas.balanceSchema);
   mongoose.models.Session || mongoose.model('Session', schemas.sessionSchema);
+  mongoose.models.Passkey || mongoose.model('Passkey', schemas.passkeySchema);
   mockDatabase = mongoose;
 });
 afterAll(async () => {
@@ -123,7 +132,7 @@ beforeEach(async () => {
     twoFactorEnabled: true,
     totpSecret: 'ABCDEFGHIJKLMNOP',
     pendingTotpSecret: 'ABCDEFGHIJKLMNOP',
-    backupCodes: [{ codeHash: await schemas.hashBackupCode('fixture-backup'), used: false }],
+    backupCodes: [{ codeHash: await schemas.hashBackupCode('a1b2c3d4'), used: false }],
   });
 });
 afterEach(() => jest.restoreAllMocks());
@@ -133,22 +142,33 @@ test.each(['enable', 'verify', 'verify-temp', 'confirm', 'disable', 'backup/rege
   async (path) => {
     const gate = deferred();
     const entered = deferred();
-    const update = User.findByIdAndUpdate.bind(User);
-    jest.spyOn(User, 'findByIdAndUpdate').mockImplementation((...args) => {
-      const query = update(...args);
-      const lean = query.lean.bind(query);
-      query.lean = async (...options) => {
+    if (['verify', 'verify-temp'].includes(path)) {
+      const update = User.updateOne.bind(User);
+      jest.spyOn(User, 'updateOne').mockImplementation((...args) => {
         entered.resolve();
-        await gate.promise;
-        return lean(...options);
-      };
-      return query;
-    });
-    let body = { backupCode: 'fixture-backup' };
+        return gate.promise.then(() => update(...args));
+      });
+    } else {
+      const update = User.findOneAndUpdate.bind(User);
+      jest.spyOn(User, 'findOneAndUpdate').mockImplementation((...args) => {
+        const query = update(...args);
+        const lean = query.lean.bind(query);
+        query.lean = async (...options) => {
+          entered.resolve();
+          await gate.promise;
+          return lean(...options);
+        };
+        return query;
+      });
+    }
+    let body = { backupCode: 'a1b2c3d4' };
     if (path === 'confirm') {
       body = { token: await generateTOTP('ABCDEFGHIJKLMNOP') };
     } else if (path === 'verify-temp') {
-      body.tempToken = jwt.sign({ userId: user.id }, process.env.JWT_SECRET);
+      body.tempToken = mockApi.generateTwoFactorLoginChallengeToken(
+        user.id,
+        process.env.JWT_SECRET,
+      );
     }
     const pending = request(app)
       .post(`/auth/2fa/${path}`)

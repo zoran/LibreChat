@@ -56,7 +56,7 @@ test('user invalidation keeps every delete and reports the hidden failed mutatio
     ),
   };
   const db = {
-    models: { User: { findByIdAndUpdate: () => ({ lean: async () => ({ _id: 'user' }) }) } },
+    models: { User: { findOneAndUpdate: () => ({ lean: async () => ({ _id: 'user' }) }) } },
   };
   const methods = createUserMethods(db as never, { getCache: () => cache });
   let failed = false;
@@ -71,7 +71,7 @@ test('user invalidation keeps every delete and reports the hidden failed mutatio
       }
     },
   };
-  const work = methods.updateUser('user', {}, observer).then(() => {
+  const work = methods.updateUser('user', {}, undefined, undefined, observer).then(() => {
     finished = true;
   });
   await new Promise((resolve) => setImmediate(resolve));

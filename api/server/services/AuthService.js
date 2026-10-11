@@ -3,6 +3,7 @@ const {
   authTrack,
   authMutation,
   authUserMutation,
+  authUserUpdate,
   authPersistence,
   legacyAuthMaintenance,
 } = require('./LegacyAuthMaintenance');
@@ -33,6 +34,7 @@ const {
   normalizeExpiresIn,
   createOpenIDSessionIdentity,
   resolveAppConfigForUser,
+  commitPasswordReset,
 } = require('@librechat/api');
 const {
   findUser,
@@ -368,7 +370,7 @@ const verifyEmail = async (req) => {
     return { message: 'Email verification was successful', status: 'success' };
   }
 
-  const updatedUser = await authUserMutation(updateUser, emailVerificationData.userId, {
+  const updatedUser = await authUserUpdate(updateUser, emailVerificationData.userId, {
     emailVerified: true,
   });
 
@@ -463,7 +465,7 @@ const registerUser = async (user, additionalData = {}) => {
         name,
       });
     } else {
-      await authUserMutation(updateUser, newUserId, { emailVerified: true });
+      await authUserUpdate(updateUser, newUserId, { emailVerified: true });
     }
 
     /** `userCreated` separates this from the identical 200 returned when the email is
@@ -549,6 +551,7 @@ const requestPasswordReset = async (req) => {
 
   await authMutation(createToken, {
     userId: user._id,
+    email: user.email.toLowerCase(),
     type: AuthTokenTypes.PASSWORD_RESET,
     token: hash,
     createdAt: Date.now(),
@@ -593,20 +596,23 @@ const requestPasswordReset = async (req) => {
  * @returns
  */
 const resetPassword = async (userId, token, password) => {
-  const passwordResetToken = await findPasswordResetToken(userId);
+  const outcome = await commitPasswordReset(
+    {
+      findResetToken: findPasswordResetToken,
+      getUserById,
+      updateUser: (...args) => authUserUpdate(updateUser, ...args),
+      deleteTokens: (...args) => authMutation(deleteTokens, ...args),
+      compareToken: (candidate, storedHash) => bcrypt.compareSync(candidate, storedHash),
+      hashPassword: (plain) => bcrypt.hashSync(plain, 10),
+    },
+    { userId, token, password },
+  );
 
-  if (!passwordResetToken) {
+  if (!outcome.ok) {
     return new Error('Invalid or expired password reset token');
   }
 
-  const isValid = bcrypt.compareSync(token, passwordResetToken.token);
-
-  if (!isValid) {
-    return new Error('Invalid or expired password reset token');
-  }
-
-  const hash = bcrypt.hashSync(password, 10);
-  const user = await authUserMutation(updateUser, userId, { password: hash });
+  const { user, resetToken: passwordResetToken } = outcome;
 
   if (checkEmailConfig()) {
     await authMutation(sendEmail, {

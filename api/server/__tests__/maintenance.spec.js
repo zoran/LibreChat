@@ -24,6 +24,8 @@ test('startup supplies existing owner ports and routes readiness through mainten
     agentTriggerMaintenance: {},
     agentQueuedTurnMaintenance: {},
     skillSyncMaintenance: {},
+    expiredFileSweepMaintenance: {},
+    legacyAuthMaintenance: {},
     process: { env: {} },
     cacheConfig: { SHARED_STATE: { mode: 'sentinel' }, USE_REDIS: true },
     GenerationJobManager: owner,
@@ -35,6 +37,10 @@ test('startup supplies existing owner ports and routes readiness through mainten
     serverReady: true,
   });
   const deps = create.mock.calls[0][0];
+  expect(deps.workOwners).not.toHaveProperty('history');
+  expect(deps.unqualifiedOwners).toContain(
+    'history request completion is not exhaustively measured',
+  );
   deps.generation.closeGenerationAdmission('request');
   deps.generation.getGenerationAdmissionCensus();
   deps.generation.getGenerationRuntimeHealth();

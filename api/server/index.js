@@ -20,7 +20,6 @@ const {
   createMetrics,
   createAppMaintenance,
   expiredFileSweepMaintenance,
-  createHistoryMutationOwner,
   initializeMaintenanceGeneration,
   probeMaintenanceRedis,
   probeMaintenanceDatabase,
@@ -36,6 +35,7 @@ const {
   createSecurityHeaders,
   performStartupChecks,
   handleJsonParseError,
+  excludeRumBodyParser,
   GenerationJobManager,
   QUERY_DEVTOOLS_HEADER,
   createStreamServices,
@@ -125,8 +125,6 @@ const trusted_proxy = Number(TRUST_PROXY) || 1; /* trust first proxy by default 
 
 const app = express();
 app.locals.codeApiUploadRegistry = createCodeApiUploadRegistry();
-const historyMaintenance = createHistoryMutationOwner();
-app.locals.historyMaintenance = historyMaintenance;
 let serverReady = false;
 /** @type {import('@librechat/api').ScheduleEngineState} */
 let scheduleEngineState = 'starting';
@@ -146,10 +144,10 @@ const maintenance = createAppMaintenance({
     skillSync: skillSyncMaintenance,
     fileRetention: expiredFileSweepMaintenance,
     auth: legacyAuthMaintenance,
-    history: historyMaintenance,
   },
   // These actual owners do not yet expose a qualified admission/settlement census.
   unqualifiedOwners: [
+    'history request completion is not exhaustively measured',
     'remaining authentication writes',
     'standalone tag/share and other HTTP mutations',
     'MCP/OAuth reconnect, search indexing, code lifecycle and remaining background owners',
@@ -229,7 +227,6 @@ const SHUTDOWN_TEARDOWN_RESERVE_MS = 10_000;
 
 const startServer = async () => {
   await waitForKeyvRedisClient();
-  await configureSubagentTaskRouting();
   const { metricsMiddleware, metricsRouter } = createMetrics({
     collectAgentEventActorStorageMetrics: () =>
       runAsSystem(async () => {
@@ -290,6 +287,7 @@ const startServer = async () => {
   // An unknown write outcome prevents startup instead of reporting an idle owner.
   await runAsSystem(sweepOrphanedPreviews);
   const appConfig = await getAppConfig({ baseOnly: true });
+  await configureSubagentTaskRouting(appConfig?.endpoints?.agents?.subagentActivity);
   registerBackgroundTaskShutdown({
     interruptGraceMs: appConfig?.endpoints?.agents?.backgroundTasks?.shutdownInterruptGraceMs,
   });
@@ -359,7 +357,6 @@ const startServer = async () => {
      caller's and the client prefers it. */
   indexHTML = injectConfiguredFooterBootstrap(indexHTML, {
     customFooter: process.env.CUSTOM_FOOTER,
-    interfaceConfig: appConfig?.interfaceConfig,
   });
 
   const cspPolicy = createCspPolicy();
@@ -395,8 +392,8 @@ const startServer = async () => {
   app.use('/api/agents/chat', agentStartupIngressMiddleware);
   app.use(metricsMiddleware);
   app.use(noIndex);
-  app.use(express.json({ limit: '3mb' }));
-  app.use(express.urlencoded({ extended: true, limit: '3mb' }));
+  app.use(excludeRumBodyParser(express.json({ limit: '3mb' })));
+  app.use(excludeRumBodyParser(express.urlencoded({ extended: true, limit: '3mb' })));
   app.use(handleJsonParseError);
 
   /**
@@ -571,6 +568,8 @@ const startServer = async () => {
         address: server.address(),
         completionResultBatchSize:
           appConfig?.endpoints?.agents?.backgroundTasks?.completionResultBatchSize,
+        completionReceiptBatching:
+          appConfig?.endpoints?.agents?.backgroundTasks?.completionReceiptBatching,
         idlePolling: appConfig?.endpoints?.agents?.eventDriven?.idlePolling,
       });
       const scheduleEngineArmed = (await initializeScheduleEngine()) != null;

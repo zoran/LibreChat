@@ -7,10 +7,13 @@ jest.mock('@librechat/agents', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
-  ...jest.requireActual('../../../../packages/api/src/conversations/history'),
-  ...jest.requireActual('../../../../packages/api/src/conversations/historyHttp'),
+  prepareToolCallPreviews: jest.fn(() => (messages) => Promise.resolve(messages)),
+  createToolCallPartHandler: jest.fn(() => (_req, res) => res.status(404).end()),
+  rejectToolCallPreviewWrites: (_req, _res, next) => next(),
+  withMessageToolCallPreviews: (_req, message) => message,
   unescapeLaTeX: jest.fn((value) => value),
   countTokens: jest.fn().mockResolvedValue(2),
+  createPrivateTextView: jest.fn(() => (_req, _res, next) => next()),
   createContentFilter: jest.fn(() => (_req, _res, next) => next()),
   sendFeedbackScore: jest.fn().mockResolvedValue(undefined),
   traceIdForMessage: jest.fn((messageId) => `trace-${messageId}`),
@@ -24,7 +27,10 @@ jest.mock('@librechat/api', () => ({
   CHILD_THREAD_READ_ONLY_ERROR: 'Child thread is view-only.',
   isSubagentThreadWriteBlocked: jest.fn().mockResolvedValue(false),
   requireFeedbackEnabled: (req, res, next) => next(),
+  applyForcedRetention: jest.fn(),
 }));
+
+jest.mock('~/server/services/Config', () => ({ getAppConfig: jest.fn() }));
 
 jest.mock('~/server/services/Endpoints/agents/subagentThreadStore', () => ({}));
 
@@ -39,6 +45,8 @@ jest.mock('@librechat/data-schemas', () => ({
 }));
 
 jest.mock('~/models', () => ({
+  saveConvo: jest.fn(),
+  saveMessage: jest.fn(),
   getMessages: jest.fn(),
   updateMessage: jest.fn(),
 }));
@@ -58,13 +66,12 @@ jest.mock('~/server/middleware', () => ({
 
 describe('PUT /:conversationId/:messageId content edit', () => {
   let app;
-  const { getMessages, updateMessage } = require('~/models');
+  const { getMessages, saveConvo, saveMessage, updateMessage } = require('~/models');
   const { assertStoredMessageMutationAllowed } = require('@librechat/api');
 
   beforeAll(() => {
     const messagesRouter = require('../messages');
     app = express();
-    app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
     app.use(express.json());
     app.use((req, res, next) => {
       req.user = { id: 'user-1' };
@@ -74,9 +81,10 @@ describe('PUT /:conversationId/:messageId content edit', () => {
   });
 
   beforeEach(() => {
-    if (app) app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
     jest.clearAllMocks();
     updateMessage.mockResolvedValue({ messageId: 'message-1' });
+    saveMessage.mockResolvedValue({ messageId: 'message-1', conversationId: 'conversation-1' });
+    saveConvo.mockResolvedValue({ conversationId: 'conversation-1' });
   });
 
   it('preserves content-part metadata when editing its text', async () => {

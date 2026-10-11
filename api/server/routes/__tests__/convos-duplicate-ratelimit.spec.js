@@ -10,8 +10,6 @@ jest.mock('~/server/services/Config/app', () => ({ getAppConfig: jest.fn() }));
 jest.mock('@librechat/agents', () => require(MOCKS).agents());
 jest.mock('@librechat/api', () =>
   require(MOCKS).api({
-    ...jest.requireActual('../../../../packages/api/src/conversations/history'),
-    ...jest.requireActual('../../../../packages/api/src/conversations/historyHttp'),
     limiterCache: jest.fn(() => undefined),
     createContentFilter: jest.fn(() => (req, res, next) => next()),
     inspectContent: jest.fn(() => null),
@@ -46,6 +44,7 @@ jest.mock('~/server/middleware', () => {
   };
 });
 
+jest.mock('~/server/services/Config', () => require(MOCKS).appConfig());
 jest.mock('~/server/utils/import/fork', () => require(MOCKS).forkUtils());
 jest.mock('~/server/utils/import', () => require(MOCKS).importUtils());
 jest.mock('~/server/routes/files/multer', () => ({
@@ -93,7 +92,6 @@ describe('POST /api/convos/duplicate - Rate Limiting', () => {
       logViolation = require('~/cache/logViolation');
 
       app = express();
-      app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
       app.use(express.json());
       app.use((req, res, next) => {
         req.user = { id: 'rate-limit-test-user' };
@@ -109,8 +107,6 @@ describe('POST /api/convos/duplicate - Rate Limiting', () => {
 
   describe('user limit', () => {
     beforeEach(() => {
-      if (app)
-        app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
       process.env.FORK_USER_MAX = '2';
       process.env.FORK_USER_WINDOW = '1';
       process.env.FORK_IP_MAX = '100';
@@ -135,7 +131,7 @@ describe('POST /api/convos/duplicate - Rate Limiting', () => {
       expect(res.body.message).toMatch(/too many/i);
     });
 
-    it('keeps the actual detached rejection handler admitted during violation persistence', async () => {
+    it('waits for violation persistence before returning the rate-limit response', async () => {
       for (let i = 0; i < 2; i++) {
         await request(app).post('/api/convos/duplicate').send({ conversationId: 'conv-123' });
       }
@@ -149,23 +145,20 @@ describe('POST /api/convos/duplicate - Rate Limiting', () => {
           complete = resolve;
         });
       });
+      let settled = false;
       const rejected = request(app)
         .post('/api/convos/duplicate')
         .send({ conversationId: 'conv-123' })
-        .then((r) => r);
+        .then((r) => {
+          settled = true;
+          return r;
+        });
       await entered;
       // The limiter's own promise has returned; only its detached handler remains.
       await new Promise((resolve) => setImmediate(resolve));
-      const owner = app.locals.historyMaintenance;
-      owner.pauseAdmissions('a');
-      expect((await owner.getMaintenanceCensus('a')).queuedContinuations).toBe(1);
+      expect(settled).toBe(false);
       complete();
       expect((await rejected).status).toBe(429);
-      expect(await owner.getMaintenanceCensus('a')).toMatchObject({
-        pendingWrites: 0,
-        queuedContinuations: 0,
-        complete: true,
-      });
     });
   });
 

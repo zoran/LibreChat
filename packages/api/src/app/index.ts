@@ -13,3 +13,4 @@ export * from './agents';
 export { resolveBuildInfo } from './build';
 export type { BuildInfo } from './build';
 export * from './maintenance';
+export { buildPreLoginInterface } from './interface';

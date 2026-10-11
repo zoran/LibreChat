@@ -120,7 +120,7 @@
     "@azure/storage-blob": "^12.30.0",
     "@google/genai": "^2.8.0",
     "@keyv/redis": "5.1.6",
-    "@librechat/agents": "^4.0.1",
+    "@librechat/agents": "^4.0.4",
     "@librechat/data-schemas": "*",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@opentelemetry/api": "^1.9.0",
@@ -171,7 +171,7 @@
     "rate-limit-redis": "^4.2.0",
     "re2js": "^2.8.6",
     "sanitize-html": "^2.17.7",
-    "sharp": "^0.35.4",
+    "sharp": "^0.35.5",
     "undici": "^7.29.0",
     "yauzl": "^3.2.1",
     "zod": "^3.22.4"
@@ -179,6 +179,7 @@
   "dependencies": {
     "@langchain/langgraph-checkpoint": "^1.1.2",
     "@langchain/langgraph-checkpoint-mongodb": "^1.4.0",
+    "@simplewebauthn/server": "^13.3.2",
     "cluster-key-slot": "^1.1.2",
     "croner": "^10.0.1",
     "express-rate-limit": "^8.5.1",

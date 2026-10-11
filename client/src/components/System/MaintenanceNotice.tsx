@@ -84,11 +84,11 @@ export default function MaintenanceNotice() {
       aria-modal="true"
       onCancel={(event) => event.preventDefault()}
       onKeyDownCapture={(event) => event.stopPropagation()}
-      className="fixed inset-0 m-0 h-dvh max-h-none w-screen max-w-none border-0 bg-surface-primary p-6 text-text-primary backdrop:bg-black/70"
+      className="bg-surface-primary text-text-primary fixed inset-0 m-0 h-dvh max-h-none w-screen max-w-none border-0 p-6 backdrop:bg-black/70"
     >
       <div className="flex min-h-full items-center justify-center">
         <div className="max-w-lg text-center">
-          <Wrench aria-hidden="true" className="mx-auto mb-6 h-10 w-10 text-text-secondary" />
+          <Wrench aria-hidden="true" className="text-text-secondary mx-auto mb-6 h-10 w-10" />
           <h1
             ref={heading}
             id="maintenance-title"
@@ -103,7 +103,7 @@ export default function MaintenanceNotice() {
           <p
             id="maintenance-recovery"
             role="status"
-            className="mt-5 text-sm leading-6 text-text-secondary"
+            className="text-text-secondary mt-5 text-sm leading-6"
           >
             {localize('com_maintenance_recovery')}
           </p>

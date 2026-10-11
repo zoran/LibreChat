@@ -2,6 +2,7 @@ const {
   withAuthRequest,
   authMutation,
   authUserMutation,
+  authUserUpdate,
 } = require('~/server/services/LegacyAuthMaintenance');
 const fs = require('fs');
 const path = require('path');
@@ -10,7 +11,9 @@ const { ErrorTypes } = require('librechat-data-provider');
 const { hashToken, logger } = require('@librechat/data-schemas');
 const { Strategy: SamlStrategy } = require('@node-saml/passport-saml');
 const {
+  findSamlUser,
   getBalanceConfig,
+  provisionSamlUser,
   isEmailDomainAllowed,
   getAvatarFileStrategy,
   getAvatarSaveParams,
@@ -20,7 +23,13 @@ const {
 } = require('@librechat/api');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { resizeAvatar } = require('~/server/services/Files/images/avatar');
-const { findUser, createUser, updateUser, claimSamlIdentity } = require('~/models');
+const {
+  findUser,
+  updateUser,
+  findBalanceByUser,
+  claimSamlIdentity,
+  createUserIfAbsent,
+} = require('~/models');
 const { getAppConfig } = require('~/server/services/Config');
 const paths = require('~/config/paths');
 
@@ -206,31 +215,13 @@ function createSamlCallback(existingUsersOnly = false) {
           return done(null, false, { message: 'Email domain not allowed' });
         }
 
-        let user = await findUser({ samlId: nameID });
-        logger.info(`[samlStrategy] User ${user ? 'found' : 'not found'} by SAML identity`);
-
-        if (!user) {
-          user = await findUser({ email: userEmail });
-          logger.info(`[samlStrategy] User ${user ? 'found' : 'not found'} by SAML email claim`);
+        const found = await findSamlUser({ findUser, nameID, email: userEmail });
+        if (found.error) {
+          return done(null, false, { message: ErrorTypes.AUTH_FAILED });
         }
+        let user = found.user;
 
-        if (user && user.provider !== 'saml') {
-          logger.info(
-            `[samlStrategy] SAML login conflicts with existing provider: ${user.provider}`,
-          );
-          return done(null, false, {
-            message: ErrorTypes.AUTH_FAILED,
-          });
-        }
-
-        if (user?.samlId && user.samlId !== nameID) {
-          logger.warn('[samlStrategy] Refused SAML login with a different NameID');
-          return done(null, false, {
-            message: ErrorTypes.AUTH_FAILED,
-          });
-        }
-
-        const appConfig = user?.tenantId
+        let appConfig = user?.tenantId
           ? await resolveAppConfigForUser(getAppConfig, user)
           : baseConfig;
 
@@ -245,32 +236,29 @@ function createSamlCallback(existingUsersOnly = false) {
           getUserName(profile) || getGivenName(profile) || getEmail(profile),
         );
 
-        if (!user) {
-          if (existingUsersOnly) {
-            logger.error('[samlStrategy] Admin auth blocked because the user does not exist');
-            return done(null, false, { message: 'User does not exist' });
-          }
-
-          user = {
-            provider: 'saml',
-            samlId: nameID,
-            username,
-            email: userEmail,
-            emailVerified: true,
-            name: fullName,
-          };
-          const balanceConfig = getBalanceConfig(appConfig);
-          user = await authMutation(createUser, user, balanceConfig, true, true);
-        } else {
-          user = await authUserMutation(claimSamlIdentity, user._id, nameID, {
-            username,
-            name: fullName,
-          });
-          if (!user) {
-            logger.warn('[samlStrategy] Refused a concurrent SAML identity binding');
-            return done(null, false, { message: ErrorTypes.AUTH_FAILED });
-          }
+        if (!user && existingUsersOnly) {
+          logger.error('[samlStrategy] Admin auth blocked because the user does not exist');
+          return done(null, false, { message: 'User does not exist' });
         }
+
+        const provisioned = await provisionSamlUser({
+          user,
+          nameID,
+          email: userEmail,
+          username,
+          name: fullName,
+          appConfig,
+          getBalanceConfig,
+          getAppConfig,
+          findUser,
+          createUserIfAbsent: (...args) => authMutation(createUserIfAbsent, ...args),
+          findBalanceByUser,
+          claimSamlIdentity: (...args) => authUserMutation(claimSamlIdentity, ...args),
+        });
+        if (provisioned.error) {
+          return done(null, false, { message: provisioned.error });
+        }
+        ({ user, appConfig } = provisioned);
 
         const picture = getPicture(profile);
         if (picture && !user.avatar?.includes('manual=true')) {
@@ -296,7 +284,7 @@ function createSamlCallback(existingUsersOnly = false) {
               }),
             );
             user.avatar = imagePath ?? '';
-            user = await authUserMutation(updateUser, user._id, user);
+            user = await authUserUpdate(updateUser, user._id, user);
           }
         }
 

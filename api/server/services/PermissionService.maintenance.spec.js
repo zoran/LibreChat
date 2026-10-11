@@ -1,4 +1,5 @@
 /** Real PermissionService -> public data composition -> auth lifetime; adapters stay in memory. */
+const { EventEmitter } = require('node:events');
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
   ...jest.requireActual('../../../packages/api/src/auth/maintenance.ts'),
@@ -37,7 +38,7 @@ const { cache } = require('~/models');
 test('an already completed OAuth membership sync retains the real delayed data-owner writes', async () => {
   jest.useFakeTimers();
   const req = {};
-  const res = { end: jest.fn() };
+  const res = Object.assign(new EventEmitter(), { end: jest.fn() });
   owner.admissionMiddleware(req, res, () => {});
   const pending = [];
   try {

@@ -6,17 +6,23 @@ jest.mock('@librechat/agents', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
-  ...jest.requireActual('../../../../packages/api/src/conversations/history'),
-  ...jest.requireActual('../../../../packages/api/src/conversations/historyHttp'),
+  prepareToolCallPreviews: jest.fn(() => (messages) => Promise.resolve(messages)),
+  createToolCallPartHandler: jest.fn(() => (_req, res) => res.status(404).end()),
+  rejectToolCallPreviewWrites: (_req, _res, next) => next(),
+  withMessageToolCallPreviews: (_req, message) => message,
   unescapeLaTeX: jest.fn((value) => value),
   countTokens: jest.fn().mockResolvedValue(10),
+  createPrivateTextView: jest.fn(() => (_req, _res, next) => next()),
   createContentFilter: jest.fn(() => (req, res, next) => next()),
   sendFeedbackScore: jest.fn().mockResolvedValue(undefined),
   traceIdForMessage: jest.fn((messageId) => `trace-${messageId}`),
   CHILD_THREAD_READ_ONLY_ERROR: 'Child thread is view-only.',
   isSubagentThreadWriteBlocked: jest.fn().mockResolvedValue(false),
   requireFeedbackEnabled: jest.fn((req, res, next) => next()),
+  applyForcedRetention: jest.fn(),
 }));
+
+jest.mock('~/server/services/Config', () => ({ getAppConfig: jest.fn() }));
 
 jest.mock('~/server/services/Endpoints/agents/subagentThreadStore', () => ({}));
 
@@ -76,7 +82,6 @@ describe('PUT /:conversationId/:messageId/feedback', () => {
     const messagesRouter = require('../messages');
 
     app = express();
-    app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
     app.use(express.json());
     app.use((req, res, next) => {
       req.user = { id: 'user-1' };
@@ -86,7 +91,6 @@ describe('PUT /:conversationId/:messageId/feedback', () => {
   });
 
   beforeEach(() => {
-    if (app) app.locals.historyMaintenance = require('@librechat/api').createHistoryMutationOwner();
     jest.clearAllMocks();
     requireFeedbackEnabled.mockImplementation((req, res, next) => next());
     updateMessage.mockImplementation((userId, { messageId, feedback }) =>
@@ -101,31 +105,26 @@ describe('PUT /:conversationId/:messageId/feedback', () => {
     );
   });
 
-  it('holds feedback after its HTTP response until the actual export settles', async () => {
-    const owner = require('@librechat/api').createHistoryMutationOwner();
-    app.locals.historyMaintenance = owner;
-    let complete;
+  it('returns persisted feedback before export and logs a later export failure', async () => {
+    let reject;
     sendFeedbackScore.mockReturnValueOnce(
-      new Promise((resolve) => {
-        complete = resolve;
+      new Promise((_resolve, no) => {
+        reject = no;
       }),
     );
-    try {
-      const response = await request(app)
-        .put('/api/messages/conversation-1/message-1/feedback')
-        .send({ feedback: null });
-      expect(response.status).toBe(200);
-      owner.pauseAdmissions('drain');
-      expect(await owner.getMaintenanceCensus('drain')).toMatchObject({ pendingWrites: 1 });
-    } finally {
-      complete();
-      await new Promise((resolve) => setImmediate(resolve));
-      owner.resumeAdmissions('drain');
-    }
-    expect(await owner.getMaintenanceCensus(null)).toMatchObject({
-      pendingWrites: 0,
-      complete: true,
-    });
+    const response = await request(app)
+      .put('/api/messages/conversation-1/message-1/feedback')
+      .send({ feedback: null });
+    expect(response.status).toBe(200);
+    expect(updateMessage).toHaveBeenCalledTimes(1);
+    expect(sendFeedbackScore).toHaveBeenCalledTimes(1);
+    const error = new Error('feedback export unavailable');
+    reject(error);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(require('@librechat/data-schemas').logger.error).toHaveBeenCalledWith(
+      '[langfuse] feedback score failed:',
+      error,
+    );
   });
 
   it('persists validated feedback and removes unknown fields', async () => {

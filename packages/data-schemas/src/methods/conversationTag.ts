@@ -32,7 +32,6 @@ export async function decrementTagCounts(
   mongoose: typeof import('mongoose'),
   user: string,
   tags: string[],
-  onUncertain?: (error: unknown) => void,
 ): Promise<void> {
   if (!tags.length) {
     return;
@@ -74,11 +73,10 @@ export async function decrementTagCounts(
     ]);
 
     const result = await tenantSafeBulkWrite(ConversationTag, bulkOps);
-    if (onUncertain && result?.isOk?.() !== true) {
-      onUncertain(new Error('Tag count decrement was not acknowledged'));
+    if (result?.isOk?.() !== true) {
+      throw new Error('Tag count decrement was not acknowledged');
     }
   } catch (error) {
-    onUncertain?.(error);
     logger.error('[decrementTagCounts] Error decrementing tag counts', error);
   }
 }
@@ -163,11 +161,7 @@ export function createConversationTagMethods(mongoose: typeof import('mongoose')
     | null
   >;
   deleteConversationTags: (filter: Record<string, unknown>) => Promise<number>;
-  bulkIncrementTagCounts: (
-    user: string,
-    tags: string[],
-    onUncertain?: (error: unknown) => void,
-  ) => Promise<void>;
+  bulkIncrementTagCounts: (user: string, tags: string[]) => Promise<void>;
   updateTagsForConversation: (
     user: string,
     conversationId: string,
@@ -420,7 +414,7 @@ export function createConversationTagMethods(mongoose: typeof import('mongoose')
       const ConversationTag = mongoose.models.ConversationTag as Model<IConversationTag>;
       const Conversation = mongoose.models.Conversation;
 
-      const conversation = await Conversation.findOne({ user, conversationId }).lean();
+      const conversation = await Conversation.findOne({ user, conversationId }, 'tags').lean();
       if (!conversation) {
         throw new Error('Conversation not found');
       }
@@ -464,15 +458,13 @@ export function createConversationTagMethods(mongoose: typeof import('mongoose')
         await tenantSafeBulkWrite(ConversationTag, bulkOps);
       }
 
-      const updatedConversation = (
-        await Conversation.findOneAndUpdate(
-          { user, conversationId },
-          { $set: { tags: [...newTags] } },
-          { new: true },
-        )
-      ).toObject();
+      const updatedConversation = await Conversation.findOneAndUpdate(
+        { user, conversationId },
+        { $set: { tags: [...newTags] } },
+        { new: true, projection: { tags: 1 } },
+      ).lean<{ tags: string[] }>();
 
-      return updatedConversation.tags;
+      return (updatedConversation as { tags: string[] }).tags;
     } catch (error) {
       logger.error('[updateTagsForConversation] Error updating tags', error);
       throw new Error('Error updating tags for conversation');
@@ -482,11 +474,7 @@ export function createConversationTagMethods(mongoose: typeof import('mongoose')
   /**
    * Increments tag counts for existing tags only.
    */
-  async function bulkIncrementTagCounts(
-    user: string,
-    tags: string[],
-    onUncertain?: (error: unknown) => void,
-  ): Promise<void> {
+  async function bulkIncrementTagCounts(user: string, tags: string[]): Promise<void> {
     if (!tags || tags.length === 0) {
       return;
     }
@@ -506,8 +494,8 @@ export function createConversationTagMethods(mongoose: typeof import('mongoose')
       }));
 
       const result = await tenantSafeBulkWrite(ConversationTag, bulkOps);
-      if (onUncertain && result?.isOk?.() !== true) {
-        onUncertain(new Error('Tag count increment was not acknowledged'));
+      if (result?.isOk?.() !== true) {
+        throw new Error('Tag count increment was not acknowledged');
       }
       if (result && result.modifiedCount > 0) {
         logger.debug(
@@ -515,7 +503,6 @@ export function createConversationTagMethods(mongoose: typeof import('mongoose')
         );
       }
     } catch (error) {
-      onUncertain?.(error);
       logger.error('[bulkIncrementTagCounts] Error incrementing tag counts', error);
     }
   }

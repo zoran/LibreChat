@@ -5,6 +5,7 @@ jest.mock('~/server/services/LegacyAuthMaintenance', () => ({
   authWrite: async (action) => action(),
   authMutation: async (method, ...args) => method(...args),
   authUserMutation: async (method, ...args) => method(...args),
+  authUserUpdate: async (method, ...args) => method(...args),
   authCache: (store) => store,
   authPersistence: { write: async (action) => action() },
   legacyAuthMaintenance: { current: () => undefined },
@@ -364,6 +365,7 @@ describe('socialLogin', () => {
         name: 'New User',
         emailVerified: true,
         appConfig: expect.any(Object),
+        lookup: { findUser, provider, providerId: googleId, email },
       });
 
       expect(callback).toHaveBeenCalledWith(null, newUser);

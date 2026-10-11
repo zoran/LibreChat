@@ -40,7 +40,7 @@ describe('browser enrollment coordination and recovery', () => {
       enrollBrowserSession({ refresh, enroll }),
     ]);
     expect(enroll).toHaveBeenCalledTimes(1);
-    expect(responses[0].user.id).toBe(responses[1].user.id);
+    expect(responses).toEqual([result, result]);
     expect(localStorage.getItem(BROWSER_SESSION_MARKER)).toBe('active');
     expect(localStorage.getItem(BROWSER_SESSION_MARKER)).not.toContain('same-user');
   });

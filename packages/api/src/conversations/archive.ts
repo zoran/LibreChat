@@ -3,7 +3,6 @@ import { logger } from '@librechat/data-schemas';
 import type { ConversationMethods } from '@librechat/data-schemas';
 import type { Response } from 'express';
 import type { ServerRequest } from '~/types';
-import { getHistoryMutationScope, trackHistoryWrite } from './historyHttp';
 
 type ArchiveAllHandlerDependencies = Pick<ConversationMethods, 'archiveAllConvos'>;
 
@@ -12,12 +11,7 @@ export function createArchiveAllHandler(
 ): (req: ServerRequest, res: Response) => Promise<Response> {
   return async function archiveAllHandler(req: ServerRequest, res: Response): Promise<Response> {
     try {
-      const scope = getHistoryMutationScope(req);
-      const result = await trackHistoryWrite(req, () =>
-        scope
-          ? deps.archiveAllConvos(req.user!.id, { onUncertain: scope.uncertain })
-          : deps.archiveAllConvos(req.user!.id),
-      );
+      const result = await deps.archiveAllConvos(req.user!.id);
       return res.status(200).json(result);
     } catch (error) {
       logger.error('Error archiving all conversations', error);

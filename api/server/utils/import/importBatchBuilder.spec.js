@@ -27,6 +27,7 @@ const {
 const { ImportBatchBuilder } = require('./importBatchBuilder');
 
 jest.mock('~/models', () => ({
+  initializeMessageBudget: jest.fn(),
   bulkIncrementTagCounts: jest.fn(),
   bulkSaveConvos: jest.fn(),
   bulkSaveMessages: jest.fn(),
@@ -88,13 +89,7 @@ describe('ImportBatchBuilder content filtering', () => {
   it.each([false, true])(
     'retains primary failure and actual compensation completion, cleanup failed=%s',
     async (fails) => {
-      const {
-        createHistoryMutationOwner,
-      } = require('../../../../packages/api/src/conversations/history');
-      const owner = createHistoryMutationOwner();
-      const scope = owner.admit('conversation-import');
       const builder = createBuilder();
-      builder.history = scope;
       const failure = new Error('message commit uncertain');
       bulkSaveConvos.mockResolvedValueOnce({ isOk: () => true });
       bulkSaveMessages.mockRejectedValueOnce(failure);
@@ -109,24 +104,20 @@ describe('ImportBatchBuilder content filtering', () => {
           reject = no;
         });
       });
-      const result = builder
-        .saveBatch()
-        .catch((error) => error)
-        .finally(() => scope.finish());
+      let settled = false;
+      const result = builder.saveBatch().catch((error) => {
+        settled = true;
+        return error;
+      });
       await entered;
-      owner.pauseAdmissions('a');
-      expect((await owner.getMaintenanceCensus('a')).pendingWrites).toBe(1);
+      expect(settled).toBe(false);
+      expect(deleteImportedConversations).not.toHaveBeenCalled();
       if (fails) reject(new Error('compensation uncertain'));
       else complete();
       expect(await result).toBe(failure);
       // Preserve the canonical recovery order: retain conversation ownership if message cleanup failed.
       expect(deleteImportedConversations).toHaveBeenCalledTimes(fails ? 0 : 1);
-      expect(await owner.getMaintenanceCensus('a')).toMatchObject({
-        pendingWrites: 0,
-        queuedContinuations: 0,
-        complete: false,
-      });
-      expect(owner.resumeAdmissions('a')).toBe(false);
+      expect(bulkIncrementTagCounts).not.toHaveBeenCalled();
     },
   );
 

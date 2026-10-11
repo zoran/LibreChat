@@ -297,19 +297,14 @@ export async function deleteSharedLinkWithCleanup(
 export async function deleteConvoSharedLinksWithCleanup(
   user: string,
   conversationId: string,
-  onCleanup?: (pending: Promise<DeleteResult>) => void,
 ): Promise<{ message: string; deletedCount: number }> {
   const SharedLink = mongoose.models.SharedLink as Model<ISharedLink>;
   const links = await SharedLink.find({ user, conversationId }).select('_id').lean();
   const ids = links.map((l) => l._id);
-  const deletion = Promise.resolve(SharedLink.deleteMany({ user, conversationId }));
-  onCleanup?.(deletion);
-  const result = await deletion;
+  const result = await SharedLink.deleteMany({ user, conversationId });
 
   if (ids.length > 0) {
-    const cleanup = cleanupBulkSharedLinkPermissions(ids);
-    onCleanup?.(cleanup);
-    cleanup.catch((err) => {
+    cleanupBulkSharedLinkPermissions(ids).catch((err) => {
       logger.error('[deleteConvoSharedLinksWithCleanup] ACL cleanup failed', {
         conversationId,
         error: err instanceof Error ? err.message : String(err),
@@ -325,19 +320,14 @@ export async function deleteConvoSharedLinksWithCleanup(
 
 export async function deleteAllSharedLinksWithCleanup(
   user: string,
-  onCleanup?: (pending: Promise<DeleteResult>) => void,
 ): Promise<{ message: string; deletedCount: number }> {
   const SharedLink = mongoose.models.SharedLink as Model<ISharedLink>;
   const links = await SharedLink.find({ user }).select('_id').lean();
   const ids = links.map((l) => l._id);
-  const deletion = Promise.resolve(SharedLink.deleteMany({ user }));
-  onCleanup?.(deletion);
-  const result = await deletion;
+  const result = await SharedLink.deleteMany({ user });
 
   if (ids.length > 0) {
-    const cleanup = cleanupBulkSharedLinkPermissions(ids);
-    onCleanup?.(cleanup);
-    cleanup.catch((err) => {
+    cleanupBulkSharedLinkPermissions(ids).catch((err) => {
       logger.error('[deleteAllSharedLinksWithCleanup] ACL cleanup failed', {
         user,
         error: err instanceof Error ? err.message : String(err),

@@ -4,6 +4,7 @@ import type { IConversation } from '..';
 import type { IConversationTag } from '~/schema/conversationTag';
 import { createConversationTagMethods, decrementTagCounts } from './conversationTag';
 import { createModels } from '~/models';
+import logger from '~/config/winston';
 
 jest.mock('~/config/winston', () => ({
   error: jest.fn(),
@@ -219,36 +220,32 @@ describe('decrementTagCounts', () => {
   });
 });
 
-describe('history tag persistence outcomes', () => {
-  it('reports an unacknowledged fulfilled bulk result without changing the legacy response', async () => {
-    const onUncertain = jest.fn();
+describe('tag persistence outcomes', () => {
+  it('logs an unacknowledged bulk result without failing derived metadata reconciliation', async () => {
+    jest.mocked(logger.error).mockClear();
     const write = jest
       .spyOn(ConversationTag, 'bulkWrite')
       .mockResolvedValue({ isOk: () => false } as never);
     try {
       const methods = createConversationTagMethods(mongoose);
-      await expect(
-        methods.bulkIncrementTagCounts('history-owner', ['work'], onUncertain),
-      ).resolves.toBeUndefined();
-      await expect(
-        decrementTagCounts(mongoose, 'history-owner', ['work'], onUncertain),
-      ).resolves.toBeUndefined();
-      expect(onUncertain).toHaveBeenCalledTimes(2);
+      await expect(methods.bulkIncrementTagCounts('tag-owner', ['work'])).resolves.toBeUndefined();
+      await expect(decrementTagCounts(mongoose, 'tag-owner', ['work'])).resolves.toBeUndefined();
+      expect(logger.error).toHaveBeenCalledTimes(2);
     } finally {
       write.mockRestore();
     }
   });
 
-  it('reports both swallowed increment and decrement failures to the admitted owner', async () => {
-    const onUncertain = jest.fn();
+  it('logs increment and decrement failures', async () => {
+    jest.mocked(logger.error).mockClear();
     const failure = new Error('tag acknowledgment lost');
     const write = jest.spyOn(ConversationTag, 'bulkWrite').mockRejectedValue(failure);
     try {
       const methods = createConversationTagMethods(mongoose);
-      await methods.bulkIncrementTagCounts('history-owner', ['work'], onUncertain);
-      await decrementTagCounts(mongoose, 'history-owner', ['work'], onUncertain);
-      expect(onUncertain).toHaveBeenCalledTimes(2);
-      expect(onUncertain).toHaveBeenCalledWith(failure);
+      await methods.bulkIncrementTagCounts('tag-owner', ['work']);
+      await decrementTagCounts(mongoose, 'tag-owner', ['work']);
+      expect(logger.error).toHaveBeenCalledTimes(2);
+      expect(logger.error).toHaveBeenCalledWith(expect.any(String), failure);
     } finally {
       write.mockRestore();
     }

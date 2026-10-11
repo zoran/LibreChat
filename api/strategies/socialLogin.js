@@ -1,7 +1,12 @@
-const { withAuthRequest, authUserMutation } = require('~/server/services/LegacyAuthMaintenance');
+const { withAuthRequest, authUserUpdate } = require('~/server/services/LegacyAuthMaintenance');
 const { logger } = require('@librechat/data-schemas');
 const { ErrorTypes } = require('librechat-data-provider');
-const { isEnabled, isEmailDomainAllowed, resolveAppConfigForUser } = require('@librechat/api');
+const {
+  isEnabled,
+  findSocialUser,
+  isEmailDomainAllowed,
+  resolveAppConfigForUser,
+} = require('@librechat/api');
 const { createSocialUser, handleExistingUser } = require('./process');
 const { getAppConfig } = require('~/server/services/Config');
 const { findUser, updateUser } = require('~/models');
@@ -28,22 +33,8 @@ const socialLogin =
         }
 
         const providerKey = `${provider}Id`;
-        let existingUser = null;
-
-        /** First try to find user by provider ID (e.g., googleId, facebookId) */
-        if (id && typeof id === 'string') {
-          existingUser = await findUser({ [providerKey]: id });
-        }
-
-        /** If not found by provider ID, try finding by email */
-        if (!existingUser) {
-          existingUser = await findUser({ email: email?.trim() });
-          if (existingUser) {
-            logger.warn(
-              `[${provider}Login] User found by email: ${email} but not by ${providerKey}`,
-            );
-          }
-        }
+        const lookup = { findUser, provider, providerId: id, email };
+        const existingUser = await findSocialUser(lookup);
 
         const appConfig = existingUser?.tenantId
           ? await resolveAppConfigForUser(getAppConfig, existingUser)
@@ -85,7 +76,7 @@ const socialLogin =
               tenantError.code = ErrorTypes.AUTH_FAILED;
               return cb(tenantError);
             }
-            await authUserMutation(updateUser, existingUser._id, { [providerKey]: id });
+            await authUserUpdate(updateUser, existingUser._id, { [providerKey]: id });
             const verified = await findUser({ _id: existingUser._id, [providerKey]: id });
             if (!verified) {
               logger.warn(
@@ -137,6 +128,7 @@ const socialLogin =
           name,
           emailVerified,
           appConfig,
+          lookup,
         });
         return passResult(newUser);
       } catch (err) {

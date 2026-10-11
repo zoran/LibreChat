@@ -1,3 +1,4 @@
+const { EventEmitter } = require('node:events');
 jest.mock('./LegacyAuthMaintenance', () => {
   const { createAuthMaintenance } = jest.requireActual(
     '../../../packages/api/src/auth/maintenance.ts',
@@ -693,7 +694,7 @@ describe('OpenIDSessionRefresh', () => {
     it('retains accepted IdP work and the actual session save callback after pause and response end', async () => {
       const owner = require('./LegacyAuthMaintenance').maintenance();
       const req = buildReq(buildExpiredSession('rt-old'));
-      const res = { ...buildRes(), end: jest.fn() };
+      const res = Object.assign(new EventEmitter(), buildRes(), { end: jest.fn() });
       owner.admissionMiddleware(req, res, () => undefined);
       let grant;
       let save;
@@ -739,7 +740,7 @@ describe('OpenIDSessionRefresh', () => {
     it('settles an ordinary invalid_grant without poisoning local persistence evidence', async () => {
       const owner = require('./LegacyAuthMaintenance').maintenance();
       const req = buildReq(buildExpiredSession('rt-old'));
-      const res = { ...buildRes(), end: jest.fn() };
+      const res = Object.assign(new EventEmitter(), buildRes(), { end: jest.fn() });
       owner.admissionMiddleware(req, res, () => undefined);
       openIdClient.refreshTokenGrant.mockRejectedValueOnce(new Error('invalid_grant'));
       await expect(

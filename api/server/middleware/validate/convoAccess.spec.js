@@ -1,7 +1,3 @@
-jest.mock('@librechat/api', () => ({
-  ...jest.requireActual('@librechat/api'),
-  ...jest.requireActual('../../../../packages/api/src/conversations/historyHttp'),
-}));
 const mongoose = require('mongoose');
 const { MongoMemoryServer } = require('mongodb-memory-server');
 const { ViolationTypes } = require('librechat-data-provider');
@@ -117,17 +113,11 @@ describe('validateConvoAccess', () => {
   });
 
   it.each([false, true])(
-    'retains a detached access-cache write and failed=%s outcome after next',
+    'logs failed=%s detached access-cache writes after next',
     async (fails) => {
-      const {
-        createHistoryMutationOwner,
-      } = require('../../../../packages/api/src/conversations/history');
-      const {
-        createHistoryMutationHandler,
-      } = require('../../../../packages/api/src/conversations/historyHttp');
-      const owner = createHistoryMutationOwner();
+      const { logger } = require('@librechat/data-schemas');
+      const warning = jest.spyOn(logger, 'warn').mockImplementation(() => {});
       const req = createRequest(OWNER_ID, CONVERSATION_ID);
-      req.app = { locals: { historyMaintenance: owner } };
       let resolve, reject;
       mockCache.set.mockReturnValueOnce(
         new Promise((yes, no) => {
@@ -135,23 +125,25 @@ describe('validateConvoAccess', () => {
           reject = no;
         }),
       );
-      await createHistoryMutationHandler('conversation-pin', validateConvoAccess, async () => {})(
-        req,
-        res,
-        next,
-      );
-      owner.pauseAdmissions('a');
-      expect(await owner.getMaintenanceCensus('a')).toMatchObject({
-        pendingWrites: 1,
-        queuedContinuations: 0,
-      });
-      if (fails) reject(new Error('cache acknowledgment lost'));
-      else resolve(true);
-      await new Promise((done) => setImmediate(done));
-      expect(await owner.getMaintenanceCensus('a')).toMatchObject({
-        pendingWrites: 0,
-        complete: !fails,
-      });
+      try {
+        await validateConvoAccess(req, res, next);
+        expect(next).toHaveBeenCalledTimes(1);
+        expect(warning).not.toHaveBeenCalled();
+        const error = new Error('cache acknowledgment lost');
+        if (fails) reject(error);
+        else resolve(true);
+        await new Promise((done) => setImmediate(done));
+        if (fails) {
+          expect(warning).toHaveBeenCalledWith(
+            '[validateConvoAccess] Failed to cache conversation access',
+            error,
+          );
+        } else {
+          expect(warning).not.toHaveBeenCalled();
+        }
+      } finally {
+        warning.mockRestore();
+      }
     },
   );
 

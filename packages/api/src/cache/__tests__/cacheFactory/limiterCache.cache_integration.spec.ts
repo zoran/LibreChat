@@ -56,16 +56,30 @@ describe('limiterCache', () => {
     // Verify it returns a RedisStore instance
     expect(testStore).toBeDefined();
     expect(testStore!.constructor.name).toBe('RedisStore');
-    expect(testStore!.prefix).toBe('test-limiter:');
+    expect(testStore!.prefix).toBe('Cache-Integration-Test::test-limiter:');
     expect(typeof testStore!.sendCommand).toBe('function');
+
+    // rate-limit-redis sends uppercase dynamic commands. The pinned ioredis
+    // key lookup is case-sensitive, so these raw calls bypass keyPrefix and
+    // RedisStore must carry the deployment prefix itself.
+    const limiterKey = 'rate-limit-user:123';
+    testStore!.init({ windowMs: 60_000 } as Parameters<RedisStore['init']>[0]);
+    await expect(testStore!.increment(limiterKey)).resolves.toMatchObject({ totalHits: 1 });
+    expect(await ioredisClient!.call('GET', `${testStore!.prefix}${limiterKey}`)).toBe('1');
+    expect(await ioredisClient!.call('GET', `test-limiter:${limiterKey}`)).toBeNull();
+    expect(
+      await ioredisClient!.call('GET', `Cache-Integration-Test::${testStore!.prefix}${limiterKey}`),
+    ).toBeNull();
+    await testStore!.resetKey(limiterKey);
+    expect(await ioredisClient!.call('GET', `${testStore!.prefix}${limiterKey}`)).toBeNull();
 
     const testKey = 'user:123';
 
     // SET operation
     await testStore!.sendCommand('SET', testKey, '1', 'EX', '60');
 
-    // The limiter and normal client must address the same globally prefixed key.
-    const directValue = await ioredisClient!.get(testKey);
+    // Raw commands bypass client keyPrefix; RedisStore prefixes its own limiter operations.
+    const directValue = await ioredisClient!.call('GET', testKey);
 
     expect(directValue).toBe('1');
 
@@ -78,7 +92,7 @@ describe('limiterCache', () => {
     expect(incremented).toBe(2);
 
     // Verify increment worked with ioredis
-    const incrementedValue = await ioredisClient!.get(testKey);
+    const incrementedValue = await ioredisClient!.call('GET', testKey);
     expect(incrementedValue).toBe('2');
 
     // TTL operation
@@ -93,7 +107,7 @@ describe('limiterCache', () => {
     // Verify deletion
     const afterDelete = await testStore!.sendCommand('GET', testKey);
     expect(afterDelete).toBeNull();
-    const directAfterDelete = await ioredisClient!.get(testKey);
+    const directAfterDelete = await ioredisClient!.call('GET', testKey);
     expect(directAfterDelete).toBeNull();
 
     // Test error handling
