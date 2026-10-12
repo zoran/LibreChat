@@ -58,6 +58,8 @@ export type EndpointFileConfig = {
 };
 
 export type FileConfig = {
+  /** Optional original-upload retention; absence preserves upstream admission. */
+  retentionHours?: number;
   endpoints: {
     [key: string]: EndpointFileConfig;
   };
@@ -99,6 +101,8 @@ export type FileConfig = {
 };
 
 export type FileConfigInput = {
+  /** Optional original-upload retention; absence preserves upstream admission. */
+  retentionHours?: number;
   endpoints?: {
     [key: string]: EndpointFileConfig;
   };
@@ -172,6 +176,8 @@ export type TFile = {
   height?: number;
   expiresAt?: string | Date;
   expiredAt?: string | Date | null;
+  /** Server-owned original document admission, absent for ordinary files. */
+  retentionAcceptedAt?: string | Date;
   preview?: string;
   text?: string;
   /**

@@ -62,8 +62,8 @@ import {
   findReasoningLabelMessageIndex,
   appendAppliedSteerIds,
   collectAppliedSteerIds,
-  collectDroppedSteerQuotes,
-  mergeRestagedQuotes,
+  collectDroppedSteerQuoteDraft,
+  mergeRestagedQuoteDraft,
   removeConvoFromAllQueries,
   upsertConvoInAllQueries,
   invalidateConversationLists,
@@ -1046,18 +1046,18 @@ export default function useResumableSSE(
         /** A part applied by a pre-quotes server carries no quotes while the
          *  chip being settled may hold the only copy of the user's excerpts
          *  (its 202 was lost, so the ACK-echo restore never ran). Re-stage
-         *  them before removal; `mergeRestagedQuotes` keeps this idempotent
+         *  them before removal; `mergeRestagedQuoteDraft` keeps this idempotent
          *  with the ACK path for the same excerpts. */
         if (appliedPartQuotes == null || appliedPartQuotes.length === 0) {
           const chips = snapshot
             .getLoadable(store.pendingSteersByConvoId(conversationId))
             .getValue();
-          const droppedQuotes = chips.find(
+          const dropped = chips.find(
             (steer) => settledIds.includes(steer.steerId) && (steer.quotes?.length ?? 0) > 0,
-          )?.quotes;
-          if (droppedQuotes != null && droppedQuotes.length > 0) {
-            set(store.pendingQuotesByConvoId(conversationId), (prev) =>
-              mergeRestagedQuotes(prev, droppedQuotes),
+          );
+          if (dropped?.quotes != null && dropped.quotes.length > 0) {
+            set(store.pendingQuoteDraftByConvoId(conversationId), (prev) =>
+              mergeRestagedQuoteDraft(prev, dropped.quotes ?? [], dropped.quoteSourceRefs),
             );
           }
         }
@@ -1254,15 +1254,12 @@ export default function useResumableSSE(
         /** Chips settled by quote-less applied parts hold the only copy of
          *  their excerpts (a pre-quotes server injected the words bare) —
          *  re-stage them as composer chips before the removal below. */
-        const droppedQuotes = collectDroppedSteerQuotes(
-          values,
-          snapshot.getLoadable(store.pendingSteersByConvoId(conversationId)).getValue(),
+        const quoteChips = snapshot
+          .getLoadable(store.pendingSteersByConvoId(conversationId))
+          .getValue();
+        set(store.pendingQuoteDraftByConvoId(conversationId), (prev) =>
+          collectDroppedSteerQuoteDraft(values, quoteChips, prev),
         );
-        if (droppedQuotes.length > 0) {
-          set(store.pendingQuotesByConvoId(conversationId), (prev) =>
-            mergeRestagedQuotes(prev, droppedQuotes),
-          );
-        }
         set(store.appliedSteerIdsByConvoId(conversationId), (prev) =>
           appendAppliedSteerIds(prev, ids),
         );

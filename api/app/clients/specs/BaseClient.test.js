@@ -4675,3 +4675,33 @@ describe('BaseClient compaction turns', () => {
     expect(compactionHistory[1].tokenCount).toBe(7);
   });
 });
+
+it('fences response persistence without marking the independent user question', async () => {
+  const client = Object.create(BaseClientClass.prototype);
+  const sourceRetention = { sourceFileIds: ['a'], sourceExpiresAt: new Date('2030-01-20') };
+  Object.assign(client, {
+    user: 'owner',
+    skipSaveConvo: true,
+    options: {
+      endpoint: 'custom',
+      req: { user: { id: 'owner' }, body: {}, config: {}, _fileSourceRetention: sourceRetention },
+    },
+  });
+  saveMessage.mockImplementation(async (_ctx, row) => ({ ...row, _id: 'db-id' }));
+  await client.saveMessageToDatabase(
+    { messageId: 'answer', conversationId: 'chat', text: 'derived', isCreatedByUser: false },
+    {},
+    'owner',
+  );
+  expect(saveMessage).toHaveBeenLastCalledWith(
+    expect.any(Object),
+    expect.any(Object),
+    expect.objectContaining({ sourceRetention }),
+  );
+  await client.saveMessageToDatabase(
+    { messageId: 'question', conversationId: 'chat', text: 'independent', isCreatedByUser: true },
+    {},
+    'owner',
+  );
+  expect(saveMessage.mock.calls.at(-1)[2]).not.toHaveProperty('sourceRetention');
+});

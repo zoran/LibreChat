@@ -187,7 +187,10 @@ export default function useSteerRecovery(conversationId: string) {
           clientSteerId,
           text: steer.text,
           files: steer.files,
-          ...(steer.quotes != null && { quotes: steer.quotes }),
+          ...(steer.quotes != null && {
+            quotes: steer.quotes,
+            quoteSourceRefs: steer.quoteSourceRefs,
+          }),
           ...(steer.generationCreatedAt != null && {
             generationCreatedAt: steer.generationCreatedAt,
           }),

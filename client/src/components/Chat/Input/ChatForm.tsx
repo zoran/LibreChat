@@ -390,6 +390,7 @@ const ChatForm = memo(function ChatForm({
         text,
         overrideFiles,
         overrideQuotes: context?.quotes ?? [],
+        overrideQuoteSourceRefs: context?.quoteSourceRefs,
         overrideManualSkills: context?.manualSkills ?? [],
         overrideReasoning: context?.reasoningOverride ?? null,
         overrideClientRequestId: context?.clientRequestId,

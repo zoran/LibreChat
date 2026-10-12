@@ -741,6 +741,7 @@ describe('useSteerRecovery', () => {
             status: 'failed',
             createdAt: 4,
             quotes: ['carried quote'],
+            quoteSourceRefs: [{ messageId: 'source', quoteIndex: 0, messageVersion: 4 }],
             manualSkills: ['carried-skill'],
           },
         ]);
@@ -750,12 +751,16 @@ describe('useSteerRecovery', () => {
       });
       await flush();
       expect(mockMutateAsync).toHaveBeenCalledWith(
-        expect.objectContaining({ quotes: ['carried quote'] }),
+        expect.objectContaining({
+          quotes: ['carried quote'],
+          quoteSourceRefs: [{ messageId: 'source', quoteIndex: 0, messageVersion: 4 }],
+        }),
       );
       expect(result.current.chips).toEqual([
         expect.objectContaining({
           steerId: 'srv-ctx',
           quotes: ['carried quote'],
+          quoteSourceRefs: [{ messageId: 'source', quoteIndex: 0, messageVersion: 4 }],
           manualSkills: ['carried-skill'],
         }),
       ]);

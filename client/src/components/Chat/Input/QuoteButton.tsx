@@ -2,7 +2,8 @@ import { memo, useRef, useEffect, useCallback, useLayoutEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { TextQuote } from 'lucide-react';
 import { useSetRecoilState } from 'recoil';
-import { cn, MAX_QUOTE_COUNT } from '~/utils';
+import type { TMessage } from 'librechat-data-provider';
+import { cn, mergeRestagedQuoteDraft } from '~/utils';
 import { mainTextareaId } from '~/common';
 import { useLocalize } from '~/hooks';
 import store from '~/store';
@@ -31,6 +32,7 @@ type Anchor = {
 };
 
 type SelectionState = {
+  sourceRef: NonNullable<NonNullable<TMessage['quoteSourceRefs']>[number]>;
   text: string;
   anchor: Anchor;
   /** Touch selections carry an OS callout above them, so the popup goes below. */
@@ -38,6 +40,7 @@ type SelectionState = {
 };
 
 type Reading = {
+  sourceRef: SelectionState['sourceRef'];
   text: string;
   anchor: Anchor;
   /** Retained so scrolling can re-measure without re-walking the selection. */
@@ -151,6 +154,35 @@ const readSelection = (): Reading | null => {
     measured = clamped;
   }
 
+  if (!message.id) return null;
+  const quoteField = (node: Node): HTMLElement | null => {
+    const element = node instanceof Element ? node : node.parentElement;
+    return element?.closest<HTMLElement>('[data-quote-index]') ?? null;
+  };
+  const firstField = quoteField(measured.startContainer);
+  const lastField = quoteField(measured.endContainer);
+  if (firstField !== lastField) return null;
+  // A body selection can enclose a nested quote even when both endpoints are outside it.
+  for (const field of message.querySelectorAll<HTMLElement>('[data-quote-index]')) {
+    if (field !== firstField && measured.intersectsNode(field)) return null;
+  }
+  let sourceRef: Reading['sourceRef'] = { messageId: message.id };
+  if (firstField) {
+    const quoteIndex = Number(firstField.dataset.quoteIndex);
+    const rawVersion = firstField.dataset.quoteMessageVersion;
+    const messageVersion = Number(rawVersion);
+    if (
+      !Number.isSafeInteger(quoteIndex) ||
+      quoteIndex < 0 ||
+      rawVersion == null ||
+      rawVersion.trim() === '' ||
+      !Number.isSafeInteger(messageVersion) ||
+      messageVersion < 0
+    )
+      return null;
+    sourceRef = { messageId: message.id, quoteIndex, messageVersion };
+  }
+
   /** `Selection.toString()` reflects rendered text, so it stays the quote source
    *  even when the measured range was clamped to the message. */
   const text = selection
@@ -172,6 +204,7 @@ const readSelection = (): Reading | null => {
       : (measured.startContainer.parentElement ?? message);
 
   return {
+    sourceRef,
     text: text.slice(0, MAX_QUOTE_LENGTH),
     anchor,
     range: measured,
@@ -326,10 +359,10 @@ function QuoteButton({ conversationId }: { conversationId: string }) {
   const clippersRef = useRef<HTMLElement[]>([]);
   /** Excerpt captured when a touch press begins, committed only if that press
    *  completes on the button. */
-  const pressedTextRef = useRef<string | null>(null);
+  const pressedTextRef = useRef<SelectionState | null>(null);
   /** Set by the listener effect so the press handlers can dismiss the popup. */
   const hideRef = useRef<() => void>(() => undefined);
-  const setQuotes = useSetRecoilState(store.pendingQuotesByConvoId(conversationId));
+  const setQuotes = useSetRecoilState(store.pendingQuoteDraftByConvoId(conversationId));
 
   /** Selection and scroll events must not enter React's commit/selection-restoration
    *  path. Keep the portal mounted and update only its transient presentation. */
@@ -409,10 +442,18 @@ function QuoteButton({ conversationId }: { conversationId: string }) {
       if (
         !previous ||
         previous.text !== reading.text ||
+        previous.sourceRef.messageId !== reading.sourceRef.messageId ||
+        previous.sourceRef.quoteIndex !== reading.sourceRef.quoteIndex ||
+        previous.sourceRef.messageVersion !== reading.sourceRef.messageVersion ||
         previous.viaTouch !== touch ||
         !sameAnchor(previous.anchor, anchor)
       ) {
-        presentSelection({ text: reading.text, anchor, viaTouch: touch });
+        presentSelection({
+          text: reading.text,
+          sourceRef: reading.sourceRef,
+          anchor,
+          viaTouch: touch,
+        });
       }
     };
 
@@ -540,10 +581,8 @@ function QuoteButton({ conversationId }: { conversationId: string }) {
   }, [conversationId]);
 
   const commitQuote = useCallback(
-    (text: string) => {
-      setQuotes((prev) =>
-        prev.includes(text) || prev.length >= MAX_QUOTE_COUNT ? prev : [...prev, text],
-      );
+    ({ text, sourceRef }: SelectionState) => {
+      setQuotes((prev) => mergeRestagedQuoteDraft(prev, [text], [sourceRef]));
       rangeRef.current = null;
       clippersRef.current = [];
       pressedTextRef.current = null;
@@ -557,7 +596,7 @@ function QuoteButton({ conversationId }: { conversationId: string }) {
   const addQuote = useCallback(() => {
     const selection = selectionRef.current;
     if (selection) {
-      commitQuote(selection.text);
+      commitQuote(selection);
     }
   }, [commitQuote]);
 
@@ -591,7 +630,7 @@ function QuoteButton({ conversationId }: { conversationId: string }) {
           return;
         }
         event.preventDefault();
-        pressedTextRef.current = selectionRef.current?.text ?? null;
+        pressedTextRef.current = selectionRef.current;
         try {
           event.currentTarget.setPointerCapture(event.pointerId);
         } catch {

@@ -17,6 +17,7 @@ import { synthesizeAppliedSteerEvents, toPendingSteer } from '~/stream/SteeringL
 import { InMemoryEventTransport } from '~/stream/implementations/InMemoryEventTransport';
 import { buildPendingAction, buildToolApprovalPayload } from '~/agents/hitl/policy';
 import { GenerationJobManagerClass } from '~/stream/GenerationJobManager';
+import { serializeQuoteRetention } from '~/files/retention';
 
 jest.spyOn(console, 'log').mockImplementation();
 
@@ -60,6 +61,53 @@ describe('SteeringLifecycle via GenerationJobManager.steering (in-memory)', () =
       expect(projected.quotes).toEqual(['the excerpt']);
       expect(projected).not.toHaveProperty('userId');
     });
+  });
+
+  test('private quoted steer requires a live bound source and public projection omits its lineage', async () => {
+    const job = await manager.createJob('source-steer', 'user-1', undefined, {
+      initialMetadata: { steerQuotesCapable: true },
+    });
+    const ref = { messageId: 'source-message' };
+    const item = {
+      ...buildSteer('independent question'),
+      quotes: ['excerpt'],
+      quoteSourceRefs: [ref],
+      quoteRetention: serializeQuoteRetention(
+        {
+          quotes: ['excerpt'],
+          sourceMessageConditions: [],
+          quoteSourceRetention: [
+            {
+              index: 0,
+              sourceRef: ref,
+              sourceFileIds: ['file-a'],
+              sourceExpiresAt: new Date(Date.now() + 60000),
+            },
+          ],
+        },
+        [ref],
+      ),
+    };
+    expect(await manager.steering.enqueue('source-steer', item, job.createdAt)).toBe(
+      STEER_ENQUEUE_NOT_RUNNING,
+    );
+    expect(
+      await manager.bindSourceRetention('source-steer', job.createdAt, {
+        sourceFileIds: ['file-a'],
+        sourceExpiresAt: new Date(Date.now() + 60000),
+      }),
+    ).toBe(true);
+    expect(await manager.steering.enqueue('source-steer', item, job.createdAt)).toBe(1);
+    expect(toPendingSteer(item)).toMatchObject({
+      text: 'independent question',
+      quotes: ['excerpt'],
+      quoteSourceRefs: [ref],
+    });
+    expect(toPendingSteer(item)).not.toHaveProperty('quoteRetention');
+    await jobStore.revokeSourceRetention('source-steer', job.createdAt);
+    expect(
+      await manager.steering.enqueue('source-steer', { ...item, steerId: 'late' }, job.createdAt),
+    ).toBe(STEER_ENQUEUE_NOT_RUNNING);
   });
 
   describe('enqueue', () => {

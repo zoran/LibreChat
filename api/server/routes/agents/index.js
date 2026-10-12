@@ -3,6 +3,8 @@ const {
   reportLocatorTraversalFailure,
   isEnabled,
   GenerationJobManager,
+  readFileSourceRetention,
+  deserializeQuoteRetention,
   TERMINAL_PUBLICATION_RECONNECT_ERROR,
   hasPersistableAbortContent,
   announceStoppedReply,
@@ -873,7 +875,12 @@ router.post('/chat/abort', chatConfigMiddleware, async (req, res, next) => {
                   { saveMessage, getPersistedPrivateTextId, getPrivateMessageTexts },
                   messageContext,
                   requestMessage,
-                  { context: 'api/server/routes/agents/index.js - abort user prerequisite' },
+                  {
+                    context: 'api/server/routes/agents/index.js - abort user prerequisite',
+                    ...(jobData.userMessage?.quoteRetention && {
+                      quoteRetention: deserializeQuoteRetention(jobData.userMessage.quoteRetention),
+                    }),
+                  },
                   req.user?.tenantId,
                   pendingAbortResult.finalEvent,
                 );
@@ -888,6 +895,9 @@ router.post('/chat/abort', chatConfigMiddleware, async (req, res, next) => {
 
             try {
               const persistedResponse = await saveMessage(messageContext, responseMessage, {
+                ...(jobData.sourceRetention != null && {
+                  sourceRetention: readFileSourceRetention(jobData.sourceRetention),
+                }),
                 context: 'api/server/routes/agents/index.js - abort endpoint',
               });
               if (!persistedResponse) {

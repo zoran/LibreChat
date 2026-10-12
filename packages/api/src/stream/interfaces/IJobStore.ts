@@ -10,11 +10,13 @@ import type {
 } from 'librechat-data-provider';
 import type { ScheduleMCPOutcome, ScheduledMCPIdentity } from 'librechat-data-provider';
 import type { RunStep, StandardGraph } from '@librechat/agents';
+import type { QuoteSourceRef } from 'librechat-data-provider';
 import type { AgentEventDetachedTerminalEvidence } from '~/agents/triggers/types';
 import type { EarlyBufferOverflowState } from '../../types/earlyBufferRecovery';
 import type { ActivityPhaseSnapshot } from '~/agents/activityPhases/runtime';
 import type { ReplayLimits, ReplayPublication } from '../internal/replay';
 import type { ResolvedAskUserQuestion } from '~/agents/hitl/resume';
+import type { SerializedQuoteRetention } from '~/files/retention';
 import type { RecoveredSteerPayload } from '../SteerRecovery';
 import type { MCPRuntimeRequestBody } from '~/mcp/types';
 
@@ -111,8 +113,61 @@ export type GenerationSettlementState = Pick<
   'createdAt' | 'status' | 'terminalPersistencePending'
 >;
 
+/** Internal wire form; public file-retention contexts carry a Date. */
+export interface GenerationSourceRetention {
+  sourceFileIds: readonly string[];
+  sourceExpiresAt: number;
+}
+
+export function sourceRetentionAvailable(
+  job:
+    | Pick<
+        SerializableJobData,
+        'sourceRetention' | 'sourceRetentionRevokedAt' | 'sourceRetentionPurged'
+      >
+    | null
+    | undefined,
+  now: number = Date.now(),
+): boolean {
+  return (
+    job?.sourceRetention == null ||
+    (job.sourceRetentionRevokedAt == null &&
+      !job.sourceRetentionPurged &&
+      Number.isFinite(job.sourceRetention.sourceExpiresAt) &&
+      job.sourceRetention.sourceExpiresAt > now)
+  );
+}
+
+/** Only lifecycle evidence can advance after revocation; content cannot be reintroduced. */
+export function sourceSafeJobPatch(
+  job: SerializableJobData,
+  patch: Partial<SerializableJobData>,
+): Partial<SerializableJobData> {
+  const {
+    sourceRetention: _binding,
+    sourceRetentionRevokedAt: _revoked,
+    sourceRetentionPurged: _purged,
+    ...ordinary
+  } = patch;
+  if (sourceRetentionAvailable(job)) return ordinary;
+  const allowed = new Set([
+    'status',
+    'completedAt',
+    'terminalPersistencePending',
+    'terminalPersistenceStartedAt',
+    'terminalHostActionPending',
+    'providerDrained',
+    'providerExecutionId',
+    'providerExecutionStartedId',
+  ]);
+  return Object.fromEntries(Object.entries(ordinary).filter(([key]) => allowed.has(key)));
+}
+
 /** Serializable job data without object references, suitable for external storage. */
 export interface SerializableJobData {
+  sourceRetention?: GenerationSourceRetention;
+  sourceRetentionRevokedAt?: number;
+  sourceRetentionPurged?: boolean;
   streamId: string;
   userId: string;
   tenantId?: string;
@@ -159,6 +214,9 @@ export interface SerializableJobData {
     /** Quoted excerpts referenced on this turn, carried so resumable/aborted
      *  reconstructions of the user message keep their `MessageQuotes`. */
     quotes?: string[];
+    quoteSourceRefs?: Array<QuoteSourceRef | null>;
+    /** Trusted server-only per-field lineage, encoded by the shared retention owner. */
+    quoteRetention?: SerializedQuoteRetention;
     /** Skill selections, carried so a HITL-resumed turn's requestMessage keeps its pills. */
     manualSkills?: string[];
     alwaysAppliedSkills?: string[];
@@ -478,6 +536,7 @@ export type JobMetadataPatch = Partial<
     | 'agent_id'
     | 'isTemporary'
     | 'retentionExpiresAt'
+    | 'sourceRetention'
     | 'agentEventDeliveryKey'
     | 'agentEventInvocationKey'
     | 'agentEventInvocationGenerationCreatedAt'
@@ -552,6 +611,9 @@ export interface SteerQueueItem {
    *  (`getReferencedQuotes`). Kept separate from `text` so the persisted
    *  steer part stays clean; merged into the model-bound turn at injection. */
   quotes?: string[];
+  quoteSourceRefs?: Array<QuoteSourceRef | null>;
+  /** Trusted server-only per-field lineage, encoded by the shared retention owner. */
+  quoteRetention?: SerializedQuoteRetention;
   /** The steer asked to seal the live model stream at the next provider-safe
    *  boundary instead of waiting for a tool step. Durable so a parked,
    *  claimed, or replayed chip keeps its "interrupting" label. */
@@ -979,6 +1041,20 @@ export interface IJobStore {
    * stores fall back to inspecting the current generation only. */
   getIdempotencyClaim?(key: string): Promise<IdempotencyClaimValue | null>;
 
+  /** Optional only for source-free custom stores; source-bearing admission requires all source operations. */
+  bindSourceRetention?(
+    streamId: string,
+    expectedCreatedAt: number,
+    context: GenerationSourceRetention,
+  ): Promise<boolean>;
+  revokeSourceRetention?(streamId: string, expectedCreatedAt: number): Promise<boolean>;
+  purgeSourceRetention?(streamId: string, expectedCreatedAt: number): Promise<boolean>;
+  /** Remove source file objects from existing recovery copies, independently of the current epoch. */
+  purgeFileSourceRecovery?(
+    streamId: string,
+    owner: { userId: string; tenantId?: string },
+    sourceFileIds: readonly string[],
+  ): Promise<boolean>;
   deleteJob(streamId: string, expectedCreatedAt?: number): Promise<boolean>;
   hasJob(streamId: string): Promise<boolean>;
   getRunningJobs(): Promise<SerializableJobData[]>;
@@ -1698,6 +1774,12 @@ export class GenerationPublicationFencedError extends Error {
  * Implementations can use EventEmitter, Redis Pub/Sub, etc.
  */
 export interface IEventTransport {
+  readonly sourceRetentionSupported?: boolean;
+  setSourceRetentionReader?(
+    reader: (streamId: string) => Promise<SerializableJobData | null>,
+  ): void;
+  /** Invalidate only the revoked epoch; keep independent sequence/recovery state. */
+  purgeSourceRetention?(streamId: string, expectedCreatedAt: number): Promise<void>;
   /** Actual dedicated command/subscriber and subscription readiness, when supported. */
   isGenerationTransportReady?(): boolean;
   /**
@@ -1740,7 +1822,12 @@ export interface IEventTransport {
    * Redis returns the assigned absolute sequence so locally replayed events can
    * advance a subscriber to the exact ordering frontier.
    */
-  emitChunk(streamId: string, event: unknown, generationId?: number): void | Promise<void | number>;
+  emitChunk(
+    streamId: string,
+    event: unknown,
+    generationId?: number,
+    requireSourceBinding?: boolean,
+  ): void | Promise<void | number>;
 
   /** Retain an observational chunk even with no viewers, then publish it atomically. */
   emitReplayableChunk?(
@@ -1760,13 +1847,23 @@ export interface IEventTransport {
    * Publish a done event - returns Promise in Redis mode for ordered delivery.
    * `generationId` is optional for compatibility with legacy, untagged publishers.
    */
-  emitDone(streamId: string, event: unknown, generationId?: number): void | Promise<void>;
+  emitDone(
+    streamId: string,
+    event: unknown,
+    generationId?: number,
+    requireSourceBinding?: boolean,
+  ): void | Promise<void>;
 
   /**
    * Publish an error event - returns Promise in Redis mode for ordered delivery.
    * `generationId` is optional for compatibility with legacy, untagged publishers.
    */
-  emitError(streamId: string, error: string, generationId?: number): void | Promise<void>;
+  emitError(
+    streamId: string,
+    error: string,
+    generationId?: number,
+    requireSourceBinding?: boolean,
+  ): void | Promise<void>;
 
   /** Optional live-view demand marker used by observational streams that do not replay. */
   renewDemand?(streamId: string, ttlMs: number): void | Promise<void>;

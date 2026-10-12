@@ -1,4 +1,5 @@
 import type { SubagentIdentity, ContentTypes } from './runs';
+import type { QuoteSourceRef } from '../schemas';
 import type { Agents } from './agents';
 import type { TFile } from './files';
 
@@ -256,6 +257,7 @@ export type SteerContentPart = {
    *  typed text (mirroring `TMessage.quotes`) so the UI renders them as
    *  reference blocks; merged into the model-bound user turn on every replay. */
   quotes?: string[];
+  quoteSourceRefs?: Array<QuoteSourceRef | null>;
 };
 
 export type TMessageContentParts =

@@ -15,6 +15,9 @@ const {
   resolveResumableRetention,
   buildMessageFiles,
   getReferencedQuotes,
+  normalizeReferencedQuoteSources,
+  serializeQuoteRetention,
+  quoteRetentionContext,
   resolveTitleTiming,
   GenerationJobManager,
   createConvoPersistenceSignal,
@@ -66,7 +69,13 @@ const {
   settleExistingRowsBeforeErrorTurn,
   resolveDisconnectSnapshotMode,
   markAbortedCompactionContent,
+  readFileSourceRetention,
 } = require('@librechat/api');
+// Request-private state is populated by the awaited provider admission, never by body metadata.
+const responseSourceRetention = (req) =>
+  req?._fileSourceRetention == null
+    ? {}
+    : { sourceRetention: readFileSourceRetention(req._fileSourceRetention) };
 const { disposeClient } = require('~/server/cleanup');
 const {
   getMCPRequestContext,
@@ -103,6 +112,8 @@ const {
   isAgentTriggerPrincipalActive,
   isSubagentOwnerAdmissible,
   appendConvoMessageReference,
+  resolveQuoteRetention,
+  resolveFileRetentionContext,
 } = require('~/models');
 const {
   acquireEventChildGenerationLease,
@@ -264,6 +275,7 @@ function getPreliminaryUserMessage(
     parentMessageId,
     text,
     quotes,
+    quoteSourceRefs,
     files,
     manualSkills,
     alwaysAppliedSkills,
@@ -290,6 +302,7 @@ function getPreliminaryUserMessage(
     conversationId,
     text,
     ...(referencedQuotes != null && { quotes: referencedQuotes }),
+    ...(referencedQuotes != null && Array.isArray(quoteSourceRefs) && { quoteSourceRefs }),
     // Persist the turn's uploaded files on this AWAITED preliminary write so they land on
     // job.metadata.userMessage BEFORE the run can reach its first interrupt. onStart's
     // later writes are fire-and-forget, so a fast approval could otherwise read the job
@@ -481,6 +494,7 @@ async function saveErrorTurn(
       getMessages,
       saveFinalizedTurn: (message) =>
         saveMessage(reqCtx, message, {
+          ...responseSourceRetention(req),
           context: 'api/server/controllers/agents/request.js - finalize failed compaction turn',
         }),
       announceSettledTurn: (messageId) =>
@@ -517,7 +531,7 @@ async function saveErrorTurn(
           error: false,
           unfinished: false,
         },
-        { context },
+        { context, ...(req._quoteRetention && { quoteRetention: req._quoteRetention }) },
       );
       if (!savedUserMessage) {
         throw new Error('Failed user message could not be persisted');
@@ -546,7 +560,7 @@ async function saveErrorTurn(
         isCreatedByUser: false,
         ...resolveFailedTurnContent(req.body, errorText),
       },
-      { context },
+      { context, ...responseSourceRetention(req) },
     );
     if (!savedErrorMessage) {
       throw new Error('Failed response message could not be persisted');
@@ -902,7 +916,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
   const isRecoveredSteerRequest = recoveredSteerId != null;
   const recoveryUserMessageId = rawOverrideUserMessageId;
   const recoveredSteerPayload = isRecoveredSteerRequest
-    ? buildRecoveredSteerPayload(text, req.body?.files, req.body?.quotes)
+    ? buildRecoveredSteerPayload(text, req.body?.files, req.body?.quotes, req.body?.quoteSourceRefs)
     : undefined;
   /** A recovered steer is handed off as a new ordinary user turn. Edit,
    * regenerate, continue, and arbitrary override-id shapes can reuse an
@@ -1678,6 +1692,34 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
 
     const endpointIconURL = getEndpointIconURL(req, endpointOption);
     const responseModel = getAgentResponseModel(req, endpointOption);
+    const quoteOwner = { userId, tenantId };
+    const normalizedQuotes = normalizeReferencedQuoteSources(
+      req.body.quotes,
+      req.body.quoteSourceRefs,
+    );
+    let quoteRetention;
+    if (recoveredSteerId) {
+      quoteRetention = await GenerationJobManager.steering.getRecoveredQuoteRetention(
+        streamId,
+        recoveredSteerId,
+        quoteOwner,
+      );
+    } else if (normalizedQuotes.quoteSourceRefs.some(Boolean)) {
+      quoteRetention = await resolveQuoteRetention(
+        quoteOwner,
+        normalizedQuotes.quotes.map((text, index) => ({
+          text,
+          sourceRef: normalizedQuotes.quoteSourceRefs[index],
+        })),
+      );
+    }
+    if (quoteRetention) {
+      req._quoteRetention = quoteRetention;
+      req._quoteRetentionMessageId = preallocatedUserMessageId;
+      req.body.quotes = quoteRetention.quotes;
+      req.body.quoteSourceRefs = normalizedQuotes.quoteSourceRefs;
+    }
+    const quoteSources = quoteRetention && quoteRetentionContext(quoteRetention);
     const preliminaryUserMessage = isCompaction
       ? projectCompactionAnchor({ messageId: parentMessageId, conversationId })
       : stampPreliminaryPrivateTextMessage(
@@ -1757,7 +1799,11 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
           : {}),
         responseMessageId: preallocatedResponseMessageId,
         mcpRequestBody,
-        userMessage: preliminaryUserMessage,
+        // Only publish quote payloads after this epoch is bound and the source is live.
+        userMessage:
+          quoteRetention && preliminaryUserMessage
+            ? { ...preliminaryUserMessage, quotes: undefined, quoteSourceRefs: undefined }
+            : preliminaryUserMessage,
       },
     });
     startupTelemetry?.mark('job_created');
@@ -1765,6 +1811,52 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     jobCreatedAt = job.createdAt; // Capture creation time to detect job replacement
     req.turnStartedAt = jobCreatedAt;
     providerExecutionId = job.metadata?.providerExecutionId;
+
+    if (quoteRetention) {
+      try {
+        if (quoteSources) {
+          if (
+            !(await GenerationJobManager.bindSourceRetention(streamId, jobCreatedAt, quoteSources))
+          ) {
+            throw new Error('Quote source generation is no longer available');
+          }
+          const liveSources = await resolveFileRetentionContext(quoteOwner, {
+            fileIds: quoteSources.sourceFileIds,
+            historyMessageIds: [],
+          });
+          if (!liveSources) throw new Error('Quote source binding disappeared');
+        }
+        const serializedQuotes = serializeQuoteRetention(
+          quoteRetention,
+          normalizedQuotes.quoteSourceRefs,
+        );
+        await GenerationJobManager.updateMetadata(
+          streamId,
+          {
+            userMessage: {
+              ...preliminaryUserMessage,
+              quoteRetention: serializedQuotes,
+            },
+          },
+          jobCreatedAt,
+        );
+        const installed = await GenerationJobManager.getJobStore().getJob(streamId);
+        if (
+          installed?.createdAt !== jobCreatedAt ||
+          installed.status !== 'running' ||
+          JSON.stringify(installed.userMessage?.quoteRetention) !== JSON.stringify(serializedQuotes)
+        ) {
+          throw new Error('Quote generation was replaced before admission');
+        }
+      } catch (error) {
+        if (quoteSources)
+          await GenerationJobManager.revokeFileSourceGenerations(
+            quoteOwner,
+            quoteSources.sourceFileIds,
+          );
+        throw error;
+      }
+    }
 
     /** Authentication can precede a slow admission path. Recheck the durable
      * account-deletion fence after the job is committed but before execution
@@ -2005,6 +2097,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             },
             partialMessage,
             {
+              ...responseSourceRetention(req),
               context: 'api/server/controllers/agents/request.js - partial response on disconnect',
             },
           );
@@ -2400,6 +2493,13 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
                   conversationId: userMsg.conversationId,
                   text: userMsg.text,
                   quotes: userMsg.quotes,
+                  quoteSourceRefs: userMsg.quoteSourceRefs,
+                  ...(req._quoteRetention && {
+                    quoteRetention: serializeQuoteRetention(
+                      req._quoteRetention,
+                      userMsg.quoteSourceRefs,
+                    ),
+                  }),
                   privacyRevision: userMsg.privacyRevision,
                   reasoningOverride: userMsg.reasoningOverride,
                   // Persist the turn's uploaded files here (authoritative job metadata) so a
@@ -2857,6 +2957,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
                     {
                       context:
                         'api/server/controllers/agents/request.js - user message before HITL pause',
+                      ...(req._quoteRetention && { quoteRetention: req._quoteRetention }),
                     },
                   );
                   if (!savedUserMessage) {
@@ -2891,6 +2992,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
                   user: userId,
                 },
                 {
+                  ...responseSourceRetention(req),
                   context:
                     'api/server/controllers/agents/request.js - HITL pause (persist unfinished)',
                 },
@@ -3142,6 +3244,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             }),
           },
           {
+            ...responseSourceRetention(req),
             context: responseIsUnfinished
               ? 'api/server/controllers/agents/request.js - terminal response unfinished'
               : 'api/server/controllers/agents/request.js - resumable response end',

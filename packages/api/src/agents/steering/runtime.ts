@@ -135,6 +135,11 @@ async function drainAndBuildInjections(
     for (let i = 0; i < steers.length; i++) {
       const item = steers[i];
       try {
+        if (item.quoteRetention?.quoteSourceRetention.length) {
+          const live = await GenerationJobManager.getJob(streamId);
+          if (!live || live.createdAt !== jobCreatedAt)
+            throw new Error('Quote source generation unavailable');
+        }
         await applySteer(item);
         appliedSteers.push(item);
       } catch (error) {
@@ -196,6 +201,10 @@ async function drainAndBuildInjections(
       /** The media path already merged quotes into its text part; the plain
        *  path (no files, or a degraded encode) merges here so the excerpts
        *  reach the model exactly like `prependQuotes` on a normal turn. */
+      if (item.quoteRetention?.quoteSourceRetention.length) {
+        const live = await GenerationJobManager.getJob(streamId);
+        if (!live || live.createdAt !== jobCreatedAt) continue;
+      }
       const quotes = getReferencedQuotes(item.quotes);
       const textContent = quotes != null ? mergeQuotedText(item.text, quotes) : item.text;
       injectedMessages.push({

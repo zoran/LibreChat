@@ -172,6 +172,7 @@ jest.mock('@librechat/api', () => {
     sweepExpiredFiles: jest.fn().mockResolvedValue({ scanned: 0, deleted: 0, failed: 0 }),
     startExpiredFileSweep: jest.fn().mockReturnValue('sweep-interval'),
     isLeader: jest.fn().mockResolvedValue(true),
+    GenerationJobManager: { revokeFileSourceGenerations: jest.fn() },
   };
 });
 
@@ -195,6 +196,10 @@ jest.mock('~/server/services/Tools/credentials', () => ({
 }));
 
 jest.mock('~/models', () => ({
+  revokeFileSources: jest.fn(),
+  getFileSourceDeletionCandidates: jest.fn(),
+  redactFileSourceContent: jest.fn(),
+  finalizeFileSourceDeletion: jest.fn(),
   createFile: jest.fn().mockResolvedValue({ file_id: 'created-file-id' }),
   updateFileUsage: jest.fn(),
   deleteFiles: jest.fn(),
@@ -1199,6 +1204,28 @@ describe('processAgentFileUpload', () => {
           tool_resource: EToolResources.context,
         }),
       );
+    });
+
+    test('passes original document admission through the actual upload to the data owner', async () => {
+      const acceptedAt = new Date('2030-01-01T00:00:00.000Z');
+      const expiredAt = new Date('2030-01-29T00:00:00.000Z');
+      const retention = { acceptedAt, expiredAt };
+      getRetentionExpiry.mockResolvedValueOnce({ expiredAt, retention });
+      const req = makeReq({ mimetype: PDF_MIME, ocrConfig: null });
+
+      await processAgentFileUpload({
+        req,
+        res: mockRes,
+        metadata: { ...makeMetadata(), message_file: true },
+      });
+
+      expect(db.createFile).toHaveBeenCalledWith(
+        expect.objectContaining({ expiredAt, context: FileContext.message_attachment }),
+        true,
+        { retention },
+      );
+      expect(db.createFile.mock.calls[0][0]).not.toHaveProperty('retention');
+      expect(db.addAgentResourceFile).not.toHaveBeenCalled();
     });
 
     test('applies retention metadata to context files uploaded as message attachments', async () => {
@@ -3390,5 +3417,71 @@ describe('fallback text for uploads left to tools', () => {
       expect.objectContaining({ llmDeliveryPath: 'none', text: 'region,total' }),
       true,
     );
+  });
+});
+
+describe('managed source deletion composition', () => {
+  const req = { body: {}, config: {}, user: { id: 'owner', tenantId: 'tenant' } };
+  const file = {
+    file_id: 'managed',
+    retentionAcceptedAt: new Date(0),
+    filepath: '/owned/document.txt',
+    source: FileSources.local,
+  };
+  beforeEach(() => {
+    jest.clearAllMocks();
+    db.getFileSourceDeletionCandidates.mockResolvedValue([file]);
+    db.finalizeFileSourceDeletion.mockResolvedValue({ completedFileIds: ['managed'] });
+    db.redactFileSourceContent.mockResolvedValue({ redactedMessages: 1, detachedMessages: 1 });
+    db.revokeFileSources.mockResolvedValue();
+    db.removeAgentResourceFilesFromAllAgents.mockResolvedValue();
+  });
+  it.each([true, false])(
+    'finalizes only a complete replay purge (complete=%s)',
+    async (complete) => {
+      const { GenerationJobManager } = require('@librechat/api');
+      const events = [];
+      db.revokeFileSources.mockImplementation(async () => {
+        events.push('revoke');
+      });
+      GenerationJobManager.revokeFileSourceGenerations.mockImplementation(async () => {
+        events.push('replay');
+        return { complete, pending: complete ? [] : [{ streamId: 's', createdAt: 1 }] };
+      });
+      db.redactFileSourceContent.mockImplementation(async () => {
+        events.push('redact');
+      });
+      getStrategyFunctions.mockReturnValue({
+        deleteFile: jest.fn(async () => {
+          events.push('storage');
+        }),
+      });
+      db.finalizeFileSourceDeletion.mockImplementation(async () => {
+        events.push('finalize');
+        return { completedFileIds: ['managed'] };
+      });
+      const result = await processDeleteRequest({ req, files: [file] });
+      expect(events.slice(0, 4)).toEqual(['revoke', 'replay', 'redact', 'storage']);
+      expect(events.includes('finalize')).toBe(complete);
+      expect(db.deleteFiles).not.toHaveBeenCalled();
+      expect(result).toEqual(
+        complete
+          ? { deletedFileIds: ['managed'], failedFileIds: [] }
+          : { deletedFileIds: [], failedFileIds: ['managed'] },
+      );
+    },
+  );
+  it('keeps the tombstone pending when storage fails despite successful replay', async () => {
+    require('@librechat/api').GenerationJobManager.revokeFileSourceGenerations.mockResolvedValue({
+      complete: true,
+      pending: [],
+    });
+    getStrategyFunctions.mockReturnValue({
+      deleteFile: jest.fn().mockRejectedValue(new Error('storage down')),
+    });
+    const result = await processDeleteRequest({ req, files: [file] });
+    expect(result.failedFileIds).toEqual(['managed']);
+    expect(db.finalizeFileSourceDeletion).not.toHaveBeenCalled();
+    expect(db.deleteFiles).not.toHaveBeenCalled();
   });
 });

@@ -479,6 +479,7 @@ export default function useQueueDrain(
       {
         overrideFiles: next.files ?? [],
         overrideQuotes: next.quotes ?? [],
+        overrideQuoteSourceRefs: next.quoteSourceRefs,
         overrideManualSkills: next.manualSkills ?? [],
         overrideReasoning: next.reasoningOverride ?? null,
         overrideClientRequestId: next.clientRequestId,

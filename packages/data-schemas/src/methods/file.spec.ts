@@ -24,6 +24,7 @@ describe('File Methods', () => {
     Object.assign(mongoose.models, models);
 
     File = mongoose.models.File as mongoose.Model<unknown>;
+    await File.init();
     fileMethods = createFileMethods(mongoose);
   });
 
@@ -45,6 +46,43 @@ describe('File Methods', () => {
 
   beforeEach(async () => {
     await File.deleteMany({});
+  });
+
+  it('keeps original admission, rejects resurrection and excludes completed tombstones', async () => {
+    const userId = new mongoose.Types.ObjectId();
+    const fileId = uuidv4();
+    const acceptedAt = new Date(Date.now() - 1000);
+    const expiredAt = new Date(Date.now() + 60000);
+    const data = {
+      file_id: fileId,
+      user: userId,
+      filename: 'private.txt',
+      filepath: '/private/document',
+      type: 'text/plain',
+      bytes: 10,
+      text: 'private body',
+    };
+    const file = await fileMethods.createFile(data, false, {
+      retention: { acceptedAt, expiredAt },
+    });
+    expect(file?.expiresAt).toBeUndefined();
+    expect(file?.retentionAcceptedAt).toEqual(acceptedAt);
+    await expect(
+      fileMethods.updateFile({ file_id: fileId, expiredAt: new Date(expiredAt.getTime() + 1) }),
+    ).rejects.toThrow();
+    const owner = { userId: userId.toString() };
+    await fileMethods.revokeFileSources(owner, [fileId]);
+    expect(await fileMethods.getFileSourceDeletionCandidates(owner, [fileId])).toHaveLength(1);
+    expect(await fileMethods.findFileById(fileId)).toBeNull();
+    await fileMethods.finalizeFileSourceDeletion(owner, [fileId]);
+    expect(await fileMethods.getFileSourceDeletionCandidates(owner, [fileId])).toHaveLength(0);
+    const tombstone = await File.findOne({ file_id: fileId }).lean<Record<string, unknown>>();
+    expect(tombstone?.text).toBeUndefined();
+    expect(tombstone?.filepath).toBeUndefined();
+    expect(tombstone?.deletionCompletedAt).toBeInstanceOf(Date);
+    await expect(
+      fileMethods.createFile(data, false, { retention: { acceptedAt, expiredAt } }),
+    ).rejects.toThrow();
   });
 
   describe('createFile', () => {

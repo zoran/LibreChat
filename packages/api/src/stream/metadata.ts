@@ -5,9 +5,19 @@ import {
 import type { JobMetadataPatch } from './interfaces/IJobStore';
 import type { GenerationJobMetadata } from '~/types';
 import { parseScheduleMCPCompletion } from '~/schedules/authorization/continuation';
+import { deserializeQuoteRetention } from '~/files/retention';
 
 export function sanitizeJobMetadata(metadata: Partial<GenerationJobMetadata>): JobMetadataPatch {
   const patch: JobMetadataPatch = {};
+  if (metadata.sourceRetention) {
+    const expires = metadata.sourceRetention.sourceExpiresAt.getTime();
+    if (!Number.isFinite(expires) || !metadata.sourceRetention.sourceFileIds.length)
+      throw new Error('Invalid source retention context');
+    patch.sourceRetention = {
+      sourceFileIds: [...new Set(metadata.sourceRetention.sourceFileIds)].sort(),
+      sourceExpiresAt: expires,
+    };
+  }
   if (metadata.responseMessageId) {
     patch.responseMessageId = metadata.responseMessageId;
   }
@@ -27,6 +37,8 @@ export function sanitizeJobMetadata(metadata: Partial<GenerationJobMetadata>): J
     patch.conversationId = metadata.conversationId;
   }
   if (metadata.userMessage) {
+    if (metadata.userMessage.quoteRetention)
+      deserializeQuoteRetention(metadata.userMessage.quoteRetention);
     patch.userMessage = metadata.userMessage;
   }
   if (metadata.endpoint) {

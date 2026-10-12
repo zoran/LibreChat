@@ -32,6 +32,7 @@ jest.mock('@librechat/api', () => ({
   isAbortError: jest.requireActual('@librechat/api').isAbortError,
   hasPersistableAbortContent: jest.requireActual('@librechat/api').hasPersistableAbortContent,
   announceReply: jest.requireActual('@librechat/api').announceReply,
+  readFileSourceRetention: jest.requireActual('@librechat/api').readFileSourceRetention,
   countTokens: jest.fn().mockResolvedValue(100),
   isEnabled: jest.fn().mockReturnValue(false),
   sendEvent: jest.fn(),
@@ -165,6 +166,25 @@ describe('abortMiddleware - handleAbortError', () => {
  * the write proceeds even when `transactions.enabled` is false.
  */
 describe('abortMiddleware - handleAbort billing', () => {
+  it('passes the stopped generation source binding to the real partial save', async () => {
+    const sourceExpiresAt = Date.parse('2030-01-20T00:00:00Z');
+    GenerationJobManager.abortJob.mockResolvedValue({
+      success: true,
+      jobData: { ...buildJobData(), sourceRetention: { sourceFileIds: ['a'], sourceExpiresAt } },
+      content: [],
+      text: 'partial answer',
+    });
+    require('~/models').saveMessage.mockResolvedValueOnce({ messageId: 'msg-123' });
+    await handleAbort()(buildReq(), buildRes());
+    expect(require('~/models').saveMessage).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ text: 'partial answer' }),
+      expect.objectContaining({
+        sourceRetention: { sourceFileIds: ['a'], sourceExpiresAt: new Date(sourceExpiresAt) },
+      }),
+    );
+  });
+
   const buildJobData = () => ({
     model: 'gpt-4',
     responseMessageId: 'msg-123',

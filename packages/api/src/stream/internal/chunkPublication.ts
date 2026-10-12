@@ -17,6 +17,8 @@ export type ChunkPublicationReceipt = number | false | void;
  */
 export interface ChunkPublicationOptions {
   coalesce?: boolean;
+  /** Fixed source-bearing generation fence; never downgrade an unsupported transport. */
+  requireSourceBinding?: boolean;
 }
 
 type ChunkPublicationCapability = (
@@ -50,6 +52,8 @@ export function emitChunkWithReceipt(
   generationId?: number,
   options?: ChunkPublicationOptions,
 ): Promise<ChunkPublicationReceipt> {
+  if (options?.requireSourceBinding && transport.sourceRetentionSupported !== true)
+    return Promise.resolve(false);
   const capability = chunkPublicationCapabilities.get(transport);
   if (capability) {
     /** Preserve the 3-arg call shape when no hint is given: registered
@@ -58,7 +62,11 @@ export function emitChunkWithReceipt(
       ? capability(streamId, event, generationId)
       : capability(streamId, event, generationId, options);
   }
-  return Promise.resolve(transport.emitChunk(streamId, event, generationId));
+  return Promise.resolve(
+    options?.requireSourceBinding
+      ? transport.emitChunk(streamId, event, generationId, true)
+      : transport.emitChunk(streamId, event, generationId),
+  );
 }
 
 /**

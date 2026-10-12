@@ -82,7 +82,18 @@ export type RunArtifactClaim = {
   file?: RunArtifactFile;
 };
 
+export type FileOwnerScope = {
+  userId: string;
+  tenantId?: string | null;
+};
+
+export type FileRetentionAdmission = Readonly<{ acceptedAt: Date; expiredAt: Date }>;
+
 export interface IMongoFile extends Omit<Document, 'model'> {
+  retentionAcceptedAt?: Date;
+  retentionRevision?: number;
+  deletionRequestedAt?: Date;
+  deletionCompletedAt?: Date;
   user: Types.ObjectId;
   conversationId?: string;
   messageId?: string;

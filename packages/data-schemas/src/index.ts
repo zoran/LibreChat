@@ -1,3 +1,4 @@
+export { FileSourceUnavailableError } from './methods/fileRetention';
 export * from './app';
 export * from './admin';
 export * from './common';

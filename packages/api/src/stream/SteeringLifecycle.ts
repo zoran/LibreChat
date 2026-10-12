@@ -1,5 +1,6 @@
 import { logger } from '@librechat/data-schemas';
 import { ContentTypes, SteerEvents } from 'librechat-data-provider';
+import type { ResolvedQuoteRetention } from '@librechat/data-schemas';
 import type { TPendingSteer } from 'librechat-data-provider';
 import type {
   GenerationProtocolVersion,
@@ -15,6 +16,7 @@ import type {
   TerminalSteerAdmissionResult,
 } from '~/stream/interfaces/IJobStore';
 import type { ServerSentEvent } from '~/types';
+import { redactQuoteRetention, deserializeQuoteRetention } from '~/files/retention';
 
 /** Client-safe projection of a queued steer (drops the server-only userId). */
 export function toPendingSteer(item: SteerQueueItem): TPendingSteer {
@@ -25,8 +27,20 @@ export function toPendingSteer(item: SteerQueueItem): TPendingSteer {
     createdAt: item.createdAt,
     ...(item.files && item.files.length > 0 && { files: item.files }),
     ...(item.quotes && item.quotes.length > 0 && { quotes: item.quotes }),
+    ...(Array.isArray(item.quoteSourceRefs) &&
+      item.quoteSourceRefs.length > 0 && { quoteSourceRefs: item.quoteSourceRefs }),
     ...(item.preempt === true && { preempt: true }),
     ...(item.preemptRevision != null && { preemptRevision: item.preemptRevision }),
+  };
+}
+
+/** Private parked projection preserves lineage without widening the client DTO. */
+export function toRetainedSteer(
+  item: SteerQueueItem,
+): TPendingSteer & Pick<SteerQueueItem, 'quoteRetention'> {
+  return {
+    ...toPendingSteer(item),
+    ...(item.quoteRetention && { quoteRetention: item.quoteRetention }),
   };
 }
 
@@ -39,7 +53,7 @@ export interface SteerOwner {
 
 interface ParkedSteers extends SteerOwner {
   generationProtocolVersion?: GenerationProtocolVersion;
-  steers: TPendingSteer[];
+  steers: Array<TPendingSteer & Pick<SteerQueueItem, 'quoteRetention'>>;
 }
 
 export interface ParkedSteerRecovery {
@@ -310,11 +324,39 @@ export class SteeringLifecycle {
     }
   }
 
-  /**
-   * Owner-gated read of parked leftovers. The store keeps the payload until
-   * a recovered item starts its deterministic next generation, so losing this
-   * HTTP response cannot lose the user's words.
-   */
+  /** Trusted recovery lineage; never re-resolve a historical quote index. */
+  async getRecoveredQuoteRetention(
+    streamId: string,
+    steerId: string,
+    owner: SteerOwner,
+  ): Promise<ResolvedQuoteRetention | undefined> {
+    if (
+      !this.store.purgeFileSourceRecovery ||
+      !(await this.store.purgeFileSourceRecovery(streamId, owner, []))
+    )
+      throw new Error('Quote recovery cleanup unconfirmed');
+    const claim = await this.store.claimParkedSteersDetailed?.(
+      streamId,
+      owner.userId,
+      owner.tenantId,
+      2,
+    );
+    if (!claim?.payload || claim.generationProtocolVersion !== 2) return undefined;
+    const parked = JSON.parse(claim.payload) as ParkedSteers;
+    if (
+      parked.userId !== owner.userId ||
+      (parked.tenantId ?? undefined) !== (owner.tenantId ?? undefined)
+    )
+      throw new Error('Quote recovery owner mismatch');
+    const item = parked.steers.find((entry) => entry.steerId === steerId);
+    if (!item?.quoteRetention) return undefined;
+    const retained = deserializeQuoteRetention(redactQuoteRetention(item.quoteRetention, []));
+    // These copies were already admitted against their original message snapshot.
+    // Recovery binds the retained File lineage, never a historical message index.
+    return { ...retained, sourceMessageConditions: [] };
+  }
+
+  /** Owner-gated read retains leftovers until deterministic recovery consumes them. */
   async claim(streamId: string, requester: SteerOwner): Promise<TPendingSteer[]> {
     return (await this.claimDetailed(streamId, requester, 2)).steers;
   }
@@ -326,6 +368,11 @@ export class SteeringLifecycle {
     requester: SteerOwner,
     requestedProtocolVersion: GenerationProtocolVersion = 1,
   ): Promise<ParkedSteerRecovery> {
+    if (
+      this.store.purgeFileSourceRecovery &&
+      !(await this.store.purgeFileSourceRecovery(streamId, requester, []))
+    )
+      return { generationProtocolVersion: requestedProtocolVersion, steers: [] };
     let raw: string | undefined;
     let generationProtocolVersion: GenerationProtocolVersion = 1;
     try {
@@ -362,7 +409,9 @@ export class SteeringLifecycle {
       }
       return {
         generationProtocolVersion,
-        steers: Array.isArray(parsed.steers) ? parsed.steers : [],
+        steers: Array.isArray(parsed.steers)
+          ? parsed.steers.map((item) => toPendingSteer(item as SteerQueueItem))
+          : [],
       };
     } catch (error) {
       logger.warn(`[SteeringLifecycle] Failed to parse leftover steers: ${streamId}`, error);

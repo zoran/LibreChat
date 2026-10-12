@@ -508,6 +508,45 @@ describe('Agent Abort Endpoint', () => {
     });
 
     describe('Partial Response Saving', () => {
+      it('fences the actual stopped response with its server generation sources', async () => {
+        const conversationId = 'test-stream-123';
+        const sourceExpiresAt = Date.parse('2030-01-20T00:00:00Z');
+        mockHasPersistedPrivateText.mockResolvedValue(false);
+        const abortResult = {
+          success: true,
+          jobData: {
+            userMessage: { messageId: 'user-msg', text: 'independent question' },
+            responseMessageId: 'response-msg',
+            conversationId,
+            endpoint: 'agents',
+            sourceRetention: { sourceFileIds: ['a'], sourceExpiresAt },
+          },
+          content: [{ type: 'text', text: 'derived answer' }],
+          text: 'derived answer',
+        };
+        mockGenerationJobManager.getJob.mockResolvedValue({
+          metadata: { userId: 'test-user-123' },
+        });
+        mockGenerationJobManager.abortJob.mockImplementation(async (_id, options) => {
+          await options.beforePublish(abortResult);
+          return abortResult;
+        });
+        const response = await request(app).post('/api/agents/chat/abort').send({ conversationId });
+        expect(response.status).toBe(200);
+        expect(mockSaveMessage).toHaveBeenCalledWith(
+          expect.anything(),
+          expect.objectContaining({ messageId: 'response-msg', isCreatedByUser: false }),
+          expect.objectContaining({
+            sourceRetention: { sourceFileIds: ['a'], sourceExpiresAt: new Date(sourceExpiresAt) },
+          }),
+        );
+        const userCall = mockSaveMessage.mock.calls.find(
+          (call) => call[1].messageId === 'user-msg',
+        );
+        expect(userCall).toBeDefined();
+        expect(userCall[2]).not.toHaveProperty('sourceRetention');
+      });
+
       it('does not overwrite a persisted protected user sidecar while stopping a run', async () => {
         const conversationId = 'test-stream-123';
         const userMessageId = 'protected-user-msg';

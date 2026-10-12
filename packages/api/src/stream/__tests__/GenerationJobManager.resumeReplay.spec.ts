@@ -6,6 +6,7 @@ import { InMemoryEventTransport } from '~/stream/implementations/InMemoryEventTr
 import { InMemoryJobStore } from '~/stream/implementations/InMemoryJobStore';
 import { GenerationJobManagerClass } from '~/stream/GenerationJobManager';
 import { createToolTimingTracker } from '~/agents/toolTiming';
+import { serializeQuoteRetention } from '~/files/retention';
 
 jest.spyOn(console, 'log').mockImplementation();
 
@@ -67,6 +68,118 @@ describe('GenerationJobManager resume replay events', () => {
   afterEach(async () => {
     await manager?.destroy();
     manager = undefined;
+  });
+
+  test('quote wire is available to trusted metadata but excluded from public resume', async () => {
+    manager = createInMemoryManager();
+    const job = await manager.createJob('quote-wire', 'user-1', 'quote-wire');
+    const ref = { messageId: 'source-message' };
+    const quoteRetention = serializeQuoteRetention(
+      {
+        quotes: ['excerpt'],
+        sourceMessageConditions: [],
+        quoteSourceRetention: [
+          {
+            index: 0,
+            sourceRef: ref,
+            sourceFileIds: ['file-a'],
+            sourceExpiresAt: new Date(Date.now() + 60000),
+          },
+        ],
+      },
+      [ref],
+    );
+    await manager.bindSourceRetention('quote-wire', job.createdAt, {
+      sourceFileIds: ['file-a'],
+      sourceExpiresAt: new Date(Date.now() + 60000),
+    });
+    await manager.updateMetadata(
+      'quote-wire',
+      {
+        userMessage: {
+          messageId: 'new-user',
+          text: 'independent question',
+          quotes: ['excerpt'],
+          quoteSourceRefs: [ref],
+          quoteRetention,
+        },
+      },
+      job.createdAt,
+    );
+    expect((await manager.getJob('quote-wire'))?.metadata.userMessage?.quoteRetention).toEqual(
+      quoteRetention,
+    );
+    const replay = await manager.getResumeState('quote-wire');
+    expect(replay?.userMessage).toMatchObject({ quotes: ['excerpt'], quoteSourceRefs: [ref] });
+    expect(replay?.userMessage).not.toHaveProperty('quoteRetention');
+  });
+
+  test('source revoke blocks replay and abort FINAL while preserving an unrelated job', async () => {
+    const store = new InMemoryJobStore({ ttlAfterComplete: 60000 });
+    manager = createManagerWithStore(store);
+    const source = await manager.createJob('source-chat', 'owner', 'source-chat');
+    await manager.createJob('unrelated-chat', 'owner', 'unrelated-chat');
+    expect(
+      await manager.bindSourceRetention('source-chat', source.createdAt, {
+        sourceFileIds: ['file-a'],
+        sourceExpiresAt: new Date(Date.now() + 60000),
+      }),
+    ).toBe(true);
+    const onDone = jest.fn();
+    await manager.subscribe('source-chat', () => undefined, onDone);
+    const result = await manager.revokeFileSourceGenerations({ userId: 'owner' }, ['file-a']);
+    expect(result).toEqual({ complete: true, pending: [] });
+    expect(onDone).not.toHaveBeenCalled();
+    expect(await manager.getResumeState('source-chat')).toBeNull();
+    expect(await manager.getJob('unrelated-chat')).toBeDefined();
+    await store.updateJob(
+      'source-chat',
+      { finalEvent: '{"text":"late document"}' },
+      source.createdAt,
+    );
+    expect((await store.getJob('source-chat'))?.finalEvent).toBeUndefined();
+  });
+
+  test('source recovery copies survive epoch lookup but deletion leaves the successor and user text', async () => {
+    const store = new InMemoryJobStore({ ttlAfterComplete: 60000 });
+    manager = createManagerWithStore(store);
+    const old = await store.createJob('reused', 'owner', 'reused');
+    await store.bindSourceRetention('reused', old.createdAt, {
+      sourceFileIds: ['file-a'],
+      sourceExpiresAt: Date.now() + 60000,
+    });
+    await store.parkSteers(
+      'reused',
+      JSON.stringify({
+        userId: 'owner',
+        steers: [
+          {
+            steerId: 'follow-up',
+            text: 'keep my independent instruction',
+            createdAt: Date.now(),
+            files: [{ file_id: 'file-a', text: 'document secret' }, { file_id: 'file-b' }],
+          },
+        ],
+      }),
+      old.createdAt,
+    );
+    await store.transitionStatus('reused', {
+      from: 'running',
+      to: 'complete',
+      expectCreatedAt: old.createdAt,
+      patch: { completedAt: Date.now(), providerDrained: true },
+    });
+    const successor = await manager.createJob('reused', 'owner', 'reused');
+    expect(successor.createdAt).not.toBe(old.createdAt);
+    expect(await manager.revokeFileSourceGenerations({ userId: 'owner' }, ['file-a'])).toEqual({
+      complete: true,
+      pending: [],
+    });
+    expect((await store.getJob('reused'))?.createdAt).toBe(successor.createdAt);
+    expect((await store.getJob('reused'))?.status).toBe('running');
+    const recovered = JSON.parse((await store.claimParkedSteers('reused', 'owner'))!);
+    expect(recovered.steers[0].text).toBe('keep my independent instruction');
+    expect(recovered.steers[0].files).toEqual([{ file_id: 'file-b' }]);
   });
 
   test('projects regeneration ownership into resume state', async () => {

@@ -194,6 +194,7 @@ export default function useChatHelpers(index = 0, paramId?: string): ChatContrac
           isEdited: true,
           overrideManualSkills: parentMessage.manualSkills,
           overrideQuotes: parentMessage.quotes,
+          overrideQuoteSourceRefs: parentMessage.quoteSourceRefs,
           overrideReasoning: parentMessage.reasoningOverride ?? null,
         },
       );

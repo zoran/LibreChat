@@ -655,6 +655,7 @@ const skillFileConfigSchema = z.object({
 });
 
 export const fileConfigSchema = z.object({
+  retentionHours: z.number().finite().positive().optional(),
   endpoints: z.record(endpointFileConfigSchema).optional(),
   skills: skillFileConfigSchema.optional(),
   serverFileSizeLimit: z.number().min(0).optional(),
@@ -1264,6 +1265,10 @@ function buildMergedFileConfig(dynamic: DynamicFileConfig | undefined): FileConf
   };
   if (!dynamic) {
     return mergedConfig;
+  }
+
+  if (dynamic.retentionHours !== undefined) {
+    mergedConfig.retentionHours = dynamic.retentionHours;
   }
 
   if (dynamic.defaultLLMDeliveryPath !== undefined) {

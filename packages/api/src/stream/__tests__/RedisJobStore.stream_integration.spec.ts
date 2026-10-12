@@ -8,6 +8,13 @@ import {
   PAUSE_PERSISTENCE_TIMEOUT_ERROR,
   STEER_ENQUEUE_RECEIPT_FULL,
 } from '../interfaces/IJobStore';
+import {
+  ioredisClient as staticRedisClient,
+  keyvRedisClient as staticKeyvClient,
+  keyvRedisClientReady,
+} from '~/cache/redisClients';
+import { serializeQuoteRetention, deserializeQuoteRetention } from '~/files/retention';
+import { SteeringLifecycle } from '../SteeringLifecycle';
 import { clearRedisTestPrefix } from './helpers/redis';
 
 /** Suppress winston Console transport output (survives jest.resetModules) */
@@ -27,6 +34,8 @@ jest.spyOn(console, 'log').mockImplementation();
 describe('RedisJobStore Integration Tests', () => {
   let originalEnv: NodeJS.ProcessEnv;
   let ioredisClient: Redis | Cluster | null = null;
+  let dynamicKeyvClient: { disconnect: () => unknown } | null = null;
+  let dynamicKeyvReady: Promise<unknown> | null = null;
   const testPrefix = 'Stream-Integration-Test';
 
   function buildPendingAction(streamId: string): Agents.PendingAction {
@@ -55,8 +64,10 @@ describe('RedisJobStore Integration Tests', () => {
     jest.resetModules();
 
     // Import Redis client
-    const { ioredisClient: client } = await import('../../cache/redisClients');
-    ioredisClient = client;
+    const clients = await import('../../cache/redisClients');
+    ioredisClient = clients.ioredisClient;
+    dynamicKeyvClient = clients.keyvRedisClient;
+    dynamicKeyvReady = clients.keyvRedisClientReady;
 
     if (!ioredisClient) {
       console.warn('Redis not available, skipping integration tests');
@@ -90,7 +101,160 @@ describe('RedisJobStore Integration Tests', () => {
         }
       }
     }
+    for (const ready of [keyvRedisClientReady, dynamicKeyvReady]) await ready?.catch(() => {});
+    for (const client of new Set([staticRedisClient, staticKeyvClient, dynamicKeyvClient])) {
+      if (client) await client.disconnect();
+    }
     process.env = originalEnv;
+  });
+
+  test('Redis quote recovery purge preserves paired independent entries and the current generation', async () => {
+    expect(ioredisClient).not.toBeNull();
+    const { RedisJobStore } = await import('../implementations/RedisJobStore');
+    const store = new RedisJobStore(ioredisClient!);
+    const job = await store.createJob('quote-copy', 'owner', undefined, undefined, {
+      generationProtocolVersion: 2,
+    });
+    const refs = [{ messageId: 'a' }, null];
+    const quoteRetention = serializeQuoteRetention(
+      {
+        quotes: ['same', 'same'],
+        sourceMessageConditions: [],
+        quoteSourceRetention: [
+          {
+            index: 0,
+            sourceRef: refs[0]!,
+            sourceFileIds: ['file-a'],
+            sourceExpiresAt: new Date(Date.now() + 60000),
+          },
+        ],
+      },
+      refs,
+    );
+    try {
+      await store.parkSteers(
+        job.streamId,
+        JSON.stringify({
+          userId: 'owner',
+          steers: [
+            {
+              steerId: 's',
+              createdAt: Date.now(),
+              text: 'keep this question',
+              quotes: quoteRetention.quotes,
+              quoteSourceRefs: refs,
+              quoteRetention,
+            },
+          ],
+        }),
+        job.createdAt,
+      );
+      expect(
+        await store.purgeFileSourceRecovery(job.streamId, { userId: 'foreign' }, ['file-a']),
+      ).toBe(true);
+      expect(
+        JSON.parse(
+          (await store.claimParkedSteersDetailed(job.streamId, 'owner', undefined, 2))!.payload,
+        ).steers[0].quotes,
+      ).toHaveLength(2);
+      // Both v2 observations leave the source available for the guarded handoff.
+      expect(
+        await store.purgeFileSourceRecovery(job.streamId, { userId: 'owner' }, ['file-a']),
+      ).toBe(true);
+      const parked = JSON.parse(
+        (await store.claimParkedSteersDetailed(job.streamId, 'owner', undefined, 2))!.payload,
+      );
+      expect(parked.steers[0]).toMatchObject({
+        text: 'keep this question',
+        quotes: ['same'],
+        quoteSourceRefs: [null],
+      });
+      expect(
+        deserializeQuoteRetention(parked.steers[0].quoteRetention).quoteSourceRetention,
+      ).toEqual([]);
+      // Entirely removed quote fields still expose an ordinary usable question after Lua encoding.
+      await store.parkSteers(
+        job.streamId,
+        JSON.stringify({
+          userId: 'owner',
+          steers: [
+            {
+              steerId: 'source-only',
+              createdAt: Date.now(),
+              text: 'keep another question',
+              quotes: ['same'],
+              quoteSourceRefs: [refs[0]],
+              quoteRetention: { ...quoteRetention, quotes: ['same'], quoteSourceRefs: [refs[0]] },
+            },
+          ],
+        }),
+        job.createdAt,
+      );
+      expect(
+        await store.purgeFileSourceRecovery(job.streamId, { userId: 'owner' }, ['file-a']),
+      ).toBe(true);
+      const publicItems = await new SteeringLifecycle(store).claim(job.streamId, {
+        userId: 'owner',
+      });
+      expect(publicItems.find((item) => item.steerId === 'source-only')).toMatchObject({
+        text: 'keep another question',
+      });
+      expect(publicItems.find((item) => item.steerId === 'source-only')).not.toHaveProperty(
+        'quotes',
+      );
+      expect(publicItems.find((item) => item.steerId === 'source-only')).not.toHaveProperty(
+        'quoteSourceRefs',
+      );
+      expect((await store.getJob(job.streamId))?.createdAt).toBe(job.createdAt);
+    } finally {
+      await store.destroy();
+    }
+  });
+
+  test('source guards atomically reject late writes and do not revoke a successor epoch', async () => {
+    expect(ioredisClient).not.toBeNull();
+    const { RedisJobStore } = await import('../implementations/RedisJobStore');
+    const owner = new RedisJobStore(ioredisClient!);
+    const peer = new RedisJobStore(ioredisClient!);
+    const job = await owner.createJob('source-guard', 'owner', undefined, undefined, {
+      providerExecutionId: 'source-provider',
+    });
+    try {
+      expect(
+        await owner.bindSourceRetention(job.streamId, job.createdAt, {
+          sourceFileIds: ['file-a'],
+          sourceExpiresAt: Date.now() + 60000,
+        }),
+      ).toBe(true);
+      expect(await peer.revokeSourceRetention(job.streamId, job.createdAt)).toBe(true);
+      expect(
+        await owner.appendChunk(
+          job.streamId,
+          { event: 'on_message_delta', data: { text: 'secret' } },
+          job.createdAt,
+        ),
+      ).toBe(false);
+      await owner.updateJob(job.streamId, { finalEvent: '{"text":"secret"}' }, job.createdAt);
+      expect((await peer.getJob(job.streamId))?.finalEvent).toBeUndefined();
+      await owner.transitionStatus(job.streamId, {
+        from: 'running',
+        to: 'aborted',
+        expectCreatedAt: job.createdAt,
+        patch: { completedAt: Date.now(), providerDrained: true },
+      });
+      expect(await owner.purgeSourceRetention(job.streamId, job.createdAt)).toBe(true);
+      expect(await peer.getJob(job.streamId)).toMatchObject({
+        providerExecutionId: 'source-provider',
+        providerDrained: true,
+      });
+      const successor = await peer.createJob(job.streamId, 'owner');
+      expect(await owner.revokeSourceRetention(job.streamId, job.createdAt)).toBe(false);
+      expect((await peer.getJob(job.streamId))?.createdAt).toBe(successor.createdAt);
+      expect((await peer.getJob(job.streamId))?.status).toBe('running');
+    } finally {
+      await owner.destroy();
+      await peer.destroy();
+    }
   });
 
   test.each(['update', 'transition'] as const)(

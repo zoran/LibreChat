@@ -2,6 +2,7 @@ import { logger } from '@librechat/data-schemas';
 import { formatMessage } from '@librechat/agents';
 import { ContentTypes } from 'librechat-data-provider';
 import type { TFile, TurnFileConsumers } from 'librechat-data-provider';
+import type { QuoteSourceRef } from 'librechat-data-provider';
 import type { IMongoFile } from '@librechat/data-schemas';
 import type { SteerQueueItem } from '~/stream/interfaces/IJobStore';
 import type { SteerFileFetcher } from './request';
@@ -43,6 +44,7 @@ interface SteerPart {
   steerId?: string;
   files?: Partial<TFile>[];
   quotes?: string[];
+  quoteSourceRefs?: Array<QuoteSourceRef | null>;
   media?: Array<Record<string, unknown>>;
   [key: string]: unknown;
 }

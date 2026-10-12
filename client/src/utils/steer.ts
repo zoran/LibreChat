@@ -119,12 +119,60 @@ export const MAX_QUOTE_COUNT = 10;
  * that cannot ride the next send is dropped explicitly rather than displayed
  * as a chip the submission would silently discard. */
 export function mergeRestagedQuotes(prev: string[], quotes: string[]): string[] {
-  const room = MAX_QUOTE_COUNT - prev.length;
-  if (room <= 0) {
-    return prev;
+  return mergeRestagedQuoteDraft({ quotes: prev, quoteSourceRefs: prev.map(() => null) }, quotes)
+    .quotes;
+}
+
+/** Atomic composer context; refs use the public message contract. */
+export type PendingQuoteDraft = {
+  quotes: string[];
+  quoteSourceRefs: NonNullable<TMessage['quoteSourceRefs']>;
+};
+
+export function mergeRestagedQuoteDraft(
+  previous: PendingQuoteDraft,
+  quotes: string[],
+  refs?: TMessage['quoteSourceRefs'],
+): PendingQuoteDraft {
+  let result = previous;
+  for (let index = 0; index < quotes.length && result.quotes.length < MAX_QUOTE_COUNT; index++) {
+    const text = quotes[index];
+    const ref = refs?.[index] ?? null;
+    const duplicate = result.quotes.some((candidate, at) => {
+      const current = result.quoteSourceRefs[at] ?? null;
+      return (
+        candidate === text &&
+        current?.messageId === ref?.messageId &&
+        current?.quoteIndex === ref?.quoteIndex &&
+        current?.messageVersion === ref?.messageVersion
+      );
+    });
+    if (duplicate) continue;
+    result = {
+      quotes: [...result.quotes, text],
+      quoteSourceRefs: [...result.quotes.map((_, at) => result.quoteSourceRefs[at] ?? null), ref],
+    };
   }
-  const fresh = quotes.filter((quote) => !prev.includes(quote)).slice(0, room);
-  return fresh.length > 0 ? [...prev, ...fresh] : prev;
+  return result;
+}
+
+export function collectDroppedSteerQuoteDraft(
+  values: unknown[] | undefined,
+  chips: readonly Pick<TPendingSteer, 'steerId' | 'clientSteerId' | 'quotes' | 'quoteSourceRefs'>[],
+  previous: PendingQuoteDraft = { quotes: [], quoteSourceRefs: [] },
+): PendingQuoteDraft {
+  const quoteless = collectQuotelessAppliedSteerIds(values);
+  let result = previous;
+  for (const chip of chips) {
+    if (
+      quoteless.has(chip.steerId) ||
+      (chip.clientSteerId != null && quoteless.has(chip.clientSteerId))
+    ) {
+      result = mergeRestagedQuoteDraft(result, chip.quotes ?? [], chip.quoteSourceRefs);
+    }
+    if (result.quotes.length >= MAX_QUOTE_COUNT) break;
+  }
+  return result;
 }
 
 /** Excerpts to re-stage when applied steer parts settle their chips: the
@@ -135,17 +183,7 @@ export function collectDroppedSteerQuotes(
   values: unknown[] | undefined,
   chips: readonly Pick<TPendingSteer, 'steerId' | 'clientSteerId' | 'quotes'>[],
 ): string[] {
-  const quoteless = collectQuotelessAppliedSteerIds(values);
-  if (quoteless.size === 0) {
-    return [];
-  }
-  return chips.flatMap((steer) =>
-    (steer.quotes?.length ?? 0) > 0 &&
-    (quoteless.has(steer.steerId) ||
-      (steer.clientSteerId != null && quoteless.has(steer.clientSteerId)))
-      ? (steer.quotes ?? [])
-      : [],
-  );
+  return collectDroppedSteerQuoteDraft(values, chips).quotes;
 }
 
 /**
@@ -240,6 +278,7 @@ export function appendAppliedSteerIds(prev: string[], steerIds: string[]): strin
 
 export type SteerCarriedContext = {
   quotes?: string[];
+  quoteSourceRefs?: TMessage['quoteSourceRefs'];
   manualSkills?: string[];
   reasoningOverride?: TMessage['reasoningOverride'];
 };
@@ -254,7 +293,11 @@ export function carriedSteerContext(source?: SteerCarriedContext): SteerCarriedC
   const manualSkills = source?.manualSkills;
   const reasoningOverride = source?.reasoningOverride;
   return {
-    ...(quotes && quotes.length > 0 && { quotes }),
+    ...(quotes &&
+      quotes.length > 0 && {
+        quotes,
+        ...(source?.quoteSourceRefs && { quoteSourceRefs: source.quoteSourceRefs }),
+      }),
     ...(manualSkills && manualSkills.length > 0 && { manualSkills }),
     ...(reasoningOverride != null && { reasoningOverride }),
   };

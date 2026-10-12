@@ -2782,8 +2782,11 @@ function projectModelBoundProviderContent(
 ): {
   storedMessages: StoredModelBoundMessage[];
   resolvedFiles: ModelBoundCanonicalFile[];
+  sourceMessageIds: string[];
+  sourceFileIds: string[];
   deferredTraversalErrors: ContentTraversalLimitError[];
 } {
+  const sourceMessageIds = new Set<string>();
   const selectedMessages: StoredModelBoundMessage[] = [];
   const selectedStoredMessages = new Set<StoredModelBoundMessage>();
   const selectedFileIds = new Set<string>();
@@ -2886,6 +2889,8 @@ function projectModelBoundProviderContent(
         const contentSelectionKey = getProviderContentSelectionKey(
           contribution.selectedContentPartIndices,
         );
+        const sourceId = storedMessage.messageId ?? storedMessage.id;
+        if (sourceId) sourceMessageIds.add(sourceId);
         const cachedState = getCachedStoredProviderState(
           index,
           storedMessage,
@@ -2988,6 +2993,7 @@ function projectModelBoundProviderContent(
           cachedState.messageSnapshot.isCreatedByUser === true ||
           cachedState.messageSnapshot.isUserSubmitted === true ||
           storedRole === 'user';
+        sourceMessageIds.add(sourceId);
         const explicitPathMetadata = getCapturedUserSubmittedPathMetadata(
           cachedState.explicitSubmittedPathState,
         );
@@ -3138,19 +3144,29 @@ function projectModelBoundProviderContent(
       new ContentTraversalLimitError([], getProviderPartSnapshotTraversalScopes(providerRoles)),
     );
   }
-  return { storedMessages: selectedMessages, resolvedFiles, deferredTraversalErrors };
+  return {
+    storedMessages: selectedMessages,
+    resolvedFiles,
+    sourceMessageIds: [...sourceMessageIds],
+    sourceFileIds: [...selectedFileIds],
+    deferredTraversalErrors,
+  };
 }
 
 function assertIndexedModelBoundProviderContent(
   input: ModelBoundProviderContentInput,
   index: ModelBoundProviderContentIndex,
   workBudgets?: ProviderProjectionWorkBudgets,
-): void {
-  if (!hasModelBoundContentProtection(input.filters, input.legacyPii)) {
+  collectSources = false,
+): ReturnType<typeof projectModelBoundProviderContent> | undefined {
+  if (!collectSources && !hasModelBoundContentProtection(input.filters, input.legacyPii)) {
     return;
   }
   const resolvedWorkBudgets = workBudgets ?? createProviderProjectionWorkBudgets(index);
   const projection = projectModelBoundProviderContent(input, index, resolvedWorkBudgets);
+  if (collectSources && (index.overflowed || projection.deferredTraversalErrors.length > 0)) {
+    throw new ContentTraversalLimitError();
+  }
   assertModelBoundContent({
     onTraversalFailure: input.onTraversalFailure,
     filters: input.filters,
@@ -3161,6 +3177,7 @@ function assertIndexedModelBoundProviderContent(
     deferredTraversalErrors: projection.deferredTraversalErrors,
     traversalBudget: resolvedWorkBudgets.nestedTraversal,
   });
+  return projection;
 }
 
 /** Inspects the exact provider selection while retaining persisted provenance. */
@@ -3245,6 +3262,10 @@ export function createModelBoundChatModelCallback(
   input: Omit<ModelBoundProviderContentInput, 'providerMessages'>,
   options: {
     readonly onContentRejected?: (error: unknown) => void;
+    readonly onSourceProjection?: (sources: {
+      fileIds: readonly string[];
+      sourceMessageIds: readonly string[];
+    }) => Promise<void>;
     readonly onContentAllowed?: (context: {
       runId?: string;
       parentRunId?: string;
@@ -3298,6 +3319,8 @@ export function createModelBoundChatModelCallback(
         options.onContentRejected?.(error);
         throw new FatalModelBoundPolicyError(error);
       }
+      const fileIds = new Set<string>();
+      const sourceMessageIds = new Set<string>();
       const workBudgets = createProviderProjectionWorkBudgets(index);
       let remainingProviderMessages = MAX_PROVIDER_PROJECTION_WORK;
       for (let batchIndex = 0; batchIndex < messageBatchCount; batchIndex++) {
@@ -3313,14 +3336,19 @@ export function createModelBoundChatModelCallback(
             providerMessages.push(providerMessageCandidate[index]);
           }
           remainingProviderMessages -= providerMessageCount;
-          assertIndexedModelBoundProviderContent(
+          const projection = assertIndexedModelBoundProviderContent(
             {
               ...stableInput,
               providerMessages,
             },
             index,
             workBudgets,
+            options.onSourceProjection != null,
           );
+          if (projection && options.onSourceProjection) {
+            projection.sourceFileIds.forEach((id) => fileIds.add(id));
+            projection.sourceMessageIds.forEach((id) => sourceMessageIds.add(id));
+          }
           if (providerMessageCount < providerMessageLength) {
             throw new ContentTraversalLimitError();
           }
@@ -3339,6 +3367,22 @@ export function createModelBoundChatModelCallback(
         const error = new ContentTraversalLimitError();
         options.onContentRejected?.(error);
         throw new FatalModelBoundPolicyError(error);
+      }
+      if (options.onSourceProjection) {
+        return options
+          .onSourceProjection({
+            fileIds: [...fileIds],
+            sourceMessageIds: [...sourceMessageIds],
+          })
+          .catch((error) => {
+            options.onContentRejected?.(error);
+            // The SDK recovers ordinary callback errors; retain the existing fatal bridge.
+            const rejection = new ContentTraversalLimitError();
+            rejection.name = 'FileSourceUnavailableError';
+            rejection.message = 'Document source admission failed';
+            throw new FatalModelBoundPolicyError(rejection);
+          })
+          .then(() => options.onContentAllowed?.({ runId, parentRunId, metadata }));
       }
       return options.onContentAllowed?.({ runId, parentRunId, metadata });
     },

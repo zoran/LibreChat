@@ -9,6 +9,7 @@ const {
   sanitizeFileForTransmit,
   extractFileContext,
   getReferencedQuotes,
+  readFileSourceRetention,
   applyTurnDelivery,
   encodeAndFormatAudios,
   encodeAndFormatVideos,
@@ -618,6 +619,9 @@ class BaseClient {
       const referencedQuotes = getReferencedQuotes(this.options.req?.body?.quotes);
       if (referencedQuotes != null) {
         userMessage.quotes = referencedQuotes;
+        if (Array.isArray(this.options.req?.body?.quoteSourceRefs)) {
+          userMessage.quoteSourceRefs = this.options.req.body.quoteSourceRefs;
+        }
       }
     }
 
@@ -1386,8 +1390,25 @@ class BaseClient {
         user,
         ...(hasAddedConvo && { addedConvo: true }),
       },
-      { context: 'api/app/clients/BaseClient.js - saveMessageToDatabase #saveMessage' },
+      {
+        context: 'api/app/clients/BaseClient.js - saveMessageToDatabase #saveMessage',
+        ...(message.isCreatedByUser === true &&
+          req?._quoteRetention != null && {
+            quoteRetention: req._quoteRetention,
+          }),
+        ...(message.isCreatedByUser === false &&
+          req?._fileSourceRetention != null && {
+            sourceRetention: readFileSourceRetention(req?._fileSourceRetention),
+          }),
+      },
     );
+
+    if (message.isCreatedByUser === true && savedMessage && Array.isArray(savedMessage.quotes)) {
+      // Completion/edit carries the saved field snapshot, not a consumed origin version.
+      message.quotes = savedMessage.quotes;
+      message.quoteSourceRefs = savedMessage.quoteSourceRefs;
+      message.__v = savedMessage.__v;
+    }
 
     /** Only a reply that is actually in the message history may light an indicator: a write
      *  that resolved empty (duplicate-key recovery that could not re-read the row) would

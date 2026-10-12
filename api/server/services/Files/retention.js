@@ -1,5 +1,6 @@
 const {
   getRetentionExpiry: getRetentionExpiryWithDeps,
+  getDocumentFileRetention,
   getAgentFileRetentionExpiry: getAgentFileRetentionExpiryWithDeps,
 } = require('@librechat/api');
 const { logger, createChatExpirationDate } = require('@librechat/data-schemas');
@@ -49,7 +50,9 @@ async function getRetentionExpiry(req) {
 async function getAgentFileRetentionExpiry({ tool_resource, toolResource, ...params }) {
   const inherited = getEventBindingRetention(params.req);
   if (inherited != null) {
-    return inherited;
+    return params.messageAttachment && params.req?.config?.fileConfig?.retentionHours != null
+      ? getDocumentFileRetention(params.req, inherited)
+      : inherited;
   }
   return getAgentFileRetentionExpiryWithDeps(
     { ...params, toolResource: tool_resource ?? toolResource },

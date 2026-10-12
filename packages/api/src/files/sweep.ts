@@ -44,6 +44,8 @@ const FILE_RETENTION_PARK_MS = 30 * 24 * 60 * 60 * 1000;
 
 type ExpiredFile = {
   file_id: string;
+  /** Preserved on the owner cleanup projection; ordinary reads hide revoked originals. */
+  retentionAcceptedAt?: Date;
   source?: string;
   user?: string | { toString?: () => string };
   tenantId?: string;

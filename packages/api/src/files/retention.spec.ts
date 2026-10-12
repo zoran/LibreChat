@@ -3,6 +3,12 @@ import { createChatExpirationDate } from '@librechat/data-schemas';
 import {
   createMinimalRetentionRequest,
   getAgentFileRetentionExpiry,
+  getDocumentFileRetention,
+  readFileSourceRetention,
+  serializeQuoteRetention,
+  deserializeQuoteRetention,
+  redactQuoteRetention,
+  quoteRetentionContext,
   getConversationExpirationDate,
   getRetentionExpiry,
   getSharedLinkExpiration,
@@ -15,6 +21,62 @@ import {
 describe('retention helpers', () => {
   const expirationDate = new Date('2030-01-01T00:00:00.000Z');
   let dependencies: jest.Mocked<RetentionDependencies>;
+
+  it('redacts only expired/revoked quote fields while pairing identical text and original deadlines', () => {
+    const refs = [{ messageId: 'A' }, null, { messageId: 'B', quoteIndex: 1, messageVersion: 3 }];
+    const resolved = {
+      quotes: ['same', 'independent', 'same'],
+      quoteSourceRetention: [
+        {
+          index: 0,
+          sourceRef: refs[0]!,
+          sourceFileIds: ['file-A'],
+          sourceExpiresAt: new Date(3000),
+        },
+        {
+          index: 2,
+          sourceRef: refs[2]!,
+          sourceFileIds: ['file-B'],
+          sourceExpiresAt: new Date(5000),
+        },
+      ],
+      sourceMessageConditions: [
+        { messageId: 'A', messageVersion: 0 },
+        { messageId: 'B', messageVersion: 3 },
+      ],
+    };
+    const wire = serializeQuoteRetention(resolved, refs);
+    expect(deserializeQuoteRetention(JSON.parse(JSON.stringify(wire)))).toEqual(resolved);
+    expect(quoteRetentionContext(resolved)).toEqual({
+      sourceFileIds: ['file-A', 'file-B'],
+      sourceExpiresAt: new Date(3000),
+    });
+    const redacted = redactQuoteRetention(wire, ['file-A'], 2000);
+    expect(redacted.quotes).toEqual(['independent', 'same']);
+    expect(redacted.quoteSourceRefs).toEqual([null, refs[2]]);
+    expect(redacted.quoteSourceRetention).toEqual([{ ...wire.quoteSourceRetention[1], index: 1 }]);
+    expect(redactQuoteRetention(redacted, [], 5000)).toMatchObject({
+      quotes: ['independent'],
+      quoteSourceRefs: [null],
+      quoteSourceRetention: [],
+      sourceMessageConditions: [],
+    });
+    expect(() => deserializeQuoteRetention({ ...wire, quoteSourceRefs: [] })).toThrow();
+    expect(
+      deserializeQuoteRetention({ ...wire, sourceMessageConditions: {} }).sourceMessageConditions,
+    ).toEqual([]);
+    expect(
+      deserializeQuoteRetention({
+        quotes: {},
+        quoteSourceRefs: {},
+        quoteSourceRetention: {},
+        sourceMessageConditions: {},
+      }),
+    ).toEqual({ quotes: [], quoteSourceRetention: [], sourceMessageConditions: [] });
+    expect(() =>
+      deserializeQuoteRetention({ ...wire, sourceMessageConditions: { unknown: true } }),
+    ).toThrow();
+  });
 
   beforeEach(() => {
     dependencies = {
@@ -593,5 +655,49 @@ describe('retention helpers', () => {
       ).resolves.toBe(expiredAt);
       expect(dependencies.createExpirationDate).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('original document source admission', () => {
+  afterEach(() => jest.useRealTimers());
+  it('captures before pending inherited lookup and never renews the same upload', async () => {
+    jest.useFakeTimers().setSystemTime(new Date('2030-01-01T00:00:00Z'));
+    const req = {
+      file: { mimetype: 'text/plain' },
+      config: { fileConfig: { retentionHours: 672 } },
+    };
+    let finish!: (value: { expiredAt: Date }) => void;
+    const pending = getDocumentFileRetention(
+      req,
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    jest.setSystemTime(new Date('2030-01-02T00:00:00Z'));
+    finish({ expiredAt: new Date('2030-01-20T00:00:00Z') });
+    const first = await pending;
+    expect(first.retention).toEqual({
+      acceptedAt: new Date('2030-01-01T00:00:00Z'),
+      expiredAt: new Date('2030-01-20T00:00:00Z'),
+    });
+    expect(await getDocumentFileRetention(req, {})).toEqual(first);
+  });
+  it('leaves ordinary uploads and image attachments on the upstream contract', async () => {
+    expect(await getDocumentFileRetention({ file: { mimetype: 'text/plain' } }, {})).toEqual({});
+    expect(
+      await getDocumentFileRetention(
+        { file: { mimetype: 'image/png' }, config: { fileConfig: { retentionHours: 672 } } },
+        {},
+      ),
+    ).toEqual({});
+  });
+  it('decodes only complete server contexts, including the job epoch codec', () => {
+    const expiry = Date.parse('2030-01-20T00:00:00Z');
+    expect(readFileSourceRetention({ sourceFileIds: ['a', 'a'], sourceExpiresAt: expiry })).toEqual(
+      { sourceFileIds: ['a'], sourceExpiresAt: new Date(expiry) },
+    );
+    expect(() => readFileSourceRetention({ sourceFileIds: ['a'] })).toThrow();
+    expect(() => readFileSourceRetention({ sourceFileIds: [], sourceExpiresAt: expiry })).toThrow();
+    expect(readFileSourceRetention(undefined)).toBeUndefined();
   });
 });

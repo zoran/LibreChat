@@ -294,6 +294,7 @@ function QueueRow({
       createdAt: message.createdAt,
       files: message.files,
       quotes: message.quotes,
+      quoteSourceRefs: message.quoteSourceRefs,
       manualSkills: message.manualSkills,
       ...(message.reasoningOverride != null && { reasoningOverride: message.reasoningOverride }),
       ...(message.parentMessageId != null &&
@@ -325,6 +326,7 @@ function QueueRow({
             message.files,
             {
               quotes: message.quotes,
+              quoteSourceRefs: message.quoteSourceRefs,
               manualSkills: message.manualSkills,
               ...(message.reasoningOverride != null && {
                 reasoningOverride: message.reasoningOverride,

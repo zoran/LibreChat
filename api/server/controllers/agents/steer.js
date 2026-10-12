@@ -121,6 +121,8 @@ const runSteerController = async (req, res, requireIdempotentDelivery) => {
       ...(requireIdempotentDelivery && { requireIdempotentDelivery: true }),
       getFiles: db.getFiles,
       updateFilesUsage: db.updateFilesUsage,
+      resolveQuoteRetention: db.resolveQuoteRetention,
+      resolveFileRetentionContext: db.resolveFileRetentionContext,
       checkAgentAccess: requireIdempotentDelivery
         ? async (run) =>
             typeof expectedAgentId === 'string' &&

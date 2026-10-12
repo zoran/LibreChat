@@ -1,4 +1,18 @@
-import { mergeQuotedTextForCount, QUOTE_MAX_COUNT } from './quotes';
+import {
+  mergeQuotedTextForCount,
+  normalizeReferencedQuoteSources,
+  QUOTE_MAX_COUNT,
+} from './quotes';
+
+it('keeps raw quote/ref pairs through dropped entries and rejects malformed field versions', () => {
+  const source = { messageId: 'source', quoteIndex: 2, messageVersion: 7 };
+  expect(
+    normalizeReferencedQuoteSources(['', 42, '  same  ', 'same'], [null, null, source, null]),
+  ).toEqual({ quotes: ['same', 'same'], quoteSourceRefs: [source, null] });
+  expect(() =>
+    normalizeReferencedQuoteSources(['excerpt'], [{ messageId: 'source', quoteIndex: 0 }]),
+  ).toThrow();
+});
 
 describe('mergeQuotedTextForCount', () => {
   it('returns text unchanged for non-user messages', () => {

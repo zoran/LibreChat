@@ -4233,6 +4233,25 @@ describe('useSteering', () => {
       expect(mockMutate).not.toHaveBeenCalled();
     });
 
+    it('atomically carries field refs through composer queueing', () => {
+      const quoteSourceRefs = [{ messageId: 'source', quoteIndex: 0, messageVersion: 3 }];
+      const { result } = setupWithContext({}, ({ set }) => {
+        set(store.pendingQuoteDraftByConvoId(CONVO_ID), {
+          quotes: ['dependent quote'],
+          quoteSourceRefs,
+        });
+      });
+      act(() => {
+        result.current.steering.queueFromComposer('independent question');
+      });
+      expect(result.current.queue[0]).toMatchObject({
+        text: 'independent question',
+        quotes: ['dependent quote'],
+        quoteSourceRefs,
+      });
+      expect(result.current.pendingQuotes).toEqual([]);
+    });
+
     it('queueFromComposer consumes staged quotes + skills into the queued item', () => {
       const { result } = setupWithContext({}, stageContext);
       act(() => {
@@ -4449,6 +4468,7 @@ describe('useSteering', () => {
     });
 
     it('carries a queued-origin context onto the sending chip and the 202 ACK chip', () => {
+      const quoteSourceRefs = [{ messageId: 'source', quoteIndex: 1, messageVersion: 4 }];
       mockMutate.mockImplementationOnce((_params, { onSuccess }) => {
         onSuccess({
           steerId: 'srv-ctx',
@@ -4462,14 +4482,20 @@ describe('useSteering', () => {
       act(() => {
         result.current.steering.submitSteer('carried steer', undefined, {
           quotes: ['carried quote'],
+          quoteSourceRefs,
           manualSkills: ['carried-skill'],
         });
       });
+      expect(mockMutate).toHaveBeenCalledWith(
+        expect.objectContaining({ quotes: ['carried quote'], quoteSourceRefs }),
+        expect.any(Object),
+      );
       expect(result.current.chips).toEqual([
         expect.objectContaining({
           steerId: 'srv-ctx',
           status: 'pending',
           quotes: ['carried quote'],
+          quoteSourceRefs,
           manualSkills: ['carried-skill'],
         }),
       ]);

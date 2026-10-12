@@ -18,6 +18,7 @@ import type {
   TTokenUsageEvent,
   Agents,
 } from 'librechat-data-provider';
+import type { SourceRetentionContext, FileOwnerScope } from '@librechat/data-schemas';
 import type { StandardGraph } from '@librechat/agents';
 import type {
   SerializableJobData,
@@ -44,6 +45,7 @@ import type {
   GenerationAdmissionCensus,
   GenerationRequestBinding,
 } from './generationAdmission';
+import type { GenerationSourceRetention } from './interfaces/IJobStore';
 import type { AgentStartupTelemetry } from '~/agents/startup';
 import type { RecoveredSteerPayload } from './SteerRecovery';
 import type { SteerContentView } from './SteeringLifecycle';
@@ -70,6 +72,7 @@ import {
 } from './interfaces/IJobStore';
 import { GenerationAdmissionCoordinator, generationRequestBinding } from './generationAdmission';
 import { isRecoveredSteerPayload, RecoveredSteerPayloadMismatchError } from './SteerRecovery';
+import { sourceRetentionAvailable, isStopConfirmed } from './interfaces/IJobStore';
 import { projectTerminalEvent } from './terminalProjection';
 import { assertJobStoreV2 } from './jobStoreCapabilities';
 
@@ -742,6 +745,8 @@ export interface TerminalJobClaim {
  *   when the real client connects, which would prevent readyPromise from resolving.
  */
 interface RuntimeJobState {
+  sourceRetention?: GenerationSourceRetention;
+  sourceRetentionRevokedAt?: number;
   createdAt: number;
   abortController: AbortController;
   /** Removes this generation's cross-replica abort listener without touching a replacement. */
@@ -893,6 +898,12 @@ type DeferredDelivery =
  * });
  * ```
  */
+/** Strip private lineage and CAS conditions at the public resume boundary. */
+function publicQuoteUserMessage(value: NonNullable<SerializableJobData['userMessage']>) {
+  const { quoteRetention: _private, ...publicValue } = value;
+  return publicValue;
+}
+
 class GenerationJobManagerClass {
   /** Job metadata + content state storage - swappable for Redis, etc. */
   private jobStore: IJobStoreV2;
@@ -1094,6 +1105,7 @@ class GenerationJobManagerClass {
     this._steering = new SteeringLifecycle(this.jobStore);
     this.eventTransport = options?.eventTransport ?? new InMemoryEventTransport();
     this._cleanupOnComplete = options?.cleanupOnComplete ?? true;
+    this.eventTransport.setSourceRetentionReader?.((id) => this.jobStore.getJob(id));
     this.bindStaleGenerationHandler();
   }
 
@@ -1207,6 +1219,7 @@ class GenerationJobManagerClass {
     this._approvals = this.createApprovalLifecycle(this.jobStore);
     this._steering = new SteeringLifecycle(this.jobStore);
     this.eventTransport = services.eventTransport;
+    this.eventTransport.setSourceRetentionReader?.((id) => this.jobStore.getJob(id));
     this._isRedis = services.isRedis ?? false;
     /** Coalescing needs BOTH configured services to actually batch: the flush
      * capabilities are how implementations advertise it. A custom transport
@@ -2611,6 +2624,122 @@ class GenerationJobManagerClass {
     }
   }
 
+  /** Bind only server-resolved sources before a provider call; caller revalidates Files afterward. */
+  async bindSourceRetention(
+    streamId: string,
+    epoch: number,
+    context: SourceRetentionContext,
+  ): Promise<boolean> {
+    if (
+      !this.jobStore.bindSourceRetention ||
+      !this.jobStore.revokeSourceRetention ||
+      !this.jobStore.purgeSourceRetention ||
+      !this.jobStore.purgeFileSourceRecovery ||
+      this.eventTransport.sourceRetentionSupported !== true ||
+      !this.eventTransport.purgeSourceRetention
+    )
+      return false;
+    const expires = context.sourceExpiresAt.getTime();
+    if (
+      !Number.isFinite(expires) ||
+      expires <= Date.now() ||
+      !context.sourceFileIds.length ||
+      context.sourceFileIds.some((id) => typeof id !== 'string' || !id)
+    )
+      return false;
+    const accepted = await this.jobStore.bindSourceRetention(streamId, epoch, {
+      sourceFileIds: [...new Set(context.sourceFileIds)].sort(),
+      sourceExpiresAt: expires,
+    });
+    if (!accepted) return false;
+    const job = await this.jobStore.getJob(streamId);
+    if (!job || job.createdAt !== epoch || !sourceRetentionAvailable(job)) return false;
+    const runtime = this.runtimeState.get(streamId);
+    if (runtime?.createdAt === epoch) runtime.sourceRetention = job.sourceRetention;
+    return true;
+  }
+
+  /** File revocation already committed. Only matching owner/source/epochs are stopped. */
+  async revokeFileSourceGenerations(
+    owner: FileOwnerScope,
+    sourceFileIds: readonly string[],
+  ): Promise<{
+    complete: boolean;
+    pending: Array<{ streamId: string; createdAt: number }>;
+  }> {
+    const pending: Array<{ streamId: string; createdAt: number }> = [];
+    if (!sourceFileIds.length) return { complete: true, pending };
+    if (
+      !this.jobStore.revokeSourceRetention ||
+      !this.jobStore.purgeSourceRetention ||
+      !this.jobStore.purgeFileSourceRecovery ||
+      !this.eventTransport.purgeSourceRetention
+    )
+      throw new Error('Source retention unsupported');
+    const sources = new Set(sourceFileIds);
+    let recoveryIncomplete = false;
+    const ids = await this.getAccountCleanupJobIdsForUser(
+      owner.userId,
+      owner.tenantId ?? undefined,
+    );
+    for (const streamId of ids) {
+      try {
+        if (
+          !(await this.jobStore.purgeFileSourceRecovery(
+            streamId,
+            { userId: owner.userId, tenantId: owner.tenantId ?? undefined },
+            sourceFileIds,
+          ))
+        )
+          throw new Error('Recovery copy purge unconfirmed');
+      } catch {
+        recoveryIncomplete = true;
+        continue;
+      }
+      const job = await this.jobStore.getJob(streamId);
+      if (
+        !job ||
+        job.userId !== owner.userId ||
+        (job.tenantId ?? undefined) !== (owner.tenantId ?? undefined) ||
+        !job.sourceRetention?.sourceFileIds.some((id) => sources.has(id))
+      )
+        continue;
+      const epoch = job.createdAt;
+      try {
+        if (!(await this.jobStore.revokeSourceRetention(streamId, epoch)))
+          throw new Error('Generation changed');
+        const runtime = this.runtimeState.get(streamId);
+        if (runtime?.createdAt === epoch) runtime.sourceRetentionRevokedAt = Date.now();
+        await this.eventTransport.purgeSourceRetention(streamId, epoch);
+        const stopped = await this.abortJob(streamId, {
+          expectedCreatedAt: epoch,
+          awaitProviderDrain: true,
+        });
+        if (!isStopConfirmed(stopped)) throw new Error('Provider settlement unconfirmed');
+        if (
+          !(await this.jobStore.purgeFileSourceRecovery(
+            streamId,
+            { userId: owner.userId, tenantId: owner.tenantId ?? undefined },
+            sourceFileIds,
+          ))
+        )
+          throw new Error('Drained recovery copy purge unconfirmed');
+        if (!(await this.jobStore.purgeSourceRetention(streamId, epoch)))
+          throw new Error('Content purge unconfirmed');
+        const current = this.runtimeState.get(streamId);
+        if (current?.createdAt === epoch) {
+          current.earlyEventBuffer.length = 0;
+          current.finalEvent = undefined;
+          this.jobStore.clearContentState(streamId, epoch);
+          this.retireRuntimeAfterDurableFence(streamId, current);
+        }
+      } catch {
+        pending.push({ streamId, createdAt: epoch });
+      }
+    }
+    return { complete: !recoveryIncomplete && pending.length === 0, pending };
+  }
+
   async createJob(
     streamId: string,
     userId: string,
@@ -3008,6 +3137,8 @@ class GenerationJobManagerClass {
     const resolveReady = (): void => undefined;
 
     const runtime: RuntimeJobState = {
+      sourceRetention: jobData.sourceRetention,
+      sourceRetentionRevokedAt: jobData.sourceRetentionRevokedAt,
       createdAt: jobData.createdAt,
       abortController: new AbortController(),
       readyPromise,
@@ -3212,6 +3343,12 @@ class GenerationJobManagerClass {
         // Surface whether the turn was temporary so a resume keeps it non-persisted.
         isTemporary: jobData.isTemporary,
         retentionExpiresAt: jobData.retentionExpiresAt,
+        ...(jobData.sourceRetention && {
+          sourceRetention: {
+            sourceFileIds: jobData.sourceRetention.sourceFileIds,
+            sourceExpiresAt: new Date(jobData.sourceRetention.sourceExpiresAt),
+          },
+        }),
         agentEventDeliveryKey: jobData.agentEventDeliveryKey,
         agentEventInvocationKey: jobData.agentEventInvocationKey,
         agentEventInvocationGenerationCreatedAt: jobData.agentEventInvocationGenerationCreatedAt,
@@ -3331,6 +3468,8 @@ class GenerationJobManagerClass {
     }
 
     const runtime: RuntimeJobState = {
+      sourceRetention: jobData.sourceRetention,
+      sourceRetentionRevokedAt: jobData.sourceRetentionRevokedAt,
       createdAt: jobData.createdAt,
       abortController: new AbortController(),
       readyPromise,
@@ -3431,6 +3570,8 @@ class GenerationJobManagerClass {
 
   async getJob(streamId: string): Promise<t.GenerationJob | undefined> {
     let jobData = await this.jobStore.getJob(streamId);
+    if (jobData && (!sourceRetentionAvailable(jobData) || jobData.sourceRetentionPurged))
+      return undefined;
     if (!jobData) {
       return undefined;
     }
@@ -4285,11 +4426,21 @@ class GenerationJobManagerClass {
       this.runtimeState.get(streamId) === claimedRuntime
         ? claimedRuntime
         : undefined;
+    const sourceJob = await this.jobStore.getJob(streamId);
+    const sourceBound =
+      sourceJob?.sourceRetention != null || claimedRuntime?.sourceRetention != null;
     const reconcileEvent = buildTerminalPersistenceReconcile({
       createdAt,
       conversationId: claim.conversationId,
       status: claim.status,
     });
+    if (
+      sourceBound &&
+      (!sourceJob || sourceJob.createdAt !== createdAt || !sourceRetentionAvailable(sourceJob))
+    ) {
+      await this.jobStore.finalizeTerminalPersistence(streamId, createdAt, '{}');
+      return { finalEvent: reconcileEvent, persistenceFailed: true, publicationFenced: true };
+    }
     /** The caller's event still carries prompt-building inputs, so everything
      * this method stores, publishes or caches uses the projected payload. The
      * projection allocates a new object whenever it excludes anything, so
@@ -4351,7 +4502,9 @@ class GenerationJobManagerClass {
       if (runtime?.createdEventPublication) {
         await runtime.createdEventPublication;
       }
-      await this.eventTransport.emitDone(streamId, publicationEvent, createdAt);
+      if (sourceBound)
+        await this.eventTransport.emitDone(streamId, publicationEvent, createdAt, true);
+      else await this.eventTransport.emitDone(streamId, publicationEvent, createdAt);
     } catch (publicationError) {
       if (publicationError instanceof GenerationPublicationFencedError) {
         return {
@@ -5005,6 +5158,19 @@ class GenerationJobManagerClass {
         this.releaseAbortSubscription(runtime);
       }
       runtime?.abortController.abort();
+      const sourceState = await this.jobStore.getJob(streamId);
+      if (sourceState?.createdAt === jobData.createdAt && !sourceRetentionAvailable(sourceState)) {
+        await this.jobStore.finalizeTerminalPersistence(streamId, jobData.createdAt, '{}');
+        await this.eventTransport.purgeSourceRetention?.(streamId, jobData.createdAt);
+        return {
+          success: true,
+          jobData: sourceState,
+          content: [],
+          text: '',
+          finalEvent: null,
+          collectedUsage,
+        };
+      }
 
       // A chunk append racing the initial non-destructive snapshot either
       // commits before the terminal CAS or loses its own running-status guard.
@@ -5093,6 +5259,7 @@ class GenerationJobManagerClass {
               conversationId: jobData.conversationId,
               text: jobData.userMessage.text ?? '',
               quotes: jobData.userMessage.quotes,
+              quoteSourceRefs: jobData.userMessage.quoteSourceRefs,
               privacyRevision: jobData.userMessage.privacyRevision,
               isCreatedByUser: true,
             }
@@ -5222,6 +5389,10 @@ class GenerationJobManagerClass {
     // runtime against it. This also avoids the historical second Redis lookup
     // when a cross-replica subscriber has no local runtime yet.
     let jobData = prepared ? prepared.jobData : await this.jobStore.getJob(streamId);
+    if (jobData && (!sourceRetentionAvailable(jobData) || jobData.sourceRetentionPurged)) {
+      onError?.('Document source unavailable');
+      return null;
+    }
     if (jobData) {
       jobData = await this.recoverStaleTerminalPersistence(jobData);
     }
@@ -5292,7 +5463,7 @@ class GenerationJobManagerClass {
       runtime.abortController.abort();
     };
     const deliverChunk = (event: t.ServerSentEvent): void => {
-      if (!subscriptionActive || terminalEventDelivered) {
+      if (!subscriptionActive || terminalEventDelivered || !sourceRetentionAvailable(runtime)) {
         return;
       }
       if ('created' in event) {
@@ -5304,7 +5475,7 @@ class GenerationJobManagerClass {
       onChunk(event);
     };
     const deliverDone = (event: t.ServerSentEvent): void => {
-      if (!subscriptionActive || terminalEventDelivered) {
+      if (!subscriptionActive || terminalEventDelivered || !sourceRetentionAvailable(runtime)) {
         return;
       }
       terminalEventDelivered = true;
@@ -5316,6 +5487,12 @@ class GenerationJobManagerClass {
       }
     };
     const deliverError = (error: string): void => {
+      if (error === 'Document source unavailable') {
+        runtime.sourceRetentionRevokedAt = Date.now();
+        runtime.earlyEventBuffer.length = 0;
+        runtime.finalEvent = undefined;
+        deferredDeliveries = [];
+      }
       if (!subscriptionActive || terminalEventDelivered) {
         return;
       }
@@ -5664,7 +5841,7 @@ class GenerationJobManagerClass {
           const fallbackCreatedEvent: t.ServerSentEvent = {
             created: true,
             message: {
-              ...jobData.userMessage,
+              ...publicQuoteUserMessage(jobData.userMessage),
               sender: 'User',
               isCreatedByUser: true,
             },
@@ -6102,7 +6279,7 @@ class GenerationJobManagerClass {
             const fallbackCreatedEvent: t.ServerSentEvent = {
               created: true,
               message: {
-                ...jobData.userMessage,
+                ...publicQuoteUserMessage(jobData.userMessage),
                 sender: 'User',
                 isCreatedByUser: true,
               },
@@ -6979,6 +7156,13 @@ class GenerationJobManagerClass {
     if (!('event' in event) || event.data === undefined) {
       return false;
     }
+    const sourceJob = await this.jobStore.getJob(streamId);
+    if (
+      !sourceJob ||
+      sourceJob.createdAt !== expectedCreatedAt ||
+      !sourceRetentionAvailable(sourceJob)
+    )
+      return false;
     const appended = await this.jobStore.appendChunk(
       streamId,
       { event: event.event, data: event.data },
@@ -6992,6 +7176,7 @@ class GenerationJobManagerClass {
       streamId,
       event,
       expectedCreatedAt,
+      sourceJob.sourceRetention ? { requireSourceBinding: true } : undefined,
     );
     return published !== false;
   }
@@ -7089,6 +7274,10 @@ class GenerationJobManagerClass {
     markSnapshotReady: () => void,
     options?: { durable?: boolean; deliveredSteer?: SteerQueueItem },
   ): Promise<void> {
+    if (!sourceRetentionAvailable(runtime)) {
+      markSnapshotReady();
+      return;
+    }
     if (!this.isCurrentRuntime(streamId, runtime)) {
       if (options?.durable === true) {
         throw new Error(`Durable chunk owner was fenced out for ${streamId}`);
@@ -7267,7 +7456,7 @@ class GenerationJobManagerClass {
         streamId,
         event,
         runtime.createdAt,
-        { coalesce: true },
+        { coalesce: true, ...(runtime.sourceRetention && { requireSourceBinding: true }) },
       );
       if (buffered) {
         runtime.earlyEventSequencePromises.push(
@@ -7312,6 +7501,7 @@ class GenerationJobManagerClass {
           streamId,
           event,
           runtime.createdAt,
+          runtime.sourceRetention ? { requireSourceBinding: true } : undefined,
         );
         if (published === false) {
           this.retireRuntimeAfterDurableFence(streamId, runtime);
@@ -7341,6 +7531,7 @@ class GenerationJobManagerClass {
       streamId,
       event,
       runtime.createdAt,
+      runtime.sourceRetention ? { requireSourceBinding: true } : undefined,
     );
     if (buffered) {
       // Store a non-rejecting sequence receipt before yielding. The absolute value
@@ -8928,6 +9119,8 @@ class GenerationJobManagerClass {
     const recoveryStartedAt =
       options?.validateEarlyBufferRecovery === true ? Date.now() : undefined;
     let jobData = await this.jobStore.getJob(streamId);
+    if (jobData && (!sourceRetentionAvailable(jobData) || jobData.sourceRetentionPurged))
+      return null;
     if (!jobData || (expectedCreatedAt != null && jobData.createdAt !== expectedCreatedAt)) {
       return null;
     }
@@ -9086,7 +9279,11 @@ class GenerationJobManagerClass {
      * not turn that into a plausible-looking snapshot with predecessor
      * metadata; verify the same generation is still live after the snapshot. */
     const verifiedJob = await this.jobStore.getJob(streamId);
-    if (!verifiedJob || verifiedJob.createdAt !== jobData.createdAt) {
+    if (
+      !verifiedJob ||
+      verifiedJob.createdAt !== jobData.createdAt ||
+      !sourceRetentionAvailable(verifiedJob)
+    ) {
       return null;
     }
     /** Redis reconstruction has no completion event for ask_user_question.
@@ -9107,7 +9304,7 @@ class GenerationJobManagerClass {
     return {
       runSteps: effectiveRunSteps,
       aggregatedContent,
-      userMessage: jobData.userMessage,
+      userMessage: jobData.userMessage && publicQuoteUserMessage(jobData.userMessage),
       responseMessageId: jobData.responseMessageId,
       isRegenerate: jobData.isRegenerate,
       conversationId: jobData.conversationId,
@@ -9189,7 +9386,9 @@ class GenerationJobManagerClass {
       .catch((err) => {
         logger.error(`[GenerationJobManager] Failed to persist finalEvent:`, err);
       });
-    await this.eventTransport.emitDone(streamId, event, generationId);
+    if (matchingRuntime?.sourceRetention)
+      await this.eventTransport.emitDone(streamId, event, generationId, true);
+    else await this.eventTransport.emitDone(streamId, event, generationId);
     if (matchingRuntime?.startupTelemetry) {
       this.recordStartupEvent(matchingRuntime, event);
     }
@@ -9215,7 +9414,9 @@ class GenerationJobManagerClass {
     this.jobStore.updateJob(streamId, { error }, generationId).catch((err) => {
       logger.error(`[GenerationJobManager] Failed to persist error:`, err);
     });
-    await this.eventTransport.emitError(streamId, error, generationId);
+    if (matchingRuntime?.sourceRetention)
+      await this.eventTransport.emitError(streamId, error, generationId, true);
+    else await this.eventTransport.emitError(streamId, error, generationId);
     matchingRuntime?.startupTelemetry?.mark('first_response_event_queued');
   }
 

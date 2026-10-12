@@ -52,6 +52,7 @@ const {
   getCodeApiUploadOptions,
   withCodeApiUploadRecovery,
   isLeader,
+  GenerationJobManager,
 } = require('@librechat/api');
 const {
   convertImage,
@@ -234,7 +235,24 @@ const createDeleteFileWithSecondaryStorage = ({ source, deleteFile, deletionMeth
  */
 const processDeleteRequest = async ({ req, files }) => {
   const appConfig = req.config;
-  const resolvedFileIds = new Set();
+  const owner = { userId: req.user?.id, tenantId: req.user?.tenantId };
+  const managedIds = files
+    .filter((file) => file.retentionAcceptedAt != null)
+    .map((file) => file.file_id);
+  let replayComplete = true;
+  let alreadyCompleted = [];
+  if (managedIds.length > 0) {
+    await db.revokeFileSources(owner, managedIds);
+    const receipt = await GenerationJobManager.revokeFileSourceGenerations(owner, managedIds);
+    replayComplete = receipt?.complete === true && receipt.pending?.length === 0;
+    await db.redactFileSourceContent(owner, managedIds);
+    // Ordinary reads hide revoked content; only this fixed owner may recover deletion locators.
+    const pending = await db.getFileSourceDeletionCandidates(owner, managedIds);
+    const pendingIds = new Set(pending.map((file) => file.file_id));
+    alreadyCompleted = managedIds.filter((id) => !pendingIds.has(id));
+    files = [...files.filter((file) => !managedIds.includes(file.file_id)), ...pending];
+  }
+  const resolvedFileIds = new Set(alreadyCompleted);
   const failedFileIds = new Set();
   const deletionMethods = {};
   const promises = [];
@@ -310,7 +328,20 @@ const processDeleteRequest = async ({ req, files }) => {
   let metadataDeletedFileIds = deletedFileIds;
   if (deletedFileIds.length > 0) {
     try {
-      await db.deleteFiles(deletedFileIds);
+      const ordinaryIds = deletedFileIds.filter((fileId) => !managedIds.includes(fileId));
+      if (ordinaryIds.length > 0) await db.deleteFiles(ordinaryIds);
+      const managedDeleted = deletedFileIds.filter(
+        (fileId) => managedIds.includes(fileId) && !failedFileIds.has(fileId),
+      );
+      if (managedDeleted.length > 0 && replayComplete) {
+        const result = await db.finalizeFileSourceDeletion(owner, managedDeleted);
+        for (const id of managedDeleted) {
+          if (!result.completedFileIds.includes(id)) failedFileIds.add(id);
+        }
+      } else {
+        managedDeleted.forEach((id) => failedFileIds.add(id));
+      }
+      metadataDeletedFileIds = deletedFileIds.filter((id) => !failedFileIds.has(id));
     } catch (error) {
       logger.error('Error deleting file metadata after storage deletion', error);
       deletedFileIds.forEach((fileId) => failedFileIds.add(fileId));
@@ -332,6 +363,7 @@ const processDeleteRequest = async ({ req, files }) => {
     }
   }
 
+  if (!replayComplete) managedIds.forEach((id) => failedFileIds.add(id));
   return {
     deletedFileIds: metadataDeletedFileIds,
     failedFileIds: [...failedFileIds],
@@ -976,7 +1008,7 @@ const processAgentFileUpload = async ({ req, res, metadata, sseStream }) => {
       });
       const { bytes, filename, filepath, embedded, height, width } = storageResult;
 
-      const retentionExpiry = await retentionExpiryPromise;
+      const { retention, ...retentionExpiry } = await retentionExpiryPromise;
       const fileInfo = {
         ...removeNullishValues({
           text,
@@ -1008,7 +1040,7 @@ const processAgentFileUpload = async ({ req, res, metadata, sseStream }) => {
           updatingUserId: req?.user?.id,
         });
       }
-      const result = await db.createFile(fileInfo, true);
+      const result = await db.createFile(fileInfo, true, ...(retention ? [{ retention }] : []));
       sendUploadSuccess(res, sseStream, 'Agent file uploaded and processed successfully', result);
     };
 
@@ -1323,7 +1355,7 @@ const processAgentFileUpload = async ({ req, res, metadata, sseStream }) => {
     });
   }
 
-  const retentionExpiry = await retentionExpiryPromise;
+  const { retention, ...retentionExpiry } = await retentionExpiryPromise;
   const fileInfo = {
     ...removeNullishValues({
       user: req.user.id,
@@ -1355,7 +1387,7 @@ const processAgentFileUpload = async ({ req, res, metadata, sseStream }) => {
     ...retentionExpiry,
   };
 
-  const result = await db.createFile(fileInfo, true);
+  const result = await db.createFile(fileInfo, true, ...(retention ? [{ retention }] : []));
 
   sendUploadSuccess(res, sseStream, 'Agent file uploaded and processed successfully', result);
 };

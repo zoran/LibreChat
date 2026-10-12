@@ -1,6 +1,18 @@
 import { createFallbackRetentionDate } from '@librechat/data-schemas';
-import { isAllDataRetention, isForcedTemporaryRetention } from 'librechat-data-provider';
-import type { AppConfig } from '@librechat/data-schemas';
+import {
+  isAllDataRetention,
+  isForcedTemporaryRetention,
+  isNativelyReadableText,
+  documentParserMimeTypes,
+  quoteSourceRefSchema,
+} from 'librechat-data-provider';
+import type {
+  AppConfig,
+  FileRetentionAdmission,
+  SourceRetentionContext,
+  ResolvedQuoteRetention,
+} from '@librechat/data-schemas';
+import type { QuoteSourceRef } from 'librechat-data-provider';
 
 type InterfaceConfig = AppConfig['interfaceConfig'];
 
@@ -28,14 +40,228 @@ export type RetentionRequest = {
     conversationId?: string;
     isTemporary?: boolean | string | null;
   };
+  file?: { mimetype?: string };
   config?: {
+    fileConfig?: { retentionHours?: number };
     interfaceConfig?: InterfaceConfig;
   };
 };
 
 export type RetentionExpiry = {
+  retention?: FileRetentionAdmission;
   expiredAt?: Date | null;
 };
+
+const documentAdmissions = new WeakMap<RetentionRequest, FileRetentionAdmission>();
+
+/** Capture once before parsing/storage; subsequent calls cannot renew an original's clock. */
+export async function getDocumentFileRetention(
+  req: RetentionRequest | null | undefined,
+  inherited: RetentionExpiry | Promise<RetentionExpiry>,
+): Promise<RetentionExpiry> {
+  const hours = req?.config?.fileConfig?.retentionHours;
+  const mime = req?.file?.mimetype;
+  if (
+    !req ||
+    hours == null ||
+    !mime ||
+    !(isNativelyReadableText(mime) || documentParserMimeTypes.some((pattern) => pattern.test(mime)))
+  ) {
+    return inherited;
+  }
+  if (!Number.isFinite(hours) || hours <= 0) throw new Error('Invalid document retention');
+  let admission = documentAdmissions.get(req);
+  if (!admission) {
+    const acceptedAt = new Date();
+    const expiredAt = new Date(acceptedAt.getTime() + hours * 3600000);
+    if (!Number.isFinite(expiredAt.getTime())) throw new Error('Invalid document deadline');
+    admission = { acceptedAt, expiredAt };
+    documentAdmissions.set(req, admission);
+  }
+  const previous = await inherited;
+  const earlier = previous.expiredAt == null ? undefined : new Date(previous.expiredAt.getTime());
+  if (earlier && !Number.isFinite(earlier.getTime())) throw new Error('Invalid inherited deadline');
+  const captured = documentAdmissions.get(req) ?? admission;
+  const deadline =
+    captured.expiredAt < admission.expiredAt ? captured.expiredAt : admission.expiredAt;
+  const expiredAt = earlier && earlier < deadline ? earlier : deadline;
+  admission = { acceptedAt: admission.acceptedAt, expiredAt };
+  documentAdmissions.set(req, admission);
+  return { ...previous, expiredAt, retention: admission };
+}
+
+/** Decode only a server-owned context (job wire dates are epoch milliseconds). */
+export function readFileSourceRetention(value: unknown): SourceRetentionContext | undefined {
+  if (value == null) return undefined;
+  const data = value as { sourceFileIds?: unknown; sourceExpiresAt?: unknown };
+  if (
+    !Array.isArray(data.sourceFileIds) ||
+    data.sourceFileIds.length === 0 ||
+    data.sourceFileIds.some((id) => typeof id !== 'string' || id.length === 0) ||
+    !(data.sourceExpiresAt instanceof Date || typeof data.sourceExpiresAt === 'number')
+  ) {
+    throw new Error('Invalid server source retention');
+  }
+  const sourceExpiresAt = new Date(
+    data.sourceExpiresAt instanceof Date ? data.sourceExpiresAt.getTime() : data.sourceExpiresAt,
+  );
+  if (!Number.isFinite(sourceExpiresAt.getTime())) throw new Error('Invalid source deadline');
+  return { sourceFileIds: [...new Set(data.sourceFileIds as string[])], sourceExpiresAt };
+}
+
+/** Private job/steer wire representation; never accept this from an HTTP body. */
+export type SerializedQuoteRetention = Omit<ResolvedQuoteRetention, 'quoteSourceRetention'> & {
+  quoteSourceRetention: Array<
+    Omit<ResolvedQuoteRetention['quoteSourceRetention'][number], 'sourceExpiresAt'> & {
+      sourceExpiresAt: number;
+    }
+  >;
+  quoteSourceRefs?: Array<QuoteSourceRef | null>;
+};
+
+export function serializeQuoteRetention(
+  value: ResolvedQuoteRetention,
+  quoteSourceRefs?: readonly (QuoteSourceRef | null)[],
+): SerializedQuoteRetention {
+  if (quoteSourceRefs && quoteSourceRefs.length !== value.quotes.length) {
+    throw new Error('Misaligned quote source references');
+  }
+  return {
+    quotes: [...value.quotes],
+    quoteSourceRetention: value.quoteSourceRetention.map((entry) => ({
+      ...entry,
+      sourceRef: { ...entry.sourceRef },
+      sourceFileIds: [...entry.sourceFileIds],
+      sourceExpiresAt: entry.sourceExpiresAt.getTime(),
+    })),
+    sourceMessageConditions: value.sourceMessageConditions.map((condition) => ({ ...condition })),
+    ...(quoteSourceRefs && {
+      quoteSourceRefs: quoteSourceRefs.map((ref) => (ref == null ? null : { ...ref })),
+    }),
+  };
+}
+
+export function deserializeQuoteRetention(value: unknown): ResolvedQuoteRetention {
+  const raw = value as SerializedQuoteRetention | null;
+  // Redis Lua cjson represents an empty JSON array as an empty object after encoding.
+  // Normalize only these private wire array fields; nonempty objects remain invalid.
+  const array = (entry: unknown) =>
+    entry != null &&
+    typeof entry === 'object' &&
+    !Array.isArray(entry) &&
+    Object.keys(entry).length === 0
+      ? []
+      : entry;
+  const data =
+    raw &&
+    ({
+      ...raw,
+      quotes: array(raw.quotes),
+      quoteSourceRetention: array(raw.quoteSourceRetention),
+      sourceMessageConditions: array(raw.sourceMessageConditions),
+      ...(raw.quoteSourceRefs != null && { quoteSourceRefs: array(raw.quoteSourceRefs) }),
+    } as SerializedQuoteRetention | null);
+  if (
+    !data ||
+    !Array.isArray(data.quotes) ||
+    data.quotes.length > 10 ||
+    data.quotes.some((text) => typeof text !== 'string' || !text.trim() || text.length > 1500) ||
+    !Array.isArray(data.quoteSourceRetention) ||
+    !Array.isArray(data.sourceMessageConditions)
+  ) {
+    throw new Error('Invalid server quote retention');
+  }
+  if (
+    data.quoteSourceRefs != null &&
+    (!Array.isArray(data.quoteSourceRefs) || data.quoteSourceRefs.length !== data.quotes.length)
+  ) {
+    throw new Error('Misaligned server quote references');
+  }
+  data.quoteSourceRefs?.forEach((ref) => {
+    if (ref != null) quoteSourceRefSchema.parse(ref);
+  });
+  const indices = new Set<number>();
+  return {
+    quotes: [...data.quotes],
+    quoteSourceRetention: data.quoteSourceRetention.map((entry) => {
+      if (
+        !entry ||
+        !Number.isInteger(entry.index) ||
+        entry.index < 0 ||
+        entry.index >= data.quotes.length ||
+        indices.has(entry.index)
+      ) {
+        throw new Error('Invalid server quote index');
+      }
+      indices.add(entry.index);
+      const context = readFileSourceRetention(entry)!;
+      return {
+        index: entry.index,
+        sourceRef: quoteSourceRefSchema.parse(entry.sourceRef),
+        sourceFileIds: [...context.sourceFileIds],
+        sourceExpiresAt: context.sourceExpiresAt,
+      };
+    }),
+    sourceMessageConditions: data.sourceMessageConditions.map((condition) => {
+      if (
+        !condition ||
+        typeof condition.messageId !== 'string' ||
+        !condition.messageId ||
+        (condition.messageVersion !== null &&
+          (!Number.isInteger(condition.messageVersion) || condition.messageVersion < 0))
+      ) {
+        throw new Error('Invalid server quote source version');
+      }
+      return { ...condition };
+    }),
+  };
+}
+
+export function quoteRetentionContext(
+  value: ResolvedQuoteRetention,
+): SourceRetentionContext | undefined {
+  if (value.quoteSourceRetention.length === 0) return undefined;
+  return {
+    sourceFileIds: [...new Set(value.quoteSourceRetention.flatMap((entry) => entry.sourceFileIds))],
+    sourceExpiresAt: new Date(
+      Math.min(...value.quoteSourceRetention.map((entry) => entry.sourceExpiresAt.getTime())),
+    ),
+  };
+}
+
+/** Remove only dependent fields, retaining unrelated excerpts and their exact source pairing. */
+export function redactQuoteRetention(
+  value: SerializedQuoteRetention,
+  revokedFileIds: readonly string[],
+  now: number = Date.now(),
+): SerializedQuoteRetention {
+  const decoded = deserializeQuoteRetention(value);
+  const revoked = new Set(revokedFileIds);
+  const byIndex = new Map(decoded.quoteSourceRetention.map((entry) => [entry.index, entry]));
+  const retained: ResolvedQuoteRetention = {
+    quotes: [],
+    quoteSourceRetention: [],
+    sourceMessageConditions: [],
+  };
+  const refs: Array<QuoteSourceRef | null> | undefined = value.quoteSourceRefs && [];
+  decoded.quotes.forEach((text, index) => {
+    const binding = byIndex.get(index);
+    if (
+      binding &&
+      (binding.sourceExpiresAt.getTime() <= now ||
+        binding.sourceFileIds.some((id) => revoked.has(id)))
+    )
+      return;
+    if (binding) retained.quoteSourceRetention.push({ ...binding, index: retained.quotes.length });
+    retained.quotes.push(text);
+    refs?.push(value.quoteSourceRefs![index]);
+  });
+  const sourceIds = refs && new Set(refs.flatMap((ref) => (ref ? [ref.messageId] : [])));
+  retained.sourceMessageConditions = decoded.sourceMessageConditions.filter(
+    (condition) => retained.quotes.length > 0 && (!sourceIds || sourceIds.has(condition.messageId)),
+  );
+  return serializeQuoteRetention(retained, refs);
+}
 
 export type AgentFileRetentionRequest = {
   req: RetentionRequest | null | undefined;
@@ -231,7 +457,8 @@ export async function getAgentFileRetentionExpiry(
     return {};
   }
 
-  return await getRetentionExpiry(params.req, dependencies);
+  const inherited = getRetentionExpiry(params.req, dependencies);
+  return params.messageAttachment ? getDocumentFileRetention(params.req, inherited) : inherited;
 }
 
 /**

@@ -23,6 +23,7 @@ export default function useSubmitMessage() {
       text: string;
       overrideFiles?: TMessage['files'];
       overrideQuotes?: string[];
+      overrideQuoteSourceRefs?: TMessage['quoteSourceRefs'];
       overrideManualSkills?: string[];
       overrideReasoning?: TReasoningOverride | null;
       overrideClientRequestId?: string;
@@ -55,6 +56,7 @@ export default function useSubmitMessage() {
           // quote chips, and manual skill picks (undefined = drain composer).
           overrideFiles: data.overrideFiles,
           overrideQuotes: data.overrideQuotes,
+          overrideQuoteSourceRefs: data.overrideQuoteSourceRefs,
           overrideManualSkills: data.overrideManualSkills,
           overrideReasoning: data.overrideReasoning,
           overrideClientRequestId: data.overrideClientRequestId,

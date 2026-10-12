@@ -2,6 +2,8 @@ import { logger } from '@librechat/data-schemas';
 import type { RecoveredSteerPayload } from '../SteerRecovery';
 import { getSteerRecoveryFailure, RecoveredSteerPayloadMismatchError } from '../SteerRecovery';
 import { InMemoryJobStore, PARKED_STEERS_TTL_MS } from '../implementations/InMemoryJobStore';
+import { serializeQuoteRetention } from '~/files/retention';
+import { SteeringLifecycle } from '../SteeringLifecycle';
 
 const proof: RecoveredSteerPayload = { text: 'original words', fileIds: [], quotes: [] };
 const source = { steerId: 'source', text: proof.text, createdAt: 1 };
@@ -39,6 +41,102 @@ describe('recovery admission failures', () => {
     );
     return job;
   };
+
+  test('selective quote purge keeps duplicate independent text, paired refs and replacement epoch', async () => {
+    const first = await park(store);
+    const refs = [{ messageId: 'a' }, null, { messageId: 'b' }];
+    const quoteRetention = serializeQuoteRetention(
+      {
+        quotes: ['same', 'same', 'third'],
+        sourceMessageConditions: [{ messageId: 'b', messageVersion: 7 }],
+        quoteSourceRetention: [
+          {
+            index: 0,
+            sourceRef: refs[0]!,
+            sourceFileIds: ['file-a'],
+            sourceExpiresAt: new Date(Date.now() + 60000),
+          },
+          {
+            index: 2,
+            sourceRef: refs[2]!,
+            sourceFileIds: ['file-b'],
+            sourceExpiresAt: new Date(Date.now() + 60000),
+          },
+        ],
+      },
+      refs,
+    );
+    await store.parkSteers(
+      'conversation',
+      JSON.stringify({
+        userId: 'owner',
+        steers: [
+          {
+            ...source,
+            quotes: quoteRetention.quotes,
+            quoteSourceRefs: refs,
+            quoteRetention,
+          },
+        ],
+      }),
+      first.createdAt,
+    );
+    const replacement = await store.createJob('conversation', 'owner', 'conversation');
+    expect(
+      await store.purgeFileSourceRecovery('conversation', { userId: 'owner' }, ['file-a']),
+    ).toBe(true);
+    const parked = JSON.parse((await store.claimParkedSteers('conversation', 'owner'))!);
+    expect(parked.steers[0]).toMatchObject({
+      text: proof.text,
+      quotes: ['same', 'third'],
+      quoteSourceRefs: [null, refs[2]],
+    });
+    expect(parked.steers[0].quoteRetention.quoteSourceRetention[0].index).toBe(1);
+    const retained = await new SteeringLifecycle(store).getRecoveredQuoteRetention(
+      'conversation',
+      'source',
+      { userId: 'owner' },
+    );
+    expect(retained?.sourceMessageConditions).toEqual([]);
+    expect(retained?.quoteSourceRetention[0].sourceExpiresAt.getTime()).toBe(
+      quoteRetention.quoteSourceRetention[1].sourceExpiresAt,
+    );
+    expect((await store.getJob('conversation'))?.createdAt).toBe(replacement.createdAt);
+  });
+
+  test('equal quote text with a changed source ref cannot consume the parked generation', async () => {
+    const job = await park(store);
+    const quoteSourceRefs = [{ messageId: 'source-message', quoteIndex: 1, messageVersion: 3 }];
+    await store.parkSteers(
+      'conversation',
+      JSON.stringify({
+        userId: 'owner',
+        steers: [
+          {
+            ...source,
+            quotes: ['same'],
+            quoteSourceRefs,
+          },
+        ],
+      }),
+      job.createdAt,
+    );
+    await expect(
+      recover(store, {
+        ...proof,
+        quotes: ['same'],
+        quoteSourceRefs: [
+          {
+            ...quoteSourceRefs[0],
+            quoteIndex: 0,
+          },
+        ],
+      }),
+    ).rejects.toMatchObject({ reason: 'payload_mismatch' });
+    expect((await store.getJob('conversation'))?.createdAt).toBe(job.createdAt);
+    const recovered = await recover(store, { ...proof, quotes: ['same'], quoteSourceRefs });
+    expect(recovered.recoveredSteerId).toBe('source');
+  });
 
   test('missing source is not diagnosed as changed text', async () => {
     await expect(recover(store)).rejects.toMatchObject({

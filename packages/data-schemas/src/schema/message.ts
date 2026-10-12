@@ -2,6 +2,28 @@ import mongoose, { Schema } from 'mongoose';
 import type { IMessage } from '~/types/message';
 import { agentFadingContextDefinition } from './fading';
 
+/** Public quote copies reference this saved snapshot, never stale client origin hints. */
+export function publicMessageProjection<
+  T extends {
+    messageId?: string;
+    quotes?: string[];
+    __v?: number;
+    quoteSourceRetention?: unknown;
+  },
+>(value: T): T {
+  delete value.quoteSourceRetention;
+  if (typeof value.messageId === 'string' && Array.isArray(value.quotes)) {
+    Object.assign(value, {
+      quoteSourceRefs: value.quotes.map((_, quoteIndex) => ({
+        messageId: value.messageId,
+        quoteIndex,
+        messageVersion: value.__v ?? 0,
+      })),
+    });
+  }
+  return value;
+}
+
 const messageSchema: Schema<IMessage> = new Schema(
   {
     messageId: {
@@ -308,6 +330,27 @@ const messageSchema: Schema<IMessage> = new Schema(
       default: undefined,
     },
     */
+    quoteSourceRetention: {
+      type: [
+        {
+          _id: false,
+          index: { type: Number, required: true },
+          sourceRef: {
+            _id: false,
+            messageId: { type: String, required: true },
+            quoteIndex: Number,
+            messageVersion: Number,
+          },
+          sourceFileIds: { type: [String], required: true },
+          sourceExpiresAt: { type: Date, required: true },
+        },
+      ],
+      default: undefined,
+      select: false,
+    },
+    sourceFileIds: { type: [String], default: undefined },
+    sourceExpiresAt: { type: Date },
+    sourceContentRemovedAt: { type: Date },
     expiredAt: {
       type: Date,
     },
@@ -320,9 +363,23 @@ const messageSchema: Schema<IMessage> = new Schema(
       index: true,
     },
   },
-  { timestamps: true },
+  {
+    timestamps: true,
+    toJSON: {
+      transform: (_doc, value) => {
+        return publicMessageProjection(value);
+      },
+    },
+    toObject: {
+      transform: (_doc, value) => {
+        return publicMessageProjection(value);
+      },
+    },
+  },
 );
 
+messageSchema.index({ user: 1, tenantId: 1, sourceFileIds: 1 });
+messageSchema.index({ user: 1, tenantId: 1, 'quoteSourceRetention.sourceFileIds': 1 });
 messageSchema.index({ expiredAt: 1 }, { expireAfterSeconds: 0 });
 messageSchema.index({ createdAt: 1 });
 messageSchema.index({ messageId: 1, user: 1, tenantId: 1 }, { unique: true });

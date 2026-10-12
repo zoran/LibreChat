@@ -1,6 +1,12 @@
 import { createHash, randomUUID } from 'crypto';
 import { logger } from '@librechat/data-schemas';
 import { SteerEvents } from 'librechat-data-provider';
+import type {
+  FileOwnerScope,
+  ResolvedQuoteRetention,
+  SourceRetentionContext,
+} from '@librechat/data-schemas';
+import type { QuoteSourceRef } from 'librechat-data-provider';
 import type { IMongoFile } from '@librechat/data-schemas';
 import type { TFile } from 'librechat-data-provider';
 import type {
@@ -14,10 +20,11 @@ import {
   STEER_ENQUEUE_QUEUE_FULL,
   STEER_ENQUEUE_RECEIPT_FULL,
 } from '~/stream/interfaces/IJobStore';
+import { serializeQuoteRetention, quoteRetentionContext } from '~/files/retention';
 import { toSteerFileRef, collectFileIds, buildOwnerFilter } from './refs';
 import { GenerationJobManager } from '~/stream/GenerationJobManager';
+import { normalizeReferencedQuoteSources } from '~/utils/quotes';
 import { isSteeringSupported } from './runtime';
-import { getReferencedQuotes } from '~/utils';
 
 /** Attachment cap per steer, mirroring the composer's practical limits. */
 export const STEER_MAX_FILES = 10;
@@ -53,6 +60,7 @@ export interface SteerRequestBody {
    *  normalized like the chat route's quotes and merged into the model-bound
    *  turn at the injection boundary. */
   quotes?: unknown;
+  quoteSourceRefs?: unknown;
   /** Ask the generating replica to seal the live model stream at the next
    *  provider-safe boundary instead of waiting for a tool step. NEVER a
    *  rejection reason: on an SDK without the capability the steer still
@@ -126,6 +134,15 @@ export interface SteerRunContext {
  * behavior); the LibreChat route wires all three.
  */
 export interface SteerRequestDeps {
+  resolveQuoteRetention?: (
+    owner: FileOwnerScope,
+    entries: Array<{ text: string; sourceRef?: QuoteSourceRef | null }>,
+  ) => Promise<ResolvedQuoteRetention>;
+  resolveFileRetentionContext?: (
+    owner: FileOwnerScope,
+    input: { fileIds: readonly string[]; historyMessageIds: readonly string[] },
+  ) => Promise<SourceRetentionContext | undefined>;
+
   /** Upper protocol bound selected by the HTTP host from the request markers
    * and its rollout gate. Direct package callers that omit it retain the
    * current-package (v2) behavior. */
@@ -255,8 +272,9 @@ function steerFingerprint(
 }
 
 /** Normalized-quote identity stored beside (never inside) the fingerprint. */
-function quotesFingerprint(quotes: string[]): string {
-  return createHash('sha256').update(JSON.stringify(quotes)).digest('base64url');
+function quotesFingerprint(quotes: string[], refs?: Array<QuoteSourceRef | null>): string {
+  const identity = refs?.some((ref) => ref != null) ? { quotes, quoteSourceRefs: refs } : quotes;
+  return createHash('sha256').update(JSON.stringify(identity)).digest('base64url');
 }
 
 /** Whether a receipt's recorded quote identity accepts this request's quotes.
@@ -269,11 +287,12 @@ function quotesFingerprint(quotes: string[]): string {
 function receiptQuotesCompatible(
   recorded: string | undefined,
   requested: string[] | null,
+  refs?: Array<QuoteSourceRef | null>,
 ): boolean {
   if (recorded == null) {
     return true;
   }
-  return requested != null && quotesFingerprint(requested) === recorded;
+  return requested != null && quotesFingerprint(requested, refs) === recorded;
 }
 
 function receiptResponse(conversationId: string, receipt: SteerReceipt): SteerRequestResult {
@@ -446,7 +465,14 @@ async function handleSteerRequestInternal(
 
   /** Same normalization as the chat route (trim, drop empties, cap count and
    *  excerpt length) so a steer's quotes obey the caps a normal send does. */
-  const quotes = getReferencedQuotes(body.quotes);
+  let normalized;
+  try {
+    normalized = normalizeReferencedQuoteSources(body.quotes, body.quoteSourceRefs);
+  } catch {
+    return { status: 400, body: { code: 'INVALID_QUOTE_SOURCE' } };
+  }
+  let quotes = normalized.quotes.length ? normalized.quotes : null;
+  const quoteSourceRefs = normalized.quoteSourceRefs;
 
   /** streamId === conversationId for resumable agent jobs */
   const streamId = conversationId;
@@ -479,7 +505,7 @@ async function handleSteerRequestInternal(
       }
       if (
         receipt.fingerprint !== fingerprint ||
-        !receiptQuotesCompatible(receipt.requestedQuotesFingerprint, quotes)
+        !receiptQuotesCompatible(receipt.requestedQuotesFingerprint, quotes, quoteSourceRefs)
       ) {
         return { status: 409, body: { code: 'STEER_IDEMPOTENCY_CONFLICT' } };
       }
@@ -623,6 +649,34 @@ async function handleSteerRequestInternal(
   const ownerAcceptsQuotes =
     owner.metadata?.steerQuotesExecutionId != null &&
     owner.metadata.steerQuotesExecutionId === owner.metadata.providerExecutionId;
+  let quoteRetention: ReturnType<typeof serializeQuoteRetention> | undefined;
+  if (quotes && quoteSourceRefs.some((ref) => ref != null) && ownerAcceptsQuotes) {
+    if (!deps.resolveQuoteRetention || !deps.resolveFileRetentionContext)
+      return { status: 503, body: { code: 'QUOTE_RETENTION_UNAVAILABLE' } };
+    const scope = { userId: user.id ?? '', tenantId: user.tenantId };
+    let bound: SourceRetentionContext | undefined;
+    try {
+      const resolved = await deps.resolveQuoteRetention(
+        scope,
+        quotes.map((text, index) => ({ text, sourceRef: quoteSourceRefs[index] })),
+      );
+      bound = quoteRetentionContext(resolved);
+      if (bound) {
+        if (!(await GenerationJobManager.bindSourceRetention(streamId, owner.createdAt, bound)))
+          return { status: 409, body: { code: 'RUN_REPLACED' } };
+        const liveSources = await deps.resolveFileRetentionContext(scope, {
+          fileIds: bound.sourceFileIds,
+          historyMessageIds: [],
+        });
+        if (!liveSources) throw new Error('Quote source binding disappeared');
+      }
+      quotes = resolved.quotes;
+      quoteRetention = serializeQuoteRetention(resolved, quoteSourceRefs);
+    } catch {
+      if (bound) await GenerationJobManager.revokeFileSourceGenerations(scope, bound.sourceFileIds);
+      return { status: 409, body: { code: 'QUOTE_SOURCE_UNAVAILABLE' } };
+    }
+  }
   const item: SteerQueueItem = {
     steerId: randomUUID(),
     ...(protocol.value === 2 && typeof clientSteerId === 'string' && { clientSteerId }),
@@ -630,7 +684,8 @@ async function handleSteerRequestInternal(
     userId: user.id ?? '',
     createdAt: Date.now(),
     ...(queuedFiles && { files: queuedFiles }),
-    ...(quotes != null && ownerAcceptsQuotes && { quotes }),
+    ...(quotes != null &&
+      ownerAcceptsQuotes && { quotes, quoteSourceRefs, ...(quoteRetention && { quoteRetention }) }),
   };
   /**
    * Fenced to the generation the capability decision was made against. The
@@ -652,7 +707,9 @@ async function handleSteerRequestInternal(
       {
         clientSteerId,
         fingerprint,
-        ...(quotes != null && { requestedQuotesFingerprint: quotesFingerprint(quotes) }),
+        ...(quotes != null && {
+          requestedQuotesFingerprint: quotesFingerprint(quotes, quoteSourceRefs),
+        }),
         userId: user.id ?? '',
         ...(user.tenantId && { tenantId: user.tenantId }),
         ...(job.metadata?.agent_id && { agentId: job.metadata.agent_id }),
@@ -668,7 +725,7 @@ async function handleSteerRequestInternal(
       if (
         !('fingerprint' in result) ||
         result.fingerprint !== fingerprint ||
-        !receiptQuotesCompatible(result.requestedQuotesFingerprint, quotes)
+        !receiptQuotesCompatible(result.requestedQuotesFingerprint, quotes, quoteSourceRefs)
       ) {
         return { status: 409, body: { code: 'STEER_IDEMPOTENCY_CONFLICT' } };
       }

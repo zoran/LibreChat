@@ -26,6 +26,7 @@ export type RevealedQueuedTurn = {
   text: string;
   files?: TMessage['files'];
   quotes?: string[];
+  quoteSourceRefs?: TMessage['quoteSourceRefs'];
   manualSkills?: string[];
   revealedAt: string;
 };

@@ -12,7 +12,13 @@ import type {
   RunArtifactRunScope,
   PublishRunArtifactInput,
 } from '~/types/file';
+import type { FileRetentionAdmission, FileOwnerScope } from '~/types/file';
 import type { IChatProjectDocument } from '~/types';
+import {
+  createFileRetentionMethods,
+  FileSourceUnavailableError,
+  liveFileFilter,
+} from './fileRetention';
 import { tenantSafeBulkWrite } from '~/utils/tenantBulkWrite';
 import { escapeRegExp } from '~/utils/string';
 import logger from '../config/winston';
@@ -173,10 +179,7 @@ export function parseAvailableProjectFilesCursor(cursor?: string | null): string
   return cursor;
 }
 
-export type FileOwnerScope = {
-  userId: string;
-  tenantId?: string | null;
-};
+export type { FileOwnerScope } from '~/types/file';
 
 export type ExpiredFileQueryOptions = {
   now?: Date;
@@ -282,7 +285,9 @@ function serializeRunArtifact(
 }
 
 /** Factory function that takes mongoose instance and returns the file methods */
-export function createFileMethods(mongoose: typeof import('mongoose')): {
+export function createFileMethods(mongoose: typeof import('mongoose')): ReturnType<
+  typeof createFileRetentionMethods
+> & {
   getRunFileCandidates: (fileIds: readonly string[], tenantId?: string | null) => Promise<TFile[]>;
   claimRunArtifactFile: (scope: RunArtifactScope) => Promise<RunArtifactClaim>;
   publishRunArtifactFile: (input: PublishRunArtifactInput) => Promise<RunArtifactFile>;
@@ -333,7 +338,11 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
     sourceDispatchedAt?: number;
   }) => Promise<IMongoFile>;
   commitCodeFile: (data: CodeFileCommitData, sourceDispatchedAt?: number) => Promise<boolean>;
-  createFile: (data: Partial<IMongoFile>, disableTTL?: boolean) => Promise<IMongoFile | null>;
+  createFile: (
+    data: Partial<IMongoFile>,
+    disableTTL?: boolean,
+    options?: { retention?: FileRetentionAdmission },
+  ) => Promise<IMongoFile | null>;
   updateFile: (
     data: Partial<IMongoFile> & { file_id: string },
     extraFilter?: FilterQuery<IMongoFile>,
@@ -516,7 +525,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
     options: Record<string, unknown> = {},
   ): Promise<IMongoFile | null> {
     const File = mongoose.models.File as Model<IMongoFile>;
-    return File.findOne({ file_id, ...options }).lean<IMongoFile>();
+    return File.findOne({ $and: [{ file_id, ...options }, liveFileFilter()] }).lean<IMongoFile>();
   }
 
   /** Select fields for query projection - 0 to exclude, 1 to include */
@@ -538,7 +547,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
   ): Promise<IMongoFile[] | null> {
     const File = mongoose.models.File as Model<IMongoFile>;
     const sortOptions = { updatedAt: -1 as SortOrder, ..._sortOptions };
-    const query = File.find(filter);
+    const query = File.find({ $and: [filter, liveFileFilter()] });
     if (selectFields != null) {
       query.select(selectFields);
     } else {
@@ -561,6 +570,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
       user: userId,
       embedded: true,
       context: FileContext.message_attachment,
+      ...liveFileFilter(),
       // Mongo's null predicate matches explicit null and legacy missing tenant fields.
       tenantId: tenantId != null && tenantId !== '' ? tenantId : null,
     });
@@ -614,6 +624,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
         $or: [{ expiredAt: null }, { expiredAt: { $gt: now } }],
       },
     ];
+    filters.push(liveFileFilter());
     if (excludedFileIds.length > 0) {
       filters[0].file_id = { $nin: excludedFileIds };
     }
@@ -685,8 +696,11 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
   ): Promise<IMongoFile[]> {
     const File = mongoose.models.File as Model<IMongoFile>;
     return await File.find({
-      expiredAt: { $ne: null, $lte: now },
-      $or: [{ deletionRetryAt: null }, { deletionRetryAt: { $lte: now } }],
+      deletionCompletedAt: null,
+      $and: [
+        { $or: [{ expiredAt: { $ne: null, $lte: now } }, { deletionRequestedAt: { $ne: null } }] },
+        { $or: [{ deletionRetryAt: null }, { deletionRetryAt: { $lte: now } }] },
+      ],
     })
       .sort({ expiredAt: 1 })
       .limit(limit)
@@ -1089,9 +1103,14 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
   async function createFile(
     data: Partial<IMongoFile> | CodeFileCommitData,
     disableTTL?: boolean,
+    options?: { retention?: FileRetentionAdmission },
   ): Promise<IMongoFile | null> {
     const File = mongoose.models.File as Model<IMongoFile>;
-    const fileData: (Partial<IMongoFile> | CodeFileCommitData) & { expiresAt?: Date } = {
+    const fileData: (Partial<IMongoFile> | CodeFileCommitData) & {
+      expiresAt?: Date;
+      retentionAcceptedAt?: Date;
+      retentionRevision?: number;
+    } = {
       ...data,
       expiresAt: new Date(Date.now() + 3600 * 1000),
     };
@@ -1100,10 +1119,50 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
       delete fileData.expiresAt;
     }
 
-    return File.findOneAndUpdate({ file_id: data.file_id }, fileData, {
-      new: true,
-      upsert: true,
-    }).lean<IMongoFile>();
+    for (const key of [
+      'retentionAcceptedAt',
+      'retentionRevision',
+      'deletionRequestedAt',
+      'deletionCompletedAt',
+    ]) {
+      delete (fileData as unknown as Record<string, unknown>)[key];
+    }
+    if (options?.retention) {
+      const { acceptedAt, expiredAt } = options.retention;
+      if (
+        !(acceptedAt instanceof Date) ||
+        !(expiredAt instanceof Date) ||
+        !Number.isFinite(acceptedAt.getTime()) ||
+        !Number.isFinite(expiredAt.getTime()) ||
+        acceptedAt > new Date() ||
+        expiredAt <= new Date()
+      )
+        throw new FileSourceUnavailableError();
+      delete fileData.expiresAt;
+      fileData.retentionAcceptedAt = acceptedAt;
+      fileData.expiredAt = expiredAt;
+      fileData.retentionRevision = 0;
+      // Managed IDs are immutable. Duplicate creation cannot overwrite or resurrect a tombstone.
+      try {
+        return (await File.create(fileData)).toObject();
+      } catch (error) {
+        if ((error as { code?: number }).code === 11000) throw new FileSourceUnavailableError();
+        throw error;
+      }
+    }
+    try {
+      return await File.findOneAndUpdate(
+        { file_id: data.file_id, retentionAcceptedAt: { $exists: false } },
+        fileData,
+        {
+          new: true,
+          upsert: true,
+        },
+      ).lean<IMongoFile>();
+    } catch (error) {
+      if ((error as { code?: number }).code === 11000) throw new FileSourceUnavailableError();
+      throw error;
+    }
   }
 
   /**
@@ -1135,12 +1194,44 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
   ): Promise<IMongoFile | null> {
     const File = mongoose.models.File as Model<IMongoFile>;
     const { file_id, ...update } = data;
+    const current = await File.findOne({ file_id }).lean<IMongoFile>();
+    for (const key of [
+      'retentionAcceptedAt',
+      'retentionRevision',
+      'deletionRequestedAt',
+      'deletionCompletedAt',
+    ]) {
+      delete (update as Record<string, unknown>)[key];
+    }
+    if (current?.retentionAcceptedAt) {
+      for (const key of [
+        'user',
+        'tenantId',
+        'text',
+        'filename',
+        'filepath',
+        'storageKey',
+        'bytes',
+        'type',
+        'source',
+      ] as const) {
+        if (
+          Object.prototype.hasOwnProperty.call(update, key) &&
+          String(update[key]) !== String(current[key])
+        )
+          throw new FileSourceUnavailableError();
+      }
+      if (update.expiredAt != null && new Date(update.expiredAt) > new Date(current.expiredAt!)) {
+        throw new FileSourceUnavailableError();
+      }
+      if ('expiredAt' in update && update.expiredAt == null) throw new FileSourceUnavailableError();
+    }
     const updateOperation = {
       $set: update,
       $unset: { expiresAt: '' },
     };
     const query: FilterQuery<IMongoFile> = extraFilter ? { file_id, ...extraFilter } : { file_id };
-    return File.findOneAndUpdate(query, updateOperation, {
+    return File.findOneAndUpdate({ $and: [query, liveFileFilter()] }, updateOperation, {
       new: true,
       timestamps: Object.keys(update).length > 0,
     }).lean<IMongoFile>();
@@ -1303,7 +1394,12 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
    */
   async function deleteFile(file_id: string): Promise<IMongoFile | null> {
     const File = mongoose.models.File as Model<IMongoFile>;
-    const deleted = await File.findOneAndDelete({ file_id }).lean<IMongoFile>();
+    if (await File.exists({ file_id, retentionAcceptedAt: { $ne: null } }))
+      throw new FileSourceUnavailableError();
+    const deleted = await File.findOneAndDelete({
+      file_id,
+      retentionAcceptedAt: null,
+    }).lean<IMongoFile>();
     if (deleted) {
       await detachFilesFromProjects([deleted]);
     }
@@ -1317,7 +1413,11 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
    */
   async function deleteFileByFilter(filter: FilterQuery<IMongoFile>): Promise<IMongoFile | null> {
     const File = mongoose.models.File as Model<IMongoFile>;
-    const deleted = await File.findOneAndDelete(filter).lean<IMongoFile>();
+    if (await File.exists({ $and: [filter, { retentionAcceptedAt: { $ne: null } }] }))
+      throw new FileSourceUnavailableError();
+    const deleted = await File.findOneAndDelete({
+      $and: [filter, { retentionAcceptedAt: null }],
+    }).lean<IMongoFile>();
     if (deleted) {
       await detachFilesFromProjects([deleted]);
     }
@@ -1340,7 +1440,12 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
       await detachAllUserFilesFromProjects(user);
       return result;
     }
-    const deleteQuery: FilterQuery<IMongoFile> = { file_id: { $in: file_ids } };
+    if (await File.exists({ file_id: { $in: file_ids }, retentionAcceptedAt: { $ne: null } }))
+      throw new FileSourceUnavailableError();
+    const deleteQuery: FilterQuery<IMongoFile> = {
+      file_id: { $in: file_ids },
+      retentionAcceptedAt: null,
+    };
     const doomed = await File.find(deleteQuery)
       .select({ file_id: 1, user: 1 })
       .lean<IMongoFile[]>();
@@ -1368,7 +1473,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
     const File = mongoose.models.File as Model<IMongoFile>;
     const bulkOperations = updates.map((update) => ({
       updateOne: {
-        filter: { file_id: update.file_id },
+        filter: { file_id: update.file_id, ...liveFileFilter() },
         update: {
           $set: {
             filepath: update.filepath,
@@ -1547,6 +1652,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): {
   }
 
   return {
+    ...createFileRetentionMethods(mongoose),
     getRunFileCandidates,
     claimRunArtifactFile,
     publishRunArtifactFile,

@@ -370,6 +370,7 @@ export type TOptions = {
    * context even though the references still show on the user bubble.
    */
   overrideQuotes?: string[];
+  overrideQuoteSourceRefs?: t.TMessage['quoteSourceRefs'];
   /** Request-scoped reasoning selection for this exact submission. */
   overrideReasoning?: t.TReasoningOverride | null;
   /** Added conversation for multi-convo feature - sent to server as part of submission payload */

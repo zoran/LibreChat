@@ -56,7 +56,7 @@ import {
   findLiveAskUserQuestion,
   insertQueuedOrigin,
   hydrateFileDeliveryMetadata,
-  mergeRestagedQuotes,
+  mergeRestagedQuoteDraft,
 } from '~/utils';
 import {
   recoveryDispositionsFamily,
@@ -87,6 +87,7 @@ export type { DuringRunAction };
 /** Composer state consumed into a queued item alongside the text. */
 export interface QueuedMessageContext {
   quotes?: string[];
+  quoteSourceRefs?: TMessage['quoteSourceRefs'];
   manualSkills?: string[];
   reasoningOverride?: TMessage['reasoningOverride'];
   clientRequestId?: string;
@@ -459,7 +460,11 @@ function reconcileServerQueuedTurns(
           expectedPredecessorCreatedAt: receipt.expectedPredecessorCreatedAt,
         }),
         ...(files != null && files.length > 0 && { files }),
-        ...(receipt.quotes != null && receipt.quotes.length > 0 && { quotes: receipt.quotes }),
+        ...(receipt.quotes != null &&
+          receipt.quotes.length > 0 && {
+            quotes: receipt.quotes,
+            quoteSourceRefs: receipt.quoteSourceRefs,
+          }),
         ...(receipt.manualSkills != null &&
           receipt.manualSkills.length > 0 && {
             manualSkills: receipt.manualSkills,
@@ -1125,6 +1130,7 @@ export default function useSteering({
         front?: boolean;
         files?: TMessage['files'];
         quotes?: string[];
+        quoteSourceRefs?: TMessage['quoteSourceRefs'];
         manualSkills?: string[];
         reasoningOverride?: TMessage['reasoningOverride'];
         /** Set when the files were ALREADY queued/steered: their TTL was
@@ -1176,7 +1182,11 @@ export default function useSteering({
             options?.expectedPredecessorCreatedAt ?? predecessorCreatedAt ?? undefined,
         }),
         ...(options?.files && options.files.length > 0 && { files: options.files }),
-        ...(options?.quotes && options.quotes.length > 0 && { quotes: options.quotes }),
+        ...(options?.quotes &&
+          options.quotes.length > 0 && {
+            quotes: options.quotes,
+            quoteSourceRefs: options.quoteSourceRefs,
+          }),
         ...(options?.manualSkills &&
           options.manualSkills.length > 0 && {
             manualSkills: options.manualSkills,
@@ -1208,7 +1218,11 @@ export default function useSteering({
             parentMessageId,
             text: item.text,
             ...(serverFiles != null && { files: serverFiles }),
-            ...(item.quotes != null && item.quotes.length > 0 && { quotes: item.quotes }),
+            ...(item.quotes != null &&
+              item.quotes.length > 0 && {
+                quotes: item.quotes,
+                quoteSourceRefs: item.quoteSourceRefs,
+              }),
             ...(item.manualSkills != null &&
               item.manualSkills.length > 0 && {
                 manualSkills: item.manualSkills,
@@ -1333,8 +1347,8 @@ export default function useSteering({
   const takeComposerContext = useRecoilCallback(
     ({ snapshot, reset }) =>
       (): QueuedMessageContext => {
-        const quotes = snapshot
-          .getLoadable(store.pendingQuotesByConvoId(conversationId))
+        const { quotes, quoteSourceRefs } = snapshot
+          .getLoadable(store.pendingQuoteDraftByConvoId(conversationId))
           .getValue();
         const manualSkills = snapshot
           .getLoadable(store.pendingManualSkillsByConvoId(conversationId))
@@ -1343,7 +1357,7 @@ export default function useSteering({
           pendingReasoningOverrideFamily(reasoningStateKey),
         );
         if (quotes.length > 0) {
-          reset(store.pendingQuotesByConvoId(conversationId));
+          reset(store.pendingQuoteDraftByConvoId(conversationId));
         }
         if (manualSkills.length > 0) {
           reset(store.pendingManualSkillsByConvoId(conversationId));
@@ -1352,7 +1366,7 @@ export default function useSteering({
           reasoningStore.set(pendingReasoningOverrideFamily(reasoningStateKey), undefined);
         }
         return {
-          ...(quotes.length > 0 && { quotes }),
+          ...(quotes.length > 0 && { quotes, quoteSourceRefs }),
           ...(manualSkills.length > 0 && { manualSkills }),
           ...(reasoningOverride != null && { reasoningOverride }),
         };
@@ -1367,14 +1381,14 @@ export default function useSteering({
   const takeComposerQuotes = useRecoilCallback(
     ({ snapshot, reset }) =>
       (): QueuedMessageContext => {
-        const quotes = snapshot
-          .getLoadable(store.pendingQuotesByConvoId(conversationId))
+        const { quotes, quoteSourceRefs } = snapshot
+          .getLoadable(store.pendingQuoteDraftByConvoId(conversationId))
           .getValue();
         if (quotes.length === 0) {
           return {};
         }
-        reset(store.pendingQuotesByConvoId(conversationId));
-        return { quotes };
+        reset(store.pendingQuoteDraftByConvoId(conversationId));
+        return { quotes, quoteSourceRefs };
       },
     [conversationId],
   );
@@ -1401,7 +1415,11 @@ export default function useSteering({
         if (quotes == null || quotes.length === 0) {
           return;
         }
-        set(store.pendingQuotesByConvoId(convoId), (prev) => mergeRestagedQuotes(prev, quotes));
+        const refs =
+          chip?.quotes != null ? chip.quoteSourceRefs : chip?.queuedOrigin?.item.quoteSourceRefs;
+        set(store.pendingQuoteDraftByConvoId(convoId), (prev) =>
+          mergeRestagedQuoteDraft(prev, quotes, refs),
+        );
         set(store.pendingSteersByConvoId(convoId), (prev) => {
           let changed = false;
           const next = prev.map((steer) => {
@@ -1410,11 +1428,15 @@ export default function useSteering({
               return steer;
             }
             changed = true;
-            const { quotes: _quotes, ...rest } = steer;
+            const { quotes: _quotes, quoteSourceRefs: _quoteSourceRefs, ...rest } = steer;
             if (!originHasQuotes || rest.queuedOrigin == null) {
               return rest;
             }
-            const { quotes: _originQuotes, ...originItem } = rest.queuedOrigin.item;
+            const {
+              quotes: _originQuotes,
+              quoteSourceRefs: _originRefs,
+              ...originItem
+            } = rest.queuedOrigin.item;
             return {
               ...rest,
               queuedOrigin: { ...rest.queuedOrigin, item: originItem },
@@ -1927,7 +1949,10 @@ export default function useSteering({
             clientSteerId: localId,
             text: trimmed,
             ...(files && { files }),
-            ...(carried.quotes && { quotes: carried.quotes }),
+            ...(carried.quotes && {
+              quotes: carried.quotes,
+              quoteSourceRefs: carried.quoteSourceRefs,
+            }),
             ...(preempt && { preempt }),
             ...(targetGenerationCreatedAt != null && {
               generationCreatedAt: targetGenerationCreatedAt,
@@ -2410,7 +2435,11 @@ export default function useSteering({
         const consumed = submitSteer(
           taken.text,
           taken.files,
-          { quotes: taken.quotes, manualSkills: taken.manualSkills },
+          {
+            quotes: taken.quotes,
+            quoteSourceRefs: taken.quoteSourceRefs,
+            manualSkills: taken.manualSkills,
+          },
           {
             ...(opts?.preempt === true && { preempt: true }),
             queuedOrigin: origin,
@@ -2440,6 +2469,7 @@ export default function useSteering({
         try {
           accepted = sendNow(taken.text, taken.files ?? [], {
             quotes: taken.quotes,
+            quoteSourceRefs: taken.quoteSourceRefs,
             manualSkills: taken.manualSkills,
             reasoningOverride: taken.reasoningOverride,
             clientRequestId: taken.clientRequestId,

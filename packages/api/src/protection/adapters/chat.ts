@@ -22,6 +22,7 @@ export interface ChatSubmissionBody extends ModelParameterContentInput {
   readonly input?: string;
   readonly text?: string;
   readonly quotes?: unknown;
+  readonly quoteSourceRefs?: unknown;
   readonly answer?: string;
   readonly promptPrefix?: string | null;
   readonly system?: string;

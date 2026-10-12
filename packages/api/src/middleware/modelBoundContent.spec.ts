@@ -6234,3 +6234,58 @@ it('admits only after every native batch passes and awaits the protected commit'
   await pending;
   expect(onContentAllowed).toHaveBeenCalledTimes(1);
 });
+
+it('projects only actual file/history sources without enabling content filters', async () => {
+  const onSourceProjection = jest.fn(async () => {});
+  const callback = createModelBoundChatModelCallback(
+    {
+      storedMessages: [
+        { messageId: 'attached', role: 'user', text: 'compare', files: [{ file_id: 'file-a' }] },
+        { messageId: 'derived', role: 'assistant', text: 'derived answer', isCreatedByUser: false },
+        { messageId: 'pruned', role: 'user', text: 'old', files: [{ file_id: 'file-b' }] },
+      ],
+      resolvedFiles: [
+        { file_id: 'file-a', text: 'document a' },
+        { file_id: 'file-b', text: 'document b' },
+      ],
+      fileIdsBySourceMessageId: new Map([
+        ['attached', ['file-a']],
+        ['pruned', ['file-b']],
+      ]),
+    },
+    { onSourceProjection },
+  );
+  await callback.handleChatModelStart(undefined, [
+    [
+      { messageId: 'attached', role: 'user', content: 'compare' },
+      { messageId: 'derived', role: 'assistant', content: 'derived answer' },
+    ],
+  ]);
+  expect(onSourceProjection).toHaveBeenCalledWith({
+    fileIds: ['file-a'],
+    sourceMessageIds: ['attached', 'derived'],
+  });
+});
+
+it('awaits source admission before allowed persistence and fails closed on rejection', async () => {
+  let reject!: (error: Error) => void;
+  const onContentAllowed = jest.fn();
+  const onContentRejected = jest.fn();
+  const callback = createModelBoundChatModelCallback(
+    {},
+    {
+      onSourceProjection: () =>
+        new Promise<void>((_resolve, fail) => {
+          reject = fail;
+        }),
+      onContentAllowed,
+      onContentRejected,
+    },
+  );
+  const pending = callback.handleChatModelStart(undefined, [[{ role: 'user', content: 'safe' }]]);
+  expect(onContentAllowed).not.toHaveBeenCalled();
+  reject(new Error('source revoked'));
+  await expect(pending).rejects.toThrow();
+  expect(onContentAllowed).not.toHaveBeenCalled();
+  expect(onContentRejected).toHaveBeenCalledTimes(1);
+});

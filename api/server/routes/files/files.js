@@ -23,6 +23,7 @@ const {
   checkToolResourceUploadPermission,
   resolveAssistantToolPermissions,
   resolveDownloadPath,
+  getDocumentFileRetention,
 } = require('@librechat/api');
 const {
   isUUID,
@@ -214,7 +215,17 @@ router.delete('/', async (req, res) => {
     }
 
     const fileIds = files.map((file) => file.file_id);
-    const dbFiles = await db.getFiles({ file_id: { $in: fileIds } });
+    const visibleFiles = await db.getFiles({ file_id: { $in: fileIds } });
+    const pendingFiles =
+      typeof db.getFileSourceDeletionCandidates === 'function'
+        ? await db.getFileSourceDeletionCandidates(
+            { userId: req.user.id, tenantId: req.user.tenantId },
+            fileIds,
+          )
+        : [];
+    const dbFiles = [
+      ...new Map([...visibleFiles, ...pendingFiles].map((file) => [file.file_id, file])).values(),
+    ];
 
     if (req.body.agent_id && req.body.tool_resource) {
       if (!isAgentToolResourceKey(req.body.tool_resource)) {
@@ -801,6 +812,9 @@ const handleFileUpload = async (req, res) => {
   };
 
   try {
+    if (req.config?.fileConfig?.retentionHours != null) {
+      await getDocumentFileRetention(req, {});
+    }
     req.file.originalname = sanitizeFilename(req.file.originalname);
     const isAssistants = isAssistantsEndpoint(metadata.endpoint);
 

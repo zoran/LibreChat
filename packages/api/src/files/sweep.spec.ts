@@ -423,3 +423,29 @@ describe('expired file sweep helpers', () => {
     clearInterval(interval ?? undefined);
   });
 });
+
+it('passes managed source records intact to the existing deletion owner', async () => {
+  const file = {
+    file_id: 'managed-file',
+    user: 'owner',
+    tenantId: 'tenant',
+    source: FileSources.local,
+    retentionAcceptedAt: new Date(0),
+  };
+  const processDeleteRequest = jest
+    .fn()
+    .mockResolvedValue({ deletedFileIds: [], failedFileIds: ['managed-file'] });
+  const incrementFileDeletionAttempts = jest.fn().mockResolvedValue(1);
+  await sweepExpiredFiles(
+    { appConfig: {} as AppConfig },
+    {
+      getExpiredFiles: jest.fn().mockResolvedValue([file]),
+      processDeleteRequest,
+      incrementFileDeletionAttempts,
+      deferExpiredFile: jest.fn(),
+      logger: { error: jest.fn(), info: jest.fn(), warn: jest.fn() },
+    },
+  );
+  expect(processDeleteRequest).toHaveBeenCalledWith(expect.objectContaining({ files: [file] }));
+  expect(incrementFileDeletionAttempts).toHaveBeenCalledWith('managed-file');
+});

@@ -1,5 +1,10 @@
 import { logger } from '@librechat/data-schemas';
 import type { Redis, Cluster } from 'ioredis';
+import {
+  ioredisClient as staticRedisClient,
+  keyvRedisClient as staticKeyvClient,
+  keyvRedisClientReady,
+} from '~/cache/redisClients';
 import { createMockPublisher } from './helpers/publisher';
 
 logger.silent = true;
@@ -17,6 +22,8 @@ logger.silent = true;
 describe('RedisEventTransport Integration Tests', () => {
   let originalEnv: NodeJS.ProcessEnv;
   let ioredisClient: Redis | Cluster | null = null;
+  let dynamicKeyvClient: { disconnect: () => unknown } | null = null;
+  let dynamicKeyvReady: Promise<unknown> | null = null;
   const testPrefix = 'EventTransport-Integration-Test';
 
   beforeAll(async () => {
@@ -31,8 +38,10 @@ describe('RedisEventTransport Integration Tests', () => {
 
     jest.resetModules();
 
-    const { ioredisClient: client } = await import('../../cache/redisClients');
-    ioredisClient = client;
+    const clients = await import('../../cache/redisClients');
+    ioredisClient = clients.ioredisClient;
+    dynamicKeyvClient = clients.keyvRedisClient;
+    dynamicKeyvReady = clients.keyvRedisClientReady;
   });
 
   afterAll(async () => {
@@ -49,7 +58,57 @@ describe('RedisEventTransport Integration Tests', () => {
         }
       }
     }
+    for (const ready of [keyvRedisClientReady, dynamicKeyvReady]) await ready?.catch(() => {});
+    for (const client of new Set([staticRedisClient, staticKeyvClient, dynamicKeyvClient])) {
+      if (client) await client.disconnect();
+    }
     process.env = originalEnv;
+  });
+
+  test('source terminal publications cannot use the missing-job retained-epoch fallback', async () => {
+    expect(ioredisClient).not.toBeNull();
+    const { RedisJobStore } = await import('../implementations/RedisJobStore');
+    const { RedisEventTransport } = await import('../implementations/RedisEventTransport');
+    const subscriber = (ioredisClient as Redis).duplicate();
+    const transport = new RedisEventTransport(ioredisClient!, subscriber);
+    const store = new RedisJobStore(ioredisClient!);
+    const id = `source-terminal-${Date.now()}`;
+    const done: unknown[] = [];
+    const subscription = transport.subscribe(id, {
+      onChunk: () => undefined,
+      onDone: (event) => done.push(event),
+    });
+    await subscription.ready;
+    try {
+      const job = await store.createJob(id, 'owner');
+      await store.bindSourceRetention(id, job.createdAt, {
+        sourceFileIds: ['file-a'],
+        sourceExpiresAt: Date.now() + 60000,
+      });
+      await transport.emitDone(id, { text: 'allowed before revoke' }, job.createdAt, true);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(done).toEqual([{ text: 'allowed before revoke' }]);
+      await store.revokeSourceRetention(id, job.createdAt);
+      await store.transitionStatus(id, {
+        from: 'running',
+        to: 'aborted',
+        expectCreatedAt: job.createdAt,
+        patch: { completedAt: Date.now(), providerDrained: true },
+      });
+      await store.deleteJob(id, job.createdAt);
+      await store.deleteJob(id, job.createdAt);
+      expect(await store.getJob(id)).toBeNull();
+      await expect(
+        transport.emitDone(id, { text: 'must not reappear' }, job.createdAt, true),
+      ).rejects.toThrow();
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(done).toHaveLength(1);
+    } finally {
+      subscription.unsubscribe();
+      transport.destroy();
+      subscriber.disconnect();
+      await store.destroy();
+    }
   });
 
   describe('Pub/Sub Event Delivery', () => {

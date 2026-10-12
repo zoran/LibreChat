@@ -76,7 +76,7 @@ jest.mock('recoil', () => ({
       snapshot: {
         getLoadable: (_atom: unknown) => ({
           state: 'hasValue',
-          contents: [],
+          contents: _atom === 'pendingQuoteDraft' ? { quotes: [], quoteSourceRefs: [] } : [],
         }),
       },
       set: jest.fn(),
@@ -112,6 +112,7 @@ jest.mock('~/store', () => ({
     showStopButtonByIndex: () => 'showStopButton',
     pendingManualSkillsByConvoId: () => 'pendingManualSkills',
     pendingQuotesByConvoId: () => 'pendingQuotes',
+    pendingQuoteDraftByConvoId: () => 'pendingQuoteDraft',
     messagesSiblingIdxFamily: () => 'messagesSiblingIdx',
     conversationByKeySelector: () => 'conversation',
   },
@@ -878,6 +879,37 @@ describe('useChatFunctions ask attachments', () => {
     expect(submission.userMessage.files?.[0]).toMatchObject({
       file_id: 'file-1',
       filename: 'quarterly-report.pdf',
+    });
+  });
+
+  it('carries canonical quote refs with explicit replay overrides', () => {
+    const setSubmission = jest.fn();
+    const { result } = renderHook(() =>
+      useChatFunctions({
+        isSubmitting: false,
+        latestMessage: null,
+        conversation: conversation(Constants.NEW_CONVO as string),
+        getMessages: () => [],
+        setMessages: jest.fn(),
+        setSubmission,
+        setConversation: mockSetConversation,
+      }),
+    );
+    const quoteSourceRefs = [{ messageId: 'source', quoteIndex: 1, messageVersion: 7 }];
+    act(() => {
+      result.current.ask(
+        { text: 'independent question' },
+        {
+          overrideQuotes: ['referenced text'],
+          overrideQuoteSourceRefs: quoteSourceRefs,
+        },
+      );
+    });
+    const submission = setSubmission.mock.calls.at(-1)?.[0] as TSubmission;
+    expect(submission.userMessage).toMatchObject({
+      text: 'independent question',
+      quotes: ['referenced text'],
+      quoteSourceRefs,
     });
   });
 

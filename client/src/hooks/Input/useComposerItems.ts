@@ -34,11 +34,15 @@ export default function useComposerItems(
 ): ComposerItem[] {
   const quotes = useRecoilValue(store.pendingQuotesByConvoId(conversationId));
   const skills = useRecoilValue(store.pendingManualSkillsByConvoId(conversationId));
-  const setQuotes = useSetRecoilState(store.pendingQuotesByConvoId(conversationId));
+  const setQuotes = useSetRecoilState(store.pendingQuoteDraftByConvoId(conversationId));
   const setSkills = useSetRecoilState(store.pendingManualSkillsByConvoId(conversationId));
 
   const removeQuoteAt = useCallback(
-    (index: number) => setQuotes((prev) => prev.filter((_, i) => i !== index)),
+    (index: number) =>
+      setQuotes((prev) => ({
+        quotes: prev.quotes.filter((_, i) => i !== index),
+        quoteSourceRefs: prev.quoteSourceRefs.filter((_, i) => i !== index),
+      })),
     [setQuotes],
   );
   const removeSkill = useCallback(

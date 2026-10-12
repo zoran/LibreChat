@@ -17,6 +17,8 @@ const mockTenantStorageRun = jest.fn(async (context, callback) => {
 const mockSaveMessage = jest.fn();
 const mockGetConvo = jest.fn();
 const mockGetMessages = jest.fn();
+const mockResolveQuoteRetention = jest.fn();
+const mockResolveFileRetentionContext = jest.fn();
 const mockIsAgentTriggerPrincipalActive = jest.fn();
 const mockFilterPersistableAbortContent = jest.fn((content) => content);
 const mockCheckAndIncrementPendingRequest = jest.fn();
@@ -28,6 +30,8 @@ const mockGenerationJobManager = {
       ...args,
     ),
   createJob: jest.fn(),
+  bindSourceRetention: jest.fn(),
+  revokeFileSourceGenerations: jest.fn(),
   emitError: jest.fn(),
   completeJob: jest.fn(),
   beginProviderExecution: jest.fn(),
@@ -99,7 +103,12 @@ jest.mock('@librechat/api', () => ({
   assertChatProjectInstructions: jest.requireActual('@librechat/api').assertChatProjectInstructions,
   getChatProjectTurnFailure: jest.requireActual('@librechat/api').getChatProjectTurnFailure,
   GenerationJobManager: mockGenerationJobManager,
-  getReferencedQuotes: jest.fn(() => null),
+  readFileSourceRetention: jest.requireActual('@librechat/api').readFileSourceRetention,
+  getReferencedQuotes: jest.requireActual('@librechat/api').getReferencedQuotes,
+  normalizeReferencedQuoteSources:
+    jest.requireActual('@librechat/api').normalizeReferencedQuoteSources,
+  serializeQuoteRetention: jest.requireActual('@librechat/api').serializeQuoteRetention,
+  quoteRetentionContext: jest.requireActual('@librechat/api').quoteRetentionContext,
   cleanupMCPRequestContext: jest.fn(),
   createMCPRequestContext: jest.fn(() => ({
     connections: new Map(),
@@ -147,6 +156,8 @@ jest.mock('~/models', () => ({
   saveMessage: (...args) => mockSaveMessage(...args),
   getMessages: (...args) => mockGetMessages(...args),
   getConvo: (...args) => mockGetConvo(...args),
+  resolveQuoteRetention: (...args) => mockResolveQuoteRetention(...args),
+  resolveFileRetentionContext: (...args) => mockResolveFileRetentionContext(...args),
   isAgentTriggerPrincipalActive: (...args) => mockIsAgentTriggerPrincipalActive(...args),
 }));
 
@@ -160,6 +171,13 @@ describe('ResumableAgentController tenant context', () => {
     mockDecrementPendingRequest.mockResolvedValue(undefined);
     mockGetConvo.mockResolvedValue({ createdAt: '2026-07-31T00:00:00.000Z' });
     mockGetMessages.mockResolvedValue([]);
+    mockResolveQuoteRetention.mockReset();
+    mockResolveFileRetentionContext.mockReset();
+    mockGenerationJobManager.bindSourceRetention.mockResolvedValue(true);
+    mockGenerationJobManager.revokeFileSourceGenerations.mockResolvedValue({
+      complete: true,
+      pending: [],
+    });
     mockIsAgentTriggerPrincipalActive.mockResolvedValue(true);
     mockGenerationJobManager.updateMetadata.mockResolvedValue(undefined);
     mockGenerationJobManager.emitError.mockResolvedValue(undefined);
@@ -186,7 +204,12 @@ describe('ResumableAgentController tenant context', () => {
   const firePartialDisconnect = async (
     user,
     jobRecord = { createdAt: 1000, contextMeta: partialContextMeta },
-    { body = {}, aggregatedContent = [{ type: 'text', text: 'Partial response' }] } = {},
+    {
+      body = {},
+      sourceRetention,
+      expectAdmissionFailure = false,
+      aggregatedContent = [{ type: 'text', text: 'Partial response' }],
+    } = {},
   ) => {
     mockGetConvo.mockResolvedValue({
       conversationId: 'conversation-123',
@@ -196,7 +219,13 @@ describe('ResumableAgentController tenant context', () => {
     });
     let allSubscribersLeftHandler;
     mockGenerationJobManager.getJobStore.mockReturnValue({
-      getJob: jest.fn().mockResolvedValue(jobRecord),
+      getJob: jest.fn().mockImplementation(async () => ({
+        status: 'running',
+        ...jobRecord,
+        userMessage: mockGenerationJobManager.updateMetadata.mock.calls
+          .map((call) => call[1]?.userMessage)
+          .find((value) => value?.quoteRetention),
+      })),
     });
     mockGenerationJobManager.createJob.mockResolvedValue({
       createdAt: 1000,
@@ -231,6 +260,7 @@ describe('ResumableAgentController tenant context', () => {
     const initializeClient = jest.fn().mockRejectedValue(new Error('stop after setup'));
     const req = {
       user,
+      _fileSourceRetention: sourceRetention,
       body: {
         text: 'Continue the analysis',
         messageId: 'user-message',
@@ -251,11 +281,96 @@ describe('ResumableAgentController tenant context', () => {
     };
 
     await AgentController(req, res, jest.fn(), initializeClient, null);
+    if (expectAdmissionFailure) {
+      expect(allSubscribersLeftHandler).toBeUndefined();
+      expect(initializeClient).not.toHaveBeenCalled();
+      return req;
+    }
     expect(allSubscribersLeftHandler).toEqual(expect.any(Function));
 
     await allSubscribersLeftHandler(aggregatedContent);
     return tenantSeenBySave;
   };
+
+  it('carries trusted source retention into the actual disconnect partial write', async () => {
+    const sourceRetention = { sourceFileIds: ['file-a'], sourceExpiresAt: new Date('2030-01-20') };
+    await firePartialDisconnect({ id: 'user-123', tenantId: 'tenant-a' }, undefined, {
+      sourceRetention,
+    });
+    expect(mockSaveMessage).toHaveBeenCalledWith(
+      expect.any(Object),
+      expect.objectContaining({ messageId: 'response-message' }),
+      expect.objectContaining({ sourceRetention }),
+    );
+  });
+
+  it('withholds preliminary quotes until epoch binding and the live source recheck finish', async () => {
+    const quoteRetention = {
+      quotes: ['document excerpt'],
+      quoteSourceRetention: [
+        {
+          index: 0,
+          sourceRef: { messageId: 'source' },
+          sourceFileIds: ['file-a'],
+          sourceExpiresAt: new Date('2030-01-20'),
+        },
+      ],
+      sourceMessageConditions: [{ messageId: 'source', messageVersion: 0 }],
+    };
+    mockResolveQuoteRetention.mockResolvedValue(quoteRetention);
+    mockResolveFileRetentionContext.mockResolvedValue({
+      sourceFileIds: ['file-a'],
+      sourceExpiresAt: new Date('2030-01-20'),
+    });
+    await firePartialDisconnect({ id: 'user-123', tenantId: 'tenant-a' }, undefined, {
+      body: { quotes: quoteRetention.quotes, quoteSourceRefs: [{ messageId: 'source' }] },
+    });
+    expect(
+      mockGenerationJobManager.createJob.mock.calls[0][3].initialMetadata.userMessage.quotes,
+    ).toBeUndefined();
+    const install = mockGenerationJobManager.updateMetadata.mock.calls.find(
+      (call) => call[1]?.userMessage?.quoteRetention,
+    );
+    expect(install[1].userMessage.quotes).toEqual(quoteRetention.quotes);
+    expect(install[1].userMessage.quoteRetention.quoteSourceRetention[0].sourceExpiresAt).toBe(
+      new Date('2030-01-20').getTime(),
+    );
+    expect(mockGenerationJobManager.bindSourceRetention.mock.invocationCallOrder[0]).toBeLessThan(
+      mockResolveFileRetentionContext.mock.invocationCallOrder[0],
+    );
+    expect(mockResolveFileRetentionContext.mock.invocationCallOrder[0]).toBeLessThan(
+      mockGenerationJobManager.updateMetadata.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('compensates a revoke that wins between quote resolution and generation binding', async () => {
+    mockResolveQuoteRetention.mockResolvedValue({
+      quotes: ['document excerpt'],
+      sourceMessageConditions: [],
+      quoteSourceRetention: [
+        {
+          index: 0,
+          sourceRef: { messageId: 'source' },
+          sourceFileIds: ['file-a'],
+          sourceExpiresAt: new Date('2030-01-20'),
+        },
+      ],
+    });
+    mockResolveFileRetentionContext.mockRejectedValue(new Error('Source revoked'));
+    await firePartialDisconnect({ id: 'user-123' }, undefined, {
+      expectAdmissionFailure: true,
+      body: { quotes: ['document excerpt'], quoteSourceRefs: [{ messageId: 'source' }] },
+    });
+    expect(mockGenerationJobManager.revokeFileSourceGenerations).toHaveBeenCalledWith(
+      { userId: 'user-123', tenantId: undefined },
+      ['file-a'],
+    );
+    expect(
+      mockGenerationJobManager.updateMetadata.mock.calls.some(
+        (call) => call[1]?.userMessage?.quoteRetention,
+      ),
+    ).toBe(false);
+  });
 
   it('carries the context meta the run published onto the partial response saved on disconnect', async () => {
     await firePartialDisconnect({ id: 'user-123', tenantId: 'tenant-a' });

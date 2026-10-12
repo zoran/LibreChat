@@ -659,6 +659,7 @@ function createAgentQueuedTurnResolver({
       }),
       ...(claim.files != null && { files: claim.files }),
       ...(claim.quotes != null && { quotes: claim.quotes }),
+      ...('quoteSourceRefs' in claim && { quoteSourceRefs: claim.quoteSourceRefs }),
       ...(claim.manualSkills != null && { manualSkills: claim.manualSkills }),
       ...(claim.codeApprovalMode != null && { codeApprovalMode: claim.codeApprovalMode }),
       ...(claim.reasoningOverride != null && { reasoningOverride: claim.reasoningOverride }),

@@ -2,7 +2,9 @@ import { EventEmitter } from 'events';
 import { logger } from '@librechat/data-schemas';
 import { subagentActivityConfigSchema } from 'librechat-data-provider';
 import type { ReplayLimits, ReplayPublication } from '../internal/replay';
+import type { SerializableJobData } from '../interfaces/IJobStore';
 import type { IEventTransport } from '../interfaces/IJobStore';
+import { sourceRetentionAvailable } from '../interfaces/IJobStore';
 
 interface StreamState {
   emitter: EventEmitter;
@@ -23,6 +25,33 @@ interface ReplayBuffer {
  * For horizontal scaling, replace with RedisEventTransport.
  */
 export class InMemoryEventTransport implements IEventTransport {
+  readonly sourceRetentionSupported = true;
+  private sourceReader?: (streamId: string) => Promise<SerializableJobData | null>;
+  setSourceRetentionReader(
+    reader: (streamId: string) => Promise<SerializableJobData | null>,
+  ): void {
+    this.sourceReader = reader;
+  }
+
+  private async publishSourceBound(
+    streamId: string,
+    epoch: number | undefined,
+    publish: () => void,
+  ): Promise<void> {
+    const job = await this.sourceReader?.(streamId);
+    // No await between this read/check and the synchronous EventEmitter dispatch.
+    if (!job || job.createdAt !== epoch || !job.sourceRetention || !sourceRetentionAvailable(job))
+      throw new Error('Document source unavailable');
+    publish();
+  }
+
+  async purgeSourceRetention(streamId: string, epoch: number): Promise<void> {
+    const job = await this.sourceReader?.(streamId);
+    if (job?.createdAt !== epoch) return;
+    this.dropReplay(streamId);
+    this.emitError(streamId, 'Document source unavailable', epoch);
+  }
+
   private replay = new Map<string, ReplayBuffer>();
   private replayBytes = 0;
   private readonly replayMaxStreams: number;
@@ -252,17 +281,44 @@ export class InMemoryEventTransport implements IEventTransport {
       this.emitDone(streamId, event);
   }
 
-  emitChunk(streamId: string, event: unknown, generationId?: number): void {
+  emitChunk(
+    streamId: string,
+    event: unknown,
+    generationId?: number,
+    requireSourceBinding = false,
+  ): void | Promise<void> {
+    if (requireSourceBinding)
+      return this.publishSourceBound(streamId, generationId, () => {
+        this.emitChunk(streamId, event, generationId);
+      });
     const state = this.streams.get(streamId);
     state?.emitter.emit('chunk', event, generationId);
   }
 
-  emitDone(streamId: string, event: unknown, generationId?: number): void {
+  emitDone(
+    streamId: string,
+    event: unknown,
+    generationId?: number,
+    requireSourceBinding = false,
+  ): void | Promise<void> {
+    if (requireSourceBinding)
+      return this.publishSourceBound(streamId, generationId, () => {
+        this.emitDone(streamId, event, generationId);
+      });
     const state = this.streams.get(streamId);
     state?.emitter.emit('done', event, generationId);
   }
 
-  emitError(streamId: string, error: string, generationId?: number): void {
+  emitError(
+    streamId: string,
+    error: string,
+    generationId?: number,
+    requireSourceBinding = false,
+  ): void | Promise<void> {
+    if (requireSourceBinding)
+      return this.publishSourceBound(streamId, generationId, () => {
+        this.emitError(streamId, error, generationId);
+      });
     const state = this.streams.get(streamId);
     // Only emit if there are listeners - Node.js throws on unhandled 'error' events
     // This is intentional for the race condition where error occurs before client connects

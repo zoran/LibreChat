@@ -310,6 +310,8 @@ describe('RedisJobStore', () => {
       .mockImplementation((...args: unknown[]) => ['', '', args[Number(args[1]) + 3]]);
     const redis = {
       isCluster: true,
+      get: jest.fn().mockResolvedValue(null),
+      hvals: jest.fn().mockResolvedValue([]),
       eval: evalJobCreation,
       hgetall: jest.fn(() => jobHashFromCreationCall(evalJobCreation.mock.calls[0])),
       sadd: jest.fn().mockResolvedValue(1),
@@ -626,6 +628,8 @@ describe('RedisJobStore', () => {
       ]);
     const redis = {
       isCluster: true,
+      get: jest.fn().mockResolvedValue(null),
+      hvals: jest.fn().mockResolvedValue([]),
       eval: evalJobCreation,
       hgetall: jest.fn(() => jobHashFromCreationCall(evalJobCreation.mock.calls[0])),
       sadd: jest.fn().mockResolvedValue(1),
@@ -681,6 +685,8 @@ describe('RedisJobStore', () => {
     const now = jest.spyOn(Date, 'now').mockReturnValue(100);
     const redis = {
       isCluster: true,
+      get: jest.fn().mockResolvedValue(null),
+      hvals: jest.fn().mockResolvedValue([]),
       eval: jest.fn().mockResolvedValue(['user-1', '', '100']),
       hgetall: jest.fn().mockResolvedValue({
         streamId: 'stream-overlap',
@@ -711,6 +717,8 @@ describe('RedisJobStore', () => {
   test('rejects creation when its durable epoch is already terminal', async () => {
     const redis = {
       isCluster: true,
+      get: jest.fn().mockResolvedValue(null),
+      hvals: jest.fn().mockResolvedValue([]),
       eval: jest.fn().mockResolvedValue(['', '', '100']),
       hgetall: jest.fn().mockResolvedValue({
         streamId: 'stream-terminal-create',
@@ -735,6 +743,12 @@ describe('RedisJobStore', () => {
     const redis = {
       isCluster: true,
       eval: evalRedis,
+      hgetall: jest.fn().mockResolvedValue({
+        streamId: 'stream-local-epoch',
+        userId: 'user-1',
+        createdAt: '101',
+        status: 'running',
+      }),
     } as unknown as Cluster;
     const store = new RedisJobStore(redis);
     const replacementContent = [{ type: 'text', text: 'replacement' }];
@@ -812,6 +826,8 @@ describe('RedisJobStore', () => {
     });
     const redis = {
       isCluster: true,
+      get: jest.fn().mockResolvedValue(null),
+      hvals: jest.fn().mockResolvedValue([]),
       eval: evalJobCreation,
       sadd: jest.fn((key: string) => {
         if (key === 'stream:running') {
@@ -930,6 +946,8 @@ describe('RedisJobStore', () => {
         }
         return 1;
       }),
+      get: jest.fn().mockResolvedValue(null),
+      hvals: jest.fn().mockResolvedValue([]),
       hgetall,
       sadd,
       srem,
@@ -1384,6 +1402,8 @@ it('confirms initial retention in Cluster membership before returning a created 
     .mockImplementation((...args: unknown[]) => ['', '', args[Number(args[1]) + 3]]);
   const redis = {
     isCluster: true,
+    get: jest.fn().mockResolvedValue(null),
+    hvals: jest.fn().mockResolvedValue([]),
     eval: create,
     hgetall: jest.fn(() => jobHashFromCreationCall(create.mock.calls[0])),
     sadd: jest.fn().mockResolvedValue(1),
@@ -1406,6 +1426,8 @@ it('withholds a newly retained provider when its recovery index cannot be confir
     .mockImplementation((...args: unknown[]) => ['', '', args[Number(args[1]) + 3]]);
   const redis = {
     isCluster: true,
+    get: jest.fn().mockResolvedValue(null),
+    hvals: jest.fn().mockResolvedValue([]),
     eval: create,
     hgetall: jest.fn(() => jobHashFromCreationCall(create.mock.calls[0])),
     sadd: jest.fn(async (key: string) => {
@@ -1434,6 +1456,8 @@ describe('retained creation read repair', () => {
   };
   const client = (read: jest.Mock, add = jest.fn().mockResolvedValue(1)) => ({
     isCluster: true,
+    get: jest.fn().mockResolvedValue(null),
+    hvals: jest.fn().mockResolvedValue([]),
     hgetall: read,
     sadd: add,
     srem: jest.fn().mockResolvedValue(1),

@@ -196,6 +196,10 @@ const file: Schema<IMongoFile> = new Schema(
       type: String,
       index: true,
     },
+    retentionAcceptedAt: { type: Date },
+    retentionRevision: { type: Number },
+    deletionRequestedAt: { type: Date },
+    deletionCompletedAt: { type: Date },
     expiredAt: {
       /* Retention deadline for persisted files. The file sweep deletes the
        * backing storage first, then removes this metadata record. */
@@ -219,7 +223,9 @@ const file: Schema<IMongoFile> = new Schema(
   },
 );
 
+file.index({ tenantId: 1, file_id: 1 }, { unique: true, name: 'file_identity' });
 file.index({ expiredAt: 1 });
+file.index({ deletionCompletedAt: 1, deletionRequestedAt: 1, deletionRetryAt: 1 });
 file.index(
   { user: 1, tenantId: 1, context: 1, _id: -1 },
   { name: 'project_file_picker', partialFilterExpression: { embedded: true } },

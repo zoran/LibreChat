@@ -10,7 +10,7 @@ const Container = ({ children, message }: { children: React.ReactNode; message?:
   >
     {message?.isCreatedByUser === true && (
       <>
-        <MessageQuotes quotes={message.quotes} />
+        <MessageQuotes quotes={message.quotes} messageVersion={message.__v} />
         <Files message={message} />
         <SkillPills skills={message.alwaysAppliedSkills} source="always-apply" />
         <SkillPills skills={message.manualSkills} source="manual" />

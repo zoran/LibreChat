@@ -1,5 +1,7 @@
 import { logger } from '@librechat/data-schemas';
 import type { TFile, TPendingSteer } from 'librechat-data-provider';
+import type { QuoteSourceRef } from 'librechat-data-provider';
+import { normalizeReferencedQuoteSources } from '../utils/quotes';
 import { getReferencedQuotes } from '../utils/quotes';
 
 /** Immutable user-visible payload a parked steer recovery is allowed to submit. */
@@ -13,6 +15,7 @@ export interface RecoveredSteerPayload {
    * same recoverySteerId with altered or missing quotes must not consume the
    * parked source. Empty when the source carried none. */
   quotes: string[];
+  quoteSourceRefs?: Array<QuoteSourceRef | null>;
 }
 
 const recoveryFailureMessages = {
@@ -80,6 +83,7 @@ export function buildRecoveredSteerPayload(
   text: unknown,
   files: unknown,
   quotes?: unknown,
+  quoteSourceRefs?: unknown,
 ): RecoveredSteerPayload | null {
   if (typeof text !== 'string') {
     return null;
@@ -88,7 +92,19 @@ export function buildRecoveredSteerPayload(
   if (fileIds == null) {
     return null;
   }
-  return { text, fileIds, quotes: getReferencedQuotes(quotes) ?? [] };
+  try {
+    const normalized = normalizeReferencedQuoteSources(quotes, quoteSourceRefs);
+    return {
+      text,
+      fileIds,
+      quotes: normalized.quotes,
+      ...(normalized.quoteSourceRefs.some((ref) => ref != null) && {
+        quoteSourceRefs: normalized.quoteSourceRefs,
+      }),
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function isRecoveredSteerPayload(value: unknown): value is RecoveredSteerPayload {
@@ -96,6 +112,11 @@ export function isRecoveredSteerPayload(value: unknown): value is RecoveredSteer
     return false;
   }
   const payload = value as Partial<RecoveredSteerPayload>;
+  try {
+    normalizeReferencedQuoteSources(payload.quotes, payload.quoteSourceRefs);
+  } catch {
+    return false;
+  }
   return (
     typeof payload.text === 'string' &&
     Array.isArray(payload.fileIds) &&
@@ -108,7 +129,7 @@ export function isRecoveredSteerPayload(value: unknown): value is RecoveredSteer
 }
 
 export function recoveredSteerPayloadMatches(
-  item: Pick<TPendingSteer, 'text' | 'files' | 'quotes'>,
+  item: Pick<TPendingSteer, 'text' | 'files' | 'quotes' | 'quoteSourceRefs'>,
   expected: RecoveredSteerPayload,
 ): boolean {
   const fileIds = canonicalRecoveryFileIds(item.files);
@@ -119,6 +140,12 @@ export function recoveredSteerPayloadMatches(
     fileIds.length === expected.fileIds.length &&
     fileIds.every((id, index) => id === expected.fileIds[index]) &&
     itemQuotes.length === expected.quotes.length &&
+    JSON.stringify(
+      normalizeReferencedQuoteSources(item.quotes, item.quoteSourceRefs).quoteSourceRefs,
+    ) ===
+      JSON.stringify(
+        normalizeReferencedQuoteSources(expected.quotes, expected.quoteSourceRefs).quoteSourceRefs,
+      ) &&
     itemQuotes.every((quote, index) => quote === expected.quotes[index])
   );
 }

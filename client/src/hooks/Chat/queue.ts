@@ -31,6 +31,7 @@ export type PendingSteer = {
    *  merges them into the injected turn); kept on the chip so a steer that
    *  never injects restores onto the queued item with them intact. */
   quotes?: string[];
+  quoteSourceRefs?: TMessage['quoteSourceRefs'];
   /** Manual skill picks, carried for restoration only (a skill pick
    *  configures a NEW turn's run, so it never rides the steer POST). */
   manualSkills?: string[];
@@ -102,6 +103,7 @@ export type QueuedMessage = {
   /** Quote chips consumed from the composer at enqueue time; passed to `ask`
    *  as `overrideQuotes` on drain so they pair with THIS message. */
   quotes?: string[];
+  quoteSourceRefs?: TMessage['quoteSourceRefs'];
   /** Manual skill picks consumed from the composer at enqueue time; passed
    *  to `ask` as `overrideManualSkills` on drain. */
   manualSkills?: string[];

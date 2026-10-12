@@ -38,7 +38,13 @@ const rect = ({
 
 function Quotes() {
   const quotes = useRecoilValue(store.pendingQuotesByConvoId(CONVO_ID));
-  return <output data-testid="quotes">{JSON.stringify(quotes)}</output>;
+  const draft = useRecoilValue(store.pendingQuoteDraftByConvoId(CONVO_ID));
+  return (
+    <>
+      <output data-testid="quotes">{JSON.stringify(quotes)}</output>
+      <output data-testid="quote-refs">{JSON.stringify(draft.quoteSourceRefs)}</output>
+    </>
+  );
 }
 
 function pointer(target: Document | HTMLElement, type: string) {
@@ -50,6 +56,56 @@ function pointer(target: Document | HTMLElement, type: string) {
 describe('QuoteButton', () => {
   afterEach(() => {
     window.getSelection()?.removeAllRanges();
+  });
+
+  it('captures the precise quote version and rejects selections crossing body and quote fields', () => {
+    const bodyText = 'Independent question';
+    const quoteText = 'Dependent quote';
+    const original = Range.prototype.getBoundingClientRect;
+    Object.defineProperty(Range.prototype, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => rect({ top: 100, bottom: 120, left: 100, right: 180 }),
+    });
+    try {
+      render(
+        <RecoilRoot>
+          <div id="mixed-source" className="message-render">
+            <span data-testid="own-body">{bodyText}</span>
+            <div data-quote-index="0" data-quote-message-version="7">
+              <span data-testid="source-quote">{quoteText}</span>
+            </div>
+          </div>
+          <Quotes />
+          <QuoteButton conversationId={CONVO_ID} />
+        </RecoilRoot>,
+      );
+      const body = screen.getByTestId('own-body').firstChild!;
+      const quoted = screen.getByTestId('source-quote').firstChild!;
+      const range = document.createRange();
+      range.setStart(body, 0);
+      range.setEnd(quoted, quoted.textContent!.length);
+      window.getSelection()?.addRange(range);
+      fireEvent.mouseUp(document);
+      const button = screen.getByTestId('add-to-chat-button');
+      expect(button).not.toBeVisible();
+      window.getSelection()?.removeAllRanges();
+      range.selectNodeContents(quoted);
+      window.getSelection()?.addRange(range);
+      fireEvent.mouseUp(document);
+      expect(button).toBeVisible();
+      fireEvent.click(button);
+      expect(screen.getByTestId('quotes')).toHaveTextContent('["Dependent quote"]');
+      expect(screen.getByTestId('quote-refs')).toHaveTextContent(
+        '[{"messageId":"mixed-source","quoteIndex":0,"messageVersion":7}]',
+      );
+    } finally {
+      if (original)
+        Object.defineProperty(Range.prototype, 'getBoundingClientRect', {
+          configurable: true,
+          value: original,
+        });
+      else delete (Range.prototype as Partial<Range>).getBoundingClientRect;
+    }
   });
 
   it('shows, moves, and dismisses selections without React commits, then commits a touch quote', () => {
@@ -73,7 +129,9 @@ describe('QuoteButton', () => {
       const onRender = jest.fn();
       render(
         <RecoilRoot>
-          <div className="message-render">{SELECTED_TEXT}</div>
+          <div id="source-1" className="message-render">
+            {SELECTED_TEXT}
+          </div>
           <textarea id={mainTextareaId} />
           <Quotes />
           <Profiler id="quote-button" onRender={onRender}>
@@ -136,6 +194,7 @@ describe('QuoteButton', () => {
       pointer(button, 'pointerup');
       expect(button).not.toBeVisible();
       expect(screen.getByTestId('quotes')).toHaveTextContent('["Selected"]');
+      expect(screen.getByTestId('quote-refs')).toHaveTextContent('[{"messageId":"source-1"}]');
       expect(screen.getByRole('textbox')).toHaveFocus();
     } finally {
       jest.useRealTimers();
@@ -174,7 +233,7 @@ describe('QuoteButton', () => {
       try {
         render(
           <RecoilRoot>
-            <div className="message-render" style={{ overflow: 'auto' }}>
+            <div id="source-2" className="message-render" style={{ overflow: 'auto' }}>
               {codeFirst ? (
                 <>
                   <pre style={{ overflowX: 'auto' }}>
@@ -287,7 +346,7 @@ describe('QuoteButton', () => {
     try {
       render(
         <RecoilRoot>
-          <div className="message-render" style={{ overflow: 'auto' }}>
+          <div id="source-3" className="message-render" style={{ overflow: 'auto' }}>
             <pre style={{ overflowX: 'auto' }}>
               <code>{codeLine}</code>
             </pre>
@@ -369,7 +428,9 @@ describe('QuoteButton lifecycle', () => {
   function setup() {
     const content = (conversationId: string) => (
       <RecoilRoot>
-        <div className="message-render">{SELECTED_TEXT}</div>
+        <div id="source-4" className="message-render">
+          {SELECTED_TEXT}
+        </div>
         <textarea id={mainTextareaId} />
         <Quotes />
         <QuoteButton conversationId={conversationId} />

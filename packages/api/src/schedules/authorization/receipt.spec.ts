@@ -22,6 +22,7 @@ import { executionFixture, readTool } from './execution.helper';
 import { resolveScheduleMCPCompletion } from './continuation';
 import { retainScheduleMCPCompletion } from './continuation';
 import { createScheduleMCPConsentService } from './service';
+import { sanitizeJobMetadata } from '~/stream/metadata';
 import { createMCPRequestContext } from '~/mcp/request';
 import { createScheduledMCPRunPolicy } from './run';
 import { ScheduledMCPPolicyError } from './policy';
@@ -49,7 +50,9 @@ beforeEach(async () => {
   jest.spyOn(GenerationJobManager, 'getJobStore').mockReturnValue(store);
   jest
     .spyOn(GenerationJobManager, 'updateMetadata')
-    .mockImplementation((id, patch, epoch) => store.updateJob(id, patch, epoch));
+    .mockImplementation((id, patch, epoch) =>
+      store.updateJob(id, sanitizeJobMetadata(patch), epoch),
+    );
 });
 afterEach(async () => {
   jest.restoreAllMocks();

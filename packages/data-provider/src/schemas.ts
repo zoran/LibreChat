@@ -929,7 +929,21 @@ const agentFadingTierSchema = z.object({
   masked: z.boolean(),
 });
 
+/** Untrusted field reference parallel to one quoted excerpt. */
+export const quoteSourceRefSchema = z
+  .object({
+    messageId: z.string().min(1),
+    quoteIndex: z.number().int().nonnegative().optional(),
+    messageVersion: z.number().int().nonnegative().optional(),
+  })
+  .refine((ref) => ref.quoteIndex == null || ref.messageVersion != null, {
+    message: 'A quote index requires its message version',
+  });
+export type QuoteSourceRef = z.infer<typeof quoteSourceRefSchema>;
+
 export const tMessageSchema = z.object({
+  __v: z.number().int().nonnegative().optional(),
+  sourceContentRemovedAt: z.string().optional(),
   messageId: z.string(),
   endpoint: z.string().optional(),
   clientId: z.string().nullable().optional(),
@@ -1028,6 +1042,7 @@ export const tMessageSchema = z.object({
    * request time and counted in the user message token count.
    */
   quotes: z.array(z.string()).optional(),
+  quoteSourceRefs: z.array(quoteSourceRefSchema.nullable()).max(10).optional(),
   /** Request-scoped reasoning selection that produced this user turn. */
   reasoningOverride: reasoningOverrideSchema.optional(),
 });

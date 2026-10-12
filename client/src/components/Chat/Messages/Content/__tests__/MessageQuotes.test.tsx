@@ -8,6 +8,19 @@ jest.mock('~/hooks', () => ({
 import MessageQuotes from '../MessageQuotes';
 
 describe('MessageQuotes', () => {
+  it('exposes exact quote indices and the server message version without changing text', () => {
+    const { rerender } = render(
+      <MessageQuotes quotes={['independent', 'derived']} messageVersion={7} />,
+    );
+    const items = screen.getAllByRole('listitem');
+    expect(items[0]).toHaveAttribute('data-quote-index', '0');
+    expect(items[1]).toHaveAttribute('data-quote-index', '1');
+    expect(items[1]).toHaveAttribute('data-quote-message-version', '7');
+    rerender(<MessageQuotes quotes={['independent']} messageVersion={8} />);
+    expect(screen.getByRole('listitem')).toHaveTextContent('independent');
+    expect(screen.getByRole('listitem')).toHaveAttribute('data-quote-message-version', '8');
+  });
+
   it('renders nothing when quotes is undefined', () => {
     const { container } = render(<MessageQuotes />);
     expect(container.firstChild).toBeNull();

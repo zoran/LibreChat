@@ -73,7 +73,11 @@ export const buildRevealedMessage = (
     error: false,
     clientTimestamp: reveal.revealedAt,
     ...(reveal.files != null && reveal.files.length > 0 && { files: reveal.files }),
-    ...(reveal.quotes != null && reveal.quotes.length > 0 && { quotes: reveal.quotes }),
+    ...(reveal.quotes != null &&
+      reveal.quotes.length > 0 && {
+        quotes: reveal.quotes,
+        quoteSourceRefs: reveal.quoteSourceRefs,
+      }),
     ...(reveal.manualSkills != null &&
       reveal.manualSkills.length > 0 && { manualSkills: reveal.manualSkills }),
   }) as TMessage;
@@ -181,7 +185,8 @@ export default function useQueuedTurnReveal(
         queuePredecessorCreatedAt: item.expectedPredecessorCreatedAt,
         text: item.text,
         ...(item.files != null && item.files.length > 0 && { files: item.files }),
-        ...(item.quotes != null && item.quotes.length > 0 && { quotes: item.quotes }),
+        ...(item.quotes != null &&
+          item.quotes.length > 0 && { quotes: item.quotes, quoteSourceRefs: item.quoteSourceRefs }),
         ...(item.manualSkills != null &&
           item.manualSkills.length > 0 && { manualSkills: item.manualSkills }),
         revealedAt: new Date().toISOString(),

@@ -16,8 +16,7 @@ import {
   dedupeSteersById,
   appendAppliedSteerIds,
   collectAppliedSteerIds,
-  collectDroppedSteerQuotes,
-  mergeRestagedQuotes,
+  collectDroppedSteerQuoteDraft,
   applyPendingAction,
   carriedSteerContext,
   getBranchSiblingIndexesForTarget,
@@ -442,15 +441,12 @@ export default function useResumeOnLoad(
         /** Chips settled by quote-less applied parts hold the only copy of
          *  their excerpts (a pre-quotes server injected the words bare) —
          *  re-stage them as composer chips before the removal below. */
-        const droppedQuotes = collectDroppedSteerQuotes(
-          values,
-          snapshot.getLoadable(store.pendingSteersByConvoId(activeConversationId)).getValue(),
+        const quoteChips = snapshot
+          .getLoadable(store.pendingSteersByConvoId(activeConversationId))
+          .getValue();
+        set(store.pendingQuoteDraftByConvoId(activeConversationId), (prev) =>
+          collectDroppedSteerQuoteDraft(values, quoteChips, prev),
         );
-        if (droppedQuotes.length > 0) {
-          set(store.pendingQuotesByConvoId(activeConversationId), (prev) =>
-            mergeRestagedQuotes(prev, droppedQuotes),
-          );
-        }
         set(store.appliedSteerIdsByConvoId(activeConversationId), (prev) =>
           appendAppliedSteerIds(prev, ids),
         );

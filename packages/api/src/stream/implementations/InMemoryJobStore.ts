@@ -26,6 +26,7 @@ import type {
   ScheduleProviderOwner,
 } from '~/stream/interfaces/IJobStore';
 import type { EarlyBufferOverflowState } from '../../types/earlyBufferRecovery';
+import type { GenerationSourceRetention } from '../interfaces/IJobStore';
 import type { RecoveredSteerPayload } from '~/stream/SteerRecovery';
 import {
   JobStatusTransitionDeadlineError,
@@ -45,10 +46,16 @@ import {
   recoveredSteerPayloadMatches,
   RecoveredSteerPayloadMismatchError,
 } from '~/stream/SteerRecovery';
+import {
+  redactQuoteRetention,
+  deserializeQuoteRetention,
+  quoteRetentionContext,
+} from '~/files/retention';
+import { sourceRetentionAvailable, sourceSafeJobPatch } from '../interfaces/IJobStore';
 import { retainedScheduleReceipt } from '~/stream/internal/scheduleReceipts';
+import { toPendingSteer, toRetainedSteer } from '~/stream/SteeringLifecycle';
 import { createCheckpointNamespace } from '~/stream/checkpoints';
 import { retainScheduleMCPFailure } from '../scheduleFailure';
-import { toPendingSteer } from '~/stream/SteeringLifecycle';
 
 /** Recovery window for parked steers (mirrors Redis's completed-job TTL). */
 export const PARKED_STEERS_TTL_MS: number = 5 * 60 * 1000;
@@ -631,7 +638,14 @@ export class InMemoryJobStore implements IJobStoreV2 {
         : previousJob.userId;
       if (previousUserKey !== userKey) {
         const previousUserJobs = this.userJobMap.get(previousUserKey);
-        previousUserJobs?.delete(streamId);
+        if (
+          !this.recoveryOwners(streamId).some(
+            (owner) =>
+              (owner.tenantId ? `${owner.tenantId}:${owner.userId}` : owner.userId) ===
+              previousUserKey,
+          )
+        )
+          previousUserJobs?.delete(streamId);
         if (previousUserJobs?.size === 0) {
           this.userJobMap.delete(previousUserKey);
         }
@@ -735,6 +749,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
     }
     // Plain field writer. Membership-aware status transitions
     // (running ⇄ requires_action) go solely through transitionStatus.
+    updates = sourceSafeJobPatch(job, updates);
     const patch = retainScheduleMCPFailure(job, updates);
     Object.assign(job, patch, retainedScheduleReceipt(job, updates));
   }
@@ -780,6 +795,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
     providerExecutionId: string,
   ): Promise<boolean> {
     const job = this.jobs.get(streamId);
+    if (job && !sourceRetentionAvailable(job)) return false;
     if (
       job?.createdAt !== expectedCreatedAt ||
       job.providerExecutionId !== providerExecutionId ||
@@ -803,7 +819,8 @@ export class InMemoryJobStore implements IJobStoreV2 {
       return false;
     }
     job.terminalPersistencePending = false;
-    job.finalEvent = finalEvent;
+    if (sourceRetentionAvailable(job)) job.finalEvent = finalEvent;
+    else delete job.finalEvent;
     return true;
   }
 
@@ -833,11 +850,15 @@ export class InMemoryJobStore implements IJobStoreV2 {
       }
       this.parkQueuedSteers(streamId, job, Date.now());
     }
+    if (!sourceRetentionAvailable(job) && !['complete', 'error', 'aborted'].includes(args.to))
+      return false;
     job.status = args.to;
-    const patch = retainScheduleMCPFailure(job, args.patch ?? {});
+    const patch = retainScheduleMCPFailure(job, sourceSafeJobPatch(job, args.patch ?? {}));
     const receipt = retainedScheduleReceipt(job, args.patch ?? {}, args.clear ?? []);
     Object.assign(job, patch);
-    for (const field of args.clear ?? []) delete job[field];
+    for (const field of args.clear ?? []) {
+      if (!String(field).startsWith('sourceRetention')) delete job[field];
+    }
     Object.assign(job, receipt);
     const receiptEntries = this.steerReceipts.get(streamId)?.values() ?? [];
     if (args.to === 'requires_action' && args.patch?.pendingAction?.expiresAt == null) {
@@ -1059,12 +1080,148 @@ export class InMemoryJobStore implements IJobStoreV2 {
     this.idempotencyClaims.delete(key);
   }
 
+  private recoveryOwners(streamId: string): Array<{ userId: string; tenantId?: string }> {
+    const owners: Array<{ userId: string; tenantId?: string }> = [];
+    const parked = this.parkedSteers.get(streamId);
+    if (parked && parked.expiresAt > Date.now()) owners.push(JSON.parse(parked.payload));
+    for (const entry of this.steerReceipts.get(streamId)?.values() ?? []) {
+      if (entry.expiresAt > Date.now()) owners.push(entry.receipt);
+    }
+    return owners;
+  }
+
+  async purgeFileSourceRecovery(
+    streamId: string,
+    owner: { userId: string; tenantId?: string },
+    sourceFileIds: readonly string[],
+  ): Promise<boolean> {
+    const ids = new Set(sourceFileIds);
+    const belongs = (value: { userId: string; tenantId?: string }) =>
+      value.userId === owner.userId &&
+      (value.tenantId ?? undefined) === (owner.tenantId ?? undefined);
+    const redact = (item?: SteerQueueItem) => {
+      if (item?.quoteRetention) {
+        item.quoteRetention = redactQuoteRetention(item.quoteRetention, sourceFileIds);
+        item.quotes = item.quoteRetention.quotes;
+        item.quoteSourceRefs = item.quoteRetention.quoteSourceRefs;
+      }
+      if (item?.files)
+        item.files = item.files.filter((file) => !file.file_id || !ids.has(file.file_id));
+    };
+    const parked = this.parkedSteers.get(streamId);
+    if (parked) {
+      const value = JSON.parse(parked.payload);
+      if (belongs(value)) {
+        for (const item of value.steers ?? []) redact(item);
+        parked.payload = JSON.stringify(value);
+      }
+    }
+    for (const entry of this.steerReceipts.get(streamId)?.values() ?? []) {
+      if (belongs(entry.receipt)) redact(entry.receipt.item);
+    }
+    return true;
+  }
+
+  async bindSourceRetention(
+    streamId: string,
+    epoch: number,
+    context: GenerationSourceRetention,
+  ): Promise<boolean> {
+    const job = this.jobs.get(streamId);
+    if (
+      !job ||
+      job.createdAt !== epoch ||
+      !sourceRetentionAvailable(job) ||
+      job.sourceRetentionPurged ||
+      context.sourceExpiresAt <= Date.now() ||
+      !Number.isFinite(context.sourceExpiresAt) ||
+      !context.sourceFileIds.length
+    )
+      return false;
+    job.sourceRetention = {
+      sourceFileIds: [
+        ...new Set([...(job.sourceRetention?.sourceFileIds ?? []), ...context.sourceFileIds]),
+      ].sort(),
+      sourceExpiresAt: Math.min(
+        job.sourceRetention?.sourceExpiresAt ?? Infinity,
+        context.sourceExpiresAt,
+      ),
+    };
+    return true;
+  }
+
+  async revokeSourceRetention(streamId: string, epoch: number): Promise<boolean> {
+    const job = this.jobs.get(streamId);
+    if (!job || job.createdAt !== epoch || !job.sourceRetention) return false;
+    job.sourceRetentionRevokedAt ??= Date.now();
+    return true;
+  }
+
+  async purgeSourceRetention(streamId: string, epoch: number): Promise<boolean> {
+    const job = this.jobs.get(streamId);
+    if (
+      !job ||
+      job.createdAt !== epoch ||
+      !job.sourceRetention ||
+      job.providerDrained === false ||
+      job.terminalPersistencePending ||
+      job.terminalHostActionPending ||
+      job.status === 'running' ||
+      job.status === 'requires_action'
+    )
+      return false;
+    const parked = this.parkedSteers.get(streamId);
+    let payload: { steers?: SteerQueueItem[] } | undefined;
+    try {
+      payload = parked ? JSON.parse(parked.payload) : undefined;
+    } catch {
+      return false;
+    }
+    if (job.sourceRetentionRevokedAt != null || job.sourceRetention.sourceExpiresAt <= Date.now()) {
+      const ids = new Set(job.sourceRetention.sourceFileIds);
+      const redact = (item?: SteerQueueItem) => {
+        if (item?.files)
+          item.files = item.files.filter((file) => !file.file_id || !ids.has(file.file_id));
+      };
+      for (const item of payload?.steers ?? []) redact(item);
+      for (const entry of this.steerReceipts.get(streamId)?.values() ?? [])
+        redact(entry.receipt.item);
+      if (parked && payload) parked.payload = JSON.stringify(payload);
+    }
+    // Parked steers are independent user submissions, not generated output.
+    const keep = new Set([
+      'streamId',
+      'userId',
+      'tenantId',
+      'conversationId',
+      'createdAt',
+      'status',
+      'completedAt',
+      'sourceRetention',
+      'sourceRetentionRevokedAt',
+      'providerExecutionId',
+      'providerDrained',
+    ]);
+    for (const key of Object.keys(job))
+      if (!keep.has(key)) delete (job as unknown as Record<string, unknown>)[key];
+    job.sourceRetentionPurged = true;
+    this.contentState.delete(streamId);
+    return true;
+  }
+
   async deleteJob(streamId: string, expectedCreatedAt?: number): Promise<boolean> {
     const job = this.jobs.get(streamId);
     if (!job || (expectedCreatedAt != null && job.createdAt !== expectedCreatedAt)) {
       return false;
     }
 
+    if (
+      job.sourceRetention &&
+      !job.sourceRetentionPurged &&
+      job.status !== 'running' &&
+      job.status !== 'requires_action'
+    )
+      return this.purgeSourceRetention(streamId, job.createdAt);
     this.retainGenerationEpoch(streamId, job.createdAt);
     this.jobs.delete(streamId);
     this.contentState.delete(streamId);
@@ -1074,7 +1231,14 @@ export class InMemoryJobStore implements IJobStoreV2 {
     this.closedSteerQueues.delete(streamId);
     const userKey = job.tenantId ? `${job.tenantId}:${job.userId}` : job.userId;
     const userJobs = this.userJobMap.get(userKey);
-    userJobs?.delete(streamId);
+    if (
+      !this.recoveryOwners(streamId).some(
+        (owner) =>
+          owner.userId === job.userId &&
+          (owner.tenantId ?? undefined) === (job.tenantId ?? undefined),
+      )
+    )
+      userJobs?.delete(streamId);
     if (userJobs?.size === 0) {
       this.userJobMap.delete(userKey);
     }
@@ -1367,6 +1531,19 @@ export class InMemoryJobStore implements IJobStoreV2 {
     for (const { streamId, createdAt } of toDelete) {
       await this.deleteJob(streamId, createdAt);
     }
+    for (const [ownerKey, streams] of this.userJobMap) {
+      for (const streamId of streams) {
+        if (
+          !this.jobs.has(streamId) &&
+          !this.recoveryOwners(streamId).some(
+            (owner) =>
+              (owner.tenantId ? `${owner.tenantId}:${owner.userId}` : owner.userId) === ownerKey,
+          )
+        )
+          streams.delete(streamId);
+      }
+      if (!streams.size) this.userJobMap.delete(ownerKey);
+    }
 
     if (staleRunning > 0) {
       logger.warn(
@@ -1461,7 +1638,13 @@ export class InMemoryJobStore implements IJobStoreV2 {
     const streamIds = new Set(ownerKeys.flatMap((key) => [...(this.userJobMap.get(key) ?? [])]));
     return [...streamIds].filter((streamId) => {
       const job = this.jobs.get(streamId);
-      return job?.userId === userId && (job.tenantId == null || job.tenantId === tenantId);
+      return (
+        (job?.userId === userId && (job.tenantId == null || job.tenantId === tenantId)) ||
+        this.recoveryOwners(streamId).some(
+          (owner) =>
+            owner.userId === userId && (owner.tenantId ?? undefined) === (tenantId ?? undefined),
+        )
+      );
     });
   }
 
@@ -1485,7 +1668,13 @@ export class InMemoryJobStore implements IJobStoreV2 {
         // A same-stream replacement may move from a legacy user scope into a
         // tenant-qualified scope. Never expose/count the replacement through
         // stale predecessor membership.
-        trackedIds.delete(streamId);
+        if (
+          !this.recoveryOwners(streamId).some(
+            (owner) =>
+              (owner.tenantId ? `${owner.tenantId}:${owner.userId}` : owner.userId) === userKey,
+          )
+        )
+          trackedIds.delete(streamId);
         continue;
       }
       // Include running jobs and jobs paused for human review (e.g. tool approval).
@@ -1538,6 +1727,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
    * Uses WeakRef to allow garbage collection when graph is no longer needed.
    */
   setGraph(streamId: string, graph: StandardGraph, expectedCreatedAt?: number): void {
+    if (!sourceRetentionAvailable(this.jobs.get(streamId))) return;
     if (expectedCreatedAt != null && this.jobs.get(streamId)?.createdAt !== expectedCreatedAt) {
       return;
     }
@@ -1561,6 +1751,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
     contentParts: Agents.MessageContentComplex[],
     expectedCreatedAt?: number,
   ): void {
+    if (!sourceRetentionAvailable(this.jobs.get(streamId))) return;
     if (expectedCreatedAt != null && this.jobs.get(streamId)?.createdAt !== expectedCreatedAt) {
       return;
     }
@@ -1623,6 +1814,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
     reconstructedEventCount?: number;
     durableEventCount?: number;
   } | null> {
+    if (!sourceRetentionAvailable(this.jobs.get(streamId))) return null;
     if (expectedCreatedAt != null && this.jobs.get(streamId)?.createdAt !== expectedCreatedAt) {
       return null;
     }
@@ -1738,6 +1930,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
    * Uses WeakRef - may return empty if graph has been GC'd.
    */
   async getRunSteps(streamId: string, expectedCreatedAt?: number): Promise<Agents.RunStep[]> {
+    if (!sourceRetentionAvailable(this.jobs.get(streamId))) return [];
     if (expectedCreatedAt != null && this.jobs.get(streamId)?.createdAt !== expectedCreatedAt) {
       return [];
     }
@@ -1764,6 +1957,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
     if (!job || (expectedCreatedAt != null && job.createdAt !== expectedCreatedAt)) {
       return false;
     }
+    if (!sourceRetentionAvailable(job) || job.sourceRetentionPurged) return false;
     if (job.status !== 'running' && job.status !== 'requires_action') {
       return false;
     }
@@ -1845,11 +2039,26 @@ export class InMemoryJobStore implements IJobStoreV2 {
     expectedCreatedAt?: number,
   ): Promise<SteerEnqueueVersionedResult> {
     const job = this.jobs.get(streamId);
-    if (!job || job.status !== 'running' || this.closedSteerQueues.has(streamId)) {
+    if (
+      !job ||
+      !sourceRetentionAvailable(job) ||
+      job.status !== 'running' ||
+      this.closedSteerQueues.has(streamId)
+    ) {
       return STEER_ENQUEUE_NOT_RUNNING;
     }
     if (expectedCreatedAt != null && job.createdAt !== expectedCreatedAt) {
       return STEER_ENQUEUE_NOT_RUNNING;
+    }
+    if (item.quoteRetention) {
+      const context = quoteRetentionContext(deserializeQuoteRetention(item.quoteRetention));
+      if (
+        context &&
+        (!job.sourceRetention ||
+          context.sourceFileIds.some((id) => !job.sourceRetention!.sourceFileIds.includes(id)) ||
+          context.sourceExpiresAt.getTime() <= Date.now())
+      )
+        return STEER_ENQUEUE_NOT_RUNNING;
     }
     let queue = this.steerQueues.get(streamId);
     if (!queue) {
@@ -1871,6 +2080,8 @@ export class InMemoryJobStore implements IJobStoreV2 {
       (job.steerQuotesExecutionId == null || job.steerQuotesExecutionId !== job.providerExecutionId)
     ) {
       delete persisted.quotes;
+      delete persisted.quoteSourceRefs;
+      delete persisted.quoteRetention;
     }
     queue.push(persisted);
     return { item: { ...persisted }, position: queue.length };
@@ -1958,6 +2169,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
     const job = this.jobs.get(streamId);
     if (
       !job ||
+      !sourceRetentionAvailable(job) ||
       job.status !== 'running' ||
       this.closedSteerQueues.has(streamId) ||
       (expectedCreatedAt != null && job.createdAt !== expectedCreatedAt)
@@ -1966,6 +2178,16 @@ export class InMemoryJobStore implements IJobStoreV2 {
     }
     if (!usesReceiptSafeProtocol(job)) {
       return this.enqueueSteerVersioned(streamId, item, wantsPreempt, expectedCreatedAt);
+    }
+    if (item.quoteRetention) {
+      const context = quoteRetentionContext(deserializeQuoteRetention(item.quoteRetention));
+      if (
+        context &&
+        (!job.sourceRetention ||
+          context.sourceFileIds.some((id) => !job.sourceRetention!.sourceFileIds.includes(id)) ||
+          context.sourceExpiresAt.getTime() <= Date.now())
+      )
+        return STEER_ENQUEUE_NOT_RUNNING;
     }
     let queue = this.steerQueues.get(streamId);
     if (!queue) {
@@ -2000,6 +2222,8 @@ export class InMemoryJobStore implements IJobStoreV2 {
       (job.steerQuotesExecutionId == null || job.steerQuotesExecutionId !== job.providerExecutionId)
     ) {
       delete persisted.quotes;
+      delete persisted.quoteSourceRefs;
+      delete persisted.quoteRetention;
     }
     queue.push(persisted);
     const receipt: SteerReceipt = {
@@ -2343,7 +2567,12 @@ export class InMemoryJobStore implements IJobStoreV2 {
     expectedCreatedAt?: number,
   ): Promise<SteerArmResult> {
     const job = this.jobs.get(streamId);
-    if (!job || job.status !== 'running' || this.closedSteerQueues.has(streamId)) {
+    if (
+      !job ||
+      !sourceRetentionAvailable(job) ||
+      job.status !== 'running' ||
+      this.closedSteerQueues.has(streamId)
+    ) {
       return { outcome: 'missing' };
     }
     if (expectedCreatedAt != null && job.createdAt !== expectedCreatedAt) {
@@ -2632,7 +2861,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
       }
     }
     const seen = new Set<string>();
-    const merged = [...prior, ...items.map(toPendingSteer)].filter((item) => {
+    const merged = [...prior, ...items.map(toRetainedSteer)].filter((item) => {
       if (seen.has(item.steerId)) {
         return false;
       }

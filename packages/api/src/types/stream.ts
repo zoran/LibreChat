@@ -4,6 +4,8 @@ import type {
 } from '@librechat/data-schemas';
 import type { ScheduleMCPOutcome, ScheduledMCPIdentity } from 'librechat-data-provider';
 import type { Agents, UserSubmittedMessageFieldPath } from 'librechat-data-provider';
+import type { SourceRetentionContext } from '@librechat/data-schemas';
+import type { QuoteSourceRef } from 'librechat-data-provider';
 import type { EventEmitter } from 'events';
 import type {
   AgentEventDetachedTerminalEvidence,
@@ -13,10 +15,12 @@ import type {
 import type { ActivityPhaseSnapshot } from '~/agents/activityPhases/runtime';
 import type { EarlyBufferOverflowState } from './earlyBufferRecovery';
 import type { ResolvedAskUserQuestion } from '../agents/hitl/resume';
+import type { SerializedQuoteRetention } from '~/files/retention';
 import type { MCPRuntimeRequestBody } from '../mcp/types';
 import type { ServerSentEvent } from './events';
 
 export interface GenerationJobMetadata {
+  sourceRetention?: SourceRetentionContext;
   userId: string;
   tenantId?: string;
   conversationId?: string;
@@ -27,7 +31,11 @@ export interface GenerationJobMetadata {
   generationProtocolVersion?: 1 | 2;
   earlyBufferOverflow?: EarlyBufferOverflowState;
   /** User message data for rebuilding submission on reconnect */
-  userMessage?: Agents.UserMessageMeta;
+  userMessage?: Agents.UserMessageMeta & {
+    quotes?: string[];
+    quoteSourceRefs?: Array<QuoteSourceRef | null>;
+    quoteRetention?: SerializedQuoteRetention;
+  };
   /** Response message ID for tracking */
   responseMessageId?: string;
   /** Whether this generation replaces an existing assistant branch. */

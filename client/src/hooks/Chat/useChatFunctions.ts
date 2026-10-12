@@ -319,13 +319,14 @@ export default function useChatFunctions({
    */
   const drainPendingQuotes = useRecoilCallback(
     ({ snapshot, reset }) =>
-      (convoId: string): string[] => {
-        const loadable = snapshot.getLoadable(store.pendingQuotesByConvoId(convoId));
-        const quotes = loadable.state === 'hasValue' ? (loadable.contents as string[]) : [];
-        if (quotes.length > 0) {
-          reset(store.pendingQuotesByConvoId(convoId));
+      (convoId: string) => {
+        const loadable = snapshot.getLoadable(store.pendingQuoteDraftByConvoId(convoId));
+        const draft =
+          loadable.state === 'hasValue' ? loadable.contents : { quotes: [], quoteSourceRefs: [] };
+        if (draft.quotes.length > 0) {
+          reset(store.pendingQuoteDraftByConvoId(convoId));
         }
-        return quotes;
+        return draft;
       },
     [],
   );
@@ -363,6 +364,7 @@ export default function useChatFunctions({
       targetResponseMessageId,
       overrideManualSkills,
       overrideQuotes,
+      overrideQuoteSourceRefs,
       overrideReasoning,
       addedConvo,
       overrideClientRequestId,
@@ -508,11 +510,13 @@ export default function useChatFunctions({
      */
     const quotesSupported = !isAssistantsEndpoint(endpoint);
     let quotes: string[] = [];
+    let quoteSourceRefs: TMessage['quoteSourceRefs'];
     if (quotesSupported) {
       if (overrideQuotes != null) {
         quotes = overrideQuotes;
+        quoteSourceRefs = overrideQuoteSourceRefs;
       } else if (!regenerateShaped && !isContinued && !isEdited) {
-        quotes = drainPendingQuotes(conversationId ?? Constants.NEW_CONVO);
+        ({ quotes, quoteSourceRefs } = drainPendingQuotes(conversationId ?? Constants.NEW_CONVO));
       }
     }
     let reasoningOverride = overrideReasoning ?? undefined;
@@ -678,6 +682,7 @@ export default function useChatFunctions({
        * also merges these into the model-facing user text at request time.
        */
       quotes: quotes.length > 0 ? quotes : undefined,
+      quoteSourceRefs: quotes.length > 0 ? quoteSourceRefs : undefined,
       reasoningOverride,
     };
 
@@ -941,6 +946,7 @@ export default function useChatFunctions({
           /** Carry the original user message's quoted excerpts forward so the
            *  regenerated response is sent the same referenced context. */
           overrideQuotes: parentMessage.quotes,
+          overrideQuoteSourceRefs: parentMessage.quoteSourceRefs,
           /** Replay the exact request-scoped reasoning selection used by this turn. */
           overrideReasoning: parentMessage.reasoningOverride ?? null,
         },

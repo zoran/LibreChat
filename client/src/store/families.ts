@@ -15,6 +15,7 @@ import type { EModelEndpoint, TConversation, TSubmission, TPreset } from 'librec
 import type { GenerationProtocolVersion } from '~/data-provider/SSE/protocol';
 import type { TOptionSettings, ExtendedFile } from '~/common';
 import type { PendingSteer } from '~/hooks/Chat/queue';
+import type { PendingQuoteDraft } from '~/utils';
 import {
   clearModelForNonEphemeralAgent,
   createChatSearchParams,
@@ -317,9 +318,33 @@ const pendingManualSkillsByConvoId = atomFamily<string[], string>({
  * textarea read this atom directly so users can see and dismiss each quote
  * before sending.
  */
-const pendingQuotesByConvoId = atomFamily<string[], string>({
+const pendingQuoteDraftByConvoId = atomFamily<PendingQuoteDraft, string>({
+  key: 'pendingQuoteDraftByConvoId',
+  default: { quotes: [], quoteSourceRefs: [] },
+});
+
+/** Preserve the existing scalar read/reset port; provenance writers use the atomic draft. */
+const pendingQuotesByConvoId = selectorFamily<string[], string>({
   key: 'pendingQuotesByConvoId',
-  default: [],
+  get:
+    (id) =>
+    ({ get }) =>
+      get(pendingQuoteDraftByConvoId(id)).quotes,
+  set:
+    (id) =>
+    ({ get, set, reset }, value) => {
+      if (value instanceof DefaultValue) {
+        reset(pendingQuoteDraftByConvoId(id));
+        return;
+      }
+      const previous = get(pendingQuoteDraftByConvoId(id));
+      set(pendingQuoteDraftByConvoId(id), {
+        quotes: value,
+        quoteSourceRefs: value.map((text, index) =>
+          previous.quotes[index] === text ? (previous.quoteSourceRefs[index] ?? null) : null,
+        ),
+      });
+    },
 });
 
 /**
@@ -555,6 +580,7 @@ export default {
   pendingComposerTextByConvoId,
   pendingManualSkillsByConvoId,
   pendingQuotesByConvoId,
+  pendingQuoteDraftByConvoId,
   pendingSteersByConvoId,
   appliedSteerIdsByConvoId,
   acceptedSteerClientIdsByConvoId,

@@ -9,6 +9,7 @@ import {
   getReasoningStateKey,
   pendingReasoningOverrideFamily,
 } from '~/components/Chat/Input/Composer/state';
+import { mergeRestagedQuoteDraft } from '~/utils';
 import store from '~/store';
 
 export interface ComposerRestore {
@@ -71,11 +72,11 @@ export default function useComposerRestore({
   const restoreComposerContext = useRecoilCallback(
     ({ set }) =>
       (context?: QueuedMessageContext) => {
-        const { quotes, manualSkills, reasoningOverride } = context ?? {};
+        const { quotes, quoteSourceRefs, manualSkills, reasoningOverride } = context ?? {};
         if (quotes != null && quotes.length > 0) {
-          set(store.pendingQuotesByConvoId(conversationId), (prev) => [
-            ...new Set([...prev, ...quotes]),
-          ]);
+          set(store.pendingQuoteDraftByConvoId(conversationId), (prev) =>
+            mergeRestagedQuoteDraft(prev, quotes, quoteSourceRefs),
+          );
         }
         if (manualSkills != null && manualSkills.length > 0) {
           set(store.pendingManualSkillsByConvoId(conversationId), (prev) => [

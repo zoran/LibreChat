@@ -370,6 +370,7 @@ const STORED_MESSAGE_HANDLED_PART_PATH_SUFFIXES = new Set([
   '/updated',
   '/steer',
   '/quotes',
+  '/quoteSourceRefs',
   '/error',
   '/image_url',
   '/video_url',

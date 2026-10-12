@@ -1,3 +1,4 @@
+import type { QuoteSourceRef } from '../schemas';
 import type { TFile } from './files';
 import { inputTokensIncludesCache } from '../schemas';
 
@@ -208,6 +209,7 @@ export type TPendingSteer = {
   /** Quoted excerpts steered with the message ("Add to chat" selections);
    *  merged into the model-bound text at the injection boundary. */
   quotes?: string[];
+  quoteSourceRefs?: Array<QuoteSourceRef | null>;
   /** The steer asked to interrupt generation at the next safe boundary —
    *  kept on parked/replayed chips so the "interrupting" label survives. */
   preempt?: boolean;
@@ -232,6 +234,7 @@ export type TSteerAppliedEvent = {
     /** Quoted excerpts steered with the message (mirrors `SteerContentPart`,
      *  which cannot be imported here without a module cycle). */
     quotes?: string[];
+    quoteSourceRefs?: Array<QuoteSourceRef | null>;
   };
   responseMessageId?: string;
   conversationId?: string;

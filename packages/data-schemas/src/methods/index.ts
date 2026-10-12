@@ -1,3 +1,4 @@
+export { FileSourceUnavailableError } from './fileRetention';
 import type { GenerationAdmissionMethods } from '~/types/generationAdmission';
 import type { AuthPersistenceObserver } from './authPersistence';
 export type { AuthPersistenceObserver, AuthContinuationObserver } from './authPersistence';

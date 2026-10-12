@@ -36,6 +36,7 @@ import type {
   ScheduleProviderOwner,
 } from '~/stream/interfaces/IJobStore';
 import type { EarlyBufferOverflowState } from '../../types/earlyBufferRecovery';
+import type { GenerationSourceRetention } from '../interfaces/IJobStore';
 import type { ResolvedAskUserQuestion } from '~/agents/hitl/resume';
 import type { RecoveredSteerPayload } from '~/stream/SteerRecovery';
 import {
@@ -63,8 +64,10 @@ import { parseScheduleMCPCompletion } from '~/schedules/authorization/continuati
 import { instrumentIORedisClient, RedisUseCases } from '~/cache/redisTelemetry';
 import { RecoveredSteerPayloadMismatchError } from '~/stream/SteerRecovery';
 import { SCHEDULE_MCP_FAILURE_PATCH_LUA } from '../scheduleFailure';
+import { sourceRetentionAvailable } from '../interfaces/IJobStore';
 import { createCheckpointNamespace } from '~/stream/checkpoints';
 import { createToolTimingTracker } from '~/agents/toolTiming';
+import { redactQuoteRetention } from '~/files/retention';
 import { evalScript } from '~/cache/redisScript';
 
 const CLIENT_REQUEST_ID_PATTERN = /^[A-Za-z0-9:_-]{1,128}$/;
@@ -151,7 +154,17 @@ function assertCreateIdempotencyArguments(
  *     ...hsetPairs
  *   ]
  */
+/** Constant-time source fence, inside the same atomic write as the content. */
+const SOURCE_RETENTION_LUA =
+  'local function sourceAvailable(key) ' +
+  'if redis.call("HGET", key, "sourceRetentionRevokedAt") or redis.call("HGET", key, "sourceRetentionPurged") == "1" then return false end ' +
+  'local expiry = redis.call("HGET", key, "sourceRetentionExpiresAt") ' +
+  'if not expiry then return true end ' +
+  'local t = redis.call("TIME") return tonumber(expiry) > tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000) end ';
+
 const JOB_CAS_LUA =
+  SOURCE_RETENTION_LUA +
+  'if not sourceAvailable(KEYS[1]) and ARGV[6] ~= "1" then return 0 end ' +
   SCHEDULE_MCP_RECEIPT_LUA +
   SCHEDULE_MEMBERSHIP_INVALIDATE_LUA +
   'if redis.call("HGET", KEYS[1], "status") ~= ARGV[1] then return 0 end ' +
@@ -203,9 +216,10 @@ const JOB_CAS_LUA =
   'local clearReceipt = false local hdelCount = tonumber(ARGV[13]) ' +
   'for i = 14, 13 + hdelCount do if ARGV[i] == "scheduleOutcome" or ARGV[i] == "scheduleOutcomeError" then clearReceipt = true end end ' +
   'local idx = 14 ' +
-  'for i = 1, hdelCount do redis.call("HDEL", KEYS[1], ARGV[idx]) idx = idx + 1 end ' +
+  'for i = 1, hdelCount do if not string.match(ARGV[idx],"^sourceRetention") then redis.call("HDEL", KEYS[1], ARGV[idx]) end idx = idx + 1 end ' +
   'local hset = {} ' +
-  'for i = idx, #ARGV do hset[#hset + 1] = ARGV[i] end ' +
+  'local sourceLive=sourceAvailable(KEYS[1]) local safe={status=true,completedAt=true,terminalPersistencePending=true,terminalPersistenceStartedAt=true,terminalHostActionPending=true,providerDrained=true,providerExecutionId=true,providerExecutionStartedId=true} ' +
+  'for i=idx,#ARGV,2 do if (sourceLive or safe[ARGV[i]]) and ARGV[i] ~= "sourceRetention" and ARGV[i] ~= "sourceRetentionExpiresAt" and ARGV[i] ~= "sourceRetentionRevokedAt" and ARGV[i] ~= "sourceRetentionPurged" then hset[#hset+1]=ARGV[i] hset[#hset+1]=ARGV[i+1] end end ' +
   'local originalReceipt = nil for i = 1, #hset, 2 do if hset[i] == "scheduleOutcomeError" then originalReceipt = hset[i+1] end end ' +
   SCHEDULE_MCP_FAILURE_PATCH_LUA +
   'hset = retainScheduleReceipt(hset, currentReceipt, clearReceipt, originalReceipt) ' +
@@ -218,6 +232,7 @@ const JOB_CAS_LUA =
   'if not terminal and redis.call("HGET", KEYS[1], "status") == "requires_action" then ' +
   'local currentTtl = redis.call("TTL", KEYS[1]) ' +
   'if currentTtl > ttl then ttl = currentTtl end end ' +
+  'if terminal and redis.call("HGET",KEYS[1],"sourceRetention") then ttl=math.max(ttl,tonumber(ARGV[9])) end ' +
   'expireScheduleJob(KEYS[1], ttl) ' +
   'local effectiveReceiptTtl = receiptTtl ' +
   'if not terminal and ttl > effectiveReceiptTtl then effectiveReceiptTtl = ttl end ' +
@@ -246,7 +261,7 @@ const JOB_CAS_LUA =
   'local clientItem = { steerId = item.steerId, text = item.text, createdAt = item.createdAt } ' +
   'if item.clientSteerId then clientItem.clientSteerId = item.clientSteerId end ' +
   'if item.files then clientItem.files = item.files end ' +
-  'if item.quotes then clientItem.quotes = item.quotes end ' +
+  'if item.quotes then clientItem.quotes = item.quotes end if item.quoteSourceRefs then clientItem.quoteSourceRefs=item.quoteSourceRefs end if item.quoteRetention then clientItem.quoteRetention=item.quoteRetention end ' +
   'if item.preempt then clientItem.preempt = item.preempt end ' +
   'if item.preemptRevision then clientItem.preemptRevision = item.preemptRevision end ' +
   'projected[#projected + 1] = clientItem ' +
@@ -527,6 +542,9 @@ const JOB_CREATE_LUA =
   'if itemQuotes ~= nil and not isDenseArray(itemQuotes) then return false end ' +
   'itemQuotes = itemQuotes or {} if #itemQuotes ~= #expectedQuotes then return false end ' +
   'for i = 1, #itemQuotes do if itemQuotes[i] ~= expectedQuotes[i] then return false end end ' +
+  'local actualRefs=item.quoteSourceRefs or {} local expectedRefs=expected.quoteSourceRefs or {} ' +
+  'for i=1,#itemQuotes do local a=actualRefs[i] local b=expectedRefs[i] if a==cjson.null then a=nil end if b==cjson.null then b=nil end ' +
+  'if (a==nil)~=(b==nil) then return false end if a and (a.messageId~=b.messageId or a.quoteIndex~=b.quoteIndex or a.messageVersion~=b.messageVersion) then return false end end ' +
   'local actualSeen = {} local actualCount = 0 local files = item.files ' +
   'if files then if not isDenseArray(files) then return false end ' +
   'for i = 1, #files do local file = files[i] ' +
@@ -568,7 +586,7 @@ const JOB_CREATE_LUA =
   'if ok and item.steerId and not seen[item.steerId] then seen[item.steerId] = true ' +
   'local projected = { steerId = item.steerId, text = item.text, createdAt = item.createdAt } ' +
   'if item.clientSteerId then projected.clientSteerId = item.clientSteerId end ' +
-  'if item.files then projected.files = item.files end if item.quotes then projected.quotes = item.quotes end ' +
+  'if item.files then projected.files = item.files end if item.quotes then projected.quotes = item.quotes end if item.quoteSourceRefs then projected.quoteSourceRefs=item.quoteSourceRefs end if item.quoteRetention then projected.quoteRetention=item.quoteRetention end ' +
   'if item.preempt then projected.preempt = item.preempt end ' +
   'if item.preemptRevision then projected.preemptRevision = item.preemptRevision end ' +
   'merged[#merged + 1] = projected receiptUpdates[#receiptUpdates + 1] = item end end end end ' +
@@ -638,12 +656,15 @@ const JOB_CREATE_LUA =
  *   ]
  */
 const JOB_UPDATE_LUA =
+  SOURCE_RETENTION_LUA +
   SCHEDULE_MCP_RECEIPT_LUA +
   SCHEDULE_MEMBERSHIP_INVALIDATE_LUA +
   'if redis.call("EXISTS", KEYS[1]) == 0 then return 0 end ' +
   'if ARGV[1] ~= "" and redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] then return 0 end ' +
   'local hset = {} local releaseRetention = false ' +
-  'for i = 6, #ARGV do hset[#hset + 1] = ARGV[i] end ' +
+  'local safe = {status=true,completedAt=true,terminalPersistencePending=true,terminalPersistenceStartedAt=true,terminalHostActionPending=true,providerDrained=true,providerExecutionId=true,providerExecutionStartedId=true} ' +
+  'local sourceLive = sourceAvailable(KEYS[1]) ' +
+  'for i = 6, #ARGV, 2 do if (sourceLive or safe[ARGV[i]]) and ARGV[i] ~= "sourceRetention" and ARGV[i] ~= "sourceRetentionExpiresAt" and ARGV[i] ~= "sourceRetentionRevokedAt" and ARGV[i] ~= "sourceRetentionPurged" then hset[#hset+1]=ARGV[i] hset[#hset+1]=ARGV[i+1] end end ' +
   'for i = 6, #ARGV, 2 do if ARGV[i] == "preserveForScheduleReconcile" and ARGV[i+1] == "0" then releaseRetention = true end end ' +
   'local originalReceipt = nil for i = 1, #hset, 2 do if hset[i] == "scheduleOutcomeError" then originalReceipt = hset[i+1] end end ' +
   SCHEDULE_MCP_FAILURE_PATCH_LUA +
@@ -756,6 +777,8 @@ const RECOVER_SCHEDULE_PROVIDER_OWNER_LUA =
   'redis.call("HSET", KEYS[1], "providerDrained", "1", "error", "Scheduled provider owner termination confirmed") return 1';
 
 const PROVIDER_BEGIN_LUA =
+  SOURCE_RETENTION_LUA +
+  'if not sourceAvailable(KEYS[1]) then return 0 end ' +
   'if redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] then return 0 end ' +
   'if redis.call("HGET", KEYS[1], "providerExecutionId") ~= ARGV[2] then return 0 end ' +
   'if redis.call("HGET", KEYS[1], "status") ~= "running" then return 0 end ' +
@@ -766,9 +789,11 @@ const PROVIDER_BEGIN_LUA =
  * terminal payload. Owner success/failure and stale-owner recovery share this
  * CAS, so a timeout cannot overwrite a normal FINAL (or vice versa). */
 const TERMINAL_PERSISTENCE_FINALIZE_LUA =
+  SOURCE_RETENTION_LUA +
   'if redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] then return 0 end ' +
   'if redis.call("HGET", KEYS[1], "terminalPersistencePending") ~= "1" then return 0 end ' +
-  'redis.call("HSET", KEYS[1], "terminalPersistencePending", "0", "finalEvent", ARGV[2]) ' +
+  'redis.call("HSET", KEYS[1], "terminalPersistencePending", "0") ' +
+  'if sourceAvailable(KEYS[1]) then redis.call("HSET", KEYS[1], "finalEvent", ARGV[2]) else redis.call("HDEL", KEYS[1], "finalEvent") end ' +
   'return 1';
 
 /**
@@ -838,7 +863,7 @@ const STALE_JOB_DELETE_LUA =
   'if item.steerId and not seen[item.steerId] then seen[item.steerId] = true fullItems[#fullItems + 1] = item ' +
   'local clientItem = { steerId = item.steerId, text = item.text, createdAt = item.createdAt } ' +
   'if item.clientSteerId then clientItem.clientSteerId = item.clientSteerId end ' +
-  'if item.files then clientItem.files = item.files end if item.quotes then clientItem.quotes = item.quotes end ' +
+  'if item.files then clientItem.files = item.files end if item.quotes then clientItem.quotes = item.quotes end if item.quoteSourceRefs then clientItem.quoteSourceRefs=item.quoteSourceRefs end if item.quoteRetention then clientItem.quoteRetention=item.quoteRetention end ' +
   'if item.preempt then clientItem.preempt = item.preempt end ' +
   'if item.preemptRevision then clientItem.preemptRevision = item.preemptRevision end ' +
   'projected[#projected + 1] = clientItem end ' +
@@ -900,6 +925,8 @@ const STALE_JOB_DELETE_LUA =
  *          parkedSteersTtl, generationEpochGraceTtl]
  */
 const CHUNK_APPEND_LUA =
+  SOURCE_RETENTION_LUA +
+  'if not sourceAvailable(KEYS[2]) then return 0 end ' +
   SCHEDULE_RETENTION_LUA +
   'local currentCreatedAt = redis.call("HGET", KEYS[2], "createdAt") ' +
   'if not currentCreatedAt then return 0 end ' +
@@ -983,6 +1010,8 @@ const CHUNK_APPEND_LUA =
  *          generationEpochGraceTtl, eventJson...]
  */
 const CHUNK_APPEND_BATCH_LUA =
+  SOURCE_RETENTION_LUA +
+  'if not sourceAvailable(KEYS[2]) then return 0 end ' +
   SCHEDULE_RETENTION_LUA +
   'local currentCreatedAt = redis.call("HGET", KEYS[2], "createdAt") ' +
   'if not currentCreatedAt then return 0 end ' +
@@ -1037,6 +1066,8 @@ const CHUNK_APPEND_BATCH_LUA =
  *   ARGV: [runStepsJson, runningTtl, expectCreatedAt | ""]
  */
 const RUNSTEPS_SAVE_LUA =
+  SOURCE_RETENTION_LUA +
+  'if not sourceAvailable(KEYS[2]) then return 0 end ' +
   'local currentCreatedAt = redis.call("HGET", KEYS[2], "createdAt") ' +
   'if not currentCreatedAt then return 0 end ' +
   'if ARGV[3] ~= "" and currentCreatedAt ~= ARGV[3] then return 0 end ' +
@@ -1092,11 +1123,21 @@ const RUNSTEPS_READ_LUA =
  *   ARGV: [itemJson, ttl, maxDepth]
  *   Returns: new depth, -1 (not running / closed), or -2 (queue full)
  */
+/** Enqueue validates private lineage against the same live job binding atomically. */
+const STEER_QUOTE_SOURCE_LUA =
+  SOURCE_RETENTION_LUA +
+  'local function quoteSourceAvailable(item) if not sourceAvailable(KEYS[1]) then return false end ' +
+  'local entries=item.quoteRetention and item.quoteRetention.quoteSourceRetention if not entries or #entries==0 then return true end ' +
+  'local raw=redis.call("HGET",KEYS[1],"sourceRetention") if not raw then return false end local bound=cjson.decode(raw) local ids={} for _,id in ipairs(bound.sourceFileIds) do ids[id]=true end ' +
+  'local t=redis.call("TIME") local now=tonumber(t[1])*1000+math.floor(tonumber(t[2])/1000) for _,entry in ipairs(entries) do if entry.sourceExpiresAt<=now then return false end for _,id in ipairs(entry.sourceFileIds) do if not ids[id] then return false end end end return true end ';
+
 const STEER_ENQUEUE_LUA =
+  STEER_QUOTE_SOURCE_LUA +
   'if ARGV[4] ~= "" and redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[4] then return -1 end ' +
   'if redis.call("HGET", KEYS[1], "status") ~= "running" then return -1 end ' +
   'if redis.call("HGET", KEYS[1], "steersClosed") == "1" then return -1 end ' +
   'if redis.call("LLEN", KEYS[2]) >= tonumber(ARGV[3]) then return -2 end ' +
+  'if not quoteSourceAvailable(cjson.decode(ARGV[1])) then return -1 end ' +
   'redis.call("RPUSH", KEYS[2], ARGV[1]) ' +
   'redis.call("EXPIRE", KEYS[2], tonumber(ARGV[2])) ' +
   'return redis.call("LLEN", KEYS[2])';
@@ -1105,12 +1146,13 @@ const STEER_ENQUEUE_LUA =
  * The persisted item and its queue position are returned from the same Lua
  * step, eliminating the legacy enqueue→arm failure window. */
 const STEER_ENQUEUE_VERSIONED_LUA =
+  STEER_QUOTE_SOURCE_LUA +
   'if ARGV[4] ~= "" and redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[4] then return -1 end ' +
   'if redis.call("HGET", KEYS[1], "status") ~= "running" then return -1 end ' +
   'if redis.call("HGET", KEYS[1], "steersClosed") == "1" then return -1 end ' +
   'if redis.call("LLEN", KEYS[2]) >= tonumber(ARGV[3]) then return -2 end ' +
-  'local item = cjson.decode(ARGV[1]) ' +
-  'if item.quotes then local qexec = redis.call("HGET", KEYS[1], "steerQuotesExecutionId") if not qexec or qexec == "" or qexec ~= redis.call("HGET", KEYS[1], "providerExecutionId") then item.quotes = nil end end ' +
+  'local item = cjson.decode(ARGV[1]) if not quoteSourceAvailable(item) then return -1 end ' +
+  'if item.quotes then local qexec = redis.call("HGET", KEYS[1], "steerQuotesExecutionId") if not qexec or qexec == "" or qexec ~= redis.call("HGET", KEYS[1], "providerExecutionId") then item.quotes = nil item.quoteSourceRefs=nil item.quoteRetention=nil end end ' +
   'if ARGV[5] == "1" then item.preemptRevision = 1 ' +
   'if redis.call("HGET", KEYS[1], "preemptCapable") == "1" then item.preempt = true end end ' +
   'local itemJson = cjson.encode(item) ' +
@@ -1123,6 +1165,7 @@ const STEER_ENQUEUE_VERSIONED_LUA =
  * receipts win before live-job guards, so retry after drain/terminal/replace
  * returns the original ACK instead of re-injecting. */
 const STEER_ENQUEUE_RECEIPT_LUA =
+  STEER_QUOTE_SOURCE_LUA +
   'local existing = redis.call("HGET", KEYS[3], ARGV[5]) ' +
   'if existing then ' +
   'local receipt = cjson.decode(existing) ' +
@@ -1148,9 +1191,9 @@ const STEER_ENQUEUE_RECEIPT_LUA =
   'if redis.call("HGET", KEYS[1], "status") ~= "running" then return -1 end ' +
   'if redis.call("HGET", KEYS[1], "steersClosed") == "1" then return -1 end ' +
   'if redis.call("LLEN", KEYS[2]) >= tonumber(ARGV[3]) then return -2 end ' +
-  'local legacyItem = cjson.decode(ARGV[1]) ' +
+  'local legacyItem = cjson.decode(ARGV[1]) if not quoteSourceAvailable(legacyItem) then return -1 end ' +
   'if legacyItem.quotes then local qexec = redis.call("HGET", KEYS[1], "steerQuotesExecutionId") ' +
-  'if not qexec or qexec == "" or qexec ~= redis.call("HGET", KEYS[1], "providerExecutionId") then legacyItem.quotes = nil end end ' +
+  'if not qexec or qexec == "" or qexec ~= redis.call("HGET", KEYS[1], "providerExecutionId") then legacyItem.quotes = nil legacyItem.quoteSourceRefs=nil legacyItem.quoteRetention=nil end end ' +
   'if ARGV[7] == "1" then legacyItem.preemptRevision = 1 ' +
   'if redis.call("HGET", KEYS[1], "preemptCapable") == "1" then legacyItem.preempt = true end end ' +
   'redis.call("RPUSH", KEYS[2], cjson.encode(legacyItem)) ' +
@@ -1161,8 +1204,8 @@ const STEER_ENQUEUE_RECEIPT_LUA =
   'if redis.call("HGET", KEYS[1], "steersClosed") == "1" then return -1 end ' +
   'if redis.call("LLEN", KEYS[2]) >= tonumber(ARGV[3]) then return -2 end ' +
   'if redis.call("ZCARD", KEYS[4]) >= tonumber(ARGV[9]) then return -3 end ' +
-  'local item = cjson.decode(ARGV[1]) ' +
-  'if item.quotes then local qexec = redis.call("HGET", KEYS[1], "steerQuotesExecutionId") if not qexec or qexec == "" or qexec ~= redis.call("HGET", KEYS[1], "providerExecutionId") then item.quotes = nil end end ' +
+  'local item = cjson.decode(ARGV[1]) if not quoteSourceAvailable(item) then return -1 end ' +
+  'if item.quotes then local qexec = redis.call("HGET", KEYS[1], "steerQuotesExecutionId") if not qexec or qexec == "" or qexec ~= redis.call("HGET", KEYS[1], "providerExecutionId") then item.quotes = nil item.quoteSourceRefs=nil item.quoteRetention=nil end end ' +
   'if ARGV[7] == "1" then ' +
   'item.preemptRevision = 1 ' +
   'if redis.call("HGET", KEYS[1], "preemptCapable") == "1" then item.preempt = true end ' +
@@ -1694,7 +1737,7 @@ const STEER_CLOSE_DRAIN_LUA =
   'local projected = { steerId = item.steerId, text = item.text, createdAt = item.createdAt } ' +
   'if item.clientSteerId then projected.clientSteerId = item.clientSteerId end ' +
   'if item.files then projected.files = item.files end ' +
-  'if item.quotes then projected.quotes = item.quotes end ' +
+  'if item.quotes then projected.quotes = item.quotes end if item.quoteSourceRefs then projected.quoteSourceRefs=item.quoteSourceRefs end if item.quoteRetention then projected.quoteRetention=item.quoteRetention end ' +
   'if item.preempt then projected.preempt = item.preempt end ' +
   'if item.preemptRevision then projected.preemptRevision = item.preemptRevision end ' +
   'currentProjected[#currentProjected + 1] = projected end ' +
@@ -2459,7 +2502,8 @@ export class RedisJobStore implements IJobStoreV2 {
       reconcileEpoch = expectedCreatedAt ?? observedJob?.createdAt;
     const completedTtl =
       updates.terminalPersistencePending === true ||
-      observedJob?.terminalPersistencePending === true
+      observedJob?.terminalPersistencePending === true ||
+      observedJob?.sourceRetention != null
         ? Math.max(this.ttl.completed, TERMINAL_PERSISTENCE_RETENTION_TTL_S)
         : this.ttl.completed;
     const fields = Object.entries(serialized).flat();
@@ -2767,6 +2811,12 @@ export class RedisJobStore implements IJobStoreV2 {
         job.terminalHostActionPending === true)
         ? KEYS.userJobs(job.userId, job.tenantId)
         : null;
+    // Recovery copies outlive a generation; preserve their existing owner index until they expire.
+    const recoveryKeys = new Set(
+      (await this.recoveryOwners(streamId)).map((owner) =>
+        KEYS.userJobs(owner.userId, owner.tenantId),
+      ),
+    );
     const ownerMembershipTtl = this.ownerMembershipTtl(job);
     const terminalMember = job == null ? null : terminalHostActionMember(streamId, job.createdAt);
     const terminalHostActionIndex =
@@ -2811,7 +2861,7 @@ export class RedisJobStore implements IJobStoreV2 {
       // Terminal host-action membership follows the durable hash field, not status, so
       // an aborted approval-expiry job stays enumerable for hook retry until acked.
       for (const userJobsKey of observedUserKeys) {
-        if (userJobsKey !== activeUserKey) {
+        if (userJobsKey !== activeUserKey && !recoveryKeys.has(userJobsKey)) {
           operations.push(this.redis.srem(userJobsKey, streamId));
         }
       }
@@ -2855,7 +2905,7 @@ export class RedisJobStore implements IJobStoreV2 {
       pipeline.srem(KEYS.detachedAgentEventTerminalHostActionJobsV1, streamId);
     }
     for (const userJobsKey of observedUserKeys) {
-      if (userJobsKey !== activeUserKey) {
+      if (userJobsKey !== activeUserKey && !recoveryKeys.has(userJobsKey)) {
         pipeline.srem(userJobsKey, streamId);
       }
     }
@@ -3277,8 +3327,144 @@ export class RedisJobStore implements IJobStoreV2 {
     );
   }
 
+  private async recoveryOwners(
+    streamId: string,
+  ): Promise<Array<{ userId: string; tenantId?: string }>> {
+    const [parked, receipts] = await Promise.all([
+      this.redis.get(KEYS.parkedSteers(streamId)),
+      this.redis.hvals(KEYS.steerReceipts(streamId)),
+    ]);
+    return [...(parked ? [parked] : []), ...receipts].map((value) => JSON.parse(value));
+  }
+
+  async purgeFileSourceRecovery(
+    streamId: string,
+    owner: { userId: string; tenantId?: string },
+    sourceFileIds: readonly string[],
+  ): Promise<boolean> {
+    // Canonical JS codec; CAS the exact old copies so concurrent receipt/park writes cannot be lost.
+    const [raw, rows] = await Promise.all([
+      this.redis.get(KEYS.parkedSteers(streamId)),
+      this.redis.hgetall(KEYS.steerReceipts(streamId)),
+    ]);
+    const ids = new Set(sourceFileIds);
+    const owned = (value: { userId: string; tenantId?: string }) =>
+      value.userId === owner.userId &&
+      (value.tenantId ?? undefined) === (owner.tenantId ?? undefined);
+    const redact = (item: SteerQueueItem) => {
+      if (item.quoteRetention) {
+        item.quoteRetention = redactQuoteRetention(item.quoteRetention, sourceFileIds);
+        item.quotes = item.quoteRetention.quotes;
+        item.quoteSourceRefs = item.quoteRetention.quoteSourceRefs;
+      }
+      if (item.files)
+        item.files = item.files.filter((file) => !file.file_id || !ids.has(file.file_id));
+    };
+    const parked = raw == null ? null : JSON.parse(raw);
+    if (parked && owned(parked)) for (const item of parked.steers ?? []) redact(item);
+    const edits = Object.entries(rows).map(([key, before]) => {
+      const receipt = JSON.parse(before) as SteerReceipt;
+      if (owned(receipt)) redact(receipt.item);
+      return [key, before, JSON.stringify(receipt)];
+    });
+    return (
+      (await this.redis.eval(
+        'local old=redis.call("GET",KEYS[1]) if (old or "")~=ARGV[1] then return 0 end ' +
+          'local edits=cjson.decode(ARGV[3]) if redis.call("HLEN",KEYS[2])~=#edits then return 0 end ' +
+          'for _,entry in ipairs(edits) do if redis.call("HGET",KEYS[2],entry[1])~=entry[2] then return 0 end end ' +
+          'if old then redis.call("SET",KEYS[1],ARGV[2],"KEEPTTL") end ' +
+          'for _,entry in ipairs(edits) do redis.call("HSET",KEYS[2],entry[1],entry[3]) end return 1',
+        2,
+        KEYS.parkedSteers(streamId),
+        KEYS.steerReceipts(streamId),
+        raw ?? '',
+        parked == null ? '' : JSON.stringify(parked),
+        JSON.stringify(edits),
+      )) === 1
+    );
+  }
+
+  async bindSourceRetention(
+    streamId: string,
+    epoch: number,
+    context: GenerationSourceRetention,
+  ): Promise<boolean> {
+    if (
+      !Number.isFinite(context.sourceExpiresAt) ||
+      context.sourceExpiresAt <= Date.now() ||
+      !context.sourceFileIds.length
+    )
+      return false;
+    const result = await this.redis.eval(
+      SOURCE_RETENTION_LUA +
+        'if redis.call("HGET",KEYS[1],"createdAt") ~= ARGV[1] or not sourceAvailable(KEYS[1]) or redis.call("HGET",KEYS[1],"sourceRetentionPurged") then return 0 end ' +
+        'local next=cjson.decode(ARGV[2]) local old=redis.call("HGET",KEYS[1],"sourceRetention") ' +
+        'local ids={} local merged={} if old then old=cjson.decode(old) next.sourceExpiresAt=math.min(next.sourceExpiresAt,old.sourceExpiresAt) for _,id in ipairs(old.sourceFileIds) do ids[id]=true end end ' +
+        'for _,id in ipairs(next.sourceFileIds) do ids[id]=true end for id in pairs(ids) do merged[#merged+1]=id end table.sort(merged) next.sourceFileIds=merged ' +
+        'redis.call("HSET",KEYS[1],"sourceRetention",cjson.encode(next),"sourceRetentionExpiresAt",tostring(next.sourceExpiresAt)) return 1',
+      1,
+      KEYS.job(streamId),
+      String(epoch),
+      JSON.stringify(context),
+    );
+    return result === 1;
+  }
+
+  async revokeSourceRetention(streamId: string, epoch: number): Promise<boolean> {
+    return (
+      (await this.redis.eval(
+        'if redis.call("HGET",KEYS[1],"createdAt") ~= ARGV[1] or not redis.call("HGET",KEYS[1],"sourceRetention") then return 0 end ' +
+          'redis.call("HSETNX",KEYS[1],"sourceRetentionRevokedAt",ARGV[2]) return 1',
+        1,
+        KEYS.job(streamId),
+        String(epoch),
+        String(Date.now()),
+      )) === 1
+    );
+  }
+
+  async purgeSourceRetention(streamId: string, epoch: number): Promise<boolean> {
+    const purged = await this.redis.eval(
+      'if redis.call("HGET",KEYS[1],"createdAt") ~= ARGV[1] or not redis.call("HGET",KEYS[1],"sourceRetention") then return 0 end ' +
+        'local status=redis.call("HGET",KEYS[1],"status") if status=="running" or status=="requires_action" or redis.call("HGET",KEYS[1],"providerDrained")=="0" or redis.call("HGET",KEYS[1],"terminalPersistencePending")=="1" or redis.call("HGET",KEYS[1],"terminalHostActionPending")=="1" then return 0 end ' +
+        'local raw=redis.call("GET",KEYS[4]) local receiptRows=redis.call("HGETALL",KEYS[5]) local revoked=redis.call("HGET",KEYS[1],"sourceRetentionRevokedAt") ' +
+        'local source=cjson.decode(redis.call("HGET",KEYS[1],"sourceRetention")) local t=redis.call("TIME") revoked=revoked or source.sourceExpiresAt<=tonumber(t[1])*1000+math.floor(tonumber(t[2])/1000) ' +
+        'local ids={} for _,id in ipairs(source.sourceFileIds) do ids[id]=true end ' +
+        'local function redact(item) if type(item)~="table" then return end if type(item.files)=="table" then local files={} for _,file in ipairs(item.files) do if type(file)~="table" or not ids[file.file_id] then files[#files+1]=file end end if #files==0 then item.files=nil else item.files=files end end end ' +
+        'local parked=nil if raw then local ok,value=pcall(cjson.decode,raw) if not ok then return 0 end parked=value end ' +
+        'local receipts={} for i=1,#receiptRows,2 do local ok,value=pcall(cjson.decode,receiptRows[i+1]) if not ok then return 0 end receipts[#receipts+1]={receiptRows[i],value} end ' +
+        'if revoked then if parked then for _,item in ipairs(parked.steers or {}) do redact(item) end redis.call("SET",KEYS[4],cjson.encode(parked),"KEEPTTL") end for _,entry in ipairs(receipts) do redact(entry[2].item) redis.call("HSET",KEYS[5],entry[1],cjson.encode(entry[2])) end end ' +
+        'local ttl=redis.call("PTTL",KEYS[1]) for i=4,5 do local retained=redis.call("PTTL",KEYS[i]) if retained==-1 then ttl=-1 break end if ttl~=-1 then ttl=math.max(ttl,retained) end end if ttl==-1 then redis.call("PERSIST",KEYS[1]) elseif ttl>0 then redis.call("PEXPIRE",KEYS[1],ttl) end ' +
+        'local keep={streamId=true,userId=true,tenantId=true,conversationId=true,createdAt=true,status=true,completedAt=true,sourceRetention=true,sourceRetentionExpiresAt=true,sourceRetentionRevokedAt=true,providerExecutionId=true,providerDrained=true} ' +
+        'for _,key in ipairs(redis.call("HKEYS",KEYS[1])) do if not keep[key] then redis.call("HDEL",KEYS[1],key) end end ' +
+        'redis.call("HSET",KEYS[1],"sourceRetentionPurged","1") redis.call("DEL",KEYS[2],KEYS[3]) return 1',
+      5,
+      KEYS.job(streamId),
+      KEYS.chunks(streamId),
+      KEYS.runSteps(streamId),
+      KEYS.parkedSteers(streamId),
+      KEYS.steerReceipts(streamId),
+      String(epoch),
+    );
+    if (purged !== 1) return false;
+    const pending = this.pendingAppends.get(streamId);
+    if (pending?.expectedCreatedAt === epoch) {
+      this.pendingAppends.delete(streamId);
+      if (pending.timer) clearTimeout(pending.timer);
+      for (const waiter of pending.settlers) waiter.resolve(false);
+    }
+    this.clearLocalStateUnlessActive(streamId, null, epoch);
+    return true;
+  }
+
   async deleteJob(streamId: string, expectedCreatedAt?: number): Promise<boolean> {
     const observedJob = await this.getJob(streamId);
+    if (
+      observedJob?.sourceRetention &&
+      !observedJob.sourceRetentionPurged &&
+      (expectedCreatedAt == null || expectedCreatedAt === observedJob.createdAt)
+    )
+      return this.purgeSourceRetention(streamId, observedJob.createdAt);
     const targetCreatedAt = expectedCreatedAt ?? observedJob?.createdAt;
     const expectMissing = expectedCreatedAt == null && observedJob == null;
     const deleted = await this.redis.eval(
@@ -3957,9 +4143,16 @@ export class RedisJobStore implements IJobStoreV2 {
     const tracked = await Promise.all(ownerKeys.map((key) => this.redis.smembers(key)));
     const streamIds = [...new Set(tracked.flat())];
     const jobs = await Promise.all(streamIds.map((streamId) => this.getJob(streamId)));
+    const retained = await Promise.all(streamIds.map((streamId) => this.recoveryOwners(streamId)));
     return streamIds.filter((_, index) => {
       const job = jobs[index];
-      return job?.userId === userId && (job.tenantId == null || job.tenantId === tenantId);
+      return (
+        (job?.userId === userId && (job.tenantId == null || job.tenantId === tenantId)) ||
+        retained[index].some(
+          (owner) =>
+            owner.userId === userId && (owner.tenantId ?? undefined) === (tenantId ?? undefined),
+        )
+      );
     });
   }
 
@@ -4360,6 +4553,8 @@ export class RedisJobStore implements IJobStoreV2 {
     reconstructedEventCount?: number;
     durableEventCount?: number;
   } | null> {
+    const sourceJob = await this.getJob(streamId);
+    if (sourceJob?.sourceRetention && !sourceRetentionAvailable(sourceJob)) return null;
     // 1. Prefer the HOST content array (same-instance fast path): it already
     // contains host-authored steer parts the SDK graph never sees.
     const hostEntry = options?.durableOnly
@@ -4672,6 +4867,8 @@ export class RedisJobStore implements IJobStoreV2 {
    * @returns Run steps array
    */
   async getRunSteps(streamId: string, expectedCreatedAt?: number): Promise<Agents.RunStep[]> {
+    const sourceJob = await this.getJob(streamId);
+    if (sourceJob?.sourceRetention && !sourceRetentionAvailable(sourceJob)) return [];
     // 1. Try local graph cache first (fast path for same-instance reconnect)
     const graphEntry = this.getLocalEntry(this.localGraphCache, streamId, expectedCreatedAt);
     if (graphEntry) {
@@ -5597,6 +5794,8 @@ export class RedisJobStore implements IJobStoreV2 {
   private serializeJob(job: Partial<SerializableJobData>): Record<string, string> {
     const result: Record<string, string> = {};
 
+    if (job.sourceRetention)
+      result.sourceRetentionExpiresAt = String(job.sourceRetention.sourceExpiresAt);
     for (const [key, value] of Object.entries(job)) {
       if (value === undefined) {
         continue;
@@ -5625,6 +5824,11 @@ export class RedisJobStore implements IJobStoreV2 {
         ? data.detachedAgentEventTerminalStatus
         : undefined;
     const job: CreatedJobData = {
+      sourceRetention: data.sourceRetention ? JSON.parse(data.sourceRetention) : undefined,
+      sourceRetentionRevokedAt: data.sourceRetentionRevokedAt
+        ? Number(data.sourceRetentionRevokedAt)
+        : undefined,
+      sourceRetentionPurged: data.sourceRetentionPurged === '1',
       streamId: data.streamId,
       userId: data.userId,
       tenantId: data.tenantId || undefined,

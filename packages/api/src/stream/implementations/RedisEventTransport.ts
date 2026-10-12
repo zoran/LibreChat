@@ -64,6 +64,7 @@ const EventTypes = {
 } as const;
 
 interface PubSubMessage {
+  sourceExpiresAt?: number;
   type: (typeof EventTypes)[keyof typeof EventTypes];
   /** Sequence number for ordering (critical for Redis Cluster) */
   seq?: number;
@@ -89,6 +90,7 @@ interface PubSubMessage {
  * each resolver settles its caller's receipt with `baseSeq + index`.
  */
 interface PendingChunkBatch {
+  requireSourceBinding?: boolean;
   generationId?: number;
   events: string[];
   resolvers: Array<(receipt: number | false | undefined) => void>;
@@ -167,6 +169,10 @@ interface PreemptRegistration {
  * because active runtimes discard terminal events for another epoch.
  */
 const PUBLISH_SEQ_LUA =
+  'local sourceExpiry = redis.call("HGET",KEYS[2],"sourceRetentionExpiresAt") ' +
+  'if ARGV[6] == "source" and not sourceExpiry then return -1 end ' +
+  'if redis.call("HGET",KEYS[2],"sourceRetentionRevokedAt") or redis.call("HGET",KEYS[2],"sourceRetentionPurged") == "1" then return -1 end ' +
+  'if sourceExpiry then local t=redis.call("TIME") if tonumber(sourceExpiry) <= tonumber(t[1])*1000+math.floor(tonumber(t[2])/1000) then return -1 end end ' +
   'if ARGV[5] ~= "" then ' +
   'local currentCreatedAt = redis.call("HGET", KEYS[2], "createdAt") ' +
   'if currentCreatedAt ~= ARGV[5] then ' +
@@ -193,12 +199,13 @@ const PUBLISH_SEQ_LUA =
   'redis.call("EXPIRE", KEYS[1], ttl) ' +
   'end ' +
   'local seq = val - count ' +
+  'local function sourceSuffix(suffix) if not sourceExpiry then return suffix end return string.sub(suffix,1,-2)..","..cjson.encode("sourceExpiresAt")..":"..sourceExpiry.."}" end ' +
   'if #ARGV > 9 then ' +
   'for i = 1, count do ' +
-  'redis.call("PUBLISH", ARGV[1], ARGV[2] .. string.format("%d", seq + i - 1) .. ARGV[9 + i]) ' +
+  'redis.call("PUBLISH", ARGV[1], ARGV[2] .. string.format("%d", seq + i - 1) .. sourceSuffix(ARGV[9 + i])) ' +
   'end ' +
   'else ' +
-  'redis.call("PUBLISH", ARGV[1], ARGV[2] .. string.format("%d", seq) .. ARGV[3]) ' +
+  'redis.call("PUBLISH", ARGV[1], ARGV[2] .. string.format("%d", seq) .. sourceSuffix(ARGV[3])) ' +
   'end ' +
   'return seq';
 
@@ -260,6 +267,7 @@ interface ChannelSubscriptionState {
  * Subscriber state for a stream
  */
 interface StreamSubscribers {
+  sourceRevokedThrough?: number;
   count: number;
   handlers: Map<
     string,
@@ -304,6 +312,7 @@ interface StreamSubscribers {
  * ```
  */
 export class RedisEventTransport implements IEventTransport {
+  readonly sourceRetentionSupported = true;
   /** Redis client for publishing events */
   private publisher: Redis | Cluster;
   /** Redis client for subscribing to events (separate connection required) */
@@ -483,6 +492,7 @@ export class RedisEventTransport implements IEventTransport {
     expectedGenerationId?: number,
     allowRetainedEpoch = false,
     requireActiveJob = false,
+    requireSourceBinding = false,
   ): Promise<number> {
     const [prefix, suffix] = RedisEventTransport.buildPayloadParts(message);
     return this.evalPublishSequenced(
@@ -493,6 +503,8 @@ export class RedisEventTransport implements IEventTransport {
       expectedGenerationId,
       allowRetainedEpoch,
       requireActiveJob,
+      [],
+      requireSourceBinding,
     );
   }
 
@@ -505,7 +517,9 @@ export class RedisEventTransport implements IEventTransport {
     allowRetainedEpoch = false,
     requireActiveJob = false,
     chunkSuffixes: string[] = [],
+    requireSourceBinding = false,
   ): Promise<number> {
+    const retainedMode = allowRetainedEpoch ? '1' : '0';
     const seq = await this.publisher.eval(
       PUBLISH_SEQ_LUA,
       3,
@@ -517,7 +531,7 @@ export class RedisEventTransport implements IEventTransport {
       suffix,
       String(RedisEventTransport.SEQUENCE_TTL_SECONDS),
       expectedGenerationId != null ? String(expectedGenerationId) : '',
-      allowRetainedEpoch ? '1' : '0',
+      requireSourceBinding ? 'source' : retainedMode,
       String(GENERATION_EPOCH_GRACE_TTL_SECONDS),
       requireActiveJob ? '1' : '0',
       String(count),
@@ -533,7 +547,12 @@ export class RedisEventTransport implements IEventTransport {
     options?: ChunkPublicationOptions,
   ): Promise<number | false | void> {
     if (options?.coalesce === true && this.coalesceWindowMs > 0) {
-      return this.enqueueCoalescedChunk(streamId, event, generationId);
+      return this.enqueueCoalescedChunk(
+        streamId,
+        event,
+        generationId,
+        options?.requireSourceBinding,
+      );
     }
     /** A sequenced non-coalescable publication is an ordering barrier: pending
      * deltas must be issued first so their reserved sequences stay below this
@@ -552,6 +571,7 @@ export class RedisEventTransport implements IEventTransport {
       generationId,
       false,
       generationId != null,
+      options?.requireSourceBinding === true,
     )
       .then((sequence) => (sequence === -1 ? false : sequence))
       .catch((err) => {
@@ -572,14 +592,26 @@ export class RedisEventTransport implements IEventTransport {
     streamId: string,
     event: unknown,
     generationId?: number,
+    requireSourceBinding = false,
   ): Promise<number | false | undefined> {
     let pending = this.pendingBatches.get(streamId);
-    if (pending && pending.generationId !== generationId) {
+    if (
+      pending &&
+      (pending.generationId !== generationId ||
+        pending.requireSourceBinding !== requireSourceBinding)
+    ) {
       void this.flushCoalescedChunks(streamId);
       pending = undefined;
     }
     if (!pending) {
-      pending = { generationId, events: [], resolvers: [], bytes: 0, timer: null };
+      pending = {
+        generationId,
+        requireSourceBinding,
+        events: [],
+        resolvers: [],
+        bytes: 0,
+        timer: null,
+      };
       this.pendingBatches.set(streamId, pending);
     }
 
@@ -630,7 +662,7 @@ export class RedisEventTransport implements IEventTransport {
       pending.timer = null;
     }
 
-    const { generationId, events, resolvers } = pending;
+    const { generationId, events, resolvers, requireSourceBinding } = pending;
     const prefix = `{"type":${JSON.stringify(EventTypes.CHUNK)},"seq":`;
 
     return this.evalPublishSequenced(
@@ -642,6 +674,7 @@ export class RedisEventTransport implements IEventTransport {
       false,
       generationId != null,
       events,
+      requireSourceBinding,
     ).then(
       (baseSeq) => {
         if (baseSeq === -1) {
@@ -913,7 +946,27 @@ export class RedisEventTransport implements IEventTransport {
     }
 
     try {
-      const parsed = JSON.parse(message) as PubSubMessage;
+      const parsed = JSON.parse(message) as PubSubMessage & { sourceRevoked?: boolean };
+      if (parsed.sourceRevoked && parsed.generationId != null) {
+        streamState.sourceRevokedThrough = Math.max(
+          streamState.sourceRevokedThrough ?? 0,
+          parsed.generationId,
+        );
+        for (const [seq, pending] of streamState.reorderBuffer.pending)
+          if (pending.generationId === parsed.generationId)
+            streamState.reorderBuffer.pending.delete(seq);
+        for (const handlers of streamState.handlers.values())
+          handlers.onError?.('Document source unavailable', parsed.generationId);
+        return;
+      }
+      if (parsed.sourceExpiresAt != null && parsed.sourceExpiresAt <= Date.now()) return;
+      if (
+        parsed.generationId != null &&
+        streamState.sourceRevokedThrough != null &&
+        parsed.generationId <= streamState.sourceRevokedThrough &&
+        (parsed.type === EventTypes.CHUNK || parsed.type === EventTypes.DONE)
+      )
+        return;
       if (
         parsed.type === EventTypes.SUBSCRIPTION_FRONTIER &&
         parsed.subscriptionFrontierId != null
@@ -1127,6 +1180,14 @@ export class RedisEventTransport implements IEventTransport {
     streamState: StreamSubscribers,
     message: PubSubMessage,
   ): void {
+    if (message.sourceExpiresAt != null && message.sourceExpiresAt <= Date.now()) return;
+    if (
+      message.generationId != null &&
+      streamState.sourceRevokedThrough != null &&
+      message.generationId <= streamState.sourceRevokedThrough &&
+      (message.type === EventTypes.CHUNK || message.type === EventTypes.DONE)
+    )
+      return;
     for (const [, handlers] of streamState.handlers) {
       if (handlers.onReplayMessage != null) continue;
       switch (message.type) {
@@ -1491,15 +1552,30 @@ export class RedisEventTransport implements IEventTransport {
    * Performance: sequence allocation and publish share one round trip. This runs per streamed
    * delta, so the saved round trip is multiplied by the token count of every response.
    */
-  emitChunk(streamId: string, event: unknown, generationId?: number): Promise<void> {
-    return this.publishChunkWithReceipt(streamId, event, generationId).then(() => undefined);
+  emitChunk(
+    streamId: string,
+    event: unknown,
+    generationId?: number,
+    requireSourceBinding = false,
+  ): Promise<void> {
+    return this.publishChunkWithReceipt(
+      streamId,
+      event,
+      generationId,
+      requireSourceBinding ? { requireSourceBinding } : undefined,
+    ).then(() => undefined);
   }
 
   /**
    * Publish a done event to all subscribers.
    * Includes sequence number to ensure delivery after all chunks.
    */
-  async emitDone(streamId: string, event: unknown, generationId?: number): Promise<void> {
+  async emitDone(
+    streamId: string,
+    event: unknown,
+    generationId?: number,
+    requireSourceBinding = false,
+  ): Promise<void> {
     try {
       /** Terminal frames must carry a later sequence than every pending delta,
        * or subscribers would close on DONE and drop the coalesced tail. */
@@ -1513,6 +1589,8 @@ export class RedisEventTransport implements IEventTransport {
         },
         generationId,
         true,
+        false,
+        requireSourceBinding,
       );
       if (sequence === -1) {
         throw new GenerationPublicationFencedError('done', streamId, generationId);
@@ -1572,7 +1650,12 @@ export class RedisEventTransport implements IEventTransport {
    * Publish an error event to all subscribers.
    * Includes sequence number to ensure delivery after all chunks.
    */
-  async emitError(streamId: string, error: string, generationId?: number): Promise<void> {
+  async emitError(
+    streamId: string,
+    error: string,
+    generationId?: number,
+    requireSourceBinding = false,
+  ): Promise<void> {
     try {
       await this.flushCoalescedChunks(streamId);
       const sequence = await this.publishWithSequence(
@@ -1584,6 +1667,8 @@ export class RedisEventTransport implements IEventTransport {
         },
         generationId,
         true,
+        false,
+        requireSourceBinding,
       );
       if (sequence === -1) {
         throw new GenerationPublicationFencedError('error', streamId, generationId);
@@ -1913,6 +1998,21 @@ export class RedisEventTransport implements IEventTransport {
    * discard the entire next turn as duplicate traffic. The counter's sliding TTL bounds
    * orphan lifetime.
    */
+  async purgeSourceRetention(streamId: string, epoch: number): Promise<void> {
+    // Control frame uses the existing channel; no source content or ordering reset.
+    await this.publisher.publish(
+      CHANNELS.events(streamId),
+      JSON.stringify({
+        type: EventTypes.ERROR,
+        error: 'Document source unavailable',
+        generationId: epoch,
+        sourceRevoked: true,
+      }),
+    );
+    const pending = this.pendingBatches.get(streamId);
+    if (pending?.generationId === epoch) this.discardCoalescedChunks(streamId);
+  }
+
   cleanup(streamId: string): void {
     const channel = CHANNELS.events(streamId);
     const state = this.streams.get(streamId);

@@ -2242,3 +2242,15 @@ describe('mergeFileConfig memoization', () => {
     expect(mergeFileConfig(undefined)).not.toBe(beforeStatic);
   });
 });
+
+describe('optional original document retention', () => {
+  it('leaves absence unchanged and carries configured hours through merge', () => {
+    expect(mergeFileConfig(undefined).retentionHours).toBeUndefined();
+    expect(mergeFileConfig(fileConfigSchema.parse({ retentionHours: 672 })).retentionHours).toBe(
+      672,
+    );
+  });
+  it.each([0, -1, Infinity, NaN])('rejects invalid retention hours %s', (retentionHours) => {
+    expect(fileConfigSchema.safeParse({ retentionHours }).success).toBe(false);
+  });
+});

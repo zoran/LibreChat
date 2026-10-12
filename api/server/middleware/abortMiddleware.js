@@ -6,6 +6,7 @@ const {
   countTokens,
   isAbortError,
   GenerationJobManager,
+  readFileSourceRetention,
   sanitizeMessageForTransmit,
   buildAbortedResponseMetadata,
   announceReply,
@@ -87,7 +88,12 @@ async function abortMessage(req, res) {
       interfaceConfig: req?.config?.interfaceConfig,
     },
     { ...responseMessage, user: userId },
-    { context: 'api/server/middleware/abortMiddleware.js' },
+    {
+      context: 'api/server/middleware/abortMiddleware.js',
+      ...(jobData?.sourceRetention != null && {
+        sourceRetention: readFileSourceRetention(jobData.sourceRetention),
+      }),
+    },
   );
 
   /* Mirrors the agents abort route: when Stop wins the terminal claim, the request controller
@@ -126,6 +132,7 @@ async function abortMessage(req, res) {
           conversationId: jobData.userMessage.conversationId,
           text: jobData.userMessage.text,
           quotes: jobData.userMessage.quotes,
+          quoteSourceRefs: jobData.userMessage.quoteSourceRefs,
           reasoningOverride: jobData.userMessage.reasoningOverride,
           isCreatedByUser: true,
         })

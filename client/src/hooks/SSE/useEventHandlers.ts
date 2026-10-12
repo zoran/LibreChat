@@ -641,9 +641,17 @@ export default function useEventHandlers({
    *  drained from the composer on submit. */
   const restorePendingContext = useRecoilCallback(
     ({ set }) =>
-      (convoId: string, quotes?: string[], reasoningOverride?: TMessage['reasoningOverride']) => {
+      (
+        convoId: string,
+        quotes?: string[],
+        reasoningOverride?: TMessage['reasoningOverride'],
+        quoteSourceRefs?: TMessage['quoteSourceRefs'],
+      ) => {
         if (Array.isArray(quotes) && quotes.length > 0) {
-          set(store.pendingQuotesByConvoId(convoId), quotes);
+          set(store.pendingQuoteDraftByConvoId(convoId), {
+            quotes,
+            quoteSourceRefs: quotes.map((_, index) => quoteSourceRefs?.[index] ?? null),
+          });
         }
         if (reasoningOverride != null) {
           const reasoningAtom = pendingReasoningOverrideFamily(
@@ -1088,6 +1096,7 @@ export default function useEventHandlers({
               currentConvoId,
               requestMessage?.quotes,
               requestMessage?.reasoningOverride,
+              requestMessage?.quoteSourceRefs,
             );
             return;
           }
@@ -1107,6 +1116,7 @@ export default function useEventHandlers({
             String(Constants.NEW_CONVO),
             requestMessage?.quotes,
             requestMessage?.reasoningOverride,
+            requestMessage?.quoteSourceRefs,
           );
           if (location.pathname !== `/c/${Constants.NEW_CONVO}`) {
             navigate(`/c/${Constants.NEW_CONVO}`, { replace: true });
@@ -1179,6 +1189,7 @@ export default function useEventHandlers({
             currentConvoId,
             requestMessage?.quotes,
             requestMessage?.reasoningOverride,
+            requestMessage?.quoteSourceRefs,
           );
           if (isNewChat) {
             requestChatFocus();

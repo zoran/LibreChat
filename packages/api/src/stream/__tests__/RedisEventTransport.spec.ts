@@ -42,6 +42,46 @@ function deliverSequencedMessage(
 }
 
 describe('RedisEventTransport', () => {
+  it('rejects a queued source publication after expiry and keeps ordinary callback behavior', async () => {
+    const store = new InMemoryJobStore();
+    const transport = new InMemoryEventTransport();
+    transport.setSourceRetentionReader((id) => store.getJob(id));
+    const job = await store.createJob('source-expiry', 'owner');
+    const now = Date.now();
+    await store.bindSourceRetention(job.streamId, job.createdAt, {
+      sourceFileIds: ['file-a'],
+      sourceExpiresAt: now + 1000,
+    });
+    const onDone = jest.fn();
+    const sub = transport.subscribe(job.streamId, { onChunk: () => undefined, onDone });
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(now + 1001);
+    try {
+      await expect(
+        transport.emitDone(job.streamId, { text: 'secret' }, job.createdAt, true),
+      ).rejects.toThrow('Document source unavailable');
+      expect(onDone).not.toHaveBeenCalled();
+      transport.emitDone('ordinary', { text: 'ordinary' });
+    } finally {
+      clock.mockRestore();
+      sub.unsubscribe();
+      transport.destroy();
+      await store.destroy();
+    }
+  });
+
+  it('does not silently ignore a required source guard on an unsupported transport', async () => {
+    const emitChunk = jest.fn();
+    const unsupported = { emitChunk } as unknown as Parameters<typeof emitChunkWithReceipt>[0];
+    expect(
+      await emitChunkWithReceipt(unsupported, 'source', { text: 'secret' }, 1, {
+        requireSourceBinding: true,
+      }),
+    ).toBe(false);
+    expect(emitChunk).not.toHaveBeenCalled();
+    await emitChunkWithReceipt(unsupported, 'ordinary', { text: 'plain' }, 2);
+    expect(emitChunk).toHaveBeenCalledWith('ordinary', { text: 'plain' }, 2);
+  });
+
   it('delivers tagged events and preserves legacy in-memory callback arity', () => {
     const transport = new InMemoryEventTransport();
     const onChunk = jest.fn();

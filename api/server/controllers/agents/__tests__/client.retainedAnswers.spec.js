@@ -43,6 +43,7 @@ jest.mock('~/server/services/MCP', () => ({
   resolveConfigServers: jest.fn().mockResolvedValue({}),
 }));
 jest.mock('~/models', () => ({
+  resolveFileRetentionContext: jest.fn(),
   bulkInsertTransactions: jest.fn(),
   getCacheMultiplier: jest.fn(),
   getAgent: jest.fn(),
@@ -441,5 +442,255 @@ describe('AgentClient retained answers', () => {
       contentText(prompt.find((message) => message.id === 'librechat:retained-answers')),
     ).toContain(ANSWER_LINE);
     expect(contentText(prompt[prompt.length - 1])).not.toContain(ANSWER_LINE);
+  });
+});
+
+describe('actual provider source retention admission', () => {
+  it('rejects a historical quote snapshot changed after prompt materialization', async () => {
+    const db = require('~/models');
+    db.resolveFileRetentionContext.mockReset().mockImplementation(async (_owner, input) => {
+      expect(input.historyQuoteSnapshots).toEqual([
+        { messageId: 'history', messageVersion: 7, quotes: ['private excerpt'] },
+      ]);
+      throw new Error('source snapshot changed');
+    });
+    jest.spyOn(GenerationJobManager, 'bindSourceRetention').mockResolvedValue(true);
+    const req = { user: { id: 'owner' }, body: {}, config: {}, _resumableStreamId: 'stream' };
+    const client = {
+      options: { req },
+      jobCreatedAt: 7,
+      modelBoundCurrentFiles: [],
+      message_file_map: {},
+      modelBoundStoredMessages: [
+        {
+          messageId: 'history',
+          role: 'user',
+          text: 'independent question',
+          __v: 7,
+          quotes: ['private excerpt'],
+        },
+      ],
+    };
+    const callback = AgentClient.prototype.createModelBoundChatModelCallback.call(client);
+    await expect(
+      callback.handleChatModelStart(undefined, [
+        [
+          {
+            messageId: 'history',
+            role: 'user',
+            content: 'private excerpt followed by an independent question',
+          },
+        ],
+      ]),
+    ).rejects.toThrow('Document source admission failed');
+    expect(db.resolveFileRetentionContext).toHaveBeenCalledWith(
+      { userId: 'owner', tenantId: undefined },
+      {
+        fileIds: [],
+        historyMessageIds: ['history'],
+        historyQuoteSnapshots: [
+          { messageId: 'history', messageVersion: 7, quotes: ['private excerpt'] },
+        ],
+      },
+    );
+    expect(GenerationJobManager.bindSourceRetention).not.toHaveBeenCalled();
+    expect(req._fileSourceRetention).toBeUndefined();
+  });
+
+  it.each([true, false])(
+    'binds fresh quoted sources only when the model selected their message (%s)',
+    async (selected) => {
+      const context = { sourceFileIds: ['a'], sourceExpiresAt: new Date('2030-01-20') };
+      const db = require('~/models');
+      db.resolveFileRetentionContext
+        .mockReset()
+        .mockImplementation(async (_owner, { fileIds }) =>
+          fileIds.includes('a') ? context : undefined,
+        );
+      jest.spyOn(GenerationJobManager, 'bindSourceRetention').mockResolvedValue(true);
+      const req = {
+        user: { id: 'owner', tenantId: 'tenant' },
+        body: {},
+        config: {},
+        _resumableStreamId: 'stream',
+        _quoteRetentionMessageId: 'fresh',
+        _quoteRetention: {
+          quotes: ['document excerpt'],
+          sourceMessageConditions: [],
+          quoteSourceRetention: [{ index: 0, sourceRef: { messageId: 'source' }, ...context }],
+        },
+      };
+      const client = {
+        options: { req },
+        jobCreatedAt: 7,
+        modelBoundCurrentFiles: [],
+        message_file_map: {},
+        modelBoundStoredMessages: [
+          { messageId: 'fresh', role: 'user', text: 'question', quotes: ['document excerpt'] },
+        ],
+      };
+      const callback = AgentClient.prototype.createModelBoundChatModelCallback.call(client);
+      await callback.handleChatModelStart(undefined, [
+        [
+          {
+            messageId: selected ? 'fresh' : 'independent',
+            role: 'user',
+            content: 'question',
+          },
+        ],
+      ]);
+      expect(db.resolveFileRetentionContext).toHaveBeenCalledWith(
+        { userId: 'owner', tenantId: 'tenant' },
+        { fileIds: selected ? ['a'] : [], historyMessageIds: [] },
+      );
+      if (selected) {
+        expect(req._fileSourceRetention).toEqual(context);
+        expect(GenerationJobManager.bindSourceRetention).toHaveBeenCalledWith('stream', 7, context);
+      } else {
+        expect(req._fileSourceRetention).toBeUndefined();
+        expect(GenerationJobManager.bindSourceRetention).not.toHaveBeenCalled();
+      }
+    },
+  );
+
+  afterEach(() => jest.restoreAllMocks());
+  it.each([true, false])(
+    'requires generation bind before live revalidation (bind=%s)',
+    async (bound) => {
+      const order = [];
+      const context = { sourceFileIds: ['a'], sourceExpiresAt: new Date('2030-01-20') };
+      const db = require('~/models');
+      db.resolveFileRetentionContext.mockImplementation(async () => {
+        order.push('resolve');
+        return context;
+      });
+      jest.spyOn(GenerationJobManager, 'bindSourceRetention').mockImplementation(async () => {
+        order.push('bind');
+        return bound;
+      });
+      const file = {
+        file_id: 'a',
+        retentionAcceptedAt: new Date(),
+        type: 'text/plain',
+        text: 'private document',
+        llmDeliveryPath: 'text',
+      };
+      const req = {
+        user: { id: 'owner', tenantId: 'tenant' },
+        body: {},
+        config: {},
+        _resumableStreamId: 'stream',
+      };
+      const client = {
+        options: { req, attachments: [file] },
+        jobCreatedAt: 7,
+        modelBoundCurrentFiles: [file],
+        modelBoundStoredMessages: [
+          { messageId: 'u', role: 'user', text: 'question', files: [{ file_id: 'a' }] },
+        ],
+        message_file_map: { u: [file] },
+      };
+      const callback = AgentClient.prototype.createModelBoundChatModelCallback.call(client);
+      const pending = callback.handleChatModelStart(undefined, [
+        [{ messageId: 'u', role: 'user', content: 'question' }],
+      ]);
+      if (bound) {
+        await pending;
+        expect(order).toEqual(['resolve', 'bind', 'resolve']);
+      } else {
+        await expect(pending).rejects.toThrow();
+        expect(order).toEqual(['resolve', 'bind']);
+      }
+      expect(req._fileSourceRetention).toEqual(context);
+      expect(GenerationJobManager.bindSourceRetention).toHaveBeenCalledWith('stream', 7, context);
+    },
+  );
+
+  it('revokes a generation if its source was deleted between bind and live revalidation', async () => {
+    const context = { sourceFileIds: ['a'], sourceExpiresAt: new Date('2030-01-20') };
+    const db = require('~/models');
+    db.resolveFileRetentionContext
+      .mockResolvedValueOnce(context)
+      .mockRejectedValueOnce(new Error('source revoked'));
+    jest.spyOn(GenerationJobManager, 'bindSourceRetention').mockResolvedValue(true);
+    const revoke = jest
+      .spyOn(GenerationJobManager, 'revokeFileSourceGenerations')
+      .mockResolvedValue({ complete: true, pending: [] });
+    const file = {
+      file_id: 'a',
+      retentionAcceptedAt: new Date(),
+      type: 'text/plain',
+      text: 'private document',
+      llmDeliveryPath: 'text',
+    };
+    const req = {
+      user: { id: 'owner', tenantId: 'tenant' },
+      body: {},
+      config: {},
+      _resumableStreamId: 'stream',
+    };
+    const client = {
+      options: { req, attachments: [file] },
+      jobCreatedAt: 7,
+      modelBoundCurrentFiles: [file],
+      modelBoundStoredMessages: [
+        { messageId: 'u', role: 'user', text: 'question', files: [{ file_id: 'a' }] },
+      ],
+      message_file_map: { u: [file] },
+    };
+    const callback = AgentClient.prototype.createModelBoundChatModelCallback.call(client);
+    await expect(
+      callback.handleChatModelStart(undefined, [
+        [{ messageId: 'u', role: 'user', content: 'question' }],
+      ]),
+    ).rejects.toThrow();
+    expect(revoke).toHaveBeenCalledWith({ userId: 'owner', tenantId: 'tenant' }, ['a']);
+    expect(req._fileSourceRetention).toEqual(context);
+  });
+
+  it('retains the union and earliest deadline when actual model callbacks overlap', async () => {
+    const expiryA = new Date('2030-01-20');
+    const expiryB = new Date('2030-01-29');
+    const db = require('~/models');
+    db.resolveFileRetentionContext.mockImplementation(async (_owner, { fileIds }) => ({
+      sourceFileIds: fileIds,
+      sourceExpiresAt: fileIds.includes('a') ? expiryA : expiryB,
+    }));
+    jest.spyOn(GenerationJobManager, 'bindSourceRetention').mockResolvedValue(true);
+    const files = ['a', 'b'].map((file_id) => ({
+      file_id,
+      retentionAcceptedAt: new Date(),
+      type: 'text/plain',
+      text: `document ${file_id}`,
+      llmDeliveryPath: 'text',
+    }));
+    const req = {
+      user: { id: 'owner', tenantId: 'tenant' },
+      body: {},
+      config: {},
+      _resumableStreamId: 'stream',
+    };
+    const client = {
+      options: { req, attachments: files },
+      jobCreatedAt: 7,
+      modelBoundCurrentFiles: files,
+      modelBoundStoredMessages: files.map((file) => ({
+        messageId: file.file_id,
+        role: 'user',
+        text: 'question',
+        files: [{ file_id: file.file_id }],
+      })),
+      message_file_map: { a: [files[0]], b: [files[1]] },
+    };
+    const callback = AgentClient.prototype.createModelBoundChatModelCallback.call(client);
+    await Promise.all(
+      ['a', 'b'].map((messageId) =>
+        callback.handleChatModelStart(undefined, [
+          [{ messageId, role: 'user', content: 'question' }],
+        ]),
+      ),
+    );
+    expect(new Set(req._fileSourceRetention.sourceFileIds)).toEqual(new Set(['a', 'b']));
+    expect(req._fileSourceRetention.sourceExpiresAt).toEqual(expiryA);
   });
 });

@@ -1,3 +1,6 @@
+import { quoteSourceRefSchema } from 'librechat-data-provider';
+import type { QuoteSourceRef } from 'librechat-data-provider';
+
 /** Max characters kept per quoted excerpt (defense-in-depth over the client cap). */
 export const QUOTE_MAX_LENGTH = 1500;
 
@@ -57,6 +60,24 @@ export function getReferencedQuotes(raw: unknown): string[] | null {
 /** Normalizes quotes while retaining their source-array positions. */
 export function getReferencedQuoteEntries(raw: unknown): ReferencedQuoteEntry[] | null {
   return normalizeReferencedQuotes(raw, toQuoteEntry);
+}
+
+/** Keep each source reference paired with its raw excerpt through normalization. */
+export function normalizeReferencedQuoteSources(
+  rawQuotes: unknown,
+  rawRefs: unknown,
+): { quotes: string[]; quoteSourceRefs: Array<QuoteSourceRef | null> } {
+  const entries = getReferencedQuoteEntries(rawQuotes) ?? [];
+  if (rawRefs != null && !Array.isArray(rawRefs)) {
+    throw new Error('Invalid quote source references');
+  }
+  return {
+    quotes: entries.map(({ text }) => text),
+    quoteSourceRefs: entries.map(({ sourceIndex }) => {
+      const ref: unknown = Array.isArray(rawRefs) ? rawRefs[sourceIndex] : null;
+      return ref == null ? null : quoteSourceRefSchema.parse(ref);
+    }),
+  };
 }
 
 /** Formats one excerpt as a Markdown blockquote, prefixing every line. */

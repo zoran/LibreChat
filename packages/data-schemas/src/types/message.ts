@@ -1,4 +1,5 @@
 import type {
+  QuoteSourceRef,
   TFeedbackRating,
   TFeedbackTag,
   TReasoningOverride,
@@ -44,8 +45,37 @@ export interface ISubagentTaskControlReceipt {
   messageTruncated?: boolean;
 }
 
+/** Server-derived body dependencies, never accepted from message request fields. */
+export type SourceRetentionContext = Readonly<{
+  sourceFileIds: readonly string[];
+  sourceExpiresAt: Date;
+}>;
+
+/** Server-private field lineage; an empty persisted array remains a no-revival fence. */
+export type QuoteSourceRetention = {
+  index: number;
+  sourceRef: QuoteSourceRef;
+  sourceFileIds: string[];
+  sourceExpiresAt: Date;
+};
+
+/** Prepared by the owned resolver, never accepted from HTTP metadata. Dates stay Dates. */
+export type ResolvedQuoteRetention = {
+  quotes: string[];
+  quoteSourceRetention: QuoteSourceRetention[];
+  /** Transient exact snapshots touched in the same transaction as first materialization. */
+  sourceMessageConditions: Array<{ messageId: string; messageVersion: number | null }>;
+};
+
 // @ts-ignore
 export interface IMessage extends Document {
+  __v?: number;
+  /** Derived public references to this saved quote snapshot; not a persistence authority. */
+  quoteSourceRefs?: Array<QuoteSourceRef | null>;
+  quoteSourceRetention?: QuoteSourceRetention[];
+  sourceFileIds?: string[];
+  sourceExpiresAt?: Date;
+  sourceContentRemovedAt?: Date;
   messageId: string;
   conversationId: string;
   user: string;
