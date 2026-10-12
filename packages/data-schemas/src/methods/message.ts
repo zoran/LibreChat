@@ -1015,6 +1015,7 @@ export interface MessageMethods {
       sortOrder?: 1 | -1;
       limit?: number;
       cursor?: string | null;
+      select?: string;
     },
   ): Promise<{ messages: IMessage[]; nextCursor: string | null }>;
   searchMessages(
@@ -1443,24 +1444,59 @@ export function createMessageMethods(
     }
   }
 
+  const sourceMetadataFields = new Set([
+    '_id',
+    '__v',
+    'user',
+    'tenantId',
+    'sourceFileIds',
+    'sourceExpiresAt',
+    'sourceContentRemovedAt',
+    'files',
+    'attachments',
+    'quotes',
+    'quoteSourceRetention',
+  ]);
+
   function hasSourceMetadata(select?: string): boolean {
     if (!select) return true;
-    const required = new Set([
-      '_id',
-      'user',
-      'tenantId',
-      'sourceFileIds',
-      'sourceExpiresAt',
-      'sourceContentRemovedAt',
-      'files',
-      'attachments',
-      'quotes',
-      'quoteSourceRetention',
-    ]);
     return select
       .trim()
       .split(/\s+/)
-      .every((field) => field.startsWith('-') && !required.has(field.slice(1)));
+      .every(
+        (field) =>
+          field.startsWith('+') ||
+          (field.startsWith('-') && !sourceMetadataFields.has(field.slice(1))),
+      );
+  }
+
+  /** Evaluate retention before removing the caller's private metadata exclusions. */
+  function messageReadProjection(select?: string) {
+    const fields = select?.trim().split(/\s+/).filter(Boolean) ?? [];
+    const exclusion = fields.every((field) => field.startsWith('-') || field.startsWith('+'));
+    const omitted = fields
+      .filter(
+        (field) =>
+          field === '-_id' ||
+          (exclusion && field.startsWith('-') && sourceMetadataFields.has(field.slice(1))),
+      )
+      .map((field) => field.slice(1));
+    return {
+      select: fields.filter((field) => !omitted.some((name) => field === `-${name}`)).join(' '),
+      omitted,
+    };
+  }
+
+  async function maskProjectedMessages(
+    rows: IMessage[],
+    projection: ReturnType<typeof messageReadProjection>,
+  ) {
+    const visible = await maskFileSourceMessages(rows, hasSourceMetadata(projection.select));
+    for (const row of visible) {
+      for (const field of projection.omitted)
+        delete (row as unknown as Record<string, unknown>)[field];
+    }
+    return visible;
   }
 
   /** Resolve all projected history rows and source files in batches, never one query per message. */
@@ -3804,9 +3840,10 @@ export function createMessageMethods(
   ) {
     try {
       const Message = mongoose.models.Message as Model<IMessage>;
+      const projection = messageReadProjection(select);
       const query = Message.find(filter).select('+quoteSourceRetention');
-      if (select) {
-        query.select(select);
+      if (projection.select) {
+        query.select(projection.select);
       }
       if (options.sort !== false) {
         query.sort(options.sort ?? { createdAt: 1 });
@@ -3815,7 +3852,7 @@ export function createMessageMethods(
         query.limit(options.limit);
       }
 
-      return maskFileSourceMessages(await query.lean<IMessage[]>(), hasSourceMetadata(select));
+      return maskProjectedMessages(await query.lean<IMessage[]>(), projection);
     } catch (err) {
       logger.error('Error getting messages:', err);
       throw err;
@@ -4999,13 +5036,14 @@ export function createMessageMethods(
   ) {
     const Message = mongoose.models.Message as Model<IMessage>;
     const { sortField = 'createdAt', sortOrder = -1, limit = 25, cursor, select } = options;
+    const projection = messageReadProjection(select);
     const queryFilter = { ...filter };
     if (cursor) {
       queryFilter[sortField] = sortOrder === 1 ? { $gt: cursor } : { $lt: cursor };
     }
     const query = Message.find(queryFilter).select('+quoteSourceRetention');
-    if (select) {
-      query.select(select);
+    if (projection.select) {
+      query.select(projection.select);
     }
     const messages = await query
       .sort({ [sortField]: sortOrder })
@@ -5021,7 +5059,7 @@ export function createMessageMethods(
       nextCursor = String(cursorValue ?? '');
     }
     return {
-      messages: await maskFileSourceMessages(messages, hasSourceMetadata(select)),
+      messages: await maskProjectedMessages(messages, projection),
       nextCursor,
     };
   }

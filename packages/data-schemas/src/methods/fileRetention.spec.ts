@@ -4,7 +4,7 @@ import { v4 as uuid } from 'uuid';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import type { IMessage } from '~/types';
 import { FileSourceUnavailableError, touchFileSources } from './fileRetention';
-import { createMessageMethods } from './message';
+import { CLIENT_MESSAGE_SELECT, createMessageMethods } from './message';
 import { createFileMethods } from './file';
 import { createModels } from '~/models';
 
@@ -65,6 +65,42 @@ describe('source-dependent message retention', () => {
   const context = () =>
     messages.resolveFileRetentionContext(owner, { fileIds: [sourceId], historyMessageIds: [] });
 
+  it.each(['list', 'cursor'] as const)(
+    'keeps the canonical %s client projection readable without extra source-free queries',
+    async (kind) => {
+      const messageId = uuid();
+      await messages.saveMessage(owner, {
+        ...row(messageId, 'ordinary transcript'),
+        quotes: ['independent quotation'],
+      });
+      await mongoose.models.Message.updateOne({ messageId }, { $set: { __v: 3 } });
+      const findMessages = jest.spyOn(mongoose.models.Message, 'find');
+      const findFiles = jest.spyOn(mongoose.models.File, 'find');
+      try {
+        const filter = { user, conversationId };
+        const rows =
+          kind === 'list'
+            ? await messages.getMessages(filter, CLIENT_MESSAGE_SELECT)
+            : (await messages.getMessagesByCursor(filter, { select: CLIENT_MESSAGE_SELECT }))
+                .messages;
+        expect(rows).toHaveLength(1);
+        expect(rows[0]).toMatchObject({
+          text: 'ordinary transcript',
+          quotes: ['independent quotation'],
+          quoteSourceRefs: [{ messageId, quoteIndex: 0, messageVersion: 3 }],
+        });
+        for (const field of ['_id', 'user', '__v', 'quoteSourceRetention']) {
+          expect(rows[0]).not.toHaveProperty(field);
+        }
+        expect(findMessages).toHaveBeenCalledTimes(1);
+        expect(findFiles).not.toHaveBeenCalled();
+      } finally {
+        findMessages.mockRestore();
+        findFiles.mockRestore();
+      }
+    },
+  );
+
   it('rejects a late save, insertOnly and attached-reference write after revoke', async () => {
     const sourceRetention = await context();
     await files.revokeFileSources(owner, [sourceId]);
@@ -117,6 +153,43 @@ describe('source-dependent message retention', () => {
       messages.bulkSaveMessages([{ ...row(answer, 'import revival'), user }]),
     ).rejects.toBeInstanceOf(FileSourceUnavailableError);
   });
+
+  it.each(['list', 'cursor'] as const)(
+    'masks revoked sources through the canonical %s projection while preserving independent text',
+    async (kind) => {
+      const answer = uuid();
+      const question = uuid();
+      await messages.saveMessage(owner, row(answer, 'document answer'), {
+        sourceRetention: await context(),
+      });
+      const quoteRetention = await messages.resolveQuoteRetention(owner, [
+        { text: 'document excerpt', sourceRef: { messageId: answer } },
+        { text: 'independent excerpt' },
+      ]);
+      await messages.saveMessage(
+        owner,
+        { ...row(question, 'independent question', true), quotes: quoteRetention.quotes },
+        { quoteRetention },
+      );
+      await files.revokeFileSources(owner, [sourceId]);
+      const filter = { user, conversationId };
+      const visible =
+        kind === 'list'
+          ? await messages.getMessages(filter, CLIENT_MESSAGE_SELECT)
+          : (await messages.getMessagesByCursor(filter, { select: CLIENT_MESSAGE_SELECT }))
+              .messages;
+      expect(visible.find((message) => message.messageId === answer)?.text).toBe('');
+      expect(visible.find((message) => message.messageId === question)).toMatchObject({
+        text: 'independent question',
+        quotes: ['independent excerpt'],
+      });
+      for (const message of visible) {
+        for (const field of ['_id', 'user', '__v', 'quoteSourceRetention']) {
+          expect(message).not.toHaveProperty(field);
+        }
+      }
+    },
+  );
 
   it('keeps the source-free read/write fast path and selectively preserves B-only content', async () => {
     const start = jest.spyOn(mongoose, 'startSession');
