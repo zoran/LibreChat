@@ -72,7 +72,7 @@ describe('one managed processing claim', () => {
         original: {},
       })),
       renew: jest.fn(async () => lease),
-      bindProcessingExecution: jest.fn(async () => undefined),
+      bindProcessingExecution: jest.fn(async (): Promise<void> => undefined),
       claimWorkBytes: jest.fn(async (_lease, bytes: number) => ({
         bytes,
         generation: 1,
@@ -341,16 +341,29 @@ describe('one managed processing claim', () => {
       outcome: 'failure',
     });
   });
-  it('never claims cleanup of derived text after a lost publication response', async () => {
-    const deps = fixture();
-    deps.management.publish.mockRejectedValueOnce(new Error('unknown commit') as never);
-    const observe = jest.fn();
-    await processNextManagedUpload({ ...deps, observe } as never, new AbortController().signal);
-    expect(deps.management.confirmCleanup).toHaveBeenCalledWith(
-      expect.objectContaining({ textAndHistoryRemoved: false, originalAbsent: false }),
-    );
-    expect(observe).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'total' }));
-  });
+  it.each(['acknowledged', 'unknown'])(
+    'never claims derived cleanup after a lost publication and %s failure result',
+    async (failureResult) => {
+      const deps = fixture();
+      deps.management.publish.mockRejectedValueOnce(new Error('unknown commit') as never);
+      if (failureResult === 'unknown') {
+        deps.management.fail.mockRejectedValueOnce(new Error('unknown failure persistence'));
+      }
+      const observe = jest.fn();
+      const result = await processNextManagedUpload(
+        { ...deps, observe } as never,
+        new AbortController().signal,
+      );
+      expect(result).toEqual({
+        claimed: true,
+        operation: failureResult === 'unknown' ? undefined : { state: 'failed' },
+      });
+      expect(deps.management.confirmCleanup).toHaveBeenCalledWith(
+        expect.objectContaining({ textAndHistoryRemoved: false, originalAbsent: false }),
+      );
+      expect(observe).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'total' }));
+    },
+  );
   it('registers a pending claim before await and joins a claim delivered after cancellation', async () => {
     const deps = fixture();
     let deliver!: (value: typeof lease) => void;

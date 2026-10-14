@@ -4,6 +4,43 @@ const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../index.js'), 'utf8');
 
+test.each(['ready', 'rejected'])(
+  'startup waits for the cache owner before any dependent work: %s',
+  async (result) => {
+    const start = source.indexOf('const startServer = async () => {');
+    const end = source.indexOf('  const { metricsMiddleware', start);
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    let ready;
+    let rejected;
+    const pending = new Promise((resolve, reject) => {
+      ready = resolve;
+      rejected = reject;
+    });
+    const waitForRedisStartup = jest.fn(() => pending);
+    const entered = jest.fn();
+    const startup = vm.runInNewContext(`${source.slice(start, end)} entered(); }; startServer();`, {
+      waitForRedisStartup,
+      waitForKeyvRedisClient: jest.fn().mockResolvedValue(undefined),
+      entered,
+    });
+    const outcome = startup.catch((error) => error);
+    await new Promise(setImmediate);
+    expect(entered).not.toHaveBeenCalled();
+    expect(waitForRedisStartup).toHaveBeenCalledTimes(1);
+    if (result === 'ready') {
+      ready();
+      await outcome;
+      expect(entered).toHaveBeenCalledTimes(1);
+    } else {
+      const failure = new Error('shared Redis startup unavailable');
+      rejected(failure);
+      expect(await outcome).toBe(failure);
+      expect(entered).not.toHaveBeenCalled();
+    }
+  },
+);
+
 test('startup supplies existing owner ports and routes readiness through maintenance only', async () => {
   const start = source.indexOf('const maintenance = createAppMaintenance(');
   const end = source.indexOf('const rejectChatStartsUntilReady', start);

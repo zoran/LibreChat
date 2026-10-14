@@ -67,7 +67,7 @@ const {
   createAgentEventTerminalHandler,
   createScheduleWriteGate,
   startCodeEnvironmentLifecycleReconciler,
-  waitForKeyvRedisClient,
+  waitForRedisStartup,
   warnOnUnreachableDeliveryPaths,
   createCodeApiUploadRegistry,
 } = require('@librechat/api');
@@ -240,7 +240,7 @@ const configureGenerationStreams = async () => {
 const SHUTDOWN_TEARDOWN_RESERVE_MS = 10_000;
 
 const startServer = async () => {
-  await waitForKeyvRedisClient();
+  await waitForRedisStartup();
   const { metricsMiddleware, metricsRouter, registry } = createMetrics({
     collectAgentEventActorStorageMetrics: () =>
       runAsSystem(async () => {

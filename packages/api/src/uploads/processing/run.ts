@@ -48,7 +48,10 @@ export async function processNextManagedUpload(
   | { claimed: false }
   | {
       claimed: true;
-      operation: Awaited<ReturnType<UploadProcessingDependencies['management']['publish']>>;
+      /** Undefined when persisting the failure did not return an acknowledged operation. */
+      operation:
+        | Awaited<ReturnType<UploadProcessingDependencies['management']['publish']>>
+        | undefined;
     }
 > {
   let lease: UploadLease | null = null;

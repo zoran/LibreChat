@@ -86,6 +86,33 @@ function waitForInitialIoRedisReady(): Promise<void> {
   return initialIoRedisReady;
 }
 
+let redisStartupReady: Promise<void> | undefined;
+
+/** Bounds initial client readiness once; later disconnects must not queue or replay work. */
+function waitForRedisStartup(): Promise<void> {
+  if (!cacheConfig.USE_REDIS) {
+    return Promise.resolve();
+  }
+  redisStartupReady ??= (async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(
+            () => reject(new Error('Redis startup timed out')),
+            cacheConfig.REDIS_CONNECT_TIMEOUT,
+          );
+          timer.unref();
+        }),
+        Promise.all([waitForKeyvRedisClient(), waitForInitialIoRedisReady()]),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+  })();
+  return redisStartupReady;
+}
+
 if (cacheConfig.USE_REDIS) {
   const redisOptions: Record<string, unknown> = {
     username: username,
@@ -426,6 +453,7 @@ export {
   keyvRedisClientReady,
   waitForInitialIoRedisReady,
   waitForKeyvRedisClient,
+  waitForRedisStartup,
   evalKeyvRedisScript,
   handleKeyvRedisError,
 };

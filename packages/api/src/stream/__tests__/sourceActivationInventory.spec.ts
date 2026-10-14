@@ -154,7 +154,7 @@ describe('finite initial source population at the existing stream owner', () => 
   });
 
   it('rejects unknown stream suffixes, orphan replay and a nonterminating bounded scan', async () => {
-    for (const rows of [
+    const cases: Array<Record<string, string[]>> = [
       { 'stream:{orphan}:unknown-future-copy': ['string', '{}'] },
       { 'stream:{orphan}:chunks': ['stream', JSON.stringify({ text: 'unclassified old text' })] },
       {
@@ -172,7 +172,8 @@ describe('finite initial source population at the existing stream owner', () => 
           '{}',
         ],
       },
-    ]) {
+    ];
+    for (const rows of cases) {
       await expect(
         redisFixture(rows).store.inspectInitialSourcePopulation(options()),
       ).rejects.toThrow(/inventory/i);

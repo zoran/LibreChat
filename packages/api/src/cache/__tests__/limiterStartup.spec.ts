@@ -65,11 +65,132 @@ describe('Sentinel limiter startup', () => {
     jest.useFakeTimers();
     mockIoClient = makeIoClient();
     mockNodeClient.removeAllListeners();
+    mockNodeClient.connect.mockReset().mockResolvedValue(undefined);
   });
 
   afterEach(() => {
     mockIoClient.emit('end');
     jest.useRealTimers();
+  });
+
+  it.each(['keyv', 'io'])(
+    'waits for both startup clients when %s is ready first',
+    async (first) => {
+      let keyvReady!: () => void;
+      mockNodeClient.connect.mockReturnValue(new Promise<void>((resolve) => (keyvReady = resolve)));
+      const { waitForRedisStartup } = await import('../redisClients');
+      const entered = jest.fn();
+      const startup = waitForRedisStartup();
+      const continuation = startup.then(entered);
+      const ioReady = () => {
+        mockIoClient.status = 'ready';
+        mockIoClient.emit('ready');
+      };
+      await jest.advanceTimersByTimeAsync(800);
+      (first === 'keyv' ? keyvReady : ioReady)();
+      await jest.advanceTimersByTimeAsync(100);
+      expect(entered).not.toHaveBeenCalled();
+      expect(waitForRedisStartup()).toBe(startup);
+      (first === 'keyv' ? ioReady : keyvReady)();
+      await continuation;
+      expect(entered).toHaveBeenCalledTimes(1);
+      expect(jest.getTimerCount()).toBe(0);
+      expect(mockIoClient.listenerCount('end')).toBe(0);
+      expect(mockIoClient.listenerCount('ready')).toBe(1);
+      expect(mockIoClient.call).not.toHaveBeenCalled();
+      mockIoClient.status = 'reconnecting';
+      expect(waitForRedisStartup()).toBe(startup);
+      await expect(startup).resolves.toBeUndefined();
+      expect(jest.getTimerCount()).toBe(0);
+    },
+  );
+
+  it.each(['keyv', 'io'])('keeps one startup deadline when %s remains pending', async (pending) => {
+    let keyvReady!: () => void;
+    mockNodeClient.connect.mockReturnValue(new Promise<void>((resolve) => (keyvReady = resolve)));
+    const { waitForRedisStartup } = await import('../redisClients');
+    const entered = jest.fn();
+    const startup = waitForRedisStartup();
+    const outcome = startup.then(entered, (error: Error) => error);
+    const ioReady = () => {
+      mockIoClient.status = 'ready';
+      mockIoClient.emit('ready');
+    };
+    await jest.advanceTimersByTimeAsync(900);
+    (pending === 'keyv' ? ioReady : keyvReady)();
+    expect(waitForRedisStartup()).toBe(startup);
+    await jest.advanceTimersByTimeAsync(99);
+    expect(entered).not.toHaveBeenCalled();
+    expect(jest.getTimerCount()).toBeGreaterThan(0);
+    await jest.advanceTimersByTimeAsync(1);
+    expect(await outcome).toEqual(new Error('Redis startup timed out'));
+    expect(jest.getTimerCount()).toBe(0);
+    (pending === 'keyv' ? keyvReady : ioReady)();
+    await jest.advanceTimersByTimeAsync(1);
+    await expect(waitForRedisStartup()).rejects.toThrow('Redis startup timed out');
+    expect(entered).not.toHaveBeenCalled();
+    expect(mockIoClient.call).not.toHaveBeenCalled();
+    expect(mockIoClient.listenerCount('end')).toBe(0);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it.each(['keyv', 'io'])(
+    'propagates initial %s rejection and clears the startup timer',
+    async (failed) => {
+      let keyvReady!: () => void;
+      let keyvFailed!: (error: Error) => void;
+      mockNodeClient.connect.mockReturnValue(
+        new Promise<void>((resolve, reject) => {
+          keyvReady = resolve;
+          keyvFailed = reject;
+        }),
+      );
+      const { waitForRedisStartup } = await import('../redisClients');
+      const startup = waitForRedisStartup();
+      const outcome = startup.catch((error: Error) => error);
+      const failure = new Error(
+        failed === 'keyv' ? 'Keyv initial connection rejected' : 'Redis initial connection ended',
+      );
+      if (failed === 'keyv') {
+        mockIoClient.status = 'ready';
+        mockIoClient.emit('ready');
+        keyvFailed(failure);
+      } else {
+        mockIoClient.status = 'end';
+        mockIoClient.emit('end');
+      }
+      expect(await outcome).toEqual(failure);
+      expect(jest.getTimerCount()).toBe(0);
+      keyvReady();
+      mockIoClient.status = 'ready';
+      mockIoClient.emit('ready');
+      await expect(waitForRedisStartup()).rejects.toEqual(failure);
+      expect(mockIoClient.listenerCount('end')).toBe(0);
+      expect(mockIoClient.call).not.toHaveBeenCalled();
+      expect(jest.getTimerCount()).toBe(0);
+    },
+  );
+
+  it('clears its deadline without cancelling another consumer of the initial IO gate', async () => {
+    let keyvFailed!: (error: Error) => void;
+    mockNodeClient.connect.mockReturnValue(
+      new Promise<void>((_resolve, reject) => (keyvFailed = reject)),
+    );
+    const { waitForRedisStartup, waitForInitialIoRedisReady } = await import('../redisClients');
+    const limiterReadiness = waitForInitialIoRedisReady().catch((error: unknown) => error);
+    expect(jest.getTimerCount()).toBe(1);
+    const startup = waitForRedisStartup();
+    const outcome = startup.catch((error: Error) => error);
+    expect(jest.getTimerCount()).toBe(2);
+    const failure = new Error('Keyv startup rejected');
+    keyvFailed(failure);
+    expect(await outcome).toBe(failure);
+    expect(jest.getTimerCount()).toBe(1);
+    mockIoClient.status = 'ready';
+    mockIoClient.emit('ready');
+    await limiterReadiness;
+    expect(jest.getTimerCount()).toBe(0);
+    await expect(waitForRedisStartup()).rejects.toBe(failure);
   });
 
   it('defers real constructor scripts until initial readiness and preserves later offline rejection', async () => {

@@ -2051,7 +2051,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
       job.sourceReplayIntent &&
       (Buffer.byteLength(subscriberId) > 128 ||
         (Object.keys(job.activeSubscriberLeases ?? {}).length >= 64 &&
-          !Object.hasOwn(job.activeSubscriberLeases ?? {}, subscriberId)))
+          !Object.prototype.hasOwnProperty.call(job.activeSubscriberLeases ?? {}, subscriberId)))
     )
       return false;
     job.activeSubscriberLeases ??= {};

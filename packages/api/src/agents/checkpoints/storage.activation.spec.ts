@@ -33,12 +33,12 @@ describe('metadata-only checkpoint admission inventory', () => {
   let calls: Array<{ name: string; pipeline: unknown[]; options: Record<string, unknown> }>;
   let rows: Record<string, unknown[]>;
   let originalDb: unknown;
-  let originalReady: number;
+  let originalReady: PropertyDescriptor | undefined;
   beforeEach(() => {
     calls = [];
     rows = {};
     originalDb = mongoose.connection.db;
-    originalReady = mongoose.connection.readyState;
+    originalReady = Object.getOwnPropertyDescriptor(mongoose.connection, 'readyState');
     Object.defineProperty(mongoose.connection, 'db', {
       configurable: true,
       writable: true,
@@ -51,7 +51,10 @@ describe('metadata-only checkpoint admission inventory', () => {
         }),
       },
     });
-    mongoose.connection.readyState = 1;
+    Object.defineProperty(mongoose.connection, 'readyState', {
+      configurable: true,
+      value: 1,
+    });
   });
   afterEach(() => {
     Object.defineProperty(mongoose.connection, 'db', {
@@ -59,7 +62,11 @@ describe('metadata-only checkpoint admission inventory', () => {
       writable: true,
       value: originalDb,
     });
-    mongoose.connection.readyState = originalReady;
+    if (originalReady) {
+      Object.defineProperty(mongoose.connection, 'readyState', originalReady);
+    } else {
+      Reflect.deleteProperty(mongoose.connection, 'readyState');
+    }
   });
 
   it('checks default, actual current and retained descriptors without initializing a saver', async () => {
