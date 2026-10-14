@@ -2108,6 +2108,19 @@ class AgentClient extends BaseClient {
    * at every chat-model call instead. */
   assertBuiltModelBoundContent() {}
 
+  hasRetainedDocumentSources(
+    fileProjection = BaseClient.prototype.getModelBoundFileProjection.call(this),
+  ) {
+    return (
+      fileProjection.resolvedFiles.some((file) => file.retentionAcceptedAt != null) ||
+      this.modelBoundStoredMessages?.some(
+        (message) => message.sourceFileIds?.length > 0 || message.quotes?.length > 0,
+      ) ||
+      this.options.req?._quoteRetention?.quoteSourceRetention?.length > 0 ||
+      this.options.req?._fileSourceRetention != null
+    );
+  }
+
   createModelBoundChatModelCallback(initialAdmission) {
     const fileProjection = BaseClient.prototype.getModelBoundFileProjection.call(this);
     const persistence = BaseClient.prototype.getModelBoundUserMessagePersistence.call(this);
@@ -2130,12 +2143,7 @@ class AgentClient extends BaseClient {
           persistence?.cancel,
           this.privateTextStart,
         ),
-        ...((fileProjection.resolvedFiles.some((file) => file.retentionAcceptedAt != null) ||
-          this.modelBoundStoredMessages?.some(
-            (message) => message.sourceFileIds?.length > 0 || message.quotes?.length > 0,
-          ) ||
-          this.options.req?._quoteRetention?.quoteSourceRetention?.length > 0 ||
-          this.options.req?._fileSourceRetention != null) && {
+        ...(AgentClient.prototype.hasRetainedDocumentSources.call(this, fileProjection) && {
           onSourceProjection: async ({ fileIds, sourceMessageIds }) => {
             const req = this.options.req;
             const owner = { userId: req.user.id, tenantId: req.user.tenantId };
@@ -4742,6 +4750,25 @@ class AgentClient extends BaseClient {
         agents: topLevelAgents,
         askUserQuestionAdminDisabled,
       });
+      // These consumers can retain independent copies in tools, checkpoints or
+      // detached runs. Until they participate in the same document lifecycle,
+      // reject before creating a run or prewarming an external environment.
+      if (
+        AgentClient.prototype.hasRetainedDocumentSources.call(this) &&
+        (runUsesCheckpointer ||
+          this.options.req?._isScheduledFire === true ||
+          this.options.req?._isAgentTrigger === true ||
+          this.eventActorInvocationId != null ||
+          this.options.subagentTasks != null ||
+          topLevelAgents.length > 1 ||
+          topLevelAgents.some((agent) => agent?.tools?.length > 0 || agent?.edges?.length > 0))
+      ) {
+        const error = new Error(
+          'This document can be used in a regular chat. Tools and background runs are unavailable for retained documents.',
+        );
+        error.code = 'DOCUMENT_SOURCE_UNSUPPORTED';
+        throw error;
+      }
       if (this.options.req?._isScheduledFire === true && runCanPause) {
         if (!GenerationJobManager.isRedis) {
           const error = new Error(
@@ -5392,6 +5419,7 @@ class AgentClient extends BaseClient {
       this.rebaseActivityPhaseBounds(contentBeforeReshape);
     } catch (err) {
       if (
+        err?.code === 'DOCUMENT_SOURCE_UNSUPPORTED' ||
         err?.code === 'SCHEDULED_HITL_REQUIRES_SHARED_STORE' ||
         err?.code === 'SCHEDULED_HITL_REQUIRES_DURABLE_CHECKPOINT' ||
         err?.code === 'HITL_CHECKPOINT_UNAVAILABLE' ||

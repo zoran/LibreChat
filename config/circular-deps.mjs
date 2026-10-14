@@ -16,7 +16,7 @@ const targets = [
   {
     name: '@librechat/api',
     dir: 'packages/api',
-    entries: ['src/index.ts', 'src/telemetry.ts'],
+    entries: ['src/index.ts', 'src/telemetry.ts', 'src/upload-activation.ts'],
     alias: { '~': 'src' },
     internal: ['~'],
     minModules: 200,

@@ -66,6 +66,8 @@ const userSchema: Schema<IUser> = new Schema<IUser>(
       required: true,
       default: 'local',
     },
+    authVersion: { type: Number, default: 0 },
+    authDisabled: { type: Boolean, default: false },
     role: {
       type: String,
       default: SystemRoles.USER,

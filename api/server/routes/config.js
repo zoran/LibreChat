@@ -1,6 +1,8 @@
 const express = require('express');
 const {
   isEnabled,
+  getAuthMode,
+  getEmailCodeConfig,
   resolveEmailChangeSettings,
   checkEmailConfig,
   isLangfuseConnectionAvailable,
@@ -86,6 +88,7 @@ function buildPreLoginPayload() {
 
   /** @type {Partial<TStartupConfig>} */
   const payload = {
+    ...getEmailCodeConfig(),
     appTitle: process.env.APP_TITLE || 'LibreChat',
     maintenanceStatusEnabled: isEnabled(process.env.MAINTENANCE_STATUS_ENABLED),
     discordLoginEnabled: !!process.env.DISCORD_CLIENT_ID && !!process.env.DISCORD_CLIENT_SECRET,
@@ -121,6 +124,27 @@ function buildPreLoginPayload() {
 
   if (ldap) {
     payload.ldap = ldap;
+  }
+
+  if (getAuthMode() !== 'default') {
+    for (const key of [
+      'discordLoginEnabled',
+      'facebookLoginEnabled',
+      'githubLoginEnabled',
+      'googleLoginEnabled',
+      'appleLoginEnabled',
+      'passkeyLoginEnabled',
+      'openidLoginEnabled',
+      'openidAutoRedirect',
+      'samlLoginEnabled',
+      'emailLoginEnabled',
+      'registrationEnabled',
+      'socialLoginEnabled',
+      'passwordResetEnabled',
+      'twoFactorAuthenticationRequired',
+    ])
+      payload[key] = false;
+    delete payload.ldap;
   }
 
   return payload;
@@ -166,7 +190,8 @@ function buildPostLoginPayload(appConfig) {
     allowAccountDeletion:
       process.env.ALLOW_ACCOUNT_DELETION === undefined ||
       isEnabled(process.env.ALLOW_ACCOUNT_DELETION),
-    allowEmailChange: resolveEmailChangeSettings(appConfig?.emailChange).enabled,
+    allowEmailChange:
+      getAuthMode() === 'default' && resolveEmailChangeSettings(appConfig?.emailChange).enabled,
     maxPasskeysPerUser: resolveMaxPasskeysPerUser(appConfig?.passkeys),
   };
 
@@ -227,6 +252,7 @@ function buildCloudFrontStartupConfig() {
 
 router.get('/', async function (req, res) {
   try {
+    res.setHeader('Cache-Control', 'private, no-store');
     const preLoginPayload = buildPreLoginPayload();
     const publicSharePayload = buildPublicSharePayload();
     const rum = getRumConfig();
@@ -238,7 +264,13 @@ router.get('/', async function (req, res) {
       /** @type {Partial<TStartupConfig>} */
       const payload = {
         ...preLoginPayload,
-        browserSessionEnabled: baseConfig?.registration?.browserSession?.enabled === true,
+        managedUploads: {
+          enabled: process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED === 'true',
+          eligible: false,
+        },
+        browserSessionEnabled:
+          getAuthMode() !== 'email_code' &&
+          baseConfig?.registration?.browserSession?.enabled === true,
         socialLogins: baseConfig?.registration?.socialLogins ?? defaultSocialLogins,
         turnstile: baseConfig?.turnstileConfig,
         ...(rum ? { rum } : {}),
@@ -307,9 +339,15 @@ router.get('/', async function (req, res) {
       ...preLoginPayload,
       ...publicSharePayload,
       ...buildPostLoginPayload(appConfig),
+      managedUploads: {
+        enabled: process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED === 'true',
+        eligible:
+          req.authenticationClass === 'verified-email' && req.user.provider === 'email_code',
+      },
       ...getConversationTitleCapabilities(appConfig?.interfaceConfig),
       conversationListLimits,
-      browserSessionEnabled: appConfig?.registration?.browserSession?.enabled === true,
+      browserSessionEnabled:
+        getAuthMode() !== 'email_code' && appConfig?.registration?.browserSession?.enabled === true,
       sharedLinksSnapshotFilesEnabled: sharedLinksEnabled && isFileSnapshotEnabled(appConfig),
       socialLogins: appConfig?.registration?.socialLogins ?? defaultSocialLogins,
       projects: appConfig?.projects,

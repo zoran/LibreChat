@@ -15,10 +15,10 @@ import type {
   CreateUserIfAbsentResult,
 } from '~/types';
 import type { TwoFactorEnrollmentGuard, TwoFactorEnrollmentUpdate } from '~/types';
-import type { CacheStore } from '~/types';
-import { evictAuthUserDocs } from '~/utils/eviction';
 import type { AuthPersistenceObserver } from './authPersistence';
+import type { CacheStore } from '~/types';
 import { observeAuthPersistence } from './authPersistence';
+import { evictAuthUserDocs } from '~/utils/eviction';
 import { escapeRegExp } from '~/utils/string';
 import { signPayload } from '~/crypto';
 import logger from '~/config/winston';
@@ -808,6 +808,9 @@ export function createUserMethods(
   async function generateToken(user: IUser, expiresIn?: number): Promise<string> {
     if (!user) {
       throw new Error('No user provided');
+    }
+    if (user.provider === 'email_code') {
+      throw new Error('Email-code credentials require a bound native session');
     }
 
     const expires = expiresIn ?? DEFAULT_SESSION_EXPIRY;

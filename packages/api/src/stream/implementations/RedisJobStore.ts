@@ -34,11 +34,13 @@ import type {
   ParkedSteerClaim,
   ScheduleCleanupScope,
   ScheduleProviderOwner,
+  InitialSourcePopulationOptions,
+  InitialSourcePopulation,
 } from '~/stream/interfaces/IJobStore';
 import type { EarlyBufferOverflowState } from '../../types/earlyBufferRecovery';
-import type { GenerationSourceRetention } from '../interfaces/IJobStore';
 import type { ResolvedAskUserQuestion } from '~/agents/hitl/resume';
 import type { RecoveredSteerPayload } from '~/stream/SteerRecovery';
+import type { SourceReplayIntent } from '../internal/sourceBudget';
 import {
   JobCreationSupersededError,
   JobStatusTransitionDeadlineError,
@@ -50,12 +52,27 @@ import {
   PROVIDER_DRAIN_TIMEOUT_MS,
   isPendingActionStale,
   toWireRunSteps,
+  InitialSourceInventory,
+  failInitialSourceInventory,
 } from '~/stream/interfaces/IJobStore';
+import {
+  SOURCE_HASH_BUDGET_LUA,
+  SOURCE_CHUNK_BUDGET_LUA,
+  SOURCE_REPLAY_INDEX,
+  PREPARE_SOURCE_REPLAY_LUA,
+  COMMIT_SOURCE_REPLAY_LUA,
+  ACK_SOURCE_REPLAY_LUA,
+} from '../internal/sourceBudgetLua';
 import {
   MAX_COALESCED_BYTES,
   MAX_COALESCED_EVENTS,
   resolveCoalesceWindowMs,
 } from '~/stream/internal/coalescing';
+import {
+  SOURCE_REPLAY_LIMITS,
+  SourceReplayError,
+  createSourceReplayIntent,
+} from '../internal/sourceBudget';
 import {
   SCHEDULE_MCP_RECEIPT_LUA,
   SCHEDULE_RETENTION_LUA,
@@ -71,6 +88,74 @@ import { redactQuoteRetention } from '~/files/retention';
 import { evalScript } from '~/cache/redisScript';
 
 const CLIENT_REQUEST_ID_PATTERN = /^[A-Za-z0-9:_-]{1,128}$/;
+const INITIAL_INVENTORY_JSON_FIELDS: ReadonlySet<string> = new Set(
+  (
+    'sourceReplayIntent sourceRetention earlyBufferOverflow activeSubscriberLeases userMessage mcpRequestBody ' +
+    'userSubmittedPaths userSubmittedMessageFieldPaths preResumeProvenance discoveredTools activityPhaseSnapshot ' +
+    'compactionSemanticIndex contextMeta scheduleMCPCompletion scheduleMCPFailure agentEventDetachedTerminalEvidence ' +
+    'agentEventExpectedAction agentEventSuspension pendingAction resolvedAskUserQuestions __replacedGenerations'
+  ).split(' '),
+);
+
+/** Admission-only read scripts cap replies before any content crosses the Redis boundary. */
+const INITIAL_INVENTORY_SCAN: string = `
+local page = redis.call('SCAN', ARGV[1], 'MATCH', ARGV[2], 'COUNT', 64)
+if #page[2] > 128 then return {'invalid'} end
+for _, key in ipairs(page[2]) do if #key > 512 then return {'invalid'} end end
+return page`;
+
+const INITIAL_INVENTORY_READ: string = `
+local key, mode = KEYS[1], ARGV[1]
+local kind = redis.call('TYPE', key).ok
+if kind == 'none' then return {'none'} end
+local limit = math.min(1048576, tonumber(ARGV[2]))
+if not limit or limit < 1 then return {'invalid'} end
+if mode == 'index' then
+  if kind ~= 'hash' then return {'invalid'} end
+  return {'hash-count', tostring(redis.call('HLEN', key))}
+end
+if mode == 'stream' then
+  if kind ~= 'stream' then return {'invalid'} end
+  return {'count', 'stream', tostring(redis.call('XLEN', key))}
+end
+if mode == 'zset' then
+  if kind ~= 'zset' then return {'invalid'} end
+  return {'type', 'zset'}
+end
+if kind ~= mode then return {'invalid'} end
+local used = 0
+local function bounded(value)
+  if not value then return false end
+  used = used + #value
+  return #value <= 1048576 and used <= limit
+end
+if kind == 'string' then
+  if redis.call('STRLEN', key) > limit then return {'invalid'} end
+  return {'string', redis.call('GET', key)}
+end
+local result = {kind}
+if kind == 'hash' then
+  if redis.call('HLEN', key) > 1024 then return {'invalid'} end
+  local fields = redis.call('HKEYS', key)
+  table.sort(fields)
+  for _, field in ipairs(fields) do
+    if #field > 512 or not bounded(field) or redis.call('HSTRLEN', key, field) > limit-used then
+      return {'invalid'}
+    end
+    local value = redis.call('HGET', key, field)
+    if not bounded(value) then return {'invalid'} end
+    result[#result+1], result[#result+2] = field, value
+  end
+elseif kind == 'list' then
+  local count = redis.call('LLEN', key)
+  if count > 1024 then return {'invalid'} end
+  for i = 0, count-1 do
+    local value = redis.call('LINDEX', key, i)
+    if not bounded(value) then return {'invalid'} end
+    result[#result+1] = value
+  end
+else return {'invalid'} end
+return result`;
 
 /** Each retention re-arm requires new publication, even at the same generation epoch. */
 const SCHEDULE_MEMBERSHIP_INVALIDATE_LUA =
@@ -158,11 +243,13 @@ function assertCreateIdempotencyArguments(
 const SOURCE_RETENTION_LUA =
   'local function sourceAvailable(key) ' +
   'if redis.call("HGET", key, "sourceRetentionRevokedAt") or redis.call("HGET", key, "sourceRetentionPurged") == "1" then return false end ' +
+  'if redis.call("HEXISTS",key,"sourceReplayIntent")==1 and redis.call("HGET",key,"sourceReplayHeld")~="1" then return false end ' +
   'local expiry = redis.call("HGET", key, "sourceRetentionExpiresAt") ' +
   'if not expiry then return true end ' +
   'local t = redis.call("TIME") return tonumber(expiry) > tonumber(t[1])*1000 + math.floor(tonumber(t[2])/1000) end ';
 
 const JOB_CAS_LUA =
+  SOURCE_HASH_BUDGET_LUA +
   SOURCE_RETENTION_LUA +
   'if not sourceAvailable(KEYS[1]) and ARGV[6] ~= "1" then return 0 end ' +
   SCHEDULE_MCP_RECEIPT_LUA +
@@ -216,13 +303,15 @@ const JOB_CAS_LUA =
   'local clearReceipt = false local hdelCount = tonumber(ARGV[13]) ' +
   'for i = 14, 13 + hdelCount do if ARGV[i] == "scheduleOutcome" or ARGV[i] == "scheduleOutcomeError" then clearReceipt = true end end ' +
   'local idx = 14 ' +
-  'for i = 1, hdelCount do if not string.match(ARGV[idx],"^sourceRetention") then redis.call("HDEL", KEYS[1], ARGV[idx]) end idx = idx + 1 end ' +
+  'local clear={} for i=1,hdelCount do if not string.match(ARGV[idx],"^sourceRetention") and not string.match(ARGV[idx],"^sourceReplay") then clear[#clear+1]=ARGV[idx] end idx=idx+1 end ' +
   'local hset = {} ' +
   'local sourceLive=sourceAvailable(KEYS[1]) local safe={status=true,completedAt=true,terminalPersistencePending=true,terminalPersistenceStartedAt=true,terminalHostActionPending=true,providerDrained=true,providerExecutionId=true,providerExecutionStartedId=true} ' +
-  'for i=idx,#ARGV,2 do if (sourceLive or safe[ARGV[i]]) and ARGV[i] ~= "sourceRetention" and ARGV[i] ~= "sourceRetentionExpiresAt" and ARGV[i] ~= "sourceRetentionRevokedAt" and ARGV[i] ~= "sourceRetentionPurged" then hset[#hset+1]=ARGV[i] hset[#hset+1]=ARGV[i+1] end end ' +
+  'for i=idx,#ARGV,2 do if (sourceLive or safe[ARGV[i]]) and not string.match(ARGV[i],"^sourceRetention") and not string.match(ARGV[i],"^sourceReplay") then hset[#hset+1]=ARGV[i] hset[#hset+1]=ARGV[i+1] end end ' +
   'local originalReceipt = nil for i = 1, #hset, 2 do if hset[i] == "scheduleOutcomeError" then originalReceipt = hset[i+1] end end ' +
   SCHEDULE_MCP_FAILURE_PATCH_LUA +
   'hset = retainScheduleReceipt(hset, currentReceipt, clearReceipt, originalReceipt) ' +
+  'if not sourceHashFits(KEYS[1],hset,clear) then return -2 end ' +
+  'for _,field in ipairs(clear) do redis.call("HDEL",KEYS[1],field) end ' +
   'invalidateScheduleMembership(KEYS[1], hset) ' +
   'if #hset > 0 then redis.call("HSET", KEYS[1], unpack(hset)) end ' +
   'if terminal then redis.call("HSET", KEYS[1], "steersClosed", "1") end ' +
@@ -398,6 +487,7 @@ const REPLACEMENT_RECEIPT_ACK_LUA =
  */
 const JOB_CREATE_LUA =
   SCHEDULE_RETENTION_LUA +
+  'if redis.call("HEXISTS",KEYS[1],"sourceReplayIntent")==1 then return {"","","0","source_replay_held"} end ' +
   'if ARGV[8] ~= "" then local claimRaw = redis.call("GET", KEYS[10]) ' +
   'if not claimRaw then return { "", "", "0", "claim_lost" } end ' +
   'local ok, claim = pcall(cjson.decode, claimRaw) ' +
@@ -656,6 +746,7 @@ const JOB_CREATE_LUA =
  *   ]
  */
 const JOB_UPDATE_LUA =
+  SOURCE_HASH_BUDGET_LUA +
   SOURCE_RETENTION_LUA +
   SCHEDULE_MCP_RECEIPT_LUA +
   SCHEDULE_MEMBERSHIP_INVALIDATE_LUA +
@@ -664,11 +755,12 @@ const JOB_UPDATE_LUA =
   'local hset = {} local releaseRetention = false ' +
   'local safe = {status=true,completedAt=true,terminalPersistencePending=true,terminalPersistenceStartedAt=true,terminalHostActionPending=true,providerDrained=true,providerExecutionId=true,providerExecutionStartedId=true} ' +
   'local sourceLive = sourceAvailable(KEYS[1]) ' +
-  'for i = 6, #ARGV, 2 do if (sourceLive or safe[ARGV[i]]) and ARGV[i] ~= "sourceRetention" and ARGV[i] ~= "sourceRetentionExpiresAt" and ARGV[i] ~= "sourceRetentionRevokedAt" and ARGV[i] ~= "sourceRetentionPurged" then hset[#hset+1]=ARGV[i] hset[#hset+1]=ARGV[i+1] end end ' +
+  'for i = 6, #ARGV, 2 do if (sourceLive or safe[ARGV[i]]) and not string.match(ARGV[i],"^sourceRetention") and not string.match(ARGV[i],"^sourceReplay") then hset[#hset+1]=ARGV[i] hset[#hset+1]=ARGV[i+1] end end ' +
   'for i = 6, #ARGV, 2 do if ARGV[i] == "preserveForScheduleReconcile" and ARGV[i+1] == "0" then releaseRetention = true end end ' +
   'local originalReceipt = nil for i = 1, #hset, 2 do if hset[i] == "scheduleOutcomeError" then originalReceipt = hset[i+1] end end ' +
   SCHEDULE_MCP_FAILURE_PATCH_LUA +
   'hset = retainScheduleReceipt(hset, redis.call("HGET", KEYS[1], "scheduleOutcomeError"), false, originalReceipt) ' +
+  'if not sourceHashFits(KEYS[1],hset,{}) then return -2 end ' +
   'invalidateScheduleMembership(KEYS[1], hset) ' +
   'if #hset > 0 then redis.call("HSET", KEYS[1], unpack(hset)) end ' +
   'if ARGV[2] == "1" then ' +
@@ -731,6 +823,7 @@ const HAS_SUBSCRIBER_ATTACHED_LUA =
 /** Generation-scoped single-winner first-subscriber claim. */
 const CLAIM_FIRST_SUBSCRIBER_LUA =
   'if redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] then return 0 end ' +
+  'if redis.call("HEXISTS",KEYS[1],"sourceReplayIntent")==1 then if #ARGV[3]>128 then return 0 end local count=redis.call("ZCARD",KEYS[2]) if count>=64 and not redis.call("ZSCORE",KEYS[2],ARGV[3]) then return 0 end end ' +
   'redis.call("ZADD", KEYS[2], ARGV[4], ARGV[3]) redis.call("PEXPIRE", KEYS[2], 60000) ' +
   'if redis.call("HEXISTS", KEYS[1], "firstSubscriberAttachedAt") == 1 then return 0 end ' +
   'redis.call("HSET", KEYS[1], "firstSubscriberAttachedAt", ARGV[2]) return 1';
@@ -754,6 +847,7 @@ const PROVIDER_DRAIN_LUA =
 /** Legacy host-action recovery. Scheduled obligations require exact segment
  * acknowledgement; elapsed time is not evidence that their provider drained. */
 const RECOVER_TERMINAL_PROVIDER_DRAIN_LUA =
+  'if redis.call("HEXISTS",KEYS[1],"sourceRetention")==1 then return 0 end ' +
   'if redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] then return 0 end ' +
   'if redis.call("HGET", KEYS[1], "preserveForScheduleReconcile") == "1" or redis.call("HEXISTS", KEYS[1], "scheduleId") == 1 then return 0 end ' +
   'if redis.call("HGET", KEYS[1], "terminalHostActionPending") ~= "1" and redis.call("HGET", KEYS[1], "detachedAgentEventTerminalHostActionPending") ~= "1" and redis.call("HGET", KEYS[1], "preserveForScheduleReconcile") ~= "1" then return 0 end ' +
@@ -789,9 +883,11 @@ const PROVIDER_BEGIN_LUA =
  * terminal payload. Owner success/failure and stale-owner recovery share this
  * CAS, so a timeout cannot overwrite a normal FINAL (or vice versa). */
 const TERMINAL_PERSISTENCE_FINALIZE_LUA =
+  SOURCE_HASH_BUDGET_LUA +
   SOURCE_RETENTION_LUA +
   'if redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] then return 0 end ' +
   'if redis.call("HGET", KEYS[1], "terminalPersistencePending") ~= "1" then return 0 end ' +
+  'if sourceAvailable(KEYS[1]) and not sourceHashFits(KEYS[1],{"terminalPersistencePending","0","finalEvent",ARGV[2]},{}) then return -2 end ' +
   'redis.call("HSET", KEYS[1], "terminalPersistencePending", "0") ' +
   'if sourceAvailable(KEYS[1]) then redis.call("HSET", KEYS[1], "finalEvent", ARGV[2]) else redis.call("HDEL", KEYS[1], "finalEvent") end ' +
   'return 1';
@@ -805,6 +901,7 @@ const TERMINAL_PERSISTENCE_FINALIZE_LUA =
  *   ARGV: [expectCreatedAt | "", expectMissing ("0" | "1")]
  */
 const JOB_DELETE_LUA =
+  'if redis.call("HEXISTS",KEYS[1],"sourceReplayIntent")==1 then return 0 end ' +
   'if ARGV[1] ~= "" and redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] then return 0 end ' +
   'local existed = redis.call("EXISTS", KEYS[1]) ' +
   'if ARGV[2] == "1" and existed == 1 then return 0 end ' +
@@ -822,6 +919,7 @@ const JOB_DELETE_LUA =
  *   ARGV: [expectCreatedAt, nowMs, staleAfterMs, parkedSteersTtl, generationEpochGraceTtl]
  */
 const STALE_JOB_DELETE_LUA =
+  'if redis.call("HEXISTS",KEYS[1],"sourceReplayIntent")==1 then return 0 end ' +
   'if redis.call("HGET", KEYS[1], "status") ~= "running" then return 0 end ' +
   'if redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] then return 0 end ' +
   'local liveSince = tonumber(redis.call("HGET", KEYS[1], "lastActiveAt")) ' +
@@ -925,6 +1023,7 @@ const STALE_JOB_DELETE_LUA =
  *          parkedSteersTtl, generationEpochGraceTtl]
  */
 const CHUNK_APPEND_LUA =
+  SOURCE_CHUNK_BUDGET_LUA +
   SOURCE_RETENTION_LUA +
   'if not sourceAvailable(KEYS[2]) then return 0 end ' +
   SCHEDULE_RETENTION_LUA +
@@ -935,6 +1034,8 @@ const CHUNK_APPEND_LUA =
   'if currentStatus ~= "running" and currentStatus ~= "requires_action" then return 0 end ' +
   'local retainedEpoch = redis.call("GET", KEYS[8]) ' +
   'if retainedEpoch and retainedEpoch ~= currentCreatedAt then return 0 end ' +
+  'if ARGV[5]~="" and redis.call("HEXISTS",KEYS[2],"sourceReplayIntent")==1 then return 0 end ' +
+  'local fits,sourceBytes,sourceCount=sourceChunkBudget(KEYS[2],{ARGV[1]}) if not fits then return 0 end ' +
   'local protocolV2 = redis.call("HGET", KEYS[2], "generationProtocolVersion") == "2" ' +
   'local delivered = nil local kept = nil local receipt = nil ' +
   'if ARGV[5] ~= "" then ' +
@@ -981,7 +1082,7 @@ const CHUNK_APPEND_LUA =
   'if delivered and protocolV2 then local claimTtl = redis.call("PTTL", KEYS[5]) redis.call("DEL", KEYS[5]) ' +
   'if #kept > 0 then redis.call("RPUSH", KEYS[5], unpack(kept)) ' +
   'if claimTtl > 0 then redis.call("PEXPIRE", KEYS[5], claimTtl) end end end ' +
-  'redis.call("XADD", KEYS[1], "*", "event", ARGV[1]) ' +
+  'redis.call("XADD", KEYS[1], "*", "event", ARGV[1]) commitSourceChunkBudget(KEYS[2],sourceBytes,sourceCount) ' +
   'local durable = redis.call("HGET", KEYS[2], "durableEventCount") ' +
   'local priorLength = redis.call("XLEN", KEYS[1]) - 1 ' +
   'if not durable or tonumber(durable) < priorLength then durable = priorLength end ' +
@@ -1010,6 +1111,7 @@ const CHUNK_APPEND_LUA =
  *          generationEpochGraceTtl, eventJson...]
  */
 const CHUNK_APPEND_BATCH_LUA =
+  SOURCE_CHUNK_BUDGET_LUA +
   SOURCE_RETENTION_LUA +
   'if not sourceAvailable(KEYS[2]) then return 0 end ' +
   SCHEDULE_RETENTION_LUA +
@@ -1020,6 +1122,8 @@ const CHUNK_APPEND_BATCH_LUA =
   'if currentStatus ~= "running" and currentStatus ~= "requires_action" then return 0 end ' +
   'local retainedEpoch = redis.call("GET", KEYS[8]) ' +
   'if retainedEpoch and retainedEpoch ~= currentCreatedAt then return 0 end ' +
+  'local events={} for i=6,#ARGV do events[#events+1]=ARGV[i] end ' +
+  'local fits,sourceBytes,sourceCount=sourceChunkBudget(KEYS[2],events) if not fits then return 0 end ' +
   'local run = tonumber(ARGV[1]) ' +
   'local target = run ' +
   'local jobTtl = redis.call("TTL", KEYS[2]) ' +
@@ -1034,7 +1138,7 @@ const CHUNK_APPEND_BATCH_LUA =
   'if retainedEpoch then local epochTtl = redis.call("TTL", KEYS[8]) ' +
   'if epochTtl >= 0 and epochTtl < epochTarget then redis.call("EXPIRE", KEYS[8], epochTarget) end ' +
   'else redis.call("SET", KEYS[8], currentCreatedAt, "EX", epochTarget) end ' +
-  'for i = 6, #ARGV do redis.call("XADD", KEYS[1], "*", "event", ARGV[i]) end ' +
+  'for i = 6, #ARGV do redis.call("XADD", KEYS[1], "*", "event", ARGV[i]) end commitSourceChunkBudget(KEYS[2],sourceBytes,sourceCount) ' +
   'local durable = redis.call("HGET", KEYS[2], "durableEventCount") ' +
   'local priorLength = redis.call("XLEN", KEYS[1]) - (#ARGV - 5) ' +
   'if not durable or tonumber(durable) < priorLength then durable = priorLength end ' +
@@ -1074,6 +1178,7 @@ const RUNSTEPS_SAVE_LUA =
   'local currentStatus = redis.call("HGET", KEYS[2], "status") ' +
   'local terminalHostActionPending = redis.call("HGET", KEYS[2], "terminalHostActionPending") == "1" or redis.call("HGET", KEYS[2], "detachedAgentEventTerminalHostActionPending") == "1" ' +
   'if currentStatus ~= "running" and currentStatus ~= "requires_action" and not terminalHostActionPending then return 0 end ' +
+  `if redis.call("HEXISTS",KEYS[2],"sourceReplayIntent")==1 and #KEYS[1]+#ARGV[1]>${SOURCE_REPLAY_LIMITS.runStepBytes} then return -2 end ` +
   'redis.call("SET", KEYS[1], ARGV[1]) ' +
   'local run = tonumber(ARGV[2]) ' +
   'local target = run ' +
@@ -1133,6 +1238,7 @@ const STEER_QUOTE_SOURCE_LUA =
 
 const STEER_ENQUEUE_LUA =
   STEER_QUOTE_SOURCE_LUA +
+  'if redis.call("HEXISTS",KEYS[1],"sourceRetention")==1 then return -1 end ' +
   'if ARGV[4] ~= "" and redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[4] then return -1 end ' +
   'if redis.call("HGET", KEYS[1], "status") ~= "running" then return -1 end ' +
   'if redis.call("HGET", KEYS[1], "steersClosed") == "1" then return -1 end ' +
@@ -1147,6 +1253,7 @@ const STEER_ENQUEUE_LUA =
  * step, eliminating the legacy enqueue→arm failure window. */
 const STEER_ENQUEUE_VERSIONED_LUA =
   STEER_QUOTE_SOURCE_LUA +
+  'if redis.call("HEXISTS",KEYS[1],"sourceRetention")==1 then return -1 end ' +
   'if ARGV[4] ~= "" and redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[4] then return -1 end ' +
   'if redis.call("HGET", KEYS[1], "status") ~= "running" then return -1 end ' +
   'if redis.call("HGET", KEYS[1], "steersClosed") == "1" then return -1 end ' +
@@ -1166,6 +1273,7 @@ const STEER_ENQUEUE_VERSIONED_LUA =
  * returns the original ACK instead of re-injecting. */
 const STEER_ENQUEUE_RECEIPT_LUA =
   STEER_QUOTE_SOURCE_LUA +
+  'if redis.call("HEXISTS",KEYS[1],"sourceRetention")==1 then return -1 end ' +
   'local existing = redis.call("HGET", KEYS[3], ARGV[5]) ' +
   'if existing then ' +
   'local receipt = cjson.decode(existing) ' +
@@ -2006,6 +2114,177 @@ export class RedisJobStore implements IJobStoreV2 {
     this.isCluster = (redis as Cluster).isCluster === true;
   }
 
+  /** Complete only for a quiesced, caller-bound standalone/Sentinel namespace; no cleanup or timers. */
+  async inspectInitialSourcePopulation(
+    options: InitialSourcePopulationOptions,
+  ): Promise<InitialSourcePopulation> {
+    const inventory = new InitialSourceInventory(options);
+    if (this.isCluster) failInitialSourceInventory();
+    const client = this.redis as Redis;
+    const prefix = client.options.keyPrefix ?? '';
+    // eslint-disable-next-line no-control-regex -- Redis namespace prefixes must reject ASCII control bytes.
+    const controlCharacters = /[\x00-\x1f]/;
+    if (
+      typeof prefix !== 'string' ||
+      Buffer.byteLength(prefix) > 256 ||
+      controlCharacters.test(prefix) ||
+      !Number.isSafeInteger(client.options.commandTimeout) ||
+      Number(client.options.commandTimeout) <= 0 ||
+      Number(client.options.commandTimeout) > 5000
+    )
+      failInitialSourceInventory();
+    inventory.observe('namespace', prefix);
+    const pattern = `${prefix.replace(/[\\*?[\]]/g, '\\$&')}stream:{*}:*`;
+    const keys = new Set<string>();
+    let cursor = '0';
+    let matched = 0;
+    const read = async (key: string, mode: string): Promise<string[]> => {
+      inventory.check();
+      let reply: unknown;
+      try {
+        reply = await client.eval(INITIAL_INVENTORY_READ, 1, key, mode, inventory.remainingBytes());
+      } catch {
+        return failInitialSourceInventory();
+      }
+      inventory.check();
+      if (
+        !Array.isArray(reply) ||
+        reply.length > 2049 ||
+        !reply.every((entry) => typeof entry === 'string') ||
+        reply[0] === 'invalid'
+      )
+        failInitialSourceInventory();
+      inventory.observe('read', reply);
+      return reply as string[];
+    };
+    for (let page = 0; page < 512; page++) {
+      inventory.check();
+      let reply: unknown;
+      try {
+        reply = await client.eval(INITIAL_INVENTORY_SCAN, 0, cursor, pattern);
+      } catch {
+        return failInitialSourceInventory();
+      }
+      inventory.check();
+      if (
+        !Array.isArray(reply) ||
+        reply.length !== 2 ||
+        typeof reply[0] !== 'string' ||
+        !/^\d+$/.test(reply[0]) ||
+        !Array.isArray(reply[1]) ||
+        reply[1].length > 128
+      )
+        failInitialSourceInventory();
+      cursor = reply[0];
+      if ((matched += reply[1].length) > 4096) failInitialSourceInventory();
+      for (const raw of reply[1] as unknown[]) {
+        if (typeof raw !== 'string' || Buffer.byteLength(raw) > 512 || !raw.startsWith(prefix))
+          failInitialSourceInventory();
+        // SCAN returns physical keys; ioredis prefixes EVAL KEYS once, so strip exactly once.
+        const key = raw.slice(prefix.length);
+        if (!/^stream:\{[^{}]+\}:.+$/.test(key)) failInitialSourceInventory();
+        keys.add(key);
+      }
+      if (cursor === '0') break;
+    }
+    if (cursor !== '0') failInitialSourceInventory();
+    const index = await read(SOURCE_REPLAY_INDEX, 'index');
+    if (index[0] !== 'none') {
+      if (index.length !== 2 || index[0] !== 'hash-count' || !/^\d+$/.test(index[1]))
+        failInitialSourceInventory();
+      if (Number(index[1]) > 0) inventory.counts.replayIntents = 1;
+    }
+    const jobs = new Map<string, boolean>();
+    const entries = [...keys].sort().map((key) => {
+      const match = /^stream:\{([^{}]+)\}:(.+)$/.exec(key);
+      if (!match) return failInitialSourceInventory();
+      return { key, streamId: match[1], suffix: match[2] };
+    });
+    for (const { key, streamId, suffix } of entries) {
+      if (suffix !== 'job') continue;
+      const row = await read(key, 'hash');
+      if (row[0] === 'none') failInitialSourceInventory();
+      if (row[0] !== 'hash' || row.length % 2 !== 1) failInitialSourceInventory();
+      const job: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+      for (let i = 1; i < row.length; i += 2) {
+        const field = row[i];
+        if (Object.prototype.hasOwnProperty.call(job, field)) failInitialSourceInventory();
+        const value = row[i + 1];
+        job[field] = INITIAL_INVENTORY_JSON_FIELDS.has(field) ? inventory.parse(value) : value;
+        if (field === 'createdAt') {
+          if (!/^\d+$/.test(value)) failInitialSourceInventory();
+          job[field] = Number(value);
+        }
+        if (/^source(Retention|Replay)/.test(field) && (value === '0' || value === 'false'))
+          job[field] = 0;
+      }
+      jobs.set(streamId, inventory.job(job, streamId));
+    }
+    for (const { key, streamId, suffix } of entries) {
+      if (suffix === 'job') continue;
+      let mode: 'string' | 'hash' | 'list' | 'stream' | 'zset';
+      if (suffix === 'chunks') mode = 'stream';
+      else if (
+        ['runsteps', 'parked', 'seq', 'generation-epoch', 'activity-bytes', 'demand'].includes(
+          suffix,
+        ) ||
+        /^abort-ack:\d+$/.test(suffix) ||
+        /^provider-drain:\d+:[^:]+$/.test(suffix)
+      )
+        mode = 'string';
+      else if (['steers', 'steers-claimed', 'activity-backlog'].includes(suffix)) mode = 'list';
+      else if (['steer-receipts', 'activity-publication'].includes(suffix)) mode = 'hash';
+      else if (suffix === 'steer-receipt-order' || /^subscriber-leases:\d+$/.test(suffix))
+        mode = 'zset';
+      else return failInitialSourceInventory();
+      const row = await read(key, mode);
+      if (row[0] === 'none') failInitialSourceInventory();
+      if (mode === 'zset') {
+        if (row.length !== 2 || row[0] !== 'type' || row[1] !== 'zset')
+          failInitialSourceInventory();
+      } else if (suffix === 'chunks') {
+        if (
+          !jobs.has(streamId) ||
+          row.length !== 3 ||
+          row[0] !== 'count' ||
+          row[1] !== 'stream' ||
+          !/^\d+$/.test(row[2])
+        )
+          failInitialSourceInventory();
+        if (Number(row[2]) > 0 && jobs.get(streamId)) inventory.counts.recoveryCopies = 1;
+      } else if (suffix === 'runsteps' || suffix === 'activity-backlog') {
+        if (!jobs.has(streamId) || row[0] !== mode || (mode === 'string' && row.length !== 2))
+          failInitialSourceInventory();
+        for (const value of row.slice(1)) {
+          if (inventory.observe('replay', inventory.parse(value)) || jobs.get(streamId))
+            inventory.counts.recoveryCopies = 1;
+        }
+      } else if (['parked', 'steers', 'steers-claimed', 'steer-receipts'].includes(suffix)) {
+        if (
+          row[0] !== mode ||
+          (mode === 'hash' && row.length % 2 !== 1) ||
+          (mode === 'string' && row.length !== 2)
+        )
+          failInitialSourceInventory();
+        for (let i = mode === 'hash' ? 2 : 1; i < row.length; i += mode === 'hash' ? 2 : 1)
+          inventory.recovery(inventory.parse(row[i]));
+      } else if (suffix === 'activity-publication') {
+        if (row[0] !== 'hash' || row.length % 2 !== 1) failInitialSourceInventory();
+        for (let i = 1; i < row.length; i += 2) {
+          if (
+            !['id', 'seq', 'ordinal', 'done'].includes(row[i]) ||
+            !row[i + 1] ||
+            (row[i] !== 'id' && !/^\d+$/.test(row[i + 1]))
+          )
+            failInitialSourceInventory();
+        }
+      } else if (row.length !== 2 || row[0] !== 'string' || !/^\d+$/.test(row[1])) {
+        failInitialSourceInventory();
+      }
+    }
+    return inventory.finish('redis');
+  }
+
   async initialize(): Promise<void> {
     if (this.cleanupInterval) {
       return;
@@ -2138,6 +2417,7 @@ export class RedisJobStore implements IJobStoreV2 {
     ) {
       throw new Error('Invalid provider execution id');
     }
+    if (initialMetadata.sourceRetention) throw new SourceReplayError('document_source_unavailable');
     const safeInitialMetadata = { ...initialMetadata };
     delete safeInitialMetadata.providerDrained;
     let generationProtocolVersion: 1 | 2 = 2;
@@ -2215,6 +2495,8 @@ export class RedisJobStore implements IJobStoreV2 {
       rejectActivePredecessor === true ? '1' : '0',
       ...hsetPairs,
     );
+    if (Array.isArray(previousOwner) && previousOwner[3] === 'source_replay_held')
+      throw new SourceReplayError('document_source_unavailable');
     if (Array.isArray(previousOwner) && previousOwner[3] === 'claim_lost') {
       throw new Error('Generation idempotency claim was taken over before job creation');
     }
@@ -2523,6 +2805,7 @@ export class RedisJobStore implements IJobStoreV2 {
       String(this.ttl.runStepsAfterComplete),
       ...fields,
     );
+    if (updated === -2) throw new SourceReplayError('document_capacity_exceeded');
     if (updated !== 1) {
       return;
     }
@@ -2808,7 +3091,8 @@ export class RedisJobStore implements IJobStoreV2 {
       (statusKey != null ||
         job.providerDrained === false ||
         job.terminalPersistencePending === true ||
-        job.terminalHostActionPending === true)
+        job.terminalHostActionPending === true ||
+        job.sourceReplayIntent != null)
         ? KEYS.userJobs(job.userId, job.tenantId)
         : null;
     // Recovery copies outlive a generation; preserve their existing owner index until they expire.
@@ -3173,6 +3457,7 @@ export class RedisJobStore implements IJobStoreV2 {
       ...clearFields,
       ...fields,
     );
+    if (result === -2) throw new SourceReplayError('document_capacity_exceeded');
     if (result === -1 && notAfterMs != null) {
       throw new JobStatusTransitionDeadlineError(notAfterMs);
     }
@@ -3384,30 +3669,91 @@ export class RedisJobStore implements IJobStoreV2 {
     );
   }
 
-  async bindSourceRetention(
-    streamId: string,
-    epoch: number,
-    context: GenerationSourceRetention,
-  ): Promise<boolean> {
-    if (
-      !Number.isFinite(context.sourceExpiresAt) ||
-      context.sourceExpiresAt <= Date.now() ||
-      !context.sourceFileIds.length
-    )
-      return false;
+  /** Cleanup and observations never load the potentially16MiB replay hash payload. */
+  async getSourceReplayJob(streamId: string): Promise<SerializableJobData | null> {
+    const fields = [
+      'streamId',
+      'userId',
+      'tenantId',
+      'createdAt',
+      'status',
+      'providerDrained',
+      'terminalPersistencePending',
+      'terminalHostActionPending',
+      'sourceRetentionPurged',
+      'sourceRetentionRevokedAt',
+      'sourceReplayIntent',
+      'sourceReplayHeld',
+    ];
+    const values = await this.redis.hmget(KEYS.job(streamId), ...fields);
+    if (values[0] == null) return null;
+    const row: Record<string, string> = {};
+    for (let i = 0; i < fields.length; i++) if (values[i] != null) row[fields[i]] = values[i]!;
+    return this.deserializeJob(row);
+  }
+
+  async prepareSourceReplay(input: SourceReplayIntent): Promise<SourceReplayIntent> {
+    if (this.isCluster) throw new SourceReplayError('document_replay_unsupported');
+    const intent = createSourceReplayIntent(input, input.sourceFileIds, input.sourceExpiresAt);
     const result = await this.redis.eval(
-      SOURCE_RETENTION_LUA +
-        'if redis.call("HGET",KEYS[1],"createdAt") ~= ARGV[1] or not sourceAvailable(KEYS[1]) or redis.call("HGET",KEYS[1],"sourceRetentionPurged") then return 0 end ' +
-        'local next=cjson.decode(ARGV[2]) local old=redis.call("HGET",KEYS[1],"sourceRetention") ' +
-        'local ids={} local merged={} if old then old=cjson.decode(old) next.sourceExpiresAt=math.min(next.sourceExpiresAt,old.sourceExpiresAt) for _,id in ipairs(old.sourceFileIds) do ids[id]=true end end ' +
-        'for _,id in ipairs(next.sourceFileIds) do ids[id]=true end for id in pairs(ids) do merged[#merged+1]=id end table.sort(merged) next.sourceFileIds=merged ' +
-        'redis.call("HSET",KEYS[1],"sourceRetention",cjson.encode(next),"sourceRetentionExpiresAt",tostring(next.sourceExpiresAt)) return 1',
-      1,
-      KEYS.job(streamId),
-      String(epoch),
-      JSON.stringify(context),
+      PREPARE_SOURCE_REPLAY_LUA,
+      12,
+      KEYS.job(intent.streamId),
+      KEYS.chunks(intent.streamId),
+      KEYS.runSteps(intent.streamId),
+      KEYS.steers(intent.streamId),
+      KEYS.claimedSteers(intent.streamId),
+      KEYS.parkedSteers(intent.streamId),
+      KEYS.steerReceipts(intent.streamId),
+      SOURCE_REPLAY_INDEX,
+      `stream:{${intent.streamId}}:activity-backlog`,
+      `stream:{${intent.streamId}}:activity-bytes`,
+      `stream:{${intent.streamId}}:activity-publication`,
+      KEYS.subscriberLeases(intent.streamId, intent.createdAt),
+      JSON.stringify(intent),
     );
-    return result === 1;
+    if (result === -2) throw new SourceReplayError('document_capacity_exceeded');
+    if (result === -3) throw new SourceReplayError('document_replay_unsupported');
+    if (typeof result !== 'string') throw new SourceReplayError('document_source_unavailable');
+    return JSON.parse(result) as SourceReplayIntent;
+  }
+
+  async commitSourceReplay(intent: SourceReplayIntent): Promise<boolean> {
+    return (
+      (await this.redis.eval(
+        COMMIT_SOURCE_REPLAY_LUA,
+        2,
+        KEYS.job(intent.streamId),
+        SOURCE_REPLAY_INDEX,
+        JSON.stringify(intent),
+      )) === 1
+    );
+  }
+
+  async listSourceReplayIntents(): Promise<SourceReplayIntent[]> {
+    if (this.isCluster) throw new SourceReplayError('document_replay_unsupported');
+    // The only producer enforces32 rows of at most16KiB atomically.
+    const rows = await this.redis.hvals(SOURCE_REPLAY_INDEX);
+    if (rows.length > SOURCE_REPLAY_LIMITS.epochs)
+      throw new SourceReplayError('document_source_unavailable');
+    return rows.map((raw) => {
+      if (Buffer.byteLength(raw) > SOURCE_REPLAY_LIMITS.intentBytes)
+        throw new SourceReplayError('document_source_unavailable');
+      return JSON.parse(raw) as SourceReplayIntent;
+    });
+  }
+
+  async acknowledgeSourceReplayRelease(intent: SourceReplayIntent): Promise<boolean> {
+    return (
+      (await this.redis.eval(
+        ACK_SOURCE_REPLAY_LUA,
+        2,
+        KEYS.job(intent.streamId),
+        SOURCE_REPLAY_INDEX,
+        JSON.stringify(intent),
+        String(this.ttl.completed),
+      )) === 1
+    );
   }
 
   async revokeSourceRetention(streamId: string, epoch: number): Promise<boolean> {
@@ -3426,6 +3772,7 @@ export class RedisJobStore implements IJobStoreV2 {
   async purgeSourceRetention(streamId: string, epoch: number): Promise<boolean> {
     const purged = await this.redis.eval(
       'if redis.call("HGET",KEYS[1],"createdAt") ~= ARGV[1] or not redis.call("HGET",KEYS[1],"sourceRetention") then return 0 end ' +
+        'if redis.call("HEXISTS",KEYS[1],"sourceReplayIntent")==1 and redis.call("HGET",KEYS[1],"providerDrained")~="1" then return 0 end ' +
         'local status=redis.call("HGET",KEYS[1],"status") if status=="running" or status=="requires_action" or redis.call("HGET",KEYS[1],"providerDrained")=="0" or redis.call("HGET",KEYS[1],"terminalPersistencePending")=="1" or redis.call("HGET",KEYS[1],"terminalHostActionPending")=="1" then return 0 end ' +
         'local raw=redis.call("GET",KEYS[4]) local receiptRows=redis.call("HGETALL",KEYS[5]) local revoked=redis.call("HGET",KEYS[1],"sourceRetentionRevokedAt") ' +
         'local source=cjson.decode(redis.call("HGET",KEYS[1],"sourceRetention")) local t=redis.call("TIME") revoked=revoked or source.sourceExpiresAt<=tonumber(t[1])*1000+math.floor(tonumber(t[2])/1000) ' +
@@ -3435,7 +3782,7 @@ export class RedisJobStore implements IJobStoreV2 {
         'local receipts={} for i=1,#receiptRows,2 do local ok,value=pcall(cjson.decode,receiptRows[i+1]) if not ok then return 0 end receipts[#receipts+1]={receiptRows[i],value} end ' +
         'if revoked then if parked then for _,item in ipairs(parked.steers or {}) do redact(item) end redis.call("SET",KEYS[4],cjson.encode(parked),"KEEPTTL") end for _,entry in ipairs(receipts) do redact(entry[2].item) redis.call("HSET",KEYS[5],entry[1],cjson.encode(entry[2])) end end ' +
         'local ttl=redis.call("PTTL",KEYS[1]) for i=4,5 do local retained=redis.call("PTTL",KEYS[i]) if retained==-1 then ttl=-1 break end if ttl~=-1 then ttl=math.max(ttl,retained) end end if ttl==-1 then redis.call("PERSIST",KEYS[1]) elseif ttl>0 then redis.call("PEXPIRE",KEYS[1],ttl) end ' +
-        'local keep={streamId=true,userId=true,tenantId=true,conversationId=true,createdAt=true,status=true,completedAt=true,sourceRetention=true,sourceRetentionExpiresAt=true,sourceRetentionRevokedAt=true,providerExecutionId=true,providerDrained=true} ' +
+        'local keep={streamId=true,userId=true,tenantId=true,conversationId=true,createdAt=true,status=true,completedAt=true,sourceRetention=true,sourceRetentionExpiresAt=true,sourceRetentionRevokedAt=true,providerExecutionId=true,providerDrained=true,sourceReplayIntent=true,sourceReplayHeld=true,sourceReplayChunkBytes=true,sourceReplayChunkEntries=true} ' +
         'for _,key in ipairs(redis.call("HKEYS",KEYS[1])) do if not keep[key] then redis.call("HDEL",KEYS[1],key) end end ' +
         'redis.call("HSET",KEYS[1],"sourceRetentionPurged","1") redis.call("DEL",KEYS[2],KEYS[3]) return 1',
       5,
@@ -3734,6 +4081,7 @@ export class RedisJobStore implements IJobStoreV2 {
         }
         if (
           !job.scheduleId &&
+          !job.sourceRetention &&
           job.preserveForScheduleReconcile !== true &&
           job.providerDrained === false &&
           job.completedAt != null &&
@@ -5585,7 +5933,7 @@ export class RedisJobStore implements IJobStoreV2 {
     runSteps: Agents.RunStep[],
     expectedCreatedAt?: number,
   ): Promise<void> {
-    await this.redis.eval(
+    const result = await this.redis.eval(
       RUNSTEPS_SAVE_LUA,
       2,
       KEYS.runSteps(streamId),
@@ -5594,6 +5942,7 @@ export class RedisJobStore implements IJobStoreV2 {
       String(this.runningStorageTtlSeconds()),
       expectedCreatedAt != null ? String(expectedCreatedAt) : '',
     );
+    if (result === -2) throw new SourceReplayError('document_capacity_exceeded');
   }
 
   // ===== Consumer Group Methods =====
@@ -5615,7 +5964,16 @@ export class RedisJobStore implements IJobStoreV2 {
   ): Promise<void> {
     const key = KEYS.chunks(streamId);
     try {
-      await this.redis.xgroup('CREATE', key, groupName, startFrom, 'MKSTREAM');
+      const result = await this.redis.eval(
+        'if redis.call("HEXISTS",KEYS[2],"sourceRetention")==1 then return -1 end ' +
+          'return redis.call("XGROUP","CREATE",KEYS[1],ARGV[1],ARGV[2],"MKSTREAM")',
+        2,
+        key,
+        KEYS.job(streamId),
+        groupName,
+        startFrom,
+      );
+      if (result === -1) throw new SourceReplayError('document_replay_unsupported');
       logger.debug(`[RedisJobStore] Created consumer group ${groupName} for ${streamId}`);
     } catch (err) {
       // BUSYGROUP error means group already exists - that's fine
@@ -5824,6 +6182,12 @@ export class RedisJobStore implements IJobStoreV2 {
         ? data.detachedAgentEventTerminalStatus
         : undefined;
     const job: CreatedJobData = {
+      sourceReplayIntent: data.sourceReplayIntent ? JSON.parse(data.sourceReplayIntent) : undefined,
+      sourceReplayHeld: data.sourceReplayHeld === '1',
+      sourceReplayChunkBytes:
+        data.sourceReplayChunkBytes == null ? undefined : Number(data.sourceReplayChunkBytes),
+      sourceReplayChunkEntries:
+        data.sourceReplayChunkEntries == null ? undefined : Number(data.sourceReplayChunkEntries),
       sourceRetention: data.sourceRetention ? JSON.parse(data.sourceRetention) : undefined,
       sourceRetentionRevokedAt: data.sourceRetentionRevokedAt
         ? Number(data.sourceRetentionRevokedAt)

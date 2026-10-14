@@ -97,6 +97,8 @@ const { jwtLogin, ldapLogin, passportLogin } = require('~/strategies');
 const { startExpiredFileSweep } = require('./services/Files/process');
 const { checkMigrations } = require('./services/start/migration');
 const optionalJwtAuth = require('./middleware/optionalJwtAuth');
+const requireJwtAuth = require('./middleware/requireJwtAuth');
+const { initializeUploads, getUploadRuntime } = require('./services/Uploads');
 const initializeMCPs = require('./services/initializeMCPs');
 const { configureSubagentTaskRouting } = require('./services/Endpoints/agents/subagentThreadStore');
 const configureSocialLogins = require('./socialLogins');
@@ -143,6 +145,18 @@ const maintenance = createAppMaintenance({
     queuedTurns: agentQueuedTurnMaintenance,
     skillSync: skillSyncMaintenance,
     fileRetention: expiredFileSweepMaintenance,
+    uploads: {
+      pauseAdmissions: (id) => getUploadRuntime()?.maintenance.pauseAdmissions(id) ?? true,
+      resumeAdmissions: (id) => getUploadRuntime()?.maintenance.resumeAdmissions(id) ?? true,
+      getMaintenanceCensus: (id) =>
+        getUploadRuntime()?.maintenance.getMaintenanceCensus(id) ??
+        Promise.resolve({
+          admissionClosed: true,
+          queuedContinuations: 0,
+          pendingWrites: 0,
+          complete: true,
+        }),
+    },
     auth: legacyAuthMaintenance,
   },
   // These actual owners do not yet expose a qualified admission/settlement census.
@@ -227,7 +241,7 @@ const SHUTDOWN_TEARDOWN_RESERVE_MS = 10_000;
 
 const startServer = async () => {
   await waitForKeyvRedisClient();
-  const { metricsMiddleware, metricsRouter } = createMetrics({
+  const { metricsMiddleware, metricsRouter, registry } = createMetrics({
     collectAgentEventActorStorageMetrics: () =>
       runAsSystem(async () => {
         const now = new Date();
@@ -294,6 +308,17 @@ const startServer = async () => {
   configureAgentEventRuntime(appConfig?.endpoints?.agents?.eventDriven);
   warnOnUnreachableDeliveryPaths(appConfig);
   initializeFileStorage(appConfig);
+  const uploads = await initializeUploads({ registry });
+  if (uploads) {
+    registerShutdownTask(
+      'managed upload workers',
+      () =>
+        uploads.close(
+          AbortSignal.timeout(Math.max(1, getRemainingShutdownMs() - SHUTDOWN_TEARDOWN_RESERVE_MS)),
+        ),
+      { priority: 105 },
+    );
+  }
   const projectRoot = path.resolve(__dirname, '../..');
   // Plugin hooks execute only when the operator opts in via DEPLOYMENT_PLUGIN_HOOKS;
   // without it, declared hook documents load as parsed-but-inert with a warning.
@@ -392,6 +417,24 @@ const startServer = async () => {
   app.use('/api/agents/chat', agentStartupIngressMiddleware);
   app.use(metricsMiddleware);
   app.use(noIndex);
+  // Authentication must precede the raw route; no body parser or proxy may pre-buffer it.
+  app.use(cookieParser());
+  app.use(authAdmissionMiddleware);
+  app.use(passport.initialize());
+  passport.use(jwtLogin());
+  passport.use(passportLogin());
+  if (uploads) {
+    app.use('/api/uploads', requireJwtAuth, uploads.bodyRouter, uploads.router);
+  } else {
+    app.use('/api/uploads', (_req, res) => res.status(503).json({ code: 'unavailable' }));
+  }
+  // Enforce the code-request cap on incoming bytes before the general JSON parser.
+  app.use(
+    '/api/auth/email-code',
+    express.json({ limit: 4096, strict: true, inflate: false }),
+    (error, _req, res, next) =>
+      error ? res.status(400).json({ code: 'EMAIL_CODE_INVALID_REQUEST' }) : next(),
+  );
   app.use(excludeRumBodyParser(express.json({ limit: '3mb' })));
   app.use(excludeRumBodyParser(express.urlencoded({ extended: true, limit: '3mb' })));
   app.use(handleJsonParseError);
@@ -411,7 +454,6 @@ const startServer = async () => {
 
   app.use(mongoSanitize());
   app.use(cors());
-  app.use(cookieParser());
 
   if (!isEnabled(DISABLE_COMPRESSION)) {
     app.use(compression());
@@ -434,11 +476,6 @@ const startServer = async () => {
   }
 
   /* OAUTH */
-  // Capture accepted request lifetimes before session and Passport callbacks run.
-  app.use(authAdmissionMiddleware);
-  app.use(passport.initialize());
-  passport.use(jwtLogin());
-  passport.use(passportLogin());
 
   /* LDAP Auth */
   if (process.env.LDAP_URL && process.env.LDAP_USER_SEARCH_BASE) {
@@ -526,6 +563,7 @@ const startServer = async () => {
   app.use(ErrorController);
 
   await configureGenerationStreams();
+  uploads?.configureSourceReplay(GenerationJobManager);
   await maintenance.listen();
   registerShutdownTask('private maintenance listener', () => maintenance.close(), {
     priority: 110,
@@ -583,6 +621,7 @@ const startServer = async () => {
             'Resolve the cause logged above and restart.',
         );
       }
+      uploads?.start();
       serverReady = true;
       logger.info('Server readiness checks passing.');
     } catch (initErr) {

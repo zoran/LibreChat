@@ -7,7 +7,72 @@ import {
   getExpiredFileRetryDelay,
   getFileRetentionMaxAttempts,
   getFileRetentionSweepInterval,
+  expiredFileSweepMaintenance,
 } from './sweep';
+
+describe('managed recovery remains inside the File sweep', () => {
+  const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() };
+  const dependencies = () => ({
+    getExpiredFiles: jest.fn().mockResolvedValue([]),
+    processDeleteRequest: jest.fn(),
+    incrementFileDeletionAttempts: jest.fn(),
+    deferExpiredFile: jest.fn(),
+    logger,
+  });
+
+  it('runs the bounded managed hook even when no accepted File has expired', async () => {
+    const sweepManagedUploads = jest.fn().mockResolvedValue({ scanned: 2, cleaned: 1, pending: 1 });
+    const deps = dependencies();
+    await expect(
+      sweepExpiredFiles({ limit: 5 }, { ...deps, sweepManagedUploads }),
+    ).resolves.toEqual({
+      scanned: 0,
+      deleted: 0,
+      failed: 0,
+      managed: { scanned: 2, cleaned: 1, pending: 1 },
+    });
+    expect(sweepManagedUploads).toHaveBeenCalledWith({ limit: 5 });
+    expect(deps.getExpiredFiles.mock.invocationCallOrder[0]).toBeLessThan(
+      sweepManagedUploads.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('retains the existing maintenance census until the managed hook actually settles', async () => {
+    let finish!: (result: { scanned: number; cleaned: number; pending: number }) => void;
+    let entered!: () => void;
+    const entering = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const sweepManagedUploads = jest.fn(() => {
+      entered();
+      return new Promise<{ scanned: number; cleaned: number; pending: number }>((resolve) => {
+        finish = resolve;
+      });
+    });
+    const run = sweepExpiredFiles({}, { ...dependencies(), sweepManagedUploads });
+    await entering;
+    expect((await expiredFileSweepMaintenance.getMaintenanceCensus(null)).pendingWrites).toBe(1);
+    finish({ scanned: 0, cleaned: 0, pending: 0 });
+    await run;
+    expect((await expiredFileSweepMaintenance.getMaintenanceCensus(null)).pendingWrites).toBe(0);
+  });
+
+  it('reports an uncertain managed pass instead of declaring maintenance complete', async () => {
+    await expect(
+      sweepExpiredFiles(
+        {},
+        {
+          ...dependencies(),
+          sweepManagedUploads: jest.fn().mockRejectedValue(new Error('unknown cleanup write')),
+        },
+      ),
+    ).rejects.toThrow('unknown cleanup write');
+    expect(await expiredFileSweepMaintenance.getMaintenanceCensus(null)).toMatchObject({
+      pendingWrites: 0,
+      complete: false,
+    });
+  });
+});
 
 describe('expired file sweep helpers', () => {
   const logger = {

@@ -22,6 +22,7 @@ const AUTHOR_ID = 'author-user-id';
 const USER_ID = 'viewer-user-id';
 const AGENT_ID = 'agent_test-abc123';
 const AGENT_MONGO_ID = 'mongo-agent-id';
+const originalAuthMode = process.env.AUTH_MODE;
 
 function makeFile(file_id, user) {
   return { file_id, user, filename: `${file_id}.txt` };
@@ -41,6 +42,7 @@ function makeAgent(overrides = {}) {
 }
 
 beforeEach(() => {
+  process.env.AUTH_MODE = 'default';
   jest.clearAllMocks();
   getEffectivePermissions.mockResolvedValue(0);
   getFiles.mockResolvedValue([
@@ -49,6 +51,59 @@ beforeEach(() => {
     makeFile('attached-3', AUTHOR_ID),
     makeFile('not-attached', AUTHOR_ID),
   ]);
+});
+afterAll(() => {
+  if (originalAuthMode === undefined) delete process.env.AUTH_MODE;
+  else process.env.AUTH_MODE = originalAuthMode;
+});
+
+describe('Cortex managed files never inherit an agent grant', () => {
+  beforeEach(() => {
+    process.env.AUTH_MODE = 'transition';
+  });
+
+  test.each([undefined, Constants.EPHEMERAL_AGENT_ID, AGENT_ID])(
+    'excludes managed owner files before the %s agent path',
+    async (agentId) => {
+      const managed = {
+        ...makeFile('managed', USER_ID),
+        uploadOperationId: 'managed',
+        filepath: '/api/files/managed/managed',
+      };
+      getFiles.mockResolvedValue([managed]);
+      // A caller's projection omits both managed markers; canonical File classification wins.
+      const result = await filterFilesByAgentAccess({
+        files: [makeFile('managed', USER_ID)],
+        userId: USER_ID,
+        agentId,
+      });
+      expect(result).toEqual([]);
+      expect(getAgent).not.toHaveBeenCalled();
+    },
+  );
+
+  it('denies a managed file even to the agent author or a viewer with edit permission', async () => {
+    const managed = { ...makeFile('attached-1', AUTHOR_ID), uploadOperationId: 'operation' };
+    getFiles.mockResolvedValue([managed]);
+    getAgent.mockResolvedValue(makeAgent());
+    checkPermission.mockResolvedValue(true);
+    for (const userId of [AUTHOR_ID, USER_ID]) {
+      const result = await hasAccessToFilesViaAgent({
+        userId,
+        agentId: AGENT_ID,
+        fileIds: ['attached-1'],
+        files: [makeFile('attached-1', AUTHOR_ID)],
+      });
+      expect(result.get('attached-1')).toBe(false);
+    }
+  });
+
+  it('fails closed when canonical managed classification is unavailable', async () => {
+    getFiles.mockRejectedValueOnce(new Error('store unavailable'));
+    expect(
+      await filterFilesByAgentAccess({ files: [makeFile('file', USER_ID)], userId: USER_ID }),
+    ).toEqual([]);
+  });
 });
 
 describe('filterFilesByAgentAccess', () => {

@@ -6,8 +6,14 @@ const {
   AGENT_TRIGGER_SCOPE,
   isTokenRetired,
   continueAfterBearerRetirement,
+  getAuthMode,
+  getAuthSelection,
+  validateEmailCodeBearer,
+  getEmailCodeSettings,
 } = require('@librechat/api');
-const { getUserById, updateUser } = require('~/models');
+const models = require('~/models');
+const { getUserById, updateUser } = models;
+const { authWrite } = require('~/server/services/LegacyAuthMaintenance');
 
 const AGENT_TRIGGER_ADMISSION_PATHS = ['/api/agents/chat/agents', '/api/agents/chat/steer/deliver'];
 
@@ -54,6 +60,49 @@ const jwtLogin = () =>
             return;
           }
           if (user) {
+            const mode = getAuthMode();
+            if (mode !== 'default' || payload?.authMethod === 'email_code') {
+              const trustedTrigger =
+                payload?.scope === AGENT_TRIGGER_SCOPE &&
+                isAgentTriggerAdmissionRequest(req) &&
+                !user.authDisabled &&
+                ((mode === 'transition' && user.provider === 'browser' && !user.tenantId) ||
+                  (user.provider === 'email_code' &&
+                    user.emailVerified &&
+                    user.tenantId === getEmailCodeSettings().tenantId));
+              if (trustedTrigger) {
+                // This existing service grant is restricted to trigger admission, never employee uploads.
+                req.authenticationClass = 'service';
+                req.tenantId = user.tenantId;
+              } else if (
+                user.provider === 'browser' &&
+                mode === 'transition' &&
+                !user.tenantId &&
+                payload?.provider === 'browser' &&
+                ['guest', undefined].includes(getAuthSelection(req))
+              ) {
+                req.authenticationClass = 'guest';
+                delete req.tenantId;
+              } else {
+                const identity = await validateEmailCodeBearer(payload, models);
+                if (!identity || identity.user.id !== String(user._id)) {
+                  done(null, false, { code: 'AUTH_SESSION_REQUIRED' });
+                  return;
+                }
+                req.emailCodeGrant = identity.grant;
+                req.authenticationClass = 'verified-email';
+                user.role = identity.user.role;
+                user.tenantId = identity.grant.tenantId;
+                // Never inherit a browser header or old pre-auth tenant on verified paths.
+                req.tenantId = identity.grant.tenantId;
+                if (
+                  ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) &&
+                  !req.originalUrl?.includes('/api/auth/')
+                ) {
+                  await authWrite(() => models.touchEmailCodeSession(identity.grant, new Date()));
+                }
+              }
+            }
             return await continueAfterBearerRetirement(
               user,
               { issuedAt: payload?.iat, issuedAtMs: payload?.issuedAtMs },

@@ -8,6 +8,7 @@ import { getLoginError, persistRedirectToSession } from '~/utils';
 import { ErrorMessage } from '~/components/Auth/ErrorMessage';
 import SocialButton from '~/components/Auth/SocialButton';
 import { useAuthContext } from '~/hooks/AuthContext';
+import EmailCodeLogin from './EmailCodeLogin';
 import { useLocalize } from '~/hooks';
 import LoginForm from './LoginForm';
 
@@ -27,6 +28,7 @@ function Login() {
   const { showToast } = useToastContext();
   const { error, setError, login } = useAuthContext();
   const { startupConfig } = useOutletContext<TLoginLayoutContext>();
+  const mode = startupConfig?.authMode ?? 'default';
 
   const [searchParams, setSearchParams] = useSearchParams();
   const location = useLocation();
@@ -72,6 +74,7 @@ function Login() {
   }, [disableAutoRedirect, searchParams, setSearchParams]);
 
   const shouldAutoRedirect =
+    mode === 'default' &&
     startupConfig?.openidLoginEnabled &&
     startupConfig?.openidAutoRedirect &&
     startupConfig?.serverDomain &&
@@ -83,6 +86,17 @@ function Login() {
       window.location.href = `${startupConfig.serverDomain}/oauth/openid`;
     }
   }, [shouldAutoRedirect, startupConfig]);
+
+  if (mode !== 'default')
+    return (
+      <EmailCodeLogin
+        config={{
+          authMode: mode,
+          emailCodeEnabled: startupConfig?.emailCodeEnabled === true,
+          emailCodeDomains: startupConfig?.emailCodeDomains ?? [],
+        }}
+      />
+    );
 
   if (shouldAutoRedirect) {
     return (

@@ -52,8 +52,11 @@ import {
 import BrowserSession, { browserSessionState } from '~/components/Auth/BrowserSession';
 import { resetChatFilterSessionAtom } from '~/components/Conversations/chatFilters';
 import { TAuthConfig, TUserContext, TAuthContext, TResError } from '~/common';
-import useClearStates from '~/hooks/Config/useClearStates';
 import { resetFacetsAtom } from '~/components/Conversations/facets';
+import { GuestEmailEntry } from '~/components/Auth/EmailCodeLogin';
+import useClearStates from '~/hooks/Config/useClearStates';
+import useAuthMode from '~/hooks/Auth/useAuthMode';
+import useLocalize from '~/hooks/useLocalize';
 import useTimeout from './useTimeout';
 import store from '~/store';
 
@@ -75,6 +78,13 @@ const endSessionClientState = (): void => {
   clearRetainedFileDeletions();
   clearComposerDraftStorage();
 };
+
+/** Consumers abort active work synchronously and fence late callbacks with this tab-local value. */
+const notifySessionEnding = (generation: number): void => {
+  window.dispatchEvent(
+    new CustomEvent('librechat:auth-session-ending', { detail: { generation } }),
+  );
+};
 /**
  * Only recognized codes override the HTTP status used by the login error translation.
  */
@@ -93,6 +103,10 @@ const AuthContextProvider = ({
   children: ReactNode;
 }) => {
   const isExternalRedirectRef = useRef(false);
+  const sessionGeneration = useRef(0);
+  const refreshPending = useRef(false);
+  const authMode = useAuthMode(authConfig?.test !== true);
+  const localize = useLocalize();
   const queryClient = useQueryClient();
   const clearStates = useClearStates();
   const [browserState, setBrowserStateAtom] = useAtom(browserSessionState);
@@ -108,6 +122,7 @@ const AuthContextProvider = ({
   const logoutRedirectRef = useRef<string | undefined>(undefined);
   const [token, setToken] = useState<string | undefined>(undefined);
   const [error, setError] = useState<string | undefined>(undefined);
+  const [logoutFailure, setLogoutFailure] = useState(false);
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [isAuthReady, setIsAuthReady] = useState<boolean>(authConfig?.test === true);
   const setQueriesEnabled = useSetRecoilState<boolean>(store.queriesEnabled);
@@ -224,6 +239,11 @@ const AuthContextProvider = ({
   });
   const { mutate: logoutMutate } = useLogoutUserMutation({
     onSuccess: (data) => {
+      setLogoutFailure(false);
+      if (user?.provider === 'email_code') {
+        void settleCortexSession('/login');
+        return;
+      }
       if (data.redirect) {
         /** data.redirect is the IdP's end_session_endpoint URL: an absolute URL generated
          * server-side from trusted IdP metadata (not user input), so isSafeRedirect is bypassed.
@@ -244,6 +264,12 @@ const AuthContextProvider = ({
       });
     },
     onError: (error) => {
+      if (user?.provider === 'email_code') {
+        // The server did not acknowledge revocation; keep the current identity and allow retry.
+        setLogoutFailure(true);
+        window.dispatchEvent(new CustomEvent('librechat:auth-session-continued'));
+        return;
+      }
       endSessionClientState();
       doSetError((error as Error).message);
       setUserContext({
@@ -258,6 +284,9 @@ const AuthContextProvider = ({
 
   const logout = useCallback(
     (redirect?: string) => {
+      setLogoutFailure(false);
+      sessionGeneration.current++;
+      notifySessionEnding(sessionGeneration.current);
       clearPostLoginRedirect();
       clearTwoFactorSetupToken();
       if (user?.provider === 'browser') {
@@ -295,10 +324,45 @@ const AuthContextProvider = ({
     ],
   );
 
+  /** A document boundary cancels old feeds/transfers and prevents late work reaching the new user. */
+  const settleCortexSession = useCallback(
+    async (destination: string) => {
+      sessionGeneration.current++;
+      notifySessionEnding(sessionGeneration.current);
+      isExternalRedirectRef.current = true;
+      setUserContext.cancel();
+      setTokenHeader(undefined);
+      setQueriesEnabled(false);
+      endSessionClientState();
+      setUser(undefined);
+      setToken(undefined);
+      setIsAuthenticated(false);
+      // A rejected cleanup must not strand a page with the previous identity still mounted.
+      await Promise.allSettled([queryClient.cancelQueries()]);
+      await Promise.allSettled([clearStates()]);
+      queryClient.removeQueries();
+      try {
+        localStorage.setItem('librechat.auth.revision', crypto.randomUUID());
+      } catch {
+        /* Storage may be disabled. */
+      }
+      window.location.assign(
+        `${apiBaseUrl()}${isSafeRedirect(destination) ? destination : '/c/new'}`,
+      );
+    },
+    [clearStates, queryClient, setQueriesEnabled, setUser, setUserContext],
+  );
+
   const completeAuthentication = useCallback(
-    (authenticatedToken: string, authenticatedUser: t.TUser) => {
+    async (authenticatedToken: string, authenticatedUser: t.TUser) => {
       const redirect =
         getPostLoginRedirect(new URLSearchParams(window.location.search)) ?? '/c/new';
+      if (authenticatedUser.provider === 'email_code' || authenticatedUser.provider === 'browser') {
+        clearTwoFactorSetupToken();
+        setBrowserState(null);
+        await settleCortexSession(redirect);
+        return;
+      }
       /** The enrollment credential has done its job; do not leave it live in the tab. */
       clearTwoFactorSetupToken();
       setUser(authenticatedUser);
@@ -310,7 +374,7 @@ const AuthContextProvider = ({
       openFileDeletionRetention();
       navigate(redirect, { replace: true });
     },
-    [navigate, setQueriesEnabled, setUser],
+    [navigate, setQueriesEnabled, setUser, setBrowserState, settleCortexSession],
   );
 
   /**
@@ -322,6 +386,8 @@ const AuthContextProvider = ({
    * leave the setup token alone, since the in-memory mirror is then its only copy.
    */
   const clearAuthenticationForRedirect = useCallback(() => {
+    sessionGeneration.current++;
+    notifySessionEnding(sessionGeneration.current);
     endSessionClientState();
     setUser(undefined);
     setToken(undefined);
@@ -338,6 +404,7 @@ const AuthContextProvider = ({
   );
 
   const silentRefresh = useCallback(() => {
+    if (refreshPending.current) return;
     if (browserStateRef.current && isBrowserSessionEntry(window.location.pathname, apiBaseUrl())) {
       return;
     }
@@ -347,9 +414,14 @@ const AuthContextProvider = ({
     if (isExternalRedirectRef.current) {
       return;
     }
+    const generation = sessionGeneration.current;
+    refreshPending.current = true;
     refreshToken.mutate(undefined, {
+      onSettled: () => {
+        refreshPending.current = false;
+      },
       onSuccess: async (data: t.TRefreshTokenResponse | undefined) => {
-        if (isExternalRedirectRef.current) {
+        if (isExternalRedirectRef.current || generation !== sessionGeneration.current) {
           return;
         }
         if (
@@ -363,7 +435,8 @@ const AuthContextProvider = ({
               queryKey: ['startupConfig', false, 'default'],
               queryFn: () => dataService.getStartupConfig(),
             });
-            if (config.browserSessionEnabled) {
+            if (generation !== sessionGeneration.current) return;
+            if (config.browserSessionEnabled && (config.authMode ?? 'default') === 'default') {
               setBrowserState('busy');
               data = await enrollBrowserSession({
                 refresh: request.refreshToken,
@@ -377,6 +450,7 @@ const AuthContextProvider = ({
             return;
           }
         }
+        if (generation !== sessionGeneration.current || isExternalRedirectRef.current) return;
         const { user, token = '', twoFASetupRequired, tempToken } = data ?? {};
         if (twoFASetupRequired && tempToken) {
           persistTwoFactorSetupToken(tempToken);
@@ -428,7 +502,7 @@ const AuthContextProvider = ({
         }
       },
       onError: (error) => {
-        if (isExternalRedirectRef.current) {
+        if (isExternalRedirectRef.current || generation !== sessionGeneration.current) {
           return;
         }
         const browserCode = browserSessionErrorCode(error);
@@ -453,6 +527,30 @@ const AuthContextProvider = ({
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps -- deps are stable at mount; adding refreshToken causes infinite re-fire
   }, []);
+
+  useEffect(() => {
+    if (authMode.data?.authMode === 'default' || !authMode.data) return;
+    const changed = (event: StorageEvent) => {
+      if (event.key !== 'librechat.auth.revision') return;
+      // Do not rebroadcast: the cookie selection is shared, but no identity is stored in this event.
+      sessionGeneration.current++;
+      notifySessionEnding(sessionGeneration.current);
+      isExternalRedirectRef.current = true;
+      setUserContext.cancel();
+      setTokenHeader(undefined);
+      setQueriesEnabled(false);
+      endSessionClientState();
+      void queryClient
+        .cancelQueries()
+        .then(() => clearStates())
+        .finally(() => {
+          queryClient.removeQueries();
+          window.location.assign(`${apiBaseUrl()}/c/new`);
+        });
+    };
+    window.addEventListener('storage', changed);
+    return () => window.removeEventListener('storage', changed);
+  }, [authMode.data, clearStates, queryClient, setQueriesEnabled, setUserContext]);
 
   useEffect(() => {
     if (authConfig?.optional === true) {
@@ -546,6 +644,10 @@ const AuthContextProvider = ({
 
   useEffect(() => {
     const handleTokenUpdate = (event: CustomEvent<string>) => {
+      if (isExternalRedirectRef.current) {
+        setTokenHeader(undefined);
+        return;
+      }
       console.log('tokenUpdated event received event');
       setUserContext({
         token: event.detail,
@@ -611,14 +713,35 @@ const AuthContextProvider = ({
     ],
   );
 
+  const content =
+    browserState &&
+    authConfig?.optional !== true &&
+    isBrowserSessionEntry(window.location.pathname, apiBaseUrl()) ? (
+      <BrowserSession code={browserState} onState={setBrowserState} />
+    ) : (
+      children
+    );
   return (
     <AuthContext.Provider value={memoedValue}>
-      {browserState &&
-      authConfig?.optional !== true &&
-      isBrowserSessionEntry(window.location.pathname, apiBaseUrl()) ? (
-        <BrowserSession code={browserState} onState={setBrowserState} />
+      {logoutFailure ||
+      (authMode.data?.authMode === 'transition' &&
+        user?.provider === 'browser' &&
+        isAuthenticated &&
+        !browserState) ? (
+        <div className="flex h-full min-h-0 flex-col">
+          {logoutFailure && (
+            <p role="alert" className="text-status-error-strong px-4 py-2 text-sm">
+              {localize('com_auth_email_code_logout_failed')}
+            </p>
+          )}
+          {authMode.data?.authMode === 'transition' &&
+            user?.provider === 'browser' &&
+            isAuthenticated &&
+            !browserState && <GuestEmailEntry config={authMode.data} />}
+          <div className="min-h-0 flex-1">{content}</div>
+        </div>
       ) : (
-        children
+        content
       )}
     </AuthContext.Provider>
   );

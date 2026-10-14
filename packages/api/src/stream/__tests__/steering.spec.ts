@@ -17,6 +17,7 @@ import { synthesizeAppliedSteerEvents, toPendingSteer } from '~/stream/SteeringL
 import { InMemoryEventTransport } from '~/stream/implementations/InMemoryEventTransport';
 import { buildPendingAction, buildToolApprovalPayload } from '~/agents/hitl/policy';
 import { GenerationJobManagerClass } from '~/stream/GenerationJobManager';
+import { configureSourceReplayForTest } from './helpers/sourceReplay';
 import { serializeQuoteRetention } from '~/files/retention';
 
 jest.spyOn(console, 'log').mockImplementation();
@@ -34,6 +35,7 @@ describe('SteeringLifecycle via GenerationJobManager.steering (in-memory)', () =
       isRedis: false,
       cleanupOnComplete: false,
     });
+    configureSourceReplayForTest(manager, jobStore);
     manager.initialize();
   });
 
@@ -63,7 +65,7 @@ describe('SteeringLifecycle via GenerationJobManager.steering (in-memory)', () =
     });
   });
 
-  test('private quoted steer requires a live bound source and public projection omits its lineage', async () => {
+  test('source-bound steering is unsupported and public projection still omits private lineage', async () => {
     const job = await manager.createJob('source-steer', 'user-1', undefined, {
       initialMetadata: { steerQuotesCapable: true },
     });
@@ -97,7 +99,9 @@ describe('SteeringLifecycle via GenerationJobManager.steering (in-memory)', () =
         sourceExpiresAt: new Date(Date.now() + 60000),
       }),
     ).toBe(true);
-    expect(await manager.steering.enqueue('source-steer', item, job.createdAt)).toBe(1);
+    expect(await manager.steering.enqueue('source-steer', item, job.createdAt)).toBe(
+      STEER_ENQUEUE_NOT_RUNNING,
+    );
     expect(toPendingSteer(item)).toMatchObject({
       text: 'independent question',
       quotes: ['excerpt'],

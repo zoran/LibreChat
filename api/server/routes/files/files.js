@@ -58,8 +58,18 @@ const { cleanFileName, getContentDisposition } = require('~/server/utils/files')
 const { Readable } = require('stream');
 const { getLogStores } = require('~/cache');
 const db = require('~/models');
+const {
+  isCortexFileMode,
+  rejectUnmanagedFileWrites,
+  createManagedFileHandlers,
+} = require('./managed');
 
 const router = express.Router();
+const managed = createManagedFileHandlers();
+const scopedFileAccess = (req, res, next) =>
+  isCortexFileMode() ? next() : fileAccess(req, res, next);
+router.use(rejectUnmanagedFileWrites);
+router.get('/managed/:id', managed.download);
 const AGENT_TOOL_RESOURCE_KEYS = new Set([
   EToolResources.execute_code,
   EToolResources.file_search,
@@ -73,6 +83,7 @@ const isAgentToolResourceKey = (toolResource) =>
 
 /** Register the list endpoint as a thin adapter around the shared file-list policy. */
 router.get('/', async (req, res) => {
+  if (isCortexFileMode()) return managed.list(req, res);
   try {
     const responseFiles = await handleFileListRequest({
       userId: req.user.id,
@@ -101,6 +112,10 @@ router.get('/', async (req, res) => {
  * @returns {Promise<TFile[]>} Array of files attached to the agent
  */
 router.get('/agent/:agent_id', async (req, res) => {
+  if (isCortexFileMode()) {
+    res.setHeader('Cache-Control', 'private, no-store');
+    return res.json([]);
+  }
   try {
     const { agent_id } = req.params;
     const userId = req.user.id;
@@ -191,23 +206,52 @@ router.delete('/', async (req, res) => {
     const sendDeleteResult = (result, successMessage) =>
       res.status(200).json(buildDeleteFilesResponse(result, successMessage));
 
-    const { files: _files } = req.body;
+    const { files: _files } = req.body ?? {};
+    let managedPrincipal;
+    if (isCortexFileMode()) {
+      managedPrincipal = await managed.authorize(req);
+      if (
+        managedPrincipal.userId !== req.user.id?.toString() ||
+        managedPrincipal.tenantId !== req.user.tenantId
+      ) {
+        return res.status(401).json({ code: 'unauthorized' });
+      }
+      if (
+        !Array.isArray(_files) ||
+        _files.length < 1 ||
+        _files.length > 10 ||
+        _files.some(
+          (file) =>
+            typeof file?.file_id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(file.file_id),
+        ) ||
+        req.body.agent_id != null ||
+        req.body.assistant_id != null ||
+        req.body.tool_resource != null
+      ) {
+        return res.status(400).json({ code: 'invalid_request' });
+      }
+    }
 
     /** @type {MongoFile[]} */
-    const files = _files.filter((file) => {
-      if (!file.file_id) {
-        return false;
-      }
-      if (!file.filepath) {
-        return false;
-      }
+    const files = managedPrincipal
+      ? [...new Set(_files.map((file) => file.file_id))].map((file_id) => ({
+          file_id,
+          filepath: `/api/files/managed/${encodeURIComponent(file_id)}`,
+        }))
+      : _files.filter((file) => {
+          if (!file.file_id) {
+            return false;
+          }
+          if (!file.filepath) {
+            return false;
+          }
 
-      if (/^(file|assistant)-/.test(file.file_id)) {
-        return true;
-      }
+          if (/^(file|assistant)-/.test(file.file_id)) {
+            return true;
+          }
 
-      return isUUID.safeParse(file.file_id).success;
-    });
+          return isUUID.safeParse(file.file_id).success;
+        });
 
     if (files.length === 0) {
       res.status(204).json({ message: 'Nothing provided to delete' });
@@ -215,7 +259,13 @@ router.delete('/', async (req, res) => {
     }
 
     const fileIds = files.map((file) => file.file_id);
-    const visibleFiles = await db.getFiles({ file_id: { $in: fileIds } });
+    const visibleFiles = await db.getFiles({
+      file_id: { $in: fileIds },
+      ...(managedPrincipal && {
+        tenantId: managedPrincipal.tenantId,
+        user: managedPrincipal.userId,
+      }),
+    });
     const pendingFiles =
       typeof db.getFileSourceDeletionCandidates === 'function'
         ? await db.getFileSourceDeletionCandidates(
@@ -226,6 +276,17 @@ router.delete('/', async (req, res) => {
     const dbFiles = [
       ...new Map([...visibleFiles, ...pendingFiles].map((file) => [file.file_id, file])).values(),
     ];
+    if (
+      managedPrincipal &&
+      (dbFiles.length !== fileIds.length ||
+        dbFiles.some(
+          (file) =>
+            file.user?.toString() !== managedPrincipal.userId ||
+            file.tenantId !== managedPrincipal.tenantId,
+        ))
+    ) {
+      return res.status(404).json({ code: 'not_found' });
+    }
 
     if (req.body.agent_id && req.body.tool_resource) {
       if (!isAgentToolResourceKey(req.body.tool_resource)) {
@@ -353,6 +414,7 @@ router.delete('/', async (req, res) => {
     );
     sendDeleteResult(result, 'Files deleted successfully');
   } catch (error) {
+    if (isCortexFileMode()) return managed.failure(res, error);
     logger.error('[/files] Error deleting files:', error);
     res.status(400).json({ message: 'Error in request', error: error.message });
   }
@@ -363,6 +425,10 @@ function isValidID(str) {
 }
 
 router.get('/code/download/:session_id/:fileId', async (req, res) => {
+  if (isCortexFileMode()) {
+    res.setHeader('Cache-Control', 'private, no-store');
+    return res.status(404).json({ code: 'not_found' });
+  }
   try {
     const { session_id, fileId } = req.params;
     const logPrefix = `Session ID: ${session_id} | File ID: ${fileId} | Code output download requested by user `;
@@ -491,7 +557,8 @@ const PREVIEW_LAZY_SWEEP_CUTOFF_MS = 2 * 60 * 1000;
  *
  * @route GET /files/:file_id/preview
  */
-router.get('/:file_id/preview', fileAccess, async (req, res) => {
+router.get('/:file_id/preview', scopedFileAccess, async (req, res) => {
+  if (isCortexFileMode()) return managed.preview(req, res);
   try {
     const { file_id } = req.params;
     /* `fileAccess` already fetched the record (sans `text`, the default
@@ -602,7 +669,8 @@ const getDownloadFileMetadata = (file) => {
   }, {});
 };
 
-router.get('/download-url/:userId/:file_id', fileAccess, async (req, res) => {
+router.get('/download-url/:userId/:file_id', scopedFileAccess, async (req, res) => {
+  if (isCortexFileMode()) return managed.downloadURL(req, res);
   try {
     const { userId, file_id } = req.params;
     logger.debug(`File download URL requested by user ${userId}: ${file_id}`);
@@ -640,7 +708,8 @@ router.get('/download-url/:userId/:file_id', fileAccess, async (req, res) => {
   }
 });
 
-router.get('/download/:userId/:file_id', fileAccess, async (req, res) => {
+router.get('/download/:userId/:file_id', scopedFileAccess, async (req, res) => {
+  if (isCortexFileMode()) return managed.download(req, res);
   try {
     const { userId, file_id } = req.params;
     logger.debug(`File download requested by user ${userId}: ${file_id}`);

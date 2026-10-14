@@ -600,6 +600,12 @@ export interface ExtendedFile {
   size: number;
   preview?: string;
   progress: number;
+  managedUpload?: {
+    operation?: t.UploadOperation;
+    phase: string;
+    transfer?: import('~/features/uploads/progress').TransferProgress;
+    error?: string;
+  };
   source?: FileSources;
   attached?: boolean;
   embedded?: boolean;

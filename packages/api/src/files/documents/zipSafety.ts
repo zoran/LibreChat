@@ -36,6 +36,8 @@ export interface ZipSafetyOptions {
   maxTotalBytes?: number;
   /** Per-entry decompressed-byte cap. */
   maxEntryBytes?: number;
+  /** Maximum count includes directory entries. */
+  maxEntries?: number;
   /** Filename for error messages — does not need to match disk. */
   name?: string;
 }
@@ -60,9 +62,23 @@ export interface ZipSafetyOptions {
  * within caps.
  */
 export function assertSafeZipSize(buffer: Buffer, options: ZipSafetyOptions = {}): Promise<void> {
+  return readSafeZipEntries(buffer, { ...options, select: () => false }).then(() => undefined);
+}
+
+/** One bounded inflate pass; only explicitly selected entries are retained. */
+export function readSafeZipEntries(
+  buffer: Buffer,
+  options: ZipSafetyOptions & { select: (name: string) => boolean },
+): Promise<Map<string, Buffer>> {
   const maxTotalBytes = options.maxTotalBytes ?? DEFAULT_MAX_TOTAL_BYTES;
   const maxEntryBytes = options.maxEntryBytes ?? DEFAULT_MAX_ENTRY_BYTES;
+  const maxEntries = options.maxEntries ?? 2048;
   const label = options.name ?? 'archive';
+  for (const limit of [maxTotalBytes, maxEntryBytes, maxEntries]) {
+    if (!Number.isSafeInteger(limit) || limit < 1) {
+      return Promise.reject(new Error('Invalid ZIP resource limit'));
+    }
+  }
 
   return new Promise((resolve, reject) => {
     yauzl.fromBuffer(buffer, { lazyEntries: true }, (err, zipfile) => {
@@ -75,6 +91,9 @@ export function assertSafeZipSize(buffer: Buffer, options: ZipSafetyOptions = {}
 
       let settled = false;
       let totalDecompressed = 0;
+      let entryCount = 0;
+      const names = new Set<string>();
+      const selected = new Map<string, Buffer>();
       const finish = (error: Error | null) => {
         if (settled) {
           return;
@@ -90,13 +109,25 @@ export function assertSafeZipSize(buffer: Buffer, options: ZipSafetyOptions = {}
         if (error) {
           reject(error);
         } else {
-          resolve();
+          resolve(selected);
         }
       };
 
       zipfile.readEntry();
 
       zipfile.on('entry', (entry: yauzl.Entry) => {
+        if (settled) {
+          return;
+        }
+        entryCount++;
+        if (entryCount > maxEntries) {
+          return finish(new ZipBombError(`${label}: archive entry count exceeds its cap`));
+        }
+        // Ambiguous duplicate parts must not be interpreted differently by another parser.
+        if (names.has(entry.fileName)) {
+          return finish(new Error('Duplicate ZIP entry'));
+        }
+        names.add(entry.fileName);
         /* Directory entries (trailing slash) are zero-byte and don't
          * need to be opened. Saves a stream allocation per directory
          * in archives like .docx that have nested subfolders. */
@@ -112,6 +143,8 @@ export function assertSafeZipSize(buffer: Buffer, options: ZipSafetyOptions = {}
 
           let entryBytes = 0;
           let entryCapped = false;
+          const chunks: Buffer[] = [];
+          const keep = options.select(entry.fileName);
 
           readStream.on('data', (chunk: Buffer) => {
             if (entryCapped) {
@@ -143,10 +176,16 @@ export function assertSafeZipSize(buffer: Buffer, options: ZipSafetyOptions = {}
               );
               return;
             }
+            if (keep) {
+              chunks.push(chunk);
+            }
           });
 
           readStream.on('end', () => {
             if (!settled) {
+              if (keep) {
+                selected.set(entry.fileName, Buffer.concat(chunks, entryBytes));
+              }
               zipfile.readEntry();
             }
           });

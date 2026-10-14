@@ -1,7 +1,8 @@
 const express = require('express');
 const request = require('supertest');
 
-const hits = { uploadIp: 0, uploadUser: 0, usage: 0 };
+const hits = { uploadIp: 0, uploadUser: 0, usage: 0, multer: 0 };
+const originalAuthMode = process.env.AUTH_MODE;
 
 jest.mock('~/server/middleware', () => ({
   createFileLimiters: jest.fn(() => ({
@@ -32,7 +33,10 @@ jest.mock('~/server/middleware', () => ({
 
 jest.mock('./multer', () => ({
   createMulterInstance: jest.fn(async () => ({
-    single: jest.fn(() => (req, res, next) => next()),
+    single: jest.fn(() => (req, res, next) => {
+      hits.multer++;
+      next();
+    }),
   })),
 }));
 
@@ -74,9 +78,15 @@ describe('file route limiter wiring', () => {
   });
 
   beforeEach(() => {
+    process.env.AUTH_MODE = 'default';
     hits.uploadIp = 0;
     hits.uploadUser = 0;
     hits.usage = 0;
+    hits.multer = 0;
+  });
+  afterAll(() => {
+    if (originalAuthMode === undefined) delete process.env.AUTH_MODE;
+    else process.env.AUTH_MODE = originalAuthMode;
   });
 
   it('meters POST /usage with the usage limiter, never leaving it unlimited', async () => {
@@ -125,5 +135,35 @@ describe('file route limiter wiring', () => {
     expect(hits.uploadIp).toBe(0);
     expect(hits.uploadUser).toBe(0);
     expect(hits.usage).toBe(0);
+  });
+
+  test.each([
+    '',
+    '/images',
+    '/images/avatar',
+    '/images/agents/agent/avatar',
+    '/images/assistants/assistant/avatar',
+    '/speech/stt',
+    '/speech/tts',
+    '/speech/tts/manual',
+  ])('rejects Cortex legacy POST %s before multipart parsing or provider work', async (path) => {
+    process.env.AUTH_MODE = 'transition';
+    const response = await request(app).post(`/api/files${path}`).send({});
+    expect(response.status).toBe(403);
+    expect(response.body).toEqual({ code: 'managed_upload_required' });
+    expect(hits.multer).toBe(0);
+    expect(hits.uploadIp).toBe(0);
+  });
+
+  it('keeps metadata usage available in email-only mode without allowing another write route', async () => {
+    process.env.AUTH_MODE = 'email_code';
+    const response = await request(app)
+      .post('/api/files/usage/')
+      .send({ file_ids: ['file'] });
+    expect(response.status).toBe(200);
+    expect(hits.usage).toBe(1);
+    expect(hits.multer).toBe(0);
+    const other = await request(app).post('/api/files/future-upload').send({});
+    expect(other.status).toBe(403);
   });
 });

@@ -5,6 +5,7 @@ import type { ReplayLimits, ReplayPublication } from '../internal/replay';
 import type { SerializableJobData } from '../interfaces/IJobStore';
 import type { IEventTransport } from '../interfaces/IJobStore';
 import { sourceRetentionAvailable } from '../interfaces/IJobStore';
+import { SourceReplayError } from '../internal/sourceBudget';
 
 interface StreamState {
   emitter: EventEmitter;
@@ -26,6 +27,11 @@ interface ReplayBuffer {
  */
 export class InMemoryEventTransport implements IEventTransport {
   readonly sourceRetentionSupported = true;
+  private sourceCleanup?: (streamId: string, epoch: number) => void;
+  setSourceRetentionCleanup(cleanup: (streamId: string, epoch: number) => void): void {
+    this.sourceCleanup = cleanup;
+  }
+
   private sourceReader?: (streamId: string) => Promise<SerializableJobData | null>;
   setSourceRetentionReader(
     reader: (streamId: string) => Promise<SerializableJobData | null>,
@@ -45,11 +51,16 @@ export class InMemoryEventTransport implements IEventTransport {
     publish();
   }
 
-  async purgeSourceRetention(streamId: string, epoch: number): Promise<void> {
+  async purgeSourceRetention(
+    streamId: string,
+    epoch: number,
+    options?: { silent?: boolean },
+  ): Promise<void> {
     const job = await this.sourceReader?.(streamId);
     if (job?.createdAt !== epoch) return;
     this.dropReplay(streamId);
-    this.emitError(streamId, 'Document source unavailable', epoch);
+    this.sourceCleanup?.(streamId, epoch);
+    if (!options?.silent) this.emitError(streamId, 'Document source unavailable', epoch);
   }
 
   private replay = new Map<string, ReplayBuffer>();
@@ -267,6 +278,8 @@ export class InMemoryEventTransport implements IEventTransport {
     limits: ReplayLimits,
     publication?: ReplayPublication,
   ): Promise<void> {
+    if ((await this.sourceReader?.(streamId))?.sourceRetention)
+      throw new SourceReplayError('document_replay_unsupported');
     if (this.retainReplay(streamId, 'chunk', event, limits, publication))
       this.emitChunk(streamId, event);
   }
@@ -277,6 +290,8 @@ export class InMemoryEventTransport implements IEventTransport {
     limits: ReplayLimits,
     publication?: ReplayPublication,
   ): Promise<void> {
+    if ((await this.sourceReader?.(streamId))?.sourceRetention)
+      throw new SourceReplayError('document_replay_unsupported');
     if (this.retainReplay(streamId, 'done', event, limits, publication))
       this.emitDone(streamId, event);
   }

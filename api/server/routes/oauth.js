@@ -15,6 +15,7 @@ const {
   createSetBalanceConfig,
   getOAuthFailureMessage,
   redirectToAuthFailure,
+  getAuthMode,
 } = require('@librechat/api');
 const {
   checkDomainAllowed,
@@ -37,6 +38,9 @@ const setBalanceConfig = ownAuthHandler(
 
 const router = express.Router();
 router.use(authAdmissionMiddleware);
+router.use((_req, res, next) =>
+  getAuthMode() === 'default' ? next() : res.status(404).json({ code: 'AUTH_MODE_DISABLED' }),
+);
 
 const domains = {
   client: process.env.DOMAIN_CLIENT,

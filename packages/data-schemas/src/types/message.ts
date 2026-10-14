@@ -67,6 +67,8 @@ export type ResolvedQuoteRetention = {
   sourceMessageConditions: Array<{ messageId: string; messageVersion: number | null }>;
 };
 
+export type RetainedTextAllocation = { fileId: string; bytes: number };
+
 // @ts-ignore
 export interface IMessage extends Document {
   __v?: number;
@@ -76,6 +78,8 @@ export interface IMessage extends Document {
   sourceFileIds?: string[];
   sourceExpiresAt?: Date;
   sourceContentRemovedAt?: Date;
+  /** Private receipts; only the transactional Message/File owners may resize these. */
+  retainedTextAllocations?: RetainedTextAllocation[];
   messageId: string;
   conversationId: string;
   user: string;

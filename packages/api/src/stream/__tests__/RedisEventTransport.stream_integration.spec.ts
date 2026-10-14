@@ -5,6 +5,7 @@ import {
   keyvRedisClient as staticKeyvClient,
   keyvRedisClientReady,
 } from '~/cache/redisClients';
+import { prepareSourceReplayForTest } from './helpers/sourceReplay';
 import { createMockPublisher } from './helpers/publisher';
 
 logger.silent = true;
@@ -81,10 +82,7 @@ describe('RedisEventTransport Integration Tests', () => {
     await subscription.ready;
     try {
       const job = await store.createJob(id, 'owner');
-      await store.bindSourceRetention(id, job.createdAt, {
-        sourceFileIds: ['file-a'],
-        sourceExpiresAt: Date.now() + 60000,
-      });
+      const intent = await prepareSourceReplayForTest(store, job);
       await transport.emitDone(id, { text: 'allowed before revoke' }, job.createdAt, true);
       await new Promise((resolve) => setTimeout(resolve, 100));
       expect(done).toEqual([{ text: 'allowed before revoke' }]);
@@ -96,6 +94,7 @@ describe('RedisEventTransport Integration Tests', () => {
         patch: { completedAt: Date.now(), providerDrained: true },
       });
       await store.deleteJob(id, job.createdAt);
+      await store.acknowledgeSourceReplayRelease(intent);
       await store.deleteJob(id, job.createdAt);
       expect(await store.getJob(id)).toBeNull();
       await expect(

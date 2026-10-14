@@ -14,6 +14,13 @@ export * from './code';
 export * from './pulls';
 /* Auth */
 export * from './auth';
+export * from './auth/authMode';
+export * from './auth/emailCode';
+export * from './uploads';
+export * from './uploads/transport';
+export * from './uploads/storage';
+export * from './uploads/processing';
+export * from './uploads/platform';
 /* API Keys */
 export * from './apiKeys';
 /* MCP */
@@ -144,3 +151,13 @@ export type * from './types';
 export * from './tools/approval';
 
 export * from './mcp/approval';
+
+export * from './auth/mailSender';
+
+export * from './uploads/control';
+
+export * from './uploads/metrics';
+
+export * from './uploads/workers';
+
+export * from './uploads/cleanup';

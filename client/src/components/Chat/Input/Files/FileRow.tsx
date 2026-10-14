@@ -2,6 +2,8 @@ import { useEffect } from 'react';
 import { useToastContext } from '@librechat/client';
 import { EToolResources } from 'librechat-data-provider';
 import type { ExtendedFile } from '~/common';
+import { ManagedUploadPanel, ManagedUploadCard } from '~/features/uploads/ManagedUploadPanel';
+import { useManagedUploads } from '~/features/uploads/useManagedUploads';
 import { useDeleteFilesMutation } from '~/data-provider';
 import { logger, getCachedPreview } from '~/utils';
 import { useFileDeletion } from '~/hooks/Files';
@@ -58,6 +60,7 @@ export default function FileRow({
   onMovePastedTextInline?: (file: ExtendedFile) => void;
 }) {
   const localize = useLocalize();
+  const managed = useManagedUploads();
   const { showToast } = useToastContext();
   const files = Array.from(_files?.values() ?? []).filter((file) =>
     fileFilter ? fileFilter(file) : true,
@@ -95,20 +98,52 @@ export default function FileRow({
       return;
     }
 
-    if (files.some((file) => file.progress < 1)) {
+    if (
+      files.some((file) =>
+        file.managedUpload ? !file.managedUpload.operation?.canUseInComposer : file.progress < 1,
+      )
+    ) {
       setFilesLoading(true);
       return;
     }
 
-    if (files.every((file) => file.progress === 1)) {
+    if (
+      files.every((file) =>
+        file.managedUpload ? file.managedUpload.operation?.canUseInComposer : file.progress === 1,
+      )
+    ) {
       setFilesLoading(false);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [files]);
 
-  if (files.length === 0) {
-    return null;
-  }
+  useEffect(() => {
+    if (!managed.data) return;
+    setFiles((previous) => {
+      let changed = false;
+      const next = new Map(previous);
+      for (const [key, file] of previous) {
+        const old = file.managedUpload?.operation;
+        const operation = old && managed.data.operations.find((row) => row.id === old.id);
+        if (
+          !operation ||
+          (operation.revision === old?.revision &&
+            operation.canUseInComposer === old?.canUseInComposer)
+        )
+          continue;
+        changed = true;
+        next.set(key, {
+          ...file,
+          ...(operation.attachment ?? {}),
+          managedUpload: { ...file.managedUpload!, operation },
+        });
+      }
+      return changed ? next : previous;
+    });
+  }, [managed.data, setFiles]);
+
+  const quotaPanel = !assistant_id && !agent_id ? <ManagedUploadPanel /> : null;
+  if (files.length === 0) return quotaPanel;
 
   const renderFiles = () => {
     const rowStyle = isRTL
@@ -144,6 +179,22 @@ export default function FileRow({
             { map: new Map(), uniqueFiles: [] as ExtendedFile[] },
           )
           .uniqueFiles.map((file: ExtendedFile, fileIndex: number) => {
+            if (file.managedUpload) {
+              return (
+                <ManagedUploadCard
+                  key={file.temp_file_id ?? file.file_id}
+                  file={file}
+                  onRemove={() => {
+                    setFiles((previous) => {
+                      const next = new Map(previous);
+                      for (const [key, value] of next)
+                        if (value === file || value.file_id === file.file_id) next.delete(key);
+                      return next;
+                    });
+                  }}
+                />
+              );
+            }
             const handleDelete = () => {
               if (abortUpload && file.progress < 1) {
                 abortUpload(file.file_id);
@@ -215,8 +266,18 @@ export default function FileRow({
   };
 
   if (Wrapper) {
-    return <Wrapper>{renderFiles()}</Wrapper>;
+    return (
+      <>
+        {quotaPanel}
+        <Wrapper>{renderFiles()}</Wrapper>
+      </>
+    );
   }
 
-  return renderFiles();
+  return (
+    <>
+      {quotaPanel}
+      {renderFiles()}
+    </>
+  );
 }

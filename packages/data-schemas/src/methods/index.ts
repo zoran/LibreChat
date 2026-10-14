@@ -24,6 +24,8 @@ import type {
 } from './file';
 import type { RoleMethods, RoleDeps } from './role';
 import { createBrowserMethods, type BrowserMethods } from './browser';
+import { createEmailCodeMethods } from './emailCode';
+import type { EmailCodeRepository } from '../types/emailCode';
 export type { BrowserIdentity, BrowserUser, BrowserMethods } from './browser';
 import {
   createOpenIDRefreshFlightMethods,
@@ -262,6 +264,7 @@ export {
 export type AllMethods = ToolApprovalGrantStorage &
   UserMethods &
   BrowserMethods &
+  EmailCodeRepository &
   GenerationAdmissionMethods &
   SessionMethods &
   TokenMethods &
@@ -503,6 +506,7 @@ export function createMethods(
   return {
     ...createUserMethods(mongoose, { getCache: deps.getCache }),
     ...createBrowserMethods(mongoose),
+    ...createEmailCodeMethods(mongoose),
     ...createGenerationAdmissionMethods(mongoose),
     ...createToolApprovalGrantMethods(mongoose),
     ...createSessionMethods(mongoose),

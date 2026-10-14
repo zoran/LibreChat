@@ -14,6 +14,7 @@ import {
   REDIS_EVENT_REORDER_TIMEOUT_MS,
 } from '~/stream/internal/timing';
 import { registerChunkPublicationCapability } from '~/stream/internal/chunkPublication';
+import { SOURCE_REPLAY_LIMITS, SourceReplayError } from '../internal/sourceBudget';
 import { GenerationPublicationFencedError } from '~/stream/interfaces/IJobStore';
 import { instrumentIORedisClient, RedisUseCases } from '~/cache/redisTelemetry';
 import { PUBLISH_REPLAY_LUA, READ_REPLAY_LUA } from '../internal/replay';
@@ -169,7 +170,9 @@ interface PreemptRegistration {
  * because active runtimes discard terminal events for another epoch.
  */
 const PUBLISH_SEQ_LUA =
+  'if redis.call("HEXISTS",KEYS[2],"sourceReplayIntent")==1 and redis.call("HGET",KEYS[2],"sourceReplayHeld")~="1" then return -1 end ' +
   'local sourceExpiry = redis.call("HGET",KEYS[2],"sourceRetentionExpiresAt") ' +
+  `if sourceExpiry then local maximum=${SOURCE_REPLAY_LIMITS.jobBytes} if ARGV[8]=="1" then maximum=${SOURCE_REPLAY_LIMITS.eventBytes + 1024} end local size=#ARGV[2]+#ARGV[3]+64 for i=10,#ARGV do size=size+#ARGV[i] end if size>maximum then return -1 end end ` +
   'if ARGV[6] == "source" and not sourceExpiry then return -1 end ' +
   'if redis.call("HGET",KEYS[2],"sourceRetentionRevokedAt") or redis.call("HGET",KEYS[2],"sourceRetentionPurged") == "1" then return -1 end ' +
   'if sourceExpiry then local t=redis.call("TIME") if tonumber(sourceExpiry) <= tonumber(t[1])*1000+math.floor(tonumber(t[2])/1000) then return -1 end end ' +
@@ -313,6 +316,11 @@ interface StreamSubscribers {
  */
 export class RedisEventTransport implements IEventTransport {
   readonly sourceRetentionSupported = true;
+  private sourceCleanup?: (streamId: string, epoch: number) => void;
+  setSourceRetentionCleanup(cleanup: (streamId: string, epoch: number) => void): void {
+    this.sourceCleanup = cleanup;
+  }
+
   /** Redis client for publishing events */
   private publisher: Redis | Cluster;
   /** Redis client for subscribing to events (separate connection required) */
@@ -946,8 +954,12 @@ export class RedisEventTransport implements IEventTransport {
     }
 
     try {
-      const parsed = JSON.parse(message) as PubSubMessage & { sourceRevoked?: boolean };
+      const parsed = JSON.parse(message) as PubSubMessage & {
+        sourceRevoked?: boolean;
+        sourceCleanupSilent?: boolean;
+      };
       if (parsed.sourceRevoked && parsed.generationId != null) {
+        this.sourceCleanup?.(streamId, parsed.generationId);
         streamState.sourceRevokedThrough = Math.max(
           streamState.sourceRevokedThrough ?? 0,
           parsed.generationId,
@@ -955,8 +967,9 @@ export class RedisEventTransport implements IEventTransport {
         for (const [seq, pending] of streamState.reorderBuffer.pending)
           if (pending.generationId === parsed.generationId)
             streamState.reorderBuffer.pending.delete(seq);
-        for (const handlers of streamState.handlers.values())
-          handlers.onError?.('Document source unavailable', parsed.generationId);
+        if (!parsed.sourceCleanupSilent)
+          for (const handlers of streamState.handlers.values())
+            handlers.onError?.('Document source unavailable', parsed.generationId);
         return;
       }
       if (parsed.sourceExpiresAt != null && parsed.sourceExpiresAt <= Date.now()) return;
@@ -1311,13 +1324,15 @@ export class RedisEventTransport implements IEventTransport {
     publication?: ReplayPublication,
   ): Promise<void> {
     const [prefix, suffix] = RedisEventTransport.buildPayloadParts({ type, data: event });
-    await this.publisher.eval(
-      PUBLISH_REPLAY_LUA,
-      4,
+    const result = await this.publisher.eval(
+      'if redis.call("HEXISTS",KEYS[5],"sourceRetention")==1 then return -1 end ' +
+        PUBLISH_REPLAY_LUA,
+      5,
       KEYS.sequence(streamId),
       KEYS.backlog(streamId),
       KEYS.backlogBytes(streamId),
       KEYS.publication(streamId),
+      KEYS.job(streamId),
       CHANNELS.events(streamId),
       prefix,
       suffix,
@@ -1329,6 +1344,7 @@ export class RedisEventTransport implements IEventTransport {
       publication?.sequence ?? '',
       type === 'done' ? '1' : '0',
     );
+    if (result === -1) throw new SourceReplayError('document_replay_unsupported');
   }
 
   emitReplayableChunk(
@@ -1998,7 +2014,11 @@ export class RedisEventTransport implements IEventTransport {
    * discard the entire next turn as duplicate traffic. The counter's sliding TTL bounds
    * orphan lifetime.
    */
-  async purgeSourceRetention(streamId: string, epoch: number): Promise<void> {
+  async purgeSourceRetention(
+    streamId: string,
+    epoch: number,
+    options?: { silent?: boolean },
+  ): Promise<void> {
     // Control frame uses the existing channel; no source content or ordering reset.
     await this.publisher.publish(
       CHANNELS.events(streamId),
@@ -2007,6 +2027,7 @@ export class RedisEventTransport implements IEventTransport {
         error: 'Document source unavailable',
         generationId: epoch,
         sourceRevoked: true,
+        sourceCleanupSilent: options?.silent === true,
       }),
     );
     const pending = this.pendingBatches.get(streamId);

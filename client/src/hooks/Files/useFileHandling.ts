@@ -6,6 +6,7 @@ import { useToastContext } from '@librechat/client';
 import { useQueryClient } from '@tanstack/react-query';
 import {
   megabyte,
+  UPLOAD_MAX_FILE_BYTES,
   QueryKeys,
   Constants,
   EToolResources,
@@ -35,9 +36,11 @@ import {
   validateFileDuplicates,
 } from '~/utils';
 import { useGetFileConfig, useUploadFileMutation } from '~/data-provider';
+import { useManagedUploads } from '~/features/uploads/useManagedUploads';
 import useAgentUploadTarget from '~/hooks/Agents/useAgentUploadTarget';
 import useLocalize, { TranslationKeys } from '~/hooks/useLocalize';
 import { useChatSettings } from '~/Providers/ChatSettingsContext';
+import { runManagedSelection } from '~/features/uploads/transfer';
 import { useDelayedUploadToast } from './useDelayedUploadToast';
 import { useChatContext } from '~/Providers/ChatContext';
 import { importWithRecovery } from '~/lib/assets/lazy';
@@ -202,6 +205,29 @@ const useFileHandlingCore = (params: UseFileHandling | undefined, fileState: Fil
     }
   };
   const { addFile, replaceFile, updateFileById, deleteFileById } = useUpdateFiles(fileSetter);
+  const managedUploads = useManagedUploads();
+  const managedIdentityRef = useRef(managedUploads.sessionKey);
+  managedIdentityRef.current = managedUploads.sessionKey;
+  const managedEndingRef = useRef(false);
+  const managedEpochRef = useRef(0);
+  useEffect(() => {
+    managedEndingRef.current = false;
+    const end = () => {
+      managedEndingRef.current = true;
+      managedEpochRef.current++;
+      abortControllerRef.current?.abort();
+    };
+    const resume = () => {
+      managedEndingRef.current = false;
+    };
+    window.addEventListener('librechat:auth-session-ending', end);
+    window.addEventListener('librechat:auth-session-continued', resume);
+    return () => {
+      end();
+      window.removeEventListener('librechat:auth-session-ending', end);
+      window.removeEventListener('librechat:auth-session-continued', resume);
+    };
+  }, [managedUploads.sessionKey]);
   const { isConfigPending, waitForConfig, resizeImageIfNeeded } = useClientResize();
 
   const agent_id = params?.additionalMetadata?.agent_id ?? '';
@@ -500,6 +526,68 @@ const useFileHandlingCore = (params: UseFileHandling | undefined, fileState: Fil
     uploadLifecycle?: UploadLifecycleCallbacks,
   ): Promise<boolean> => {
     abortControllerRef.current = new AbortController();
+
+    if (managedUploads.enabled) {
+      if (!managedUploads.eligible) {
+        setError('com_upload_login_needed');
+        setFilesLoading(false);
+        return false;
+      }
+      const formats: Record<string, string> = {
+        txt: 'text/plain',
+        pdf: 'application/pdf',
+        docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+      };
+      if (
+        !isConversationUpload ||
+        _toolResource ||
+        fileList.length > 20 ||
+        fileList.some(
+          (file) =>
+            file.size < 1 ||
+            file.size > UPLOAD_MAX_FILE_BYTES ||
+            !formats[file.name.split('.').pop()?.toLowerCase() ?? ''],
+        )
+      ) {
+        setError('com_upload_unsupported');
+        setFilesLoading(false);
+        return false;
+      }
+      const selected = fileList.map(
+        (file, index): ExtendedFile => ({
+          file,
+          file_id: index === 0 && uploadLifecycle?.fileId ? uploadLifecycle.fileId : v4(),
+          filename: file.name,
+          type: formats[file.name.split('.').pop()!.toLowerCase()],
+          size: file.size,
+          progress: 0,
+          managedUpload: { phase: 'selected' },
+        }),
+      );
+      for (const file of selected) addFile(file);
+      const signal = abortControllerRef.current.signal;
+      const identity = managedUploads.sessionKey;
+      const epoch = managedEpochRef.current;
+      const current = () =>
+        !managedEndingRef.current &&
+        managedEpochRef.current === epoch &&
+        managedIdentityRef.current === identity &&
+        uploadLifecycle?.shouldCommit?.() !== false;
+      await runManagedSelection(selected, {
+        signal,
+        current,
+        update: updateFileById,
+        refresh: managedUploads.refresh,
+        ready: managedUploads.waitForReady,
+        onStart: uploadLifecycle?.onStart,
+        onSuccess: uploadLifecycle?.onSuccess,
+        onError: uploadLifecycle?.onError,
+        onAbort: uploadLifecycle?.onAbort,
+      });
+      if (current()) setFilesLoading(false);
+      return selected.length > 0;
+    }
 
     const existingFiles = tracksReservations
       ? mergeRecentUploads(filesRef.current, uploadScope.recent)

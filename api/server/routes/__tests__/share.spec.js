@@ -9,6 +9,7 @@ const mockRecordShareLinkRejection = jest.fn();
 const mockSharedLinksAccess = jest.fn((_req, _res, next) => next());
 const mockSharedLinkConfigMiddleware = jest.fn((_req, _res, next) => next());
 let mockShareTenantId;
+let mockAuthMode = 'default';
 const mockHasCapability = jest.fn();
 const mockHasConfigCapability = jest.fn();
 const mockGetSharedLangfuseSessionUrl = jest.fn();
@@ -79,6 +80,7 @@ const mockCreateShareContentPreflight = jest.fn((filters, options = {}) => {
 });
 
 jest.mock('@librechat/api', () => ({
+  getAuthMode: () => mockAuthMode,
   prepareResultToolCallPreviews: (...args) => mockPrepareResultToolCallPreviews(...args),
   resolveDownloadPath: (file) => file.storageKey || file.filepath,
   assertModelBoundContent: (...args) => mockAssertModelBoundContent(...args),
@@ -241,6 +243,7 @@ const {
   createSharedLink,
   updateSharedLink,
   getSharedLinks,
+  getSharedLink,
   getSharedLinkFile,
   backfillSharedLinkFiles,
   getRoleByName,
@@ -310,6 +313,62 @@ const useResolvedSharedLinkConfig = () => {
     next();
   });
 };
+
+describe('Cortex sharing is unavailable', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+  });
+  afterEach(() => {
+    mockAuthMode = 'default';
+  });
+
+  test.each(['transition', 'email_code'])(
+    'denies every share entry in %s before private content or metadata is read',
+    async (mode) => {
+      mockAuthMode = mode;
+      getSharedMessages.mockResolvedValue({
+        messages: [{ text: 'Private document quote and source-derived response' }],
+      });
+      const entries = [
+        ['get', '/api/share'],
+        ['get', '/api/share/link/conversation-123'],
+        ['get', '/api/share/share-123'],
+        ['get', '/api/share/share-123/config'],
+        ['post', '/api/share/share-123/fork'],
+        ['post', '/api/share/conversation-123'],
+        ['patch', '/api/share/share-123'],
+        ['delete', '/api/share/share-123'],
+        ['get', '/api/share/share-123/files/file-1'],
+        ['get', '/api/share/share-123/files/file-1/download'],
+        ['get', '/api/share/share-123/files/file-1/preview'],
+      ];
+      const app = buildApp();
+      for (const [method, url] of entries) {
+        const response = await request(app)[method](url).send({ snapshotFiles: true });
+        expect(response.status).toBe(404);
+        expect(response.body).toEqual({ message: 'Not found' });
+        expect(response.headers['cache-control']).toBe('private, no-store');
+      }
+      for (const owner of [
+        getSharedMessages,
+        getSharedLinks,
+        getSharedLink,
+        getSharedLinkFile,
+        backfillSharedLinkFiles,
+        getFiles,
+        createSharedLink,
+        updateSharedLink,
+        forkSharedConversation,
+        mockGetStrategyFunctions,
+        mockCanAccessSharedLink,
+        mockGetAppConfig,
+        mockSharedLinksAccess,
+      ]) {
+        expect(owner).not.toHaveBeenCalled();
+      }
+    },
+  );
+});
 
 describe('share routes', () => {
   beforeEach(() => {

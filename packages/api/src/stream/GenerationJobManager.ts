@@ -45,6 +45,7 @@ import type {
   GenerationAdmissionCensus,
   GenerationRequestBinding,
 } from './generationAdmission';
+import type { SourceReplayConfiguration } from './internal/sourceReplayLifecycle';
 import type { GenerationSourceRetention } from './interfaces/IJobStore';
 import type { AgentStartupTelemetry } from '~/agents/startup';
 import type { RecoveredSteerPayload } from './SteerRecovery';
@@ -70,11 +71,23 @@ import {
   PROVIDER_DRAIN_TIMEOUT_MS,
   STEER_QUEUE_MAX_DEPTH,
 } from './interfaces/IJobStore';
+import {
+  SOURCE_REPLAY_LIMITS,
+  SourceReplayError,
+  assertSourceObjectSize,
+  sourceChunkBytes,
+} from './internal/sourceBudget';
 import { GenerationAdmissionCoordinator, generationRequestBinding } from './generationAdmission';
 import { isRecoveredSteerPayload, RecoveredSteerPayloadMismatchError } from './SteerRecovery';
 import { sourceRetentionAvailable, isStopConfirmed } from './interfaces/IJobStore';
+import { SourceReplayLifecycle } from './internal/sourceReplayLifecycle';
 import { projectTerminalEvent } from './terminalProjection';
 import { assertJobStoreV2 } from './jobStoreCapabilities';
+export type {
+  SourceReplayConfiguration,
+  SourceReplayObservation,
+} from './internal/sourceReplayLifecycle';
+export { SourceReplayError } from './internal/sourceBudget';
 
 /**
  * Tombstone budget per generation. Twice the queue depth so a full queue's
@@ -746,6 +759,8 @@ export interface TerminalJobClaim {
  */
 interface RuntimeJobState {
   sourceRetention?: GenerationSourceRetention;
+  sourceEventBytes?: number;
+  sourceEventEntries?: number;
   sourceRetentionRevokedAt?: number;
   createdAt: number;
   abortController: AbortController;
@@ -805,6 +820,7 @@ interface RuntimeJobState {
   /** Local, runtime-scoped terminal handlers. Avoids broadcasting predecessor errors to a
    * replacement generation that reuses the same durable stream ID. */
   localErrorHandlers: Set<t.ErrorHandler>;
+  sourceCleanupHandlers?: Set<() => void>;
   /** Prevents a repeated approval-expiry sweep from republishing the same terminal event. */
   approvalExpiryPublished?: boolean;
   /** Prevents a local or cross-replica stale-pause relay from retiring and
@@ -1090,6 +1106,55 @@ class GenerationJobManagerClass {
 
   /** Whether to cleanup event transport immediately on job completion */
   private _cleanupOnComplete = true;
+  private sourceReplay?: SourceReplayLifecycle;
+
+  /** Composition supplies File's existing private ledger port after configuring the stores. */
+  configureSourceReplay(config: SourceReplayConfiguration): void {
+    const store = this.jobStore;
+    if (
+      !store.prepareSourceReplay ||
+      !store.commitSourceReplay ||
+      !store.listSourceReplayIntents ||
+      !store.acknowledgeSourceReplayRelease ||
+      !store.revokeSourceRetention ||
+      !store.purgeSourceRetention ||
+      !this.eventTransport.purgeSourceRetention
+    )
+      throw new SourceReplayError('document_source_unavailable');
+    this.eventTransport.setSourceRetentionCleanup?.((streamId, epoch) =>
+      this.clearSourceReplayLocalState(streamId, epoch),
+    );
+    this.sourceReplay = new SourceReplayLifecycle(
+      {
+        getJob: (store.getSourceReplayJob ?? store.getJob).bind(store),
+        prepareSourceReplay: store.prepareSourceReplay.bind(store),
+        commitSourceReplay: store.commitSourceReplay.bind(store),
+        listSourceReplayIntents: store.listSourceReplayIntents.bind(store),
+        acknowledgeSourceReplayRelease: store.acknowledgeSourceReplayRelease.bind(store),
+        revokeSourceRetention: store.revokeSourceRetention.bind(store),
+        purgeSourceRetention: store.purgeSourceRetention.bind(store),
+      },
+      async (streamId, epoch, options) => {
+        await this.eventTransport.purgeSourceRetention!(streamId, epoch, options);
+        this.clearSourceReplayLocalState(streamId, epoch);
+      },
+      config,
+    );
+  }
+
+  private clearSourceReplayLocalState(streamId: string, epoch: number): void {
+    const runtime = this.runtimeState.get(streamId);
+    if (runtime?.createdAt !== epoch) return;
+    runtime.sourceRetentionRevokedAt ??= Date.now();
+    runtime.earlyEventBuffer.length = 0;
+    runtime.earlyEventBufferBytes = 0;
+    runtime.finalEvent = undefined;
+    runtime.errorEvent = undefined;
+    runtime.inFlightSnapshotEmissions.clear();
+    for (const cleanup of [...(runtime.sourceCleanupHandlers ?? [])]) cleanup();
+    this.runStepBuffers?.delete(streamId);
+    this.jobStore.clearContentState(streamId, epoch);
+  }
 
   /** Optional host hook; the generic stream runtime does not know what external
    * durable work (scheduled chats, webhooks, etc.) a generation represents. */
@@ -1215,6 +1280,7 @@ class GenerationJobManagerClass {
 
     this.jobStore.setStaleGenerationHandler?.(undefined);
     this.jobStore = services.jobStore;
+    this.sourceReplay = undefined;
     this.bindStaleGenerationHandler();
     this._approvals = this.createApprovalLifecycle(this.jobStore);
     this._steering = new SteeringLifecycle(this.jobStore);
@@ -2631,7 +2697,6 @@ class GenerationJobManagerClass {
     context: SourceRetentionContext,
   ): Promise<boolean> {
     if (
-      !this.jobStore.bindSourceRetention ||
       !this.jobStore.revokeSourceRetention ||
       !this.jobStore.purgeSourceRetention ||
       !this.jobStore.purgeFileSourceRecovery ||
@@ -2647,15 +2712,40 @@ class GenerationJobManagerClass {
       context.sourceFileIds.some((id) => typeof id !== 'string' || !id)
     )
       return false;
-    const accepted = await this.jobStore.bindSourceRetention(streamId, epoch, {
-      sourceFileIds: [...new Set(context.sourceFileIds)].sort(),
-      sourceExpiresAt: expires,
-    });
-    if (!accepted) return false;
+    if (!this.sourceReplay) throw new SourceReplayError('document_source_unavailable');
+    const pendingRuntime = this.runtimeState.get(streamId);
+    if (pendingRuntime?.createdAt === epoch && !pendingRuntime.sourceRetention) {
+      await this.flushCoalescedStreamBuffers(streamId);
+      await this.runStepWriteQueues.get(streamId);
+      const steps = this.runStepBuffers?.get(streamId);
+      const events = pendingRuntime.earlyEventBuffer;
+      const bytes =
+        Buffer.byteLength(JSON.stringify(events)) +
+        Buffer.byteLength(JSON.stringify(steps?.createdAt === epoch ? steps.steps : []));
+      if (
+        events.length > SOURCE_REPLAY_LIMITS.bootstrapEntries ||
+        bytes > SOURCE_REPLAY_LIMITS.bootstrapBytes ||
+        pendingRuntime.inFlightSnapshotEmissions.size > 0
+      )
+        throw new SourceReplayError('document_capacity_exceeded');
+    }
+    await this.sourceReplay.bind(streamId, epoch, context.sourceFileIds, expires);
     const job = await this.jobStore.getJob(streamId);
     if (!job || job.createdAt !== epoch || !sourceRetentionAvailable(job)) return false;
     const runtime = this.runtimeState.get(streamId);
-    if (runtime?.createdAt === epoch) runtime.sourceRetention = job.sourceRetention;
+    if (runtime?.createdAt === epoch) {
+      runtime.sourceRetention = job.sourceRetention;
+      runtime.sourceEventBytes = Math.max(
+        runtime.sourceEventBytes ?? 0,
+        job.sourceReplayChunkBytes ?? 0,
+        Buffer.byteLength(JSON.stringify(runtime.earlyEventBuffer)),
+      );
+      runtime.sourceEventEntries = Math.max(
+        runtime.sourceEventEntries ?? 0,
+        job.sourceReplayChunkEntries ?? 0,
+        runtime.earlyEventBuffer.length,
+      );
+    }
     return true;
   }
 
@@ -2818,8 +2908,19 @@ class GenerationJobManagerClass {
      * so a legacy replica winning a later HITL resume (which rewrites the
      * execution id without knowing this field) self-invalidates it. */
     const { steerQuotesCapable, ...storedMetadata } = sanitizedMetadata;
+    const initialSource = storedMetadata.sourceRetention;
+    if (
+      initialSource &&
+      (storedMetadata.scheduleId ||
+        storedMetadata.agentEventDeliveryKey ||
+        storedMetadata.preserveForScheduleReconcile ||
+        options.recoveredSteerId)
+    )
+      throw new SourceReplayError('document_replay_unsupported');
+    // A known source starts with only an identity/provider placeholder. A crash
+    // before reservation must not leave an uncharged copy of its initial text.
     const initialMetadata = {
-      ...storedMetadata,
+      ...(!initialSource ? storedMetadata : {}),
       ...(steerQuotesCapable === true && {
         steerQuotesExecutionId: creationAttemptId,
       }),
@@ -2837,6 +2938,8 @@ class GenerationJobManagerClass {
     // subscriber attached to that predecessor filters events by generation,
     // so replacement must explicitly close/handoff that old attachment.
     const observedPredecessorJob = await this.jobStore.getJob(streamId);
+    if (observedPredecessorJob?.sourceReplayIntent)
+      await this.sourceReplay?.settleCurrent(streamId, observedPredecessorJob.createdAt);
     let jobData: CreatedJobData;
     try {
       jobData = await this.jobStore.createJob(
@@ -3164,6 +3267,24 @@ class GenerationJobManagerClass {
     this.runtimeState.set(streamId, runtime);
 
     try {
+      if (initialSource) {
+        if (
+          !(await this.bindSourceRetention(streamId, jobData.createdAt, {
+            sourceFileIds: initialSource.sourceFileIds,
+            sourceExpiresAt: new Date(initialSource.sourceExpiresAt),
+          }))
+        )
+          throw new SourceReplayError('document_source_unavailable');
+        await this.jobStore.updateJob(streamId, storedMetadata, jobData.createdAt);
+        const sourceJob = await this.jobStore.getJob(streamId);
+        if (
+          !sourceJob ||
+          sourceJob.createdAt !== jobData.createdAt ||
+          !sourceRetentionAvailable(sourceJob)
+        )
+          throw new SourceReplayError('document_source_unavailable');
+        jobData = sourceJob;
+      }
       this.registerAllSubscribersLeft(streamId);
 
       await this.registerAbortSubscription(streamId, runtime);
@@ -4447,7 +4568,15 @@ class GenerationJobManagerClass {
      * `intendedEvent` — not the caller's reference — is what the success
      * bookkeeping below compares identity against. */
     const intendedEvent = finalEvent == null ? null : projectTerminalEvent(finalEvent);
-    const desiredEvent = intendedEvent ?? reconcileEvent;
+    let desiredEvent = intendedEvent ?? reconcileEvent;
+    if (sourceJob?.sourceReplayIntent) {
+      try {
+        assertSourceObjectSize({ ...sourceJob, finalEvent: JSON.stringify(desiredEvent) });
+      } catch (error) {
+        if (!(error instanceof SourceReplayError)) throw error;
+        desiredEvent = reconcileEvent;
+      }
+    }
     let publicationEvent: t.ServerSentEvent | null = null;
     let durable = false;
 
@@ -5484,6 +5613,11 @@ class GenerationJobManagerClass {
         onDone?.(event);
       } finally {
         subscription?.unsubscribe();
+        if (runtime.sourceRetention) {
+          runtime.finalEvent = undefined;
+          runtime.earlyEventBuffer.length = 0;
+          runtime.earlyEventBufferBytes = 0;
+        }
       }
     };
     const deliverError = (error: string): void => {
@@ -5507,6 +5641,7 @@ class GenerationJobManagerClass {
         onError?.(error);
       } finally {
         subscription?.unsubscribe();
+        if (runtime.sourceRetention) runtime.errorEvent = undefined;
       }
     };
     const queueChunk = (event: t.ServerSentEvent): void => {
@@ -5620,6 +5755,12 @@ class GenerationJobManagerClass {
         deferSequenceDelivery,
       },
     );
+    const clearSourceDelivery = () => {
+      deferredDeliveries = [];
+      if (!terminalEventDelivered) deliverError('Document source unavailable');
+    };
+    runtime.sourceCleanupHandlers ??= new Set();
+    runtime.sourceCleanupHandlers.add(clearSourceDelivery);
     runtime.localErrorHandlers.add(queueError);
     if (!options?.skipBufferReplay) {
       runtime.earlyReplayHandlers.add(queueChunk);
@@ -5649,6 +5790,7 @@ class GenerationJobManagerClass {
         deferredDeliveries = [];
         runtime.earlyReplayHandlers.delete(queueChunk);
         runtime.localErrorHandlers.delete(queueError);
+        runtime.sourceCleanupHandlers?.delete(clearSourceDelivery);
         detachSignal?.removeEventListener('abort', detachOnAbort);
         const fencedLastSubscriber =
           runtime.localErrorHandlers.size === 0 &&
@@ -7202,6 +7344,24 @@ class GenerationJobManagerClass {
       }
       return;
     }
+    if (runtime.sourceRetention) {
+      const encoded = JSON.stringify(event);
+      const bytes = encoded == null ? Infinity : Buffer.byteLength(encoded);
+      const total =
+        (runtime.sourceEventBytes ?? 0) + (encoded == null ? Infinity : sourceChunkBytes(encoded));
+      const entries = (runtime.sourceEventEntries ?? 0) + 1;
+      if (
+        bytes > SOURCE_REPLAY_LIMITS.eventBytes ||
+        total > SOURCE_REPLAY_LIMITS.chunkBytes ||
+        entries > SOURCE_REPLAY_LIMITS.chunkEntries ||
+        runtime.inFlightSnapshotEmissions.size >= 16
+      ) {
+        this.retireRuntimeAfterDurableFence(streamId, runtime);
+        throw new SourceReplayError('document_capacity_exceeded');
+      }
+      runtime.sourceEventBytes = total;
+      runtime.sourceEventEntries = entries;
+    }
     const sequence = ++runtime.emissionSequence;
     let signalSnapshotReady!: () => void;
     const snapshotReady = new Promise<void>((resolve) => {
@@ -7315,12 +7475,13 @@ class GenerationJobManagerClass {
       eventData != null &&
       typeof eventData === 'object'
     ) {
-      this.saveRunStepFromEvent(
+      const saved = this.saveRunStepFromEvent(
         streamId,
         eventType,
         eventData as Record<string, unknown>,
         runtime.createdAt,
       );
+      if (saved) await saved;
     }
 
     /**
@@ -7981,7 +8142,7 @@ class GenerationJobManagerClass {
     eventType: 'on_run_step' | 'on_run_step_completed' | 'on_run_step_closed',
     data: Record<string, unknown>,
     expectedCreatedAt: number,
-  ): void {
+  ): Promise<void> | void {
     const candidate = eventType === 'on_run_step_completed' ? data.result : data;
     if (
       candidate == null ||
@@ -7994,8 +8155,7 @@ class GenerationJobManagerClass {
     }
 
     if (eventType === 'on_run_step') {
-      this.accumulateRunStep(streamId, candidate as Agents.RunStep, expectedCreatedAt);
-      return;
+      return this.accumulateRunStep(streamId, candidate as Agents.RunStep, expectedCreatedAt);
     }
 
     if (eventType === 'on_run_step_closed') {
@@ -8031,7 +8191,7 @@ class GenerationJobManagerClass {
                 : call,
             )
           : terminalCalls;
-      this.accumulateRunStep(
+      return this.accumulateRunStep(
         streamId,
         {
           ...existingStep,
@@ -8042,16 +8202,14 @@ class GenerationJobManagerClass {
         },
         expectedCreatedAt,
       );
-      return;
     }
 
     if ('stepDetails' in candidate) {
-      this.accumulateRunStep(
+      return this.accumulateRunStep(
         streamId,
         { ...(candidate as Agents.RunStep), status: 'completed' },
         expectedCreatedAt,
       );
-      return;
     }
 
     const completion = candidate as Agents.ToolEndEvent;
@@ -8098,7 +8256,7 @@ class GenerationJobManagerClass {
       } as ToolCallWithExecutionStatus);
     }
 
-    this.accumulateRunStep(
+    return this.accumulateRunStep(
       streamId,
       {
         ...(existingStep ?? {
@@ -8127,7 +8285,11 @@ class GenerationJobManagerClass {
     streamId: string,
     runStep: Agents.RunStep,
     expectedCreatedAt: number,
-  ): void {
+  ): Promise<void> | void {
+    const source = this.runtimeState.get(streamId)?.sourceRetention;
+    const pending = source ? this.runStepWriteQueues.get(streamId) : undefined;
+    if (pending)
+      return pending.then(() => this.accumulateRunStep(streamId, runStep, expectedCreatedAt));
     // Lazy initialization keeps the per-stream allocation off non-agent paths.
     if (!this.runStepBuffers) {
       this.runStepBuffers = new Map();
@@ -8142,6 +8304,17 @@ class GenerationJobManagerClass {
 
     // Update or add run step
     const existingIdx = buffer.findIndex((rs) => rs.id === runStep.id);
+    if (source) {
+      const next = [...buffer];
+      if (existingIdx >= 0) next[existingIdx] = runStep;
+      else next.push(runStep);
+      if (
+        Buffer.byteLength(JSON.stringify(next)) +
+          Buffer.byteLength(`stream:{${streamId}}:runsteps`) >
+        SOURCE_REPLAY_LIMITS.runStepBytes
+      )
+        throw new SourceReplayError('document_capacity_exceeded');
+    }
     if (existingIdx >= 0) {
       buffer[existingIdx] = runStep;
     } else {
@@ -8151,9 +8324,11 @@ class GenerationJobManagerClass {
     // Save to Redis
     if (this.jobStore.saveRunSteps) {
       const snapshot = [...buffer];
-      void this.queueJobWrite(this.runStepWriteQueues, streamId, () =>
+      const write = this.queueJobWrite(this.runStepWriteQueues, streamId, () =>
         this.jobStore.saveRunSteps!(streamId, snapshot, expectedCreatedAt),
-      ).catch((err) => {
+      );
+      if (source) return write;
+      void write.catch((err) => {
         logger.error(`[GenerationJobManager] Failed to save run steps:`, err);
       });
     }
@@ -8602,6 +8777,8 @@ class GenerationJobManagerClass {
     ) {
       await this.jobStore.deleteJob(streamId, expectedCreatedAt);
     }
+    if (marked && job?.sourceReplayIntent)
+      await this.sourceReplay?.settleCurrent(streamId, expectedCreatedAt);
     return marked;
   }
 
@@ -8774,6 +8951,11 @@ class GenerationJobManagerClass {
     if (!runtime || (expectedCreatedAt != null && runtime.createdAt !== expectedCreatedAt)) {
       return;
     }
+    if (
+      runtime.sourceRetention &&
+      Buffer.byteLength(JSON.stringify(contentParts)) > SOURCE_REPLAY_LIMITS.chunkBytes
+    )
+      throw new SourceReplayError('document_capacity_exceeded');
     this.jobStore.setContentParts(streamId, contentParts, runtime.createdAt);
   }
 
@@ -8801,6 +8983,11 @@ class GenerationJobManagerClass {
     if (!runtime || (expectedCreatedAt != null && runtime.createdAt !== expectedCreatedAt)) {
       return;
     }
+    if (
+      runtime.sourceRetention &&
+      Buffer.byteLength(JSON.stringify(graph.contentData ?? [])) > SOURCE_REPLAY_LIMITS.runStepBytes
+    )
+      throw new SourceReplayError('document_capacity_exceeded');
     this.jobStore.setGraph(streamId, graph, runtime.createdAt);
   }
 
@@ -9374,21 +9561,24 @@ class GenerationJobManagerClass {
     const generationId = expectedCreatedAt ?? runtime?.createdAt;
     const matchingRuntime =
       runtime && (generationId == null || runtime.createdAt === generationId) ? runtime : undefined;
-    if (matchingRuntime) {
+    if (matchingRuntime?.createdEventPublication) await matchingRuntime.createdEventPublication;
+    const encoded = JSON.stringify(event);
+    if (matchingRuntime?.sourceRetention) {
+      if (
+        Buffer.byteLength(encoded) >
+        SOURCE_REPLAY_LIMITS.jobBytes - SOURCE_REPLAY_LIMITS.metadataBytes
+      )
+        throw new SourceReplayError('document_capacity_exceeded');
+      await this.jobStore.updateJob(streamId, { finalEvent: encoded }, generationId);
       matchingRuntime.finalEvent = event;
-    }
-    if (matchingRuntime?.createdEventPublication) {
-      await matchingRuntime.createdEventPublication;
-    }
-    // Persist finalEvent to Redis for cross-replica consistency
-    this.jobStore
-      .updateJob(streamId, { finalEvent: JSON.stringify(event) }, generationId)
-      .catch((err) => {
+      await this.eventTransport.emitDone(streamId, event, generationId, true);
+    } else {
+      if (matchingRuntime) matchingRuntime.finalEvent = event;
+      this.jobStore.updateJob(streamId, { finalEvent: encoded }, generationId).catch((err) => {
         logger.error(`[GenerationJobManager] Failed to persist finalEvent:`, err);
       });
-    if (matchingRuntime?.sourceRetention)
-      await this.eventTransport.emitDone(streamId, event, generationId, true);
-    else await this.eventTransport.emitDone(streamId, event, generationId);
+      await this.eventTransport.emitDone(streamId, event, generationId);
+    }
     if (matchingRuntime?.startupTelemetry) {
       this.recordStartupEvent(matchingRuntime, event);
     }
@@ -9404,19 +9594,20 @@ class GenerationJobManagerClass {
     const generationId = expectedCreatedAt ?? runtime?.createdAt;
     const matchingRuntime =
       runtime && (generationId == null || runtime.createdAt === generationId) ? runtime : undefined;
-    if (matchingRuntime) {
+    if (matchingRuntime?.createdEventPublication) await matchingRuntime.createdEventPublication;
+    if (matchingRuntime?.sourceRetention) {
+      if (Buffer.byteLength(error) > SOURCE_REPLAY_LIMITS.eventBytes)
+        throw new SourceReplayError('document_capacity_exceeded');
+      await this.jobStore.updateJob(streamId, { error }, generationId);
       matchingRuntime.errorEvent = error;
-    }
-    if (matchingRuntime?.createdEventPublication) {
-      await matchingRuntime.createdEventPublication;
-    }
-    // Persist error to job store for cross-replica consistency
-    this.jobStore.updateJob(streamId, { error }, generationId).catch((err) => {
-      logger.error(`[GenerationJobManager] Failed to persist error:`, err);
-    });
-    if (matchingRuntime?.sourceRetention)
       await this.eventTransport.emitError(streamId, error, generationId, true);
-    else await this.eventTransport.emitError(streamId, error, generationId);
+    } else {
+      if (matchingRuntime) matchingRuntime.errorEvent = error;
+      this.jobStore.updateJob(streamId, { error }, generationId).catch((err) => {
+        logger.error(`[GenerationJobManager] Failed to persist error:`, err);
+      });
+      await this.eventTransport.emitError(streamId, error, generationId);
+    }
     matchingRuntime?.startupTelemetry?.mark('first_response_event_queued');
   }
 
@@ -9742,6 +9933,7 @@ class GenerationJobManagerClass {
   }
 
   private async cleanup(): Promise<void> {
+    await this.sourceReplay?.sweep();
     // A crashed pause writer must never become resumable merely because its
     // lease elapsed. Give a locally-observed runtime the first chance to fail
     // closed so its attached subscriber receives the terminal error.
@@ -9997,11 +10189,15 @@ class GenerationJobManagerClass {
 
   /** Also includes retained paused jobs whose checkpoints belong to this account. */
   async getAccountCleanupJobIdsForUser(userId: string, tenantId?: string): Promise<string[]> {
-    const [retained, blocking] = await Promise.all([
+    const [retained, blocking, sourceIntents] = await Promise.all([
       this.jobStore.getRetainedJobIdsByUser?.(userId, tenantId) ?? [],
       this.getCleanupBlockingJobIdsForUser(userId, tenantId),
+      this.jobStore.listSourceReplayIntents?.() ?? [],
     ]);
-    return [...new Set([...retained, ...blocking])];
+    const source = sourceIntents
+      .filter((intent) => intent.userId === userId && (intent.tenantId ?? '') === (tenantId ?? ''))
+      .map((intent) => intent.streamId);
+    return [...new Set([...retained, ...blocking, ...source])];
   }
 
   /** Resolves every cleanup-blocking run attached to any target conversation.

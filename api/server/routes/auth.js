@@ -4,7 +4,7 @@ const {
   authPersistence,
 } = require('~/server/services/LegacyAuthMaintenance');
 const express = require('express');
-const { getTenantId, DEFAULT_SESSION_EXPIRY } = require('@librechat/data-schemas');
+const { getTenantId, tenantStorage, DEFAULT_SESSION_EXPIRY } = require('@librechat/data-schemas');
 const {
   createBrowserAuth,
   math,
@@ -13,9 +13,16 @@ const {
   requireTwoFactorSetupToken,
   createTwoFactorManagementLimiter,
   forceRefreshCloudFrontAuthCookies,
+  clearCloudFrontCookies,
   blockTwoFactorDisableWhenRequired,
   requireTwoFactorSetupAcknowledgementToken,
   requireTwoFactorSetupFinalizationToken,
+  getAuthMode,
+  getEmailCodeConfig,
+  getAuthSelection,
+  setAuthSelection,
+  mayRefreshGuest,
+  EMAIL_CODE_COOKIE_OPTIONS,
 } = require('@librechat/api');
 const {
   resetPasswordRequestController,
@@ -52,6 +59,8 @@ const { findBalanceByUser, upsertBalanceFields } = require('~/models');
 const browserMethods = require('~/models');
 const { getAppConfig } = require('~/server/services/Config');
 const middleware = require('~/server/middleware');
+const emailCodeAuth = require('~/server/controllers/auth/emailCodeController');
+const { logoutUser } = require('~/server/services/AuthService');
 
 const setBalanceConfig = ownAuthHandler(
   createSetBalanceConfig({
@@ -64,6 +73,37 @@ const setBalanceConfig = ownAuthHandler(
 
 const router = express.Router();
 router.use(authAdmissionMiddleware);
+const cortexRoutes = new Set([
+  'GET /mode',
+  'POST /email-code/request',
+  'POST /email-code/verify',
+  'POST /guest',
+  'POST /logout',
+  'POST /refresh',
+  'POST /browser',
+  'POST /browser/reset',
+]);
+router.use((req, res, next) => {
+  if (getAuthMode() !== 'default' && !cortexRoutes.has(`${req.method} ${req.path}`)) {
+    return res.status(404).json({ code: 'AUTH_MODE_DISABLED' });
+  }
+  return next();
+});
+const cortexSameOrigin = (req, res, next) =>
+  getAuthMode() === 'default' ? next() : middleware.requireSameOrigin(req, res, next);
+router.get('/mode', (_req, res) => res.set('Cache-Control', 'no-store').json(getEmailCodeConfig()));
+router.post(
+  '/email-code/request',
+  middleware.requireSameOrigin,
+  middleware.checkBan,
+  ownAuthHandler(emailCodeAuth.requestCode),
+);
+router.post(
+  '/email-code/verify',
+  middleware.requireSameOrigin,
+  middleware.checkBan,
+  ownAuthHandler(emailCodeAuth.verifyCode),
+);
 const browserAuth = createBrowserAuth({
   ...browserMethods,
   getAppConfig: () => getAppConfig({ baseOnly: true }),
@@ -90,7 +130,65 @@ const getCloudFrontAuthCookieRefreshResult = (req, res) => {
 
 const ldapAuth = !!process.env.LDAP_URL && !!process.env.LDAP_USER_SEARCH_BASE;
 //Local
-router.post('/logout', middleware.requireJwtAuth, browserAuth.forget, logoutController);
+router.post(
+  '/logout',
+  cortexSameOrigin,
+  ownAuthHandler((req, res, next) => {
+    if (getAuthMode() !== 'default' && req.cookies?.refreshToken) {
+      return emailCodeAuth.logout(req, res, next);
+    }
+    return next();
+  }),
+  middleware.requireJwtAuth,
+  ownAuthHandler(async (req, res, next) => {
+    // Signing out of email must not destroy the retained guest identity or its private history.
+    if (getAuthMode() !== 'default' && req.user?.provider === 'email_code') {
+      const result = await logoutUser(req);
+      if (result.status !== 200) {
+        return res
+          .set('Cache-Control', 'no-store')
+          .status(result.status)
+          .json({ code: 'AUTH_SESSION_UNAVAILABLE' });
+      }
+      res.clearCookie('refreshToken', EMAIL_CODE_COOKIE_OPTIONS);
+      res.clearCookie('token_provider', EMAIL_CODE_COOKIE_OPTIONS);
+      clearCloudFrontCookies(res, { userId: String(req.user._id), tenantId: req.user.tenantId });
+      return res.set('Cache-Control', 'no-store').json({ message: 'Logout successful' });
+    }
+    return browserAuth.forget(req, res, next);
+  }),
+  logoutController,
+);
+router.post(
+  '/guest',
+  middleware.requireSameOrigin,
+  middleware.checkBan,
+  ownAuthHandler(async (req, res, next) => {
+    if (getAuthMode() !== 'transition') return res.status(404).json({ code: 'AUTH_MODE_DISABLED' });
+    try {
+      await emailCodeAuth.revokeCurrentRefresh(req);
+      for (const name of [
+        'refreshToken',
+        'token_provider',
+        'openid_user_id',
+        'openid_access_token',
+        'openid_id_token',
+      ]) {
+        res.clearCookie(name, EMAIL_CODE_COOKIE_OPTIONS);
+        if (req.cookies) delete req.cookies[name];
+      }
+      setAuthSelection(res, 'guest');
+      req.headers['x-librechat-browser'] = '1';
+      delete req.tenantId;
+      return await tenantStorage.run(
+        { ...tenantStorage.getStore(), tenantId: undefined },
+        async () => browserAuth.bootstrap(req, res, next),
+      );
+    } catch {
+      return res.status(503).json({ code: 'EMAIL_CODE_UNAVAILABLE' });
+    }
+  }),
+);
 router.post(
   '/login',
   middleware.logHeaders,
@@ -102,9 +200,36 @@ router.post(
   setBalanceConfig,
   loginController,
 );
-router.post('/refresh', browserAuth.refresh, refreshController);
-router.post('/browser', middleware.checkBan, browserAuth.bootstrap);
-router.post('/browser/reset', browserAuth.reset);
+router.post(
+  '/refresh',
+  cortexSameOrigin,
+  ownAuthHandler((req, res, next) => {
+    if (getAuthMode() === 'default')
+      return browserAuth.refresh(req, res, () => refreshController(req, res, next));
+    if (req.cookies?.refreshToken) return emailCodeAuth.refresh(req, res, next);
+    if (mayRefreshGuest(req)) return browserAuth.refresh(req, res, () => res.status(200).json({}));
+    // Empty state routes to the explicit login choices, never to guest bootstrap.
+    return res.set('Cache-Control', 'no-store').status(200).json({});
+  }),
+);
+const allowBrowserAction = (req, res, next) => {
+  if (
+    getAuthMode() === 'default' ||
+    (getAuthMode() === 'transition' &&
+      (getAuthSelection(req) === 'guest' ||
+        (req.path === '/browser/reset' && mayRefreshGuest(req))))
+  )
+    return next();
+  return res.status(403).json({ code: 'AUTH_MODE_DISABLED' });
+};
+router.post(
+  '/browser',
+  cortexSameOrigin,
+  allowBrowserAction,
+  middleware.checkBan,
+  browserAuth.bootstrap,
+);
+router.post('/browser/reset', cortexSameOrigin, allowBrowserAction, browserAuth.reset);
 router.post('/cloudfront/refresh', middleware.requireJwtAuth, (req, res) => {
   const result = getCloudFrontAuthCookieRefreshResult(req, res);
   if (!result.enabled) {

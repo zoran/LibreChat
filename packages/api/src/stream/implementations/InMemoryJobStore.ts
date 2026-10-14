@@ -24,10 +24,12 @@ import type {
   ParkedSteerClaim,
   ScheduleCleanupScope,
   ScheduleProviderOwner,
+  InitialSourcePopulationOptions,
+  InitialSourcePopulation,
 } from '~/stream/interfaces/IJobStore';
 import type { EarlyBufferOverflowState } from '../../types/earlyBufferRecovery';
-import type { GenerationSourceRetention } from '../interfaces/IJobStore';
 import type { RecoveredSteerPayload } from '~/stream/SteerRecovery';
+import type { SourceReplayIntent } from '../internal/sourceBudget';
 import {
   JobStatusTransitionDeadlineError,
   JobPredecessorMismatchError,
@@ -40,7 +42,17 @@ import {
   PROVIDER_DRAIN_TIMEOUT_MS,
   isPendingActionStale,
   toWireRunSteps,
+  InitialSourceInventory,
+  failInitialSourceInventory,
 } from '~/stream/interfaces/IJobStore';
+import {
+  SOURCE_REPLAY_LIMITS,
+  SourceReplayError,
+  assertSourceObjectSize,
+  canReleaseSourceReplay,
+  createSourceReplayIntent,
+  sourceChunkBytes,
+} from '../internal/sourceBudget';
 import {
   isRecoveredSteerPayload,
   recoveredSteerPayloadMatches,
@@ -210,6 +222,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
 
   /** Maximum number of concurrent jobs */
   private maxJobs = 1000;
+  private readonly sourceReplayIntents = new Map<string, SourceReplayIntent>();
 
   /** Store-lifetime generation clock. A completed job may be deleted before a
    * same-millisecond replacement starts, so the current jobs map alone cannot
@@ -240,6 +253,52 @@ export class InMemoryJobStore implements IJobStoreV2 {
     if (options?.staleJobTimeout !== undefined) {
       this.staleJobTimeout = options.staleJobTimeout;
     }
+  }
+
+  /** Admission inspection deliberately bypasses expiry getters and cleanup. Never fleet evidence. */
+  async inspectInitialSourcePopulation(
+    options: InitialSourcePopulationOptions,
+  ): Promise<InitialSourcePopulation> {
+    const inventory = new InitialSourceInventory(options);
+    const maps = [
+      this.jobs,
+      this.contentState,
+      this.steerQueues,
+      this.claimedSteers,
+      this.parkedSteers,
+      this.steerReceipts,
+      this.sourceReplayIntents,
+    ];
+    if (maps.reduce((sum, map) => sum + map.size, 0) > 4096) failInitialSourceInventory();
+    const jobs = new Map<string, boolean>();
+    for (const [streamId, job] of this.jobs) jobs.set(streamId, inventory.job(job, streamId));
+    for (const intent of this.sourceReplayIntents.values()) {
+      inventory.observe('intent', intent);
+      inventory.counts.replayIntents = 1;
+    }
+    for (const [streamId, state] of this.contentState) {
+      if (!jobs.has(streamId)) failInitialSourceInventory();
+      if (inventory.observe('content', state.contentParts) || jobs.get(streamId))
+        inventory.counts.recoveryCopies = 1;
+      // A live graph is not a serializable metadata projection. This local adapter cannot attest it.
+      if (state.graphRef?.deref()) failInitialSourceInventory();
+    }
+    let recoveryRecords = 0;
+    for (const queues of [this.steerQueues, this.claimedSteers]) {
+      for (const queue of queues.values()) {
+        if (!Array.isArray(queue) || (recoveryRecords += queue.length) > 4096)
+          failInitialSourceInventory();
+        for (const item of queue) inventory.recovery(item);
+      }
+    }
+    for (const parked of this.parkedSteers.values()) {
+      inventory.recovery(inventory.parse(parked.payload));
+    }
+    for (const receipts of this.steerReceipts.values()) {
+      if ((recoveryRecords += receipts.size) > 4096) failInitialSourceInventory();
+      for (const { receipt } of receipts.values()) inventory.recovery(receipt);
+    }
+    return inventory.finish('memory');
   }
 
   async initialize(): Promise<void> {
@@ -326,6 +385,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
     ) {
       throw new Error('Invalid provider execution id');
     }
+    if (initialMetadata.sourceRetention) throw new SourceReplayError('document_source_unavailable');
     const safeInitialMetadata = { ...initialMetadata };
     delete safeInitialMetadata.providerDrained;
     const assertOwnerCompatible = (): void => {
@@ -498,6 +558,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
     // install this stream while capacity eviction yields; this is the exact
     // predecessor the synchronous replacement below will overwrite.
     const previousJob = this.jobs.get(streamId);
+    if (previousJob?.sourceReplayIntent) throw new SourceReplayError('document_source_unavailable');
     const previousCreatedAt = previousJob?.createdAt ?? this.getRetainedGenerationEpoch(streamId);
     const now = Date.now();
     const createdAt = Math.max(
@@ -751,6 +812,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
     // (running ⇄ requires_action) go solely through transitionStatus.
     updates = sourceSafeJobPatch(job, updates);
     const patch = retainScheduleMCPFailure(job, updates);
+    assertSourceObjectSize({ ...job, ...patch, ...retainedScheduleReceipt(job, updates) });
     Object.assign(job, patch, retainedScheduleReceipt(job, updates));
   }
 
@@ -818,6 +880,11 @@ export class InMemoryJobStore implements IJobStoreV2 {
     if (!job || job.createdAt !== expectedCreatedAt || job.terminalPersistencePending !== true) {
       return false;
     }
+    assertSourceObjectSize({
+      ...job,
+      terminalPersistencePending: false,
+      ...(sourceRetentionAvailable(job) ? { finalEvent } : {}),
+    });
     job.terminalPersistencePending = false;
     if (sourceRetentionAvailable(job)) job.finalEvent = finalEvent;
     else delete job.finalEvent;
@@ -844,6 +911,15 @@ export class InMemoryJobStore implements IJobStoreV2 {
     if (args.notAfterMs != null && Date.now() >= args.notAfterMs) {
       throw new JobStatusTransitionDeadlineError(args.notAfterMs);
     }
+    const sourceCandidate = {
+      ...job,
+      status: args.to,
+      ...sourceSafeJobPatch(job, args.patch ?? {}),
+      ...retainedScheduleReceipt(job, args.patch ?? {}, args.clear ?? []),
+    };
+    for (const field of args.clear ?? [])
+      if (!String(field).startsWith('source')) delete sourceCandidate[field];
+    assertSourceObjectSize(sourceCandidate);
     if (['complete', 'error', 'aborted'].includes(args.to)) {
       if (!this.isParkedRecoveryCompatible(streamId, job)) {
         return false;
@@ -857,7 +933,8 @@ export class InMemoryJobStore implements IJobStoreV2 {
     const receipt = retainedScheduleReceipt(job, args.patch ?? {}, args.clear ?? []);
     Object.assign(job, patch);
     for (const field of args.clear ?? []) {
-      if (!String(field).startsWith('sourceRetention')) delete job[field];
+      if (!String(field).startsWith('sourceRetention') && !String(field).startsWith('sourceReplay'))
+        delete job[field];
     }
     Object.assign(job, receipt);
     const receiptEntries = this.steerReceipts.get(streamId)?.values() ?? [];
@@ -1122,31 +1199,100 @@ export class InMemoryJobStore implements IJobStoreV2 {
     return true;
   }
 
-  async bindSourceRetention(
-    streamId: string,
-    epoch: number,
-    context: GenerationSourceRetention,
-  ): Promise<boolean> {
-    const job = this.jobs.get(streamId);
+  async prepareSourceReplay(input: SourceReplayIntent): Promise<SourceReplayIntent> {
+    const job = this.jobs.get(input.streamId);
     if (
       !job ||
-      job.createdAt !== epoch ||
-      !sourceRetentionAvailable(job) ||
+      job.createdAt !== input.createdAt ||
+      job.userId !== input.userId ||
+      (job.tenantId ?? '') !== (input.tenantId ?? '') ||
+      job.status !== 'running' ||
+      job.sourceRetentionRevokedAt != null ||
       job.sourceRetentionPurged ||
-      context.sourceExpiresAt <= Date.now() ||
-      !Number.isFinite(context.sourceExpiresAt) ||
-      !context.sourceFileIds.length
+      input.sourceExpiresAt <= Date.now()
+    )
+      throw new SourceReplayError('document_source_unavailable');
+    if (
+      job.scheduleId ||
+      job.recoveredSteerId ||
+      job.agentEventDeliveryKey ||
+      job.preserveForScheduleReconcile ||
+      job.terminalHostActionPending ||
+      this.steerQueues.has(input.streamId) ||
+      this.claimedSteers.has(input.streamId) ||
+      this.parkedSteers.has(input.streamId) ||
+      this.steerReceipts.has(input.streamId)
+    )
+      throw new SourceReplayError('document_replay_unsupported');
+    const previous = job.sourceReplayIntent;
+    if (
+      Object.keys(job.activeSubscriberLeases ?? {}).length > 64 ||
+      Object.keys(job.activeSubscriberLeases ?? {}).some((id) => Buffer.byteLength(id) > 128)
+    )
+      throw new SourceReplayError('document_capacity_exceeded');
+    if (!previous && this.sourceReplayIntents.size >= SOURCE_REPLAY_LIMITS.epochs)
+      throw new SourceReplayError('document_capacity_exceeded');
+    const merged = createSourceReplayIntent(
+      input,
+      [...new Set([...(previous?.sourceFileIds ?? []), ...input.sourceFileIds])],
+      Math.min(previous?.sourceExpiresAt ?? Infinity, input.sourceExpiresAt),
+    );
+    if (previous) merged.receipt = previous.receipt;
+    const patch = {
+      sourceReplayIntent: merged,
+      sourceReplayHeld: job.sourceReplayHeld ?? false,
+      sourceReplayChunkBytes:
+        job.sourceReplayChunkBytes ?? Buffer.byteLength(`stream:{${input.streamId}}:chunks`),
+      sourceReplayChunkEntries: job.sourceReplayChunkEntries ?? 0,
+      sourceRetention: {
+        sourceFileIds: merged.sourceFileIds,
+        sourceExpiresAt: merged.sourceExpiresAt,
+      },
+    };
+    assertSourceObjectSize({ ...job, ...patch });
+    this.sourceReplayIntents.set(merged.receipt.reservationId, merged);
+    Object.assign(job, patch);
+    return structuredClone(merged);
+  }
+
+  async commitSourceReplay(intent: SourceReplayIntent): Promise<boolean> {
+    const job = this.jobs.get(intent.streamId);
+    if (
+      !job ||
+      job.createdAt !== intent.createdAt ||
+      job.status !== 'running' ||
+      job.sourceRetentionRevokedAt != null ||
+      job.sourceRetentionPurged ||
+      (job.sourceRetention?.sourceExpiresAt ?? 0) <= Date.now() ||
+      job.sourceReplayIntent?.receipt.reservationId !== intent.receipt.reservationId ||
+      job.sourceReplayIntent.receipt.fileId !== intent.receipt.fileId ||
+      job.sourceReplayIntent.receipt.bytes !== intent.receipt.bytes
     )
       return false;
-    job.sourceRetention = {
-      sourceFileIds: [
-        ...new Set([...(job.sourceRetention?.sourceFileIds ?? []), ...context.sourceFileIds]),
-      ].sort(),
-      sourceExpiresAt: Math.min(
-        job.sourceRetention?.sourceExpiresAt ?? Infinity,
-        context.sourceExpiresAt,
-      ),
-    };
+    job.sourceReplayHeld = true;
+    return true;
+  }
+
+  async listSourceReplayIntents(): Promise<SourceReplayIntent[]> {
+    return [...this.sourceReplayIntents.values()].map((intent) => structuredClone(intent));
+  }
+
+  async acknowledgeSourceReplayRelease(intent: SourceReplayIntent): Promise<boolean> {
+    const job = this.jobs.get(intent.streamId);
+    if (
+      !job ||
+      !canReleaseSourceReplay(intent, job) ||
+      job.userId !== intent.userId ||
+      (job.tenantId ?? '') !== (intent.tenantId ?? '') ||
+      (job.sourceReplayIntent &&
+        job.sourceReplayIntent.receipt.reservationId !== intent.receipt.reservationId)
+    )
+      return false;
+    this.sourceReplayIntents.delete(intent.receipt.reservationId);
+    delete job.sourceReplayIntent;
+    delete job.sourceReplayHeld;
+    delete job.sourceReplayChunkBytes;
+    delete job.sourceReplayChunkEntries;
     return true;
   }
 
@@ -1163,6 +1309,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
       !job ||
       job.createdAt !== epoch ||
       !job.sourceRetention ||
+      (job.sourceReplayIntent != null && job.providerDrained !== true) ||
       job.providerDrained === false ||
       job.terminalPersistencePending ||
       job.terminalHostActionPending ||
@@ -1201,6 +1348,10 @@ export class InMemoryJobStore implements IJobStoreV2 {
       'sourceRetentionRevokedAt',
       'providerExecutionId',
       'providerDrained',
+      'sourceReplayIntent',
+      'sourceReplayHeld',
+      'sourceReplayChunkBytes',
+      'sourceReplayChunkEntries',
     ]);
     for (const key of Object.keys(job))
       if (!keep.has(key)) delete (job as unknown as Record<string, unknown>)[key];
@@ -1222,6 +1373,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
       job.status !== 'requires_action'
     )
       return this.purgeSourceRetention(streamId, job.createdAt);
+    if (job.sourceReplayIntent) return false;
     this.retainGenerationEpoch(streamId, job.createdAt);
     this.jobs.delete(streamId);
     this.contentState.delete(streamId);
@@ -1299,6 +1451,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
       }
       if (
         !job.scheduleId &&
+        !job.sourceRetention &&
         job.preserveForScheduleReconcile !== true &&
         job.providerDrained === false &&
         job.completedAt != null &&
@@ -1391,6 +1544,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
     }
 
     for (const [streamId, job] of this.jobs) {
+      if (job.sourceReplayIntent) continue; // Only confirmed source cleanup releases this evidence.
       if (job.status === 'requires_action' && job.terminalPersistencePending === true) {
         const startedAt = job.terminalPersistenceStartedAt ?? job.createdAt;
         if (now - startedAt < PAUSE_PERSISTENCE_TIMEOUT_MS) {
@@ -1563,6 +1717,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
     let oldestTime = Infinity;
 
     for (const [streamId, job] of this.jobs) {
+      if (job.sourceReplayIntent) continue;
       if (job.createdAt < oldestTime) {
         oldestTime = job.createdAt;
         oldestId = streamId;
@@ -1577,6 +1732,8 @@ export class InMemoryJobStore implements IJobStoreV2 {
       }
       this.parkQueuedSteers(oldestId, job, Date.now());
       await this.deleteJob(oldestId, job.createdAt);
+    } else if (this.jobs.size >= this.maxJobs) {
+      throw new SourceReplayError('document_capacity_exceeded');
     }
   }
 
@@ -1603,6 +1760,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
       this.cleanupInterval = null;
     }
     this.jobs.clear();
+    this.sourceReplayIntents.clear();
     this.contentState.clear();
     this.userJobMap.clear();
     this.steerQueues.clear();
@@ -1889,6 +2047,13 @@ export class InMemoryJobStore implements IJobStoreV2 {
     if (job?.createdAt !== expectedCreatedAt) {
       return false;
     }
+    if (
+      job.sourceReplayIntent &&
+      (Buffer.byteLength(subscriberId) > 128 ||
+        (Object.keys(job.activeSubscriberLeases ?? {}).length >= 64 &&
+          !Object.hasOwn(job.activeSubscriberLeases ?? {}, subscriberId)))
+    )
+      return false;
     job.activeSubscriberLeases ??= {};
     job.activeSubscriberLeases[subscriberId] = leaseExpiresAt;
     const firstSubscriber = job.firstSubscriberAttachedAt == null;
@@ -1958,6 +2123,19 @@ export class InMemoryJobStore implements IJobStoreV2 {
       return false;
     }
     if (!sourceRetentionAvailable(job) || job.sourceRetentionPurged) return false;
+    if (job.status !== 'running' && job.status !== 'requires_action') return false;
+    if (job.sourceReplayIntent) {
+      if (deliveredSteer) return false;
+      const encoded = JSON.stringify(_event);
+      if (encoded == null || Buffer.byteLength(encoded) > SOURCE_REPLAY_LIMITS.eventBytes)
+        return false;
+      const bytes = (job.sourceReplayChunkBytes ?? 0) + sourceChunkBytes(encoded);
+      const entries = (job.sourceReplayChunkEntries ?? 0) + 1;
+      if (bytes > SOURCE_REPLAY_LIMITS.chunkBytes || entries > SOURCE_REPLAY_LIMITS.chunkEntries)
+        return false;
+      job.sourceReplayChunkBytes = bytes;
+      job.sourceReplayChunkEntries = entries;
+    }
     if (job.status !== 'running' && job.status !== 'requires_action') {
       return false;
     }
@@ -2039,6 +2217,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
     expectedCreatedAt?: number,
   ): Promise<SteerEnqueueVersionedResult> {
     const job = this.jobs.get(streamId);
+    if (job?.sourceRetention) return STEER_ENQUEUE_NOT_RUNNING;
     if (
       !job ||
       !sourceRetentionAvailable(job) ||
@@ -2152,6 +2331,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
     wantsPreempt: boolean,
     expectedCreatedAt?: number,
   ): Promise<SteerEnqueueReceiptResult> {
+    if (this.jobs.get(streamId)?.sourceRetention) return STEER_ENQUEUE_NOT_RUNNING;
     /** Inline with no await: the event loop cannot interleave two identical
      * claims between lookup and insert. */
     const existingEntry = this.steerReceipts.get(streamId)?.get(receiptInput.clientSteerId);

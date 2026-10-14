@@ -47,6 +47,7 @@ const {
   contentFilterBlockResponse,
   sweepExpiredFiles: sweepExpiredFilesWithDeps,
   startExpiredFileSweep: startExpiredFileSweepWithDeps,
+  createExpiredFileSweepRequest,
   resolveToolRoleGrants,
   createCodeApiRateLimitBudget,
   getCodeApiUploadOptions,
@@ -236,8 +237,18 @@ const createDeleteFileWithSecondaryStorage = ({ source, deleteFile, deletionMeth
 const processDeleteRequest = async ({ req, files }) => {
   const appConfig = req.config;
   const owner = { userId: req.user?.id, tenantId: req.user?.tenantId };
+  // Composition is initialized before the sole File sweep. Lazy lookup avoids a
+  // second lifecycle registry and the Uploads -> Files composition cycle.
+  const uploadCleanup = require('~/server/services/Uploads').getUploadRuntime()?.cleanup;
+  const uploadTasks = new Map();
+  const uploadProofs = new Map();
+  for (const file of files) {
+    const task = uploadCleanup && (await uploadCleanup.beginFileDeletion(owner, file.file_id));
+    if (task) uploadTasks.set(file.file_id, task);
+    else if (file.uploadOperationId) throw new Error('MANAGED_UPLOAD_CLEANUP_UNAVAILABLE');
+  }
   const managedIds = files
-    .filter((file) => file.retentionAcceptedAt != null)
+    .filter((file) => file.retentionAcceptedAt != null || uploadTasks.has(file.file_id))
     .map((file) => file.file_id);
   let replayComplete = true;
   let alreadyCompleted = [];
@@ -285,8 +296,9 @@ const processDeleteRequest = async ({ req, files }) => {
 
   for (const file of files) {
     const source = file.source ?? FileSources.local;
+    const uploadTask = uploadTasks.get(file.file_id);
 
-    if (source === FileSources.text) {
+    if (source === FileSources.text && !uploadTask) {
       resolvedFileIds.add(file.file_id);
       continue;
     }
@@ -311,7 +323,14 @@ const processDeleteRequest = async ({ req, files }) => {
       promises.push(openai.beta.assistants.files.del(req.body.assistant_id, file.file_id));
     }
 
-    const deleteFile = getDeleteMethod({ source, deletionMethods });
+    const deleteFile = uploadTask
+      ? async () => {
+          const proof = await uploadCleanup.removeFileOriginal(uploadTask);
+          if (!proof.writerStopped || !proof.originalAbsent)
+            throw new Error('MANAGED_UPLOAD_CLEANUP_PENDING');
+          uploadProofs.set(file.file_id, proof);
+        }
+      : getDeleteMethod({ source, deletionMethods });
     enqueueDeleteOperation({
       req,
       file,
@@ -321,6 +340,26 @@ const processDeleteRequest = async ({ req, files }) => {
       failedFileIds,
       openai,
     });
+  }
+
+  // A completed File tombstone may outlive a lost quota-confirmation reply.
+  // Retry physical proof through the managed adapter, never the legacy marker delete.
+  for (const fileId of alreadyCompleted) {
+    const task = uploadTasks.get(fileId);
+    if (!task) continue;
+    promises.push(
+      uploadCleanup
+        .removeFileOriginal(task)
+        .then((proof) => {
+          if (!proof.writerStopped || !proof.originalAbsent)
+            throw new Error('MANAGED_UPLOAD_CLEANUP_PENDING');
+          uploadProofs.set(fileId, proof);
+        })
+        .catch((error) => {
+          failedFileIds.add(fileId);
+          throw error;
+        }),
+    );
   }
 
   await Promise.allSettled(promises);
@@ -364,8 +403,23 @@ const processDeleteRequest = async ({ req, files }) => {
   }
 
   if (!replayComplete) managedIds.forEach((id) => failedFileIds.add(id));
+  for (const fileId of metadataDeletedFileIds) {
+    const task = uploadTasks.get(fileId);
+    if (!task || failedFileIds.has(fileId)) continue;
+    try {
+      const proof = uploadProofs.get(fileId);
+      if (!proof) throw new Error('MANAGED_UPLOAD_CLEANUP_PENDING');
+      // All existing File, Message and generation steps above have settled.
+      await uploadCleanup.finishFileDeletion(task, proof);
+    } catch (error) {
+      failedFileIds.add(fileId);
+      logger.error('Error confirming managed file resource cleanup', error);
+    }
+  }
   return {
-    deletedFileIds: metadataDeletedFileIds,
+    deletedFileIds: metadataDeletedFileIds.filter(
+      (id) => !uploadTasks.has(id) || !failedFileIds.has(id),
+    ),
     failedFileIds: [...failedFileIds],
   };
 };
@@ -388,6 +442,32 @@ async function sweepExpiredFiles(options = {}) {
     processDeleteRequest,
     incrementFileDeletionAttempts: db.incrementFileDeletionAttempts,
     deferExpiredFile: db.deferExpiredFile,
+    sweepManagedUploads: async () => {
+      const cleanup = require('~/server/services/Uploads').getUploadRuntime()?.cleanup;
+      if (!cleanup) return { scanned: 0, cleaned: 0, pending: 0 };
+      return cleanup.sweep({
+        limit: Math.min(options.limit ?? 100, 100),
+        deleteAcceptedFile: async (task) => {
+          const file = {
+            file_id: task.fileId,
+            source: task.original?.source,
+            user: task.principal.userId,
+            tenantId: task.principal.tenantId,
+          };
+          const appConfig = options.appConfig ?? (await options.loadAppConfig?.()) ?? {};
+          const req = createExpiredFileSweepRequest({
+            appConfig,
+            file,
+            userId: task.principal.userId,
+          });
+          const result = await processDeleteRequest({ req, files: [file] });
+          return (
+            result.deletedFileIds.includes(task.fileId) &&
+            !result.failedFileIds.includes(task.fileId)
+          );
+        },
+      });
+    },
     logger,
   });
 }

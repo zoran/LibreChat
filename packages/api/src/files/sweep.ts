@@ -89,6 +89,10 @@ type SweepDependencies = {
   }) => Promise<{ deletedFileIds: string[]; failedFileIds: string[] }>;
   incrementFileDeletionAttempts: (file_id: string) => Promise<number>;
   deferExpiredFile: (file_id: string, deletionRetryAt: Date) => Promise<void>;
+  /** Same lifecycle pass also reconciles unaccepted managed attempts; no second timer. */
+  sweepManagedUploads?: (
+    options?: ExpiredFileSweepOptions,
+  ) => Promise<{ scanned: number; cleaned: number; pending: number }>;
   logger: SweepLogger;
 };
 
@@ -109,6 +113,7 @@ export type ExpiredFileSweepResult = {
   scanned: number;
   deleted: number;
   failed: number;
+  managed?: { scanned: number; cleaned: number; pending: number };
 };
 
 export function getFileRetentionSweepInterval(
@@ -304,7 +309,16 @@ export async function sweepExpiredFiles(
   if (sweepPausedBy !== null) throw new Error('FILE_SWEEP_QUIESCING');
   pendingSweeps++;
   try {
-    return await performExpiredFileSweep(options, dependencies);
+    const result = await performExpiredFileSweep(options, dependencies);
+    if (!dependencies.sweepManagedUploads) return result;
+    try {
+      const managed = await dependencies.sweepManagedUploads(options);
+      if (managed.pending > 0) sweepWritesUncertain = true;
+      return { ...result, managed };
+    } catch (error) {
+      sweepWritesUncertain = true;
+      throw error;
+    }
   } finally {
     pendingSweeps--;
   }

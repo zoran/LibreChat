@@ -198,6 +198,21 @@ const file: Schema<IMongoFile> = new Schema(
     },
     retentionAcceptedAt: { type: Date },
     retentionRevision: { type: Number },
+    retainedDerivativeBytes: { type: Number, default: 0, select: false },
+    retainedDerivativeReservations: {
+      type: [
+        {
+          _id: false,
+          reservationId: { type: String, required: true },
+          bytes: { type: Number, required: true },
+          state: { type: String, enum: ['held', 'released'], required: true },
+        },
+      ],
+      default: undefined,
+      select: false,
+    },
+    // Managed upload publication joins the existing File lifecycle transaction.
+    uploadOperationId: { type: String },
     deletionRequestedAt: { type: Date },
     deletionCompletedAt: { type: Date },
     expiredAt: {
@@ -220,10 +235,31 @@ const file: Schema<IMongoFile> = new Schema(
   },
   {
     timestamps: true,
+    toObject: {
+      transform: (_doc, value) => {
+        delete value.retainedDerivativeBytes;
+        delete value.retainedDerivativeReservations;
+        return value;
+      },
+    },
+    toJSON: {
+      transform: (_doc, value) => {
+        delete value.retainedDerivativeBytes;
+        delete value.retainedDerivativeReservations;
+        return value;
+      },
+    },
   },
 );
 
 file.index({ tenantId: 1, file_id: 1 }, { unique: true, name: 'file_identity' });
+file.index(
+  { user: 1, tenantId: 1, 'retainedDerivativeReservations.reservationId': 1 },
+  {
+    unique: true,
+    partialFilterExpression: { 'retainedDerivativeReservations.reservationId': { $exists: true } },
+  },
+);
 file.index({ expiredAt: 1 });
 file.index({ deletionCompletedAt: 1, deletionRequestedAt: 1, deletionRetryAt: 1 });
 file.index(

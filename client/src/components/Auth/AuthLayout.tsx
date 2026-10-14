@@ -120,7 +120,7 @@ function AuthLayout({
             </h1>
           )}
           {children}
-          {showsSocialLogin && (
+          {showsSocialLogin && (startupConfig?.authMode ?? 'default') === 'default' && (
             <SocialLoginRender startupConfig={startupConfig} showPasskey={isLogin} />
           )}
           {statesConsentBelowProviders && <LegalConsent startupConfig={startupConfig} />}

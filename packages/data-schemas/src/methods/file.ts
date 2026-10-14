@@ -1124,8 +1124,14 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
       'retentionRevision',
       'deletionRequestedAt',
       'deletionCompletedAt',
+      'uploadOperationId',
+      'retainedDerivativeBytes',
+      'retainedDerivativeReservations',
     ]) {
-      delete (fileData as unknown as Record<string, unknown>)[key];
+      for (const field of Object.keys(fileData)) {
+        if (field.split('.')[0] === key)
+          delete (fileData as unknown as Record<string, unknown>)[field];
+      }
     }
     if (options?.retention) {
       const { acceptedAt, expiredAt } = options.retention;
@@ -1200,8 +1206,13 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
       'retentionRevision',
       'deletionRequestedAt',
       'deletionCompletedAt',
+      'uploadOperationId',
+      'retainedDerivativeBytes',
+      'retainedDerivativeReservations',
     ]) {
-      delete (update as Record<string, unknown>)[key];
+      for (const field of Object.keys(update)) {
+        if (field.split('.')[0] === key) delete (update as Record<string, unknown>)[field];
+      }
     }
     if (current?.retentionAcceptedAt) {
       for (const key of [

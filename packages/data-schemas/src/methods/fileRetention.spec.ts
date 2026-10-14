@@ -5,6 +5,7 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import type { IMessage } from '~/types';
 import { FileSourceUnavailableError, touchFileSources } from './fileRetention';
 import { CLIENT_MESSAGE_SELECT, createMessageMethods } from './message';
+import { createUploadStore } from './uploadManagementStore';
 import { createFileMethods } from './file';
 import { createModels } from '~/models';
 
@@ -28,6 +29,8 @@ describe('source-dependent message retention', () => {
   beforeEach(async () => {
     await mongoose.models.Message.deleteMany({});
     await mongoose.models.File.deleteMany({});
+    if (mongoose.models.UploadCounter) await mongoose.models.UploadCounter.deleteMany({});
+    await createUploadStore(mongoose, { enabled: true, reconciled: true }).initialize();
     conversationId = uuid();
     sourceId = uuid();
     await files.createFile(

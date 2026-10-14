@@ -20,6 +20,13 @@ const sessionSchema: Schema<ISession> = new Schema({
     type: String,
     index: true,
   },
+  authMethod: { type: String },
+  authPolicyVersion: { type: Number },
+  authVersion: { type: Number },
+  refreshGeneration: { type: Number },
+  authCreatedAt: { type: Date },
+  idleExpiresAt: { type: Date },
+  revokedAt: { type: Date },
 });
 
 sessionSchema.index({ user: 1, refreshTokenHash: 1 }, { unique: true });

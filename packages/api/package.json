@@ -23,6 +23,12 @@
         "types": "./dist/credentials.d.cts",
         "default": "./dist/credentials.cjs"
       }
+    },
+    "./upload-activation": {
+      "require": {
+        "types": "./dist/upload-activation.d.cts",
+        "default": "./dist/upload-activation.cjs"
+      }
     }
   },
   "scripts": {

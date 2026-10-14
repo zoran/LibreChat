@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import type {
   IAgentEventActorContextMeta,
   ICompactionSemanticIndexProjection,
@@ -16,6 +18,7 @@ import type { EarlyBufferOverflowState } from '../../types/earlyBufferRecovery';
 import type { ActivityPhaseSnapshot } from '~/agents/activityPhases/runtime';
 import type { ReplayLimits, ReplayPublication } from '../internal/replay';
 import type { ResolvedAskUserQuestion } from '~/agents/hitl/resume';
+import type { SourceReplayIntent } from '../internal/sourceBudget';
 import type { SerializedQuoteRetention } from '~/files/retention';
 import type { RecoveredSteerPayload } from '../SteerRecovery';
 import type { MCPRuntimeRequestBody } from '~/mcp/types';
@@ -119,11 +122,304 @@ export interface GenerationSourceRetention {
   sourceExpiresAt: number;
 }
 
+/** Admission-only observation. The caller owns the finite client and quiesced target binding. */
+export interface InitialSourcePopulationOptions {
+  /** Canonical millisecond ISO-Z wire timestamp; retained verbatim across activation retries. */
+  originalDeadline: string;
+  targetBindingSha256: string;
+}
+
+export interface InitialSourcePopulation {
+  schema: 1;
+  owner: 'generation-stream';
+  adapter: 'redis' | 'memory';
+  originalDeadline: string;
+  observedFrom: string;
+  observedThrough: string;
+  targetBindingSha256: string;
+  saturatedCounts: { sourceJobs: 0 | 1; replayIntents: 0 | 1; recoveryCopies: 0 | 1 };
+  complete: true;
+  evidenceSha256: string;
+}
+
+export function failInitialSourceInventory(): never {
+  throw new Error('Initial source inventory is unavailable or incomplete');
+}
+
+/** An unknown future metadata field cannot acquire source-free admission by omission. */
+const INITIAL_INVENTORY_JOB_FIELDS: ReadonlySet<string> = new Set(
+  (
+    'sourceReplayIntent sourceReplayHeld sourceReplayChunkBytes sourceReplayChunkEntries ' +
+    'sourceRetention sourceRetentionRevokedAt sourceRetentionPurged sourceRetentionExpiresAt ' +
+    'streamId userId tenantId status createdAt generationProtocolVersion checkpointNamespace ' +
+    'completedAt conversationId error earlyBufferOverflow firstSubscriberAttachedAt activeSubscriberLeases ' +
+    'durableEventCount idempotencyClientRequestId recoveredSteerId userMessage responseMessageId isRegenerate ' +
+    'compact mcpRequestBody userSubmittedPaths userSubmittedMessageFieldPaths preResumeProvenance ' +
+    'activityLabels discoveredTools activityPhaseSnapshot compactionSemanticIndex contextMeta preemptCapable ' +
+    'steerQuotesCapable steerQuotesExecutionId providerAbortReady providerExecutionId providerExecutionStartedId ' +
+    'providerDrained createdEventEmitted sender syncSent scheduleId scheduledFor scheduleConfigRevision ' +
+    'scheduleManual scheduleMCPCompletion scheduleOutcome scheduleOutcomeError scheduleMCPFailure ' +
+    'preserveForScheduleReconcile terminalHostActionPending detachedAgentEventTerminalHostActionPending ' +
+    'detachedAgentEventTerminalStatus terminalHostActionRefreshedAt finalEvent terminalPersistencePending ' +
+    'terminalPersistenceStartedAt titleEvent replayEvents contextUsage tokenUsage endpoint iconURL model ' +
+    'promptTokens agent_id isTemporary retentionExpiresAt agentEventDeliveryKey agentEventInvocationKey ' +
+    'agentEventInvocationGenerationCreatedAt agentEventDetachedActionProducerRequired agentEventDetachedTerminalEvidence ' +
+    'agentEventBindingId agentEventExpectedAction agentEventSuspension agentEventLegacyTurnToken ' +
+    'pendingAction resolvedAskUserQuestions pendingActionId lastActiveAt steersClosed __creationAttemptId ' +
+    '__replacedConversationId __replacedCreatedAt __replacedGenerations __replacedStatus ' +
+    '__scheduleMembershipEpoch __scheduleMembershipPending __scheduleMembershipRevision'
+  ).split(' '),
+);
+
+/** Shared finite metadata classifier for the two built-in stores; never expires or rewrites state. */
+export class InitialSourceInventory {
+  private readonly observedFromMs: number = Date.now();
+  readonly observedFrom: string = new Date(this.observedFromMs).toISOString();
+  private readonly deadlineMs: number;
+  private readonly options: InitialSourcePopulationOptions;
+  private readonly started: number = performance.now();
+  private readonly evidence = createHash('sha256');
+  private bytes: number = 0;
+  readonly counts: InitialSourcePopulation['saturatedCounts'] = {
+    sourceJobs: 0,
+    replayIntents: 0,
+    recoveryCopies: 0,
+  };
+
+  constructor(options: InitialSourcePopulationOptions) {
+    const originalDeadline = options?.originalDeadline;
+    const targetBindingSha256 = options?.targetBindingSha256;
+    if (
+      typeof originalDeadline !== 'string' ||
+      originalDeadline.length !== 24 ||
+      typeof targetBindingSha256 !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(targetBindingSha256)
+    )
+      failInitialSourceInventory();
+    const deadlineMs = Date.parse(originalDeadline);
+    if (
+      !Number.isSafeInteger(deadlineMs) ||
+      new Date(deadlineMs).toISOString() !== originalDeadline
+    )
+      failInitialSourceInventory();
+    this.deadlineMs = deadlineMs;
+    this.options = { originalDeadline, targetBindingSha256 };
+    this.check();
+    this.evidence.update(JSON.stringify(this.options));
+  }
+
+  check(): void {
+    const now = Date.now();
+    if (
+      now < this.observedFromMs ||
+      now >= this.deadlineMs ||
+      now - this.observedFromMs >= 10_000 ||
+      performance.now() - this.started >= 10_000
+    )
+      failInitialSourceInventory();
+  }
+
+  remainingBytes(): number {
+    return 32 * 1024 * 1024 - this.bytes;
+  }
+
+  parse(value: string): unknown {
+    if (typeof value !== 'string' || Buffer.byteLength(value) > 1024 * 1024)
+      failInitialSourceInventory();
+    try {
+      return JSON.parse(value) as unknown;
+    } catch {
+      return failInitialSourceInventory();
+    }
+  }
+
+  /** Walk structured provenance only: quoted ordinary chat text is not a file binding. */
+  observe(label: string, value: unknown): boolean {
+    this.check();
+    let valueBytes = 0;
+    let nodes = 0;
+    let source = false;
+    const ancestors = new Set<object>();
+    const add = (text: string): void => {
+      const size = Buffer.byteLength(text);
+      valueBytes += size;
+      this.bytes += size;
+      if (valueBytes > 1024 * 1024 || this.remainingBytes() < 0) failInitialSourceInventory();
+      this.evidence.update(`${size}:`).update(text);
+    };
+    const walk = (item: unknown, depth: number): void => {
+      if (++nodes > 16_384 || depth > 32) failInitialSourceInventory();
+      if (item === undefined) {
+        add('undefined');
+        return;
+      }
+      if (
+        item === null ||
+        typeof item === 'string' ||
+        typeof item === 'boolean' ||
+        (typeof item === 'number' && Number.isFinite(item))
+      ) {
+        add(JSON.stringify(item));
+        return;
+      }
+      if (typeof item !== 'object' || ancestors.has(item)) failInitialSourceInventory();
+      if (item instanceof Date) {
+        if (!Number.isFinite(item.getTime())) failInitialSourceInventory();
+        add(item.toISOString());
+        return;
+      }
+      ancestors.add(item);
+      if (Array.isArray(item)) {
+        if (item.length > 16_384) failInitialSourceInventory();
+        add('[');
+        for (const entry of item) walk(entry, depth + 1);
+        add(']');
+      } else {
+        if (
+          Object.getPrototypeOf(item) !== Object.prototype &&
+          Object.getPrototypeOf(item) !== null
+        )
+          failInitialSourceInventory();
+        const record = item as Record<string, unknown>;
+        const keys = Object.keys(record).sort();
+        if (keys.length > 1024) failInitialSourceInventory();
+        add('{');
+        for (const key of keys) {
+          const entry = record[key];
+          add(key);
+          if (
+            ['files', 'fileIds', 'sourceFileIds', 'quoteSourceRetention'].includes(key) &&
+            entry != null
+          ) {
+            if (!Array.isArray(entry)) failInitialSourceInventory();
+            if (entry.length) source = true;
+          }
+          if (
+            ['sourceRetention', 'sourceReplayIntent', 'file_id', 'fileId'].includes(key) &&
+            entry != null
+          )
+            source = true;
+          if (
+            /^source(Retention|Replay)/.test(key) &&
+            entry != null &&
+            entry !== false &&
+            entry !== 0
+          )
+            source = true;
+          walk(entry, depth + 1);
+        }
+        add('}');
+      }
+      ancestors.delete(item);
+    };
+    add(label);
+    walk(value, 0);
+    this.check();
+    return source;
+  }
+
+  /** A positive binding can block by itself; a zero result also requires recognizable owner metadata. */
+  job(value: unknown, streamId: string): boolean {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) failInitialSourceInventory();
+    const job = value as Record<string, unknown>;
+    if (Object.keys(job).some((field) => !INITIAL_INVENTORY_JOB_FIELDS.has(field)))
+      failInitialSourceInventory();
+    if (
+      job.streamId !== streamId ||
+      typeof job.userId !== 'string' ||
+      !job.userId ||
+      !Number.isSafeInteger(job.createdAt) ||
+      Number(job.createdAt) < 0 ||
+      ![
+        'running',
+        'complete',
+        'aborted',
+        'error',
+        'requires_action',
+        'detached_terminal_pending_v1',
+      ].includes(String(job.status))
+    )
+      failInitialSourceInventory();
+    if (
+      job.userMessage != null &&
+      (typeof job.userMessage !== 'object' ||
+        Array.isArray(job.userMessage) ||
+        typeof (job.userMessage as Record<string, unknown>).messageId !== 'string')
+    )
+      failInitialSourceInventory();
+    let source = this.observe('job', value);
+    for (const field of [
+      'finalEvent',
+      'titleEvent',
+      'replayEvents',
+      'contextUsage',
+      'tokenUsage',
+    ]) {
+      if (job[field] == null) continue;
+      if (typeof job[field] !== 'string') failInitialSourceInventory();
+      if (this.observe(field, this.parse(job[field] as string))) source = true;
+    }
+    if (source) this.counts.sourceJobs = 1;
+    return source;
+  }
+
+  recovery(value: unknown): void {
+    if (this.observe('recovery', value)) {
+      this.counts.recoveryCopies = 1;
+      return;
+    }
+    if (
+      !value ||
+      typeof value !== 'object' ||
+      Array.isArray(value) ||
+      typeof (value as Record<string, unknown>).userId !== 'string' ||
+      !(value as Record<string, unknown>).userId
+    )
+      failInitialSourceInventory();
+    const record = value as Record<string, unknown>;
+    const isItem = (entry: unknown): boolean => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+      const item = entry as Record<string, unknown>;
+      return (
+        typeof item.userId === 'string' &&
+        item.userId.length > 0 &&
+        typeof item.steerId === 'string' &&
+        item.steerId.length > 0 &&
+        typeof item.text === 'string'
+      );
+    };
+    if (Array.isArray(record.steers) && record.steers.every(isItem)) return;
+    if (typeof record.clientSteerId === 'string' && isItem(record.item)) return;
+    if (!isItem(record)) failInitialSourceInventory();
+  }
+
+  finish(adapter: InitialSourcePopulation['adapter']): InitialSourcePopulation {
+    this.check();
+    const result: Omit<InitialSourcePopulation, 'evidenceSha256'> = {
+      schema: 1,
+      owner: 'generation-stream',
+      adapter,
+      originalDeadline: this.options.originalDeadline,
+      targetBindingSha256: this.options.targetBindingSha256,
+      observedFrom: this.observedFrom,
+      observedThrough: new Date().toISOString(),
+      saturatedCounts: { ...this.counts },
+      complete: true,
+    };
+    this.evidence.update(JSON.stringify(result));
+    return { ...result, evidenceSha256: this.evidence.digest('hex') };
+  }
+}
+
 export function sourceRetentionAvailable(
   job:
     | Pick<
         SerializableJobData,
-        'sourceRetention' | 'sourceRetentionRevokedAt' | 'sourceRetentionPurged'
+        | 'sourceRetention'
+        | 'sourceRetentionRevokedAt'
+        | 'sourceRetentionPurged'
+        | 'sourceReplayIntent'
+        | 'sourceReplayHeld'
       >
     | null
     | undefined,
@@ -131,7 +427,8 @@ export function sourceRetentionAvailable(
 ): boolean {
   return (
     job?.sourceRetention == null ||
-    (job.sourceRetentionRevokedAt == null &&
+    ((!job.sourceReplayIntent || job.sourceReplayHeld === true) &&
+      job.sourceRetentionRevokedAt == null &&
       !job.sourceRetentionPurged &&
       Number.isFinite(job.sourceRetention.sourceExpiresAt) &&
       job.sourceRetention.sourceExpiresAt > now)
@@ -147,6 +444,10 @@ export function sourceSafeJobPatch(
     sourceRetention: _binding,
     sourceRetentionRevokedAt: _revoked,
     sourceRetentionPurged: _purged,
+    sourceReplayIntent: _intent,
+    sourceReplayHeld: _held,
+    sourceReplayChunkBytes: _bytes,
+    sourceReplayChunkEntries: _entries,
     ...ordinary
   } = patch;
   if (sourceRetentionAvailable(job)) return ordinary;
@@ -165,6 +466,11 @@ export function sourceSafeJobPatch(
 
 /** Serializable job data without object references, suitable for external storage. */
 export interface SerializableJobData {
+  /** Private source-replay cleanup evidence; ordinary metadata writers cannot set it. */
+  sourceReplayIntent?: SourceReplayIntent;
+  sourceReplayHeld?: boolean;
+  sourceReplayChunkBytes?: number;
+  sourceReplayChunkEntries?: number;
   sourceRetention?: GenerationSourceRetention;
   sourceRetentionRevokedAt?: number;
   sourceRetentionPurged?: boolean;
@@ -1042,11 +1348,15 @@ export interface IJobStore {
   getIdempotencyClaim?(key: string): Promise<IdempotencyClaimValue | null>;
 
   /** Optional only for source-free custom stores; source-bearing admission requires all source operations. */
-  bindSourceRetention?(
-    streamId: string,
-    expectedCreatedAt: number,
-    context: GenerationSourceRetention,
-  ): Promise<boolean>;
+  getSourceReplayJob?(streamId: string): Promise<SerializableJobData | null>;
+  prepareSourceReplay?(intent: SourceReplayIntent): Promise<SourceReplayIntent>;
+  commitSourceReplay?(intent: SourceReplayIntent): Promise<boolean>;
+  listSourceReplayIntents?(): Promise<SourceReplayIntent[]>;
+  /** Missing adapters cannot certify initial activation; never invoke manager startup for this read. */
+  inspectInitialSourcePopulation?(
+    options: InitialSourcePopulationOptions,
+  ): Promise<InitialSourcePopulation>;
+  acknowledgeSourceReplayRelease?(intent: SourceReplayIntent): Promise<boolean>;
   revokeSourceRetention?(streamId: string, expectedCreatedAt: number): Promise<boolean>;
   purgeSourceRetention?(streamId: string, expectedCreatedAt: number): Promise<boolean>;
   /** Remove source file objects from existing recovery copies, independently of the current epoch. */
@@ -1778,8 +2088,14 @@ export interface IEventTransport {
   setSourceRetentionReader?(
     reader: (streamId: string) => Promise<SerializableJobData | null>,
   ): void;
+  /** Existing purge controls also invalidate bounded process-local copies. */
+  setSourceRetentionCleanup?(cleanup: (streamId: string, epoch: number) => void): void;
   /** Invalidate only the revoked epoch; keep independent sequence/recovery state. */
-  purgeSourceRetention?(streamId: string, expectedCreatedAt: number): Promise<void>;
+  purgeSourceRetention?(
+    streamId: string,
+    expectedCreatedAt: number,
+    options?: { silent?: boolean },
+  ): Promise<void>;
   /** Actual dedicated command/subscriber and subscription readiness, when supported. */
   isGenerationTransportReady?(): boolean;
   /**

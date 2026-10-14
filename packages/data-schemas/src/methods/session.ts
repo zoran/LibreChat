@@ -305,6 +305,9 @@ export function createSessionMethods(mongoose: typeof import('mongoose')): {
     if (!session || !session.user) {
       throw new SessionError('Invalid session object', 'INVALID_SESSION');
     }
+    if (session.authMethod === 'email_code') {
+      throw new SessionError('Email-code refresh requires atomic rotation', 'INVALID_SESSION');
+    }
 
     try {
       const expiresIn = session.expiration

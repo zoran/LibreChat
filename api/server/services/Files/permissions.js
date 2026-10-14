@@ -5,9 +5,13 @@ const {
   hasPermissions,
   isEphemeralAgentId,
 } = require('librechat-data-provider');
-const { getRemoteAgentPermissions } = require('@librechat/api');
+const { getRemoteAgentPermissions, getAuthMode } = require('@librechat/api');
 const { checkPermission, getEffectivePermissions } = require('~/server/services/PermissionService');
 const { getAgent, getFiles } = require('~/models');
+
+const managedFile = (file) =>
+  file?.uploadOperationId != null ||
+  (typeof file?.filepath === 'string' && file.filepath.startsWith('/api/files/managed/'));
 
 const checkAgentPermission = async ({
   userId,
@@ -92,14 +96,23 @@ const hasAccessToFilesViaAgent = async ({
 
     const attachedFileIds = getAttachedFileIds(agent);
     const agentAuthorId = agent.author?.toString();
+    const cortex = getAuthMode() !== 'default';
     const filesById =
-      files != null
+      files != null && !cortex
         ? getFilesById(files)
         : getFilesById(
-            await getFiles({ file_id: { $in: fileIds } }, null, { file_id: 1, user: 1 }),
+            await getFiles(
+              { file_id: { $in: fileIds } },
+              null,
+              cortex
+                ? { file_id: 1, user: 1, uploadOperationId: 1, filepath: 1 }
+                : { file_id: 1, user: 1 },
+            ),
           );
     const canInheritFromAgent = (fileId) =>
-      attachedFileIds.has(fileId) && filesById.get(fileId)?.user != null;
+      attachedFileIds.has(fileId) &&
+      filesById.get(fileId)?.user != null &&
+      !(cortex && managedFile(filesById.get(fileId)));
 
     if (agentAuthorId === userId.toString()) {
       fileIds.forEach((fileId) => {
@@ -166,6 +179,26 @@ const filterFilesByAgentAccess = async ({
   agentId,
   resourceType = ResourceType.AGENT,
 }) => {
+  if (getAuthMode() !== 'default' && files?.length) {
+    // This callback has no current email grant/workspace authority. Hydrate only
+    // classification from the File owner, so stripped caller metadata cannot
+    // re-enable a managed file through the early-return or owned-file paths.
+    if (!userId || files.length > 100) return [];
+    try {
+      const rows = await getFiles(
+        { file_id: { $in: files.map((file) => file.file_id) } },
+        null,
+        { file_id: 1, uploadOperationId: 1, filepath: 1 },
+        100,
+      );
+      const allowed = new Set(
+        (rows ?? []).filter((file) => !managedFile(file)).map((file) => file.file_id),
+      );
+      files = files.filter((file) => allowed.has(file.file_id) && !managedFile(file));
+    } catch {
+      return [];
+    }
+  }
   if (!userId || !agentId || !files || files.length === 0 || isEphemeralAgentId(agentId)) {
     return files;
   }

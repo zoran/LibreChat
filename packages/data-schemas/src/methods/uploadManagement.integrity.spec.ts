@@ -1,0 +1,362 @@
+/** Durable original identity, replay and replacement evidence through independent Mongo clients. */
+import mongoose from 'mongoose';
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import {
+  UPLOAD_MAX_FILE_BYTES,
+  UPLOAD_MAX_TEXT_BYTES,
+  UPLOAD_RECORD_BYTES,
+  UPLOAD_RETENTION_MS,
+} from 'librechat-data-provider';
+import type { UploadLease, UploadPrincipal, UploadStorageReceipt } from 'librechat-data-provider';
+import type { StoredUpload } from './uploadManagementStore';
+import { createUploadManagementRepository } from './uploadManagement';
+import { createModels } from '~/models';
+
+const manifest = (bytes = 8) => ({
+  version: 1 as const,
+  algorithm: 'sha256' as const,
+  sha256: 'a'.repeat(64),
+  chunkBytes: 262144 as const,
+  chunkSha256: Array.from({ length: Math.ceil(bytes / 262144) }, () => 'b'.repeat(64)),
+});
+
+describe('durable managed original integrity', () => {
+  let mongo: MongoMemoryReplSet;
+  const a = new mongoose.Mongoose();
+  const b = new mongoose.Mongoose();
+  const replacement = new mongoose.Mongoose();
+  let first: ReturnType<typeof createUploadManagementRepository>;
+  let second: ReturnType<typeof createUploadManagementRepository>;
+  let target: ReturnType<typeof createUploadManagementRepository>;
+  const now = Date.now();
+  const user: UploadPrincipal = {
+    tenantId: 'tenant-a',
+    userId: new mongoose.Types.ObjectId().toString(),
+    authentication: 'verified-email',
+  };
+  const worker = { hostId: 'host-a', instanceId: 'app-a' };
+  const baseline = { originalBytes: 0, objectBytes: 0, textBytes: 0, recordBytes: 0, bundles: 0 };
+  const request = (id: string, bytes = 8, filename = 'note.txt', mediaType = 'text/plain') => ({
+    operationId: id,
+    idempotencyKey: id,
+    filename,
+    mediaType,
+    declaredBytes: bytes,
+    fingerprint: JSON.stringify([{ kind: 'personal' }, filename, mediaType, bytes]),
+  });
+  const receipt = (lease: UploadLease, bytes = 8) => ({
+    outcome: 'durable' as const,
+    bytes,
+    source: 's3',
+    filepath: `/api/files/download/${lease.operationId}`,
+    storageKey: `t/${lease.tenantId}/managed-uploads/${lease.userId}/${lease.operationId}.${lease.generation}__original`,
+    etag: 'opaque-etag',
+    versionId: 'opaque-version',
+    integrity: manifest(bytes),
+  });
+  const localGone = (lease: UploadLease) => ({
+    operationId: lease.operationId,
+    generation: lease.generation,
+    writerStopped: true,
+    localCopiesAbsent: true,
+    originalAbsent: false,
+    textAndHistoryRemoved: false,
+  });
+
+  beforeAll(async () => {
+    mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
+    await Promise.all([
+      a.connect(mongo.getUri('integrity')),
+      b.connect(mongo.getUri('integrity')),
+      replacement.connect(mongo.getUri('replacement')),
+    ]);
+    for (const db of [a, b, replacement]) createModels(db);
+    await Promise.all([a.models.File.init(), b.models.File.init(), replacement.models.File.init()]);
+  });
+  beforeEach(async () => {
+    for (const db of [a, replacement]) {
+      for (const name of ['File', 'UploadOperation', 'UploadCounter'])
+        if (db.models[name]) await db.models[name].deleteMany({});
+    }
+    first = createUploadManagementRepository(a, { enabled: true, reconciled: true, baseline });
+    second = createUploadManagementRepository(b);
+    target = createUploadManagementRepository(replacement);
+    await first.initialize();
+    await Promise.all([second.initialize(), target.initialize()]);
+  });
+  afterAll(async () => {
+    await Promise.all([a.disconnect(), b.disconnect(), replacement.disconnect()]);
+    await mongo?.stop();
+  });
+
+  async function transfer(id = 'identity', bytes = 8) {
+    await first.reserve(user, request(id, bytes), now);
+    const lease = await first.claim({
+      kind: 'transfer',
+      principal: user,
+      operationId: id,
+      worker,
+      now,
+    });
+    expect(lease).not.toBeNull();
+    return lease!;
+  }
+  async function accepted(id = 'identity') {
+    const lease = await transfer(id);
+    const original = receipt(lease);
+    const operation = await first.accept(user, lease, original, now);
+    await first.confirmCleanup(localGone(lease), now);
+    return { lease, original, operation };
+  }
+
+  it.each([
+    ['missing manifest', { integrity: undefined }],
+    ['malformed manifest', { integrity: { ...manifest(), chunkSha256: [] } }],
+    ['unknown receipt key', { backendChecksum: 'not-authority' }],
+    ['oversized ETag', { etag: 'a'.repeat(1025) }],
+    ['oversized UTF-8 version', { versionId: 'é'.repeat(513) }],
+  ])(
+    'refuses first acceptance with %s and retains the unconfirmed storage obligation',
+    async (_name, change) => {
+      const lease = await transfer();
+      await expect(
+        first.accept(user, lease, { ...receipt(lease), ...change } as UploadStorageReceipt, now),
+      ).rejects.toMatchObject({ code: 'invalid_request' });
+      const row = await b.models.UploadOperation.findById(lease.operationId).lean<StoredUpload>();
+      expect(row).toMatchObject({
+        state: 'transferring',
+        pendingBytes: 8,
+        originalBytes: 8,
+        stagingHeld: true,
+      });
+      expect(row!.acceptedAt).toBeUndefined();
+      expect(row!.original).toBeUndefined();
+      expect(await b.models.File.countDocuments({})).toBe(0);
+      expect(await second.usage(user, now)).toMatchObject({
+        usedBytes: 0,
+        reservedBytes: 8,
+        retainedBytes: 0,
+      });
+    },
+  );
+
+  it('persists one exact private manifest and replays it across clients without another debit', async () => {
+    const lease = await transfer();
+    const original = receipt(lease);
+    const expected = JSON.parse(JSON.stringify(original));
+    const acceptance = first.accept(user, lease, original, now);
+    original.integrity.chunkSha256[0] = 'c'.repeat(64);
+    const operation = await acceptance;
+    const stored = await b.models.UploadOperation.findById(lease.operationId).lean<StoredUpload>();
+    expect(stored!.original).toEqual(expected);
+    const replay = Object.fromEntries(Object.entries(expected).reverse()) as UploadStorageReceipt;
+    expect(await second.accept(user, lease, replay, now + 1)).toEqual(operation);
+    expect(await first.usage(user, now + 1)).toMatchObject({
+      usedBytes: 8,
+      reservedBytes: 0,
+      retainedBytes: 8,
+    });
+    expect((await second.cleanupTasks())[0].original).toEqual(expected);
+    const file = await b.models.File.findOne({ file_id: lease.operationId }).lean();
+    expect(file).not.toHaveProperty('integrity');
+    expect(JSON.stringify(await second.list(user, now))).not.toContain('chunkSha256');
+    expect(JSON.stringify(await second.metrics(now))).not.toContain('chunkSha256');
+    expect(operation.expiresAt).toBe(new Date(now + UPLOAD_RETENTION_MS).toISOString());
+  });
+
+  it.each([
+    ['same-length identity', { integrity: { ...manifest(), sha256: 'c'.repeat(64) } }],
+    ['block identity', { integrity: { ...manifest(), chunkSha256: ['d'.repeat(64)] } }],
+    ['missing identity', { integrity: undefined }],
+    ['opaque version', { versionId: 'different-version' }],
+    ['storage key', { storageKey: 'different-object' }],
+  ])(
+    'refuses an altered accepted replay (%s) without rewriting or refunding it',
+    async (_name, change) => {
+      const { lease, original } = await accepted();
+      const before = await b.models.UploadOperation.findById(
+        lease.operationId,
+      ).lean<StoredUpload>();
+      await expect(
+        second.accept(user, lease, { ...original, ...change } as UploadStorageReceipt, now + 1),
+      ).rejects.toMatchObject({ code: 'idempotency_conflict' });
+      expect(await a.models.UploadOperation.findById(lease.operationId).lean()).toEqual(before);
+      expect(await first.usage(user, now + 1)).toMatchObject({
+        usedBytes: 8,
+        reservedBytes: 0,
+        retainedBytes: 8,
+      });
+    },
+  );
+
+  it('binds an accepted replay to the original transfer generation', async () => {
+    const { lease, original } = await accepted();
+    await expect(
+      second.accept(user, { ...lease, generation: lease.generation + 1 }, original, now + 1),
+    ).rejects.toMatchObject({ code: 'lease_lost' });
+    expect(await first.usage(user, now + 1)).toMatchObject({ usedBytes: 8 });
+  });
+
+  it('settles competing first acknowledgements to one immutable manifest and one debit', async () => {
+    const lease = await transfer();
+    const originals = [
+      receipt(lease),
+      { ...receipt(lease), integrity: { ...manifest(), sha256: 'c'.repeat(64) } },
+    ];
+    const results = await Promise.allSettled([
+      first.accept(user, lease, originals[0], now),
+      second.accept(user, lease, originals[1], now),
+    ]);
+    expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+    const refused = results.find((result) => result.status === 'rejected') as PromiseRejectedResult;
+    expect(refused.reason).toMatchObject({ code: 'idempotency_conflict' });
+    const winner = results.findIndex((result) => result.status === 'fulfilled');
+    expect(
+      (await a.models.UploadOperation.findById(lease.operationId).lean<StoredUpload>())!.original,
+    ).toEqual(originals[winner]);
+    expect(await second.usage(user, now)).toMatchObject({
+      usedBytes: 8,
+      reservedBytes: 0,
+      retainedBytes: 8,
+    });
+  });
+
+  it('does not issue a live processing input for a historical missing manifest', async () => {
+    const { lease } = await accepted();
+    await a.models.UploadOperation.updateOne(
+      { _id: lease.operationId },
+      { $unset: { 'original.integrity': 1 } },
+    );
+    const parser = await second.claim({ kind: 'processing', worker, now });
+    expect(parser).not.toBeNull();
+    await expect(first.getProcessingInput(parser!, now)).rejects.toMatchObject({
+      code: 'not_ready',
+    });
+    expect(await first.usage(user, now)).toMatchObject({ usedBytes: 8, retainedBytes: 8 });
+  });
+
+  it.each(['missing', 'malformed', 'unbounded'] as const)(
+    'refuses live-original %s metadata at both migration boundaries',
+    async (kind) => {
+      const { lease } = await accepted();
+      const page = await first.exportSnapshot({ epoch: 'move' });
+      const altered = JSON.parse(JSON.stringify(page));
+      const row = altered.records.find(
+        (record: { type: string }) => record.type === 'operation',
+      ).value;
+      if (kind === 'missing') delete row.original.integrity;
+      if (kind === 'malformed') row.original.integrity.chunkSha256 = [];
+      if (kind === 'unbounded') row.original.versionId = 'é'.repeat(513);
+      await expect(target.importSnapshot(altered)).rejects.toMatchObject({
+        code: 'migration_conflict',
+      });
+      expect(await replacement.models.UploadOperation.countDocuments({})).toBe(0);
+      await a.models.UploadOperation.updateOne(
+        { _id: lease.operationId },
+        { $set: { original: row.original } },
+      );
+      await expect(second.exportSnapshot({ epoch: 'move' })).rejects.toMatchObject({
+        code: 'migration_conflict',
+      });
+      expect(await first.usage(user, now)).toMatchObject({ usedBytes: 8, retainedBytes: 8 });
+    },
+  );
+
+  it('round-trips the exact live manifest and retained quota through the existing replacement protocol', async () => {
+    const { lease, original } = await accepted();
+    const page = await first.exportSnapshot({ epoch: 'move' });
+    await target.importSnapshot(page);
+    await target.importSnapshot(page);
+    await replacement.models.File.insertMany(await a.models.File.find({}).lean());
+    const seal = await first.completeExport('move');
+    await target.completeImport({ receipt: seal, baseline, lifecycleReconciled: true });
+    expect(
+      (await replacement.models.UploadOperation.findById(lease.operationId).lean<StoredUpload>())!
+        .original,
+    ).toEqual(original);
+    expect(await target.usage(user, now)).toEqual(await first.usage(user, now));
+    const parser = await target.claim({ kind: 'processing', worker, now });
+    expect((await target.getProcessingInput(parser!, now)).original).toEqual(original);
+  });
+
+  it('preserves fully removed legacy history and its debit without fabricating an original identity', async () => {
+    const { lease } = await accepted();
+    await first.delete(user, lease.operationId, now + 1);
+    await first.confirmCleanup(
+      { ...localGone(lease), originalAbsent: true, textAndHistoryRemoved: true },
+      now + 1,
+    );
+    await a.models.UploadOperation.updateOne(
+      { _id: lease.operationId },
+      { $unset: { 'original.integrity': 1 } },
+    );
+    const page = await first.exportSnapshot({ epoch: 'removed' });
+    await target.importSnapshot(page);
+    const seal = await first.completeExport('removed');
+    await target.completeImport({ receipt: seal, baseline, lifecycleReconciled: true });
+    const stored = await replacement.models.UploadOperation.findById(
+      lease.operationId,
+    ).lean<StoredUpload>();
+    expect(stored!.original).not.toHaveProperty('integrity');
+    expect(stored).toMatchObject({ originalBytes: 0, originalRemoved: true, actualBytes: 8 });
+    expect(await target.usage(user, now + 1)).toMatchObject({
+      usedBytes: 8,
+      reservedBytes: 0,
+      retainedBytes: 0,
+    });
+  });
+
+  it('keeps the maximum supported original manifest and bounded record inside its existing 32 KiB charge', async () => {
+    const id = 'a'.repeat(128);
+    const owner = { ...user, tenantId: 't'.repeat(128) };
+    const filename = '界'.repeat(255);
+    const input = {
+      ...request(id, UPLOAD_MAX_FILE_BYTES, filename, 'text/plain'),
+      idempotencyKey: '界'.repeat(128),
+    };
+    await first.reserve(owner, input, now);
+    const lease = (await first.claim({
+      kind: 'transfer',
+      principal: owner,
+      operationId: id,
+      worker,
+      now,
+    }))!;
+    const prefix = '/api/files/download/';
+    const original = {
+      ...receipt(lease, UPLOAD_MAX_FILE_BYTES),
+      filepath: prefix + '界'.repeat(4096 - prefix.length),
+      etag: 'é'.repeat(512),
+      versionId: 'é'.repeat(512),
+    };
+    await first.accept(owner, lease, original, now);
+    const row = (await b.models.UploadOperation.findById(id).lean<StoredUpload>())!;
+    const largest: StoredUpload = {
+      ...row,
+      revision: Number.MAX_SAFE_INTEGER,
+      generation: Number.MAX_SAFE_INTEGER,
+      worker: { hostId: '界'.repeat(128), instanceId: '界'.repeat(128) },
+      slot: 'processing',
+      leaseExpiresAt: 8.64e15,
+      workerGeneration: Number.MAX_SAFE_INTEGER,
+      workerKind: 'processing',
+      byteLeaseUntil: 8.64e15,
+      byteLeaseGeneration: Number.MAX_SAFE_INTEGER,
+      textBytes: UPLOAD_MAX_TEXT_BYTES,
+      parserExecution: {
+        attemptId: `${id}.${Number.MAX_SAFE_INTEGER}`,
+        instanceId: '界'.repeat(128),
+        expiresAt: new Date(8.64e15).toISOString(),
+      },
+      publishedDigest: 'f'.repeat(64),
+      error: 'idempotency_conflict',
+      originalRemoved: false,
+      textRemoved: false,
+    };
+    expect(original.integrity.chunkSha256).toHaveLength(120);
+    expect(row.recordBytes).toBe(UPLOAD_RECORD_BYTES);
+    expect(mongoose.mongo.BSON.calculateObjectSize(largest)).toBeLessThanOrEqual(
+      UPLOAD_RECORD_BYTES,
+    );
+  });
+});

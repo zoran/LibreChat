@@ -2,7 +2,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const multer = require('multer');
-const { sanitizeFilename, createCustomError } = require('@librechat/api');
+const { sanitizeFilename, createCustomError, getAuthMode } = require('@librechat/api');
 const { logger } = require('@librechat/data-schemas');
 const {
   mergeFileConfig,
@@ -138,11 +138,26 @@ const createMulterInstance = async (options = {}) => {
     : await getAppConfig();
   const fileConfig = mergeFileConfig(options.fileConfig ?? appConfig?.fileConfig);
   const fileFilter = createFileFilter(fileConfig, resolveEndpoint);
-  return multer({
+  const upload = multer({
     storage: uniqueTempPath ? createStorage({ uniqueTempPath: true }) : storage,
     fileFilter,
     limits: { fileSize: fileConfig.serverFileSizeLimit },
   });
+  // Agent management also uses this factory outside /api/files. Keep startup
+  // inert, but reject every legacy multipart entry before it consumes a body.
+  for (const method of ['single', 'array', 'fields', 'any', 'none']) {
+    const createMiddleware = upload[method].bind(upload);
+    upload[method] = (...args) => {
+      const middleware = createMiddleware(...args);
+      return (req, res, next) => {
+        if (getAuthMode() !== 'default') {
+          return next(createCustomError(403, 'Managed upload required'));
+        }
+        return middleware(req, res, next);
+      };
+    };
+  }
+  return upload;
 };
 
 module.exports = {

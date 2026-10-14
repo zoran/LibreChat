@@ -11,6 +11,7 @@ const { restoreTenantContextFromReq } = require('@librechat/api');
 const { avatar: asstAvatarRouter } = require('~/server/routes/assistants/v1');
 const { avatar: agentAvatarRouter } = require('~/server/routes/agents/v1');
 const { createMulterInstance } = require('./multer');
+const { rejectUnmanagedFileWrites } = require('./managed');
 
 const files = require('./files');
 const images = require('./images');
@@ -23,6 +24,7 @@ const initialize = async () => {
   router.use(configMiddleware);
   router.use(checkBan);
   router.use(uaParser);
+  router.use(rejectUnmanagedFileWrites);
 
   const upload = await createMulterInstance();
   router.post('/speech/stt', upload.single('audio'), restoreTenantContextFromReq);

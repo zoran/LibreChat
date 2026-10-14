@@ -1,6 +1,6 @@
 const { ownAuthHandler } = require('~/server/services/LegacyAuthMaintenance');
 const express = require('express');
-const { createUserPreferencesHandler } = require('@librechat/api');
+const { createUserPreferencesHandler, getAuthMode } = require('@librechat/api');
 const {
   updateUserPluginsController,
   resendVerificationController,
@@ -28,6 +28,15 @@ const settings = require('./settings');
 const { updateUserStatefulCodeEnvironment } = require('~/models');
 
 const router = express.Router();
+router.use((req, res, next) => {
+  if (
+    getAuthMode() !== 'default' &&
+    /^\/(?:email\/(?:change|verify)|verify(?:\/resend)?)\/?$/i.test(req.path)
+  ) {
+    return res.status(404).json({ code: 'AUTH_MODE_DISABLED' });
+  }
+  return next();
+});
 
 const updateUserPreferences = createUserPreferencesHandler({
   updateStatefulCodeEnvironment: updateUserStatefulCodeEnvironment,

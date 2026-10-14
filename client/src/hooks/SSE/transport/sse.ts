@@ -39,9 +39,11 @@ const emitFrame = (onEvent: EventCallback) => (e: MessageEvent) => {
  * expired first turns enrollment enforcement into a 401 the stream cannot read, so the refresh is
  * where enrollment surfaces: it succeeds without a token, which is not a failure to report.
  */
-async function refreshToken(): Promise<string | null | false> {
+async function refreshToken(generation: number): Promise<string | null | false> {
   try {
+    request.assertAuthSessionGeneration(generation);
     const refreshResponse = await request.refreshToken();
+    request.assertAuthSessionGeneration(generation);
     if (request.redirectIfTwoFactorSetupPayload(refreshResponse)) {
       return false;
     }
@@ -51,6 +53,7 @@ async function refreshToken(): Promise<string | null | false> {
     }
     return refreshedToken;
   } catch (error) {
+    if (request.getAuthSessionGeneration() !== generation) return false;
     /* token refresh failed, continue handling the original 401 */
     console.log(error);
     return null;
@@ -91,6 +94,7 @@ export function createSSETransport({ token }: { token?: string }): ChatTransport
       if (signal.aborted) {
         return;
       }
+      const generation = request.getAuthSessionGeneration();
 
       const sse = new SSE(server, {
         payload: JSON.stringify(payload),
@@ -116,20 +120,26 @@ export function createSSETransport({ token }: { token?: string }): ChatTransport
        * live until the retry settles, so an abort meanwhile must still cancel. */
       let refreshing = false;
       sse.addEventListener('error', async (e: StreamErrorEvent) => {
+        if (request.getAuthSessionGeneration() !== generation || signal.aborted) return;
         if (isTwoFactorSetupRefusal(e)) {
           return;
         }
         if (e.responseCode === 401 && !refreshed) {
           refreshed = true;
           refreshing = true;
-          const refreshedToken = await refreshToken();
+          const refreshedToken = await refreshToken(generation);
           refreshing = false;
-          if (signal.aborted || refreshedToken === false) {
+          if (
+            signal.aborted ||
+            refreshedToken === false ||
+            request.getAuthSessionGeneration() !== generation
+          ) {
             return;
           }
           if (refreshedToken) {
             sse.headers = jsonHeaders(refreshedToken);
-            request.dispatchTokenUpdatedEvent(refreshedToken);
+            request.dispatchTokenUpdatedEvent(refreshedToken, generation);
+            if (request.getAuthSessionGeneration() !== generation) return;
             sse.stream();
             return;
           }
@@ -169,6 +179,7 @@ export function createSSETransport({ token }: { token?: string }): ChatTransport
       if (signal.aborted) {
         return { closed: true };
       }
+      const generation = request.getAuthSessionGeneration();
 
       const sse = new SSE(url, {
         headers: { Authorization: `Bearer ${token}`, ...headers },
@@ -200,19 +211,25 @@ export function createSSETransport({ token }: { token?: string }): ChatTransport
 
       let refreshed = false;
       sse.addEventListener('error', async (e: StreamErrorEvent) => {
+        if (request.getAuthSessionGeneration() !== generation || signal.aborted) return;
         failureSeen = true;
         if (isTwoFactorSetupRefusal(e)) {
           return;
         }
         if (e.responseCode === 401 && !refreshed) {
           refreshed = true;
-          const refreshedToken = await refreshToken();
-          if (signal.aborted || refreshedToken === false) {
+          const refreshedToken = await refreshToken(generation);
+          if (
+            signal.aborted ||
+            refreshedToken === false ||
+            request.getAuthSessionGeneration() !== generation
+          ) {
             return;
           }
           if (refreshedToken) {
             sse.headers = { ...sse.headers, Authorization: `Bearer ${refreshedToken}` };
-            request.dispatchTokenUpdatedEvent(refreshedToken);
+            request.dispatchTokenUpdatedEvent(refreshedToken, generation);
+            if (request.getAuthSessionGeneration() !== generation) return;
             sse.stream();
             return;
           }

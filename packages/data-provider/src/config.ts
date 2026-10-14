@@ -3135,6 +3135,11 @@ export type TStartupConfig = {
   maintenanceStatusEnabled?: boolean;
   /** Optional browser identity; never enables registration or administrative login. */
   browserSessionEnabled?: boolean;
+  authMode?: import('./email-code').AuthMode;
+  emailCodeEnabled?: boolean;
+  emailCodeDomains?: string[];
+  /** UI capability only; every operation independently authorizes the server identity. */
+  managedUploads?: { enabled: boolean; eligible: boolean };
   conversationTitleOwnershipVersion?: typeof CONVERSATION_TITLE_OWNERSHIP_VERSION;
   appTitle: string;
   socialLogins?: string[];

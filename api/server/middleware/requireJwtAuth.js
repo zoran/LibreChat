@@ -14,6 +14,7 @@ const {
   getValidOpenIdReuseUserId,
   generateTwoFactorSetupToken,
   isTwoFactorEnrollmentRequired,
+  getAuthMode,
 } = require('@librechat/api');
 const { getUserById } = require('~/models');
 
@@ -32,6 +33,16 @@ const getAuthTokenSource = (req) => {
 };
 
 const getAuthStrategies = (req) => {
+  if (getAuthMode() !== 'default') {
+    return {
+      tokenProvider: 'librechat',
+      tokenSource: getAuthTokenSource(req),
+      openidReuseEnabled: false,
+      openidJwtAvailable: false,
+      openIdReuseUserId: null,
+      strategies: ['jwt'],
+    };
+  }
   const cookieHeader = req.headers.cookie;
   const parsedCookies = cookieHeader ? cookies.parse(cookieHeader) : {};
   const tokenProvider = parsedCookies.token_provider;
@@ -200,14 +211,18 @@ const requireJwtAuth = (req, res, next) => {
       req.user = user;
       req.authStrategy = strategy;
       logFallbackSuccess(strategy);
-      return requiredTwoFactorGate(req, res, next, () => {
+      const continueAuthenticated = () => {
         tenantContextMiddleware(req, res, (tenantErr) => {
           if (tenantErr) {
             return next(tenantErr);
           }
           refreshCloudFrontCookies(req, res, next);
         });
-      });
+      };
+      // Cortex's native JWT strategy already validated its complete authentication policy.
+      // Upstream's password/SSO enrollment flow is closed in these deployment modes.
+      if (getAuthMode() !== 'default') return continueAuthenticated();
+      return requiredTwoFactorGate(req, res, next, continueAuthenticated);
     })(req, res, next);
   };
 

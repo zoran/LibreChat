@@ -27,6 +27,7 @@ const {
   traceIdForMessage,
   resolveDownloadPath,
   prepareResultToolCallPreviews,
+  getAuthMode,
 } = require('@librechat/api');
 const {
   logger,
@@ -60,6 +61,13 @@ const { getHeldCapabilities } = require('~/server/middleware/roles/capabilities'
 const configMiddleware = require('~/server/middleware/config/app');
 const { getAppConfig } = require('~/server/services/Config/app');
 const router = express.Router();
+// Cortex does not publish conversations: generated text and quoted source
+// content remain private even when an upstream share omits file snapshots.
+router.use((_req, res, next) => {
+  if (getAuthMode() === 'default') return next();
+  res.setHeader('Cache-Control', 'private, no-store');
+  return res.status(404).json({ message: 'Not found' });
+});
 const sharedLinkConfigMiddleware = createSharedLinkConfigMiddleware({ getAppConfig });
 const sharedStartupConfigMiddleware = createSharedLinkConfigMiddleware({
   getAppConfig,

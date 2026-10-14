@@ -13,6 +13,7 @@ import type {
   SourceRetentionContext,
   QuoteSourceRetention,
   ResolvedQuoteRetention,
+  RetainedTextAllocation,
 } from '~/types/message';
 import type { SchemaWithMeiliMethods } from '~/models/plugins/mongoMeili';
 import type { AppConfig, IConversation, IMessage } from '~/types';
@@ -23,6 +24,8 @@ import {
   liveFileFilter,
   resolveFileSources,
   touchFileSources,
+  resizeMessageDerivatives,
+  unreconciledDocumentStorage,
 } from './fileRetention';
 import { createChatExpirationDate, createTempChatExpirationDate } from '~/utils/tempChatRetention';
 import { activeExpirationFilter, createFallbackRetentionDate } from '~/utils/retention';
@@ -302,10 +305,11 @@ function sanitizeMessageUpdate(
           'tenantId',
           '__v',
           'quoteSourceRefs',
+          'retainedTextAllocations',
           ...(!trustedRetention
             ? ['sourceFileIds', 'sourceExpiresAt', 'sourceContentRemovedAt', 'quoteSourceRetention']
             : []),
-        ].includes(key),
+        ].includes(key.split('.')[0]),
     ),
   );
 }
@@ -886,7 +890,10 @@ export interface MessageMethods {
   bulkSaveMessages(
     messages: Array<Partial<IMessage>>,
     overrideTimestamp?: boolean,
-    provenance?: { privateTextTokens: ReadonlyMap<string, readonly string[]> },
+    provenance?: {
+      privateTextTokens: ReadonlyMap<string, readonly string[]>;
+      nativeSources?: ReadonlyMap<string, { messageId: string; messageVersion: number | null }>;
+    },
   ): Promise<unknown>;
   recordMessage(params: {
     user: string;
@@ -1121,6 +1128,75 @@ export function createMessageMethods(
     };
   }
 
+  /** Charge components once; operational claim receipts carry no document text. */
+  function retainedAllocations(row: IMessage): RetainedTextAllocation[] {
+    const allocations = new Map<string, number>();
+    const charge = (ids: readonly string[], payload: Record<string, unknown>) => {
+      const fileId = [...new Set(ids)].sort()[0];
+      if (!fileId) throw new FileSourceUnavailableError();
+      allocations.set(
+        fileId,
+        (allocations.get(fileId) ?? 0) + mongoose.mongo.BSON.calculateObjectSize(payload),
+      );
+    };
+    if (row.sourceFileIds?.length && !row.sourceContentRemovedAt) {
+      const body = Object.fromEntries(
+        Object.entries(row).filter(
+          ([key]) =>
+            !bodyKeep.has(key) && !['retainedTextAllocations', 'subagentTask'].includes(key),
+        ),
+      );
+      if (Array.isArray(body.content))
+        body.content = body.content.map((part) => {
+          if (!part?.tool_call) return part;
+          const { backgroundTask: _claims, ...tool_call } = part.tool_call;
+          return { ...part, tool_call };
+        });
+      charge(row.sourceFileIds, body);
+    }
+    for (const binding of row.quoteSourceRetention ?? []) {
+      const quote = row.quotes?.[binding.index];
+      if (typeof quote !== 'string') throw new FileSourceUnavailableError();
+      charge(binding.sourceFileIds, { quote });
+    }
+    return [...allocations]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([fileId, bytes]) => ({ fileId, bytes }));
+  }
+
+  async function accountRetainedMessage(
+    owner: FileOwnerScope,
+    previous: IMessage | null,
+    id: unknown,
+    session: ClientSession,
+  ): Promise<void> {
+    const Message = mongoose.models.Message as Model<IMessage>;
+    if (
+      previous &&
+      retainedAllocations(previous).length &&
+      previous.retainedTextAllocations == null
+    )
+      unreconciledDocumentStorage();
+    const next = await Message.findOne({ _id: id, ...fileSourceScope(owner) })
+      .select(privateMessagePaths())
+      .session(session)
+      .lean<IMessage>();
+    if (!next) throw new FileSourceUnavailableError();
+    const allocations = retainedAllocations(next);
+    await resizeMessageDerivatives(
+      mongoose,
+      owner,
+      previous?.retainedTextAllocations ?? [],
+      allocations,
+      session,
+    );
+    await Message.updateOne(
+      { _id: id, ...fileSourceScope(owner) },
+      { $set: { retainedTextAllocations: allocations } },
+      { session, timestamps: false },
+    );
+  }
+
   /** Selective pair filtering is shared by reads, late writes and physical redaction. */
   function filterQuotes(
     row: { quotes?: string[]; quoteSourceRetention?: QuoteSourceRetention[] },
@@ -1327,12 +1403,46 @@ export function createMessageMethods(
           commitState.write = undefined;
           const current = await Message.findOne({ ...identity, ...fileSourceScope(owner) })
             .session(session)
-            .select(
-              'sourceFileIds sourceExpiresAt sourceContentRemovedAt quotes +quoteSourceRetention',
-            )
+            .select(privateMessagePaths())
             .lean<IMessage>();
           if (current?.sourceContentRemovedAt) throw new FileSourceUnavailableError();
-          const prepared = options.quoteRetention;
+          let prepared = options.quoteRetention;
+          let sourceRetention = options.sourceRetention;
+          if (options.nativeSource) {
+            const source = await Message.findOne({
+              ...fileSourceScope(owner),
+              messageId: options.nativeSource.messageId,
+              __v: options.nativeSource.messageVersion,
+            })
+              .select(privateMessagePaths())
+              .session(session)
+              .lean<IMessage>();
+            if (
+              !source ||
+              source.sourceContentRemovedAt ||
+              (source.sourceExpiresAt && source.sourceExpiresAt <= new Date())
+            )
+              throw new FileSourceUnavailableError();
+            await Message.updateOne(
+              { _id: source._id, ...fileSourceScope(owner), __v: source.__v ?? null },
+              { $inc: { __v: 1 } },
+              { session, timestamps: false },
+            );
+            if (source.sourceFileIds?.length)
+              sourceRetention = {
+                sourceFileIds: source.sourceFileIds,
+                sourceExpiresAt: source.sourceExpiresAt!,
+              };
+            if (source.quoteSourceRetention != null) {
+              if (JSON.stringify(input.quotes ?? []) !== JSON.stringify(source.quotes ?? []))
+                throw new FileSourceUnavailableError();
+              prepared = {
+                quotes: source.quotes ?? [],
+                quoteSourceRetention: source.quoteSourceRetention,
+                sourceMessageConditions: [],
+              };
+            }
+          }
           const sameCommitted =
             current?.quoteSourceRetention != null &&
             prepared != null &&
@@ -1377,7 +1487,7 @@ export function createMessageMethods(
           const ids = [
             ...new Set([
               ...(current?.sourceFileIds ?? []),
-              ...(options.sourceRetention?.sourceFileIds ?? []),
+              ...(sourceRetention?.sourceFileIds ?? []),
             ]),
           ];
           await touchFileSources(
@@ -1412,6 +1522,7 @@ export function createMessageMethods(
                   { new: true, session },
                 )
               : await Message.findOne({ ...identity, ...fileSourceScope(owner) }).session(session);
+            if (result) await accountRetainedMessage(owner, current, result._id, session);
             return;
           }
           result = await writeMessage(
@@ -1434,6 +1545,7 @@ export function createMessageMethods(
               },
             },
           );
+          if (result) await accountRetainedMessage(owner, current, result._id, session);
         },
         { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } },
       );
@@ -1659,11 +1771,25 @@ export function createMessageMethods(
         };
         // Preserve the existing tenant replacement guard's canonical absence representation.
         if (replacement.tenantId == null) delete replacement.tenantId;
-        const result = await Message.replaceOne(
-          { _id: row._id, ...scope, __v: row.__v ?? null },
-          replacement,
-          { timestamps: false },
-        );
+        let result = { matchedCount: 0, modifiedCount: 0 };
+        const session = await mongoose.startSession();
+        try {
+          await session.withTransaction(
+            async () => {
+              result = await Message.replaceOne(
+                { _id: row!._id, ...scope, __v: row!.__v ?? null },
+                replacement,
+                { timestamps: false, session },
+              );
+              // Unknown legacy copies can still be physically redacted, but yield no credit.
+              if (result.matchedCount && row!.retainedTextAllocations != null)
+                await accountRetainedMessage(owner, row, row!._id, session);
+            },
+            { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } },
+          );
+        } finally {
+          await session.endSession();
+        }
         if (result.matchedCount === 1) {
           redactedMessages += result.modifiedCount;
           settled = true;
@@ -1753,6 +1879,7 @@ export function createMessageMethods(
       session?: ClientSession;
       sourceRetention?: SourceRetentionContext;
       quoteRetention?: ResolvedQuoteRetention;
+      nativeSource?: { messageId: string; messageVersion: number | null };
       attachmentSourceFileIds?: readonly string[];
       insertOnly?: boolean;
       onWrite?: (inserted: boolean, id: unknown) => void;
@@ -1780,7 +1907,23 @@ export function createMessageMethods(
             .select('file_id')
             .lean()
         : [];
-      if (options.quoteRetention || options.sourceRetention?.sourceFileIds.length || managed.length)
+      if (managed.length) {
+        const managedIds = new Set(managed.map((file) => file.file_id));
+        for (const key of ['files', 'attachments']) {
+          if (!Array.isArray(update[key])) continue;
+          update[key] = update[key].map((file: Record<string, unknown> | null) => {
+            if (!file || !managedIds.has(file.file_id)) return file;
+            const { text: _canonicalText, ...reference } = file;
+            return reference;
+          });
+        }
+      }
+      if (
+        options.nativeSource ||
+        options.quoteRetention ||
+        options.sourceRetention?.sourceFileIds.length ||
+        managed.length
+      )
         return writeRetainedMessage(
           identity,
           { ...update, userSubmittedPaths: paths, userSubmittedMessageFieldPaths: fields },
@@ -1920,6 +2063,19 @@ export function createMessageMethods(
       delete update.privateText;
       delete update.privacyRevision;
       delete update.privateTextTokens;
+      for (const key of Object.keys(update)) {
+        if (
+          [
+            'retainedTextAllocations',
+            'sourceFileIds',
+            'sourceExpiresAt',
+            'sourceContentRemovedAt',
+            'quoteSourceRetention',
+            'quoteSourceRefs',
+          ].includes(key.split('.')[0])
+        )
+          delete update[key];
+      }
       if (metadata?.privateText != null) {
         if (params.isCreatedByUser !== true || typeof params.text !== 'string') {
           throw new Error('Private text requires a user message.');
@@ -2163,7 +2319,10 @@ export function createMessageMethods(
   async function bulkSaveMessages(
     messages: Array<Record<string, unknown>>,
     overrideTimestamp = false,
-    provenance?: { privateTextTokens: ReadonlyMap<string, readonly string[]> },
+    provenance?: {
+      privateTextTokens: ReadonlyMap<string, readonly string[]>;
+      nativeSources?: ReadonlyMap<string, { messageId: string; messageVersion: number | null }>;
+    },
   ) {
     try {
       const Message = mongoose.models.Message as Model<IMessage>;
@@ -2229,6 +2388,7 @@ export function createMessageMethods(
       const guarded: typeof bulkOps = [];
       const ordinary = bulkOps.filter((op) => {
         if (
+          provenance?.nativeSources?.has(String(op.updateOne.filter.messageId)) ||
           hasBoundAppSnapshots(op.updateOne.update.$set.attachments) ||
           (Array.isArray(op.updateOne.update.$set.files) &&
             op.updateOne.update.$set.files.length > 0) ||
@@ -2284,6 +2444,7 @@ export function createMessageMethods(
       for (const op of guarded) {
         await writeMessage(op.updateOne.filter, op.updateOne.update.$set, {
           upsert: true,
+          nativeSource: provenance?.nativeSources?.get(String(op.updateOne.filter.messageId)),
           unsetPrivateText: true,
           timestamps: !overrideTimestamp,
           onWrite: (inserted, id) => {
@@ -2500,7 +2661,68 @@ export function createMessageMethods(
      * or `undefined` to ignore steps. */
     stepMatch: string | null | undefined,
     fallback?: SteplessToolCallFallback,
+    session?: ClientSession,
   ): Promise<{ matched: boolean; unfinished: boolean }> {
+    const Message = mongoose.models.Message as Model<IMessage>;
+    const owner = { userId, tenantId: tenantStorage.getStore()?.tenantId };
+    const identity = { messageId, conversationId, ...fileSourceScope(owner) };
+    if (
+      !session &&
+      (await Message.exists({
+        ...identity,
+        $or: [
+          { 'sourceFileIds.0': { $exists: true } },
+          { quoteSourceRetention: { $exists: true } },
+          { sourceContentRemovedAt: { $exists: true } },
+        ],
+      }))
+    ) {
+      const transaction = await mongoose.startSession();
+      let result = { matched: false, unfinished: false };
+      try {
+        await transaction.withTransaction(
+          async () => {
+            const current = await Message.findOne(identity)
+              .select(privateMessagePaths())
+              .session(transaction)
+              .lean<IMessage>();
+            if (!current || current.sourceContentRemovedAt) throw new FileSourceUnavailableError();
+            await touchFileSources(
+              mongoose,
+              owner,
+              [
+                ...(current.sourceFileIds ?? []),
+                ...(current.quoteSourceRetention ?? []).flatMap((binding) => binding.sourceFileIds),
+              ],
+              transaction,
+            );
+            result = await settleToolCallResult(
+              {
+                userId,
+                messageId,
+                conversationId,
+                toolCallId,
+                stepId,
+                agentId,
+                output,
+                attachments,
+                markBackgrounded,
+                backgroundTask,
+              },
+              stepMatch,
+              fallback,
+              transaction,
+            );
+            if (result.matched)
+              await accountRetainedMessage(owner, current, current._id, transaction);
+          },
+          { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } },
+        );
+        return result;
+      } finally {
+        await transaction.endSession();
+      }
+    }
     /** One source of truth for which content part this settle may touch:
      * `prefix: ''` yields the `$elemMatch` document filter, `prefix: 'part.'`
      * the arrayFilters element filter — the same predicate in one dialect,
@@ -2517,6 +2739,7 @@ export function createMessageMethods(
       messageId,
       user: userId,
       conversationId,
+      ...(!session && NO_SOURCE_BODY),
       ...(fallback == null
         ? { content: { $elemMatch: partScope('') } }
         : { content: fallback.content, unfinished: { $ne: true } }),
@@ -2579,6 +2802,7 @@ export function createMessageMethods(
     };
     const settleOptions = {
       new: true,
+      session,
       projection: { unfinished: 1 },
       ...(Object.keys(partPatch).length > 0 || disarmWakeup
         ? { arrayFilters: [partIdentityFilter] }
@@ -2604,6 +2828,7 @@ export function createMessageMethods(
             },
           },
           {
+            session,
             arrayFilters: [
               { ...partIdentityFilter, 'part.tool_call.backgroundTask.resultClaim': null },
             ],
@@ -2664,6 +2889,7 @@ export function createMessageMethods(
       const incomingApp = hasBoundAppSnapshots(incomingAttachments);
       for (let attempt = 0; attempt < ATTACHMENT_MERGE_CAS_ATTEMPTS; attempt += 1) {
         const row = await Message.findOne(messageFilter)
+          .session(session ?? null)
           .select(incomingApp ? privateMessagePaths() : { _id: 1, attachments: 1, __v: 1 })
           .lean<
             | (Record<string, unknown> & {
@@ -2685,6 +2911,7 @@ export function createMessageMethods(
                 _id: row._id,
                 __v: row.__v ?? null,
               })
+                .session(session ?? null)
                 .select(privateMessagePaths())
                 .lean<
                   | (Record<string, unknown> & { _id: Types.ObjectId; attachments?: unknown[] })

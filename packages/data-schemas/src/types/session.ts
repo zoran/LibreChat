@@ -5,6 +5,13 @@ export interface ISession extends Document {
   expiration: Date;
   user: Types.ObjectId;
   tenantId?: string;
+  authMethod?: 'email_code';
+  authPolicyVersion?: number;
+  authVersion?: number;
+  refreshGeneration?: number;
+  authCreatedAt?: Date;
+  idleExpiresAt?: Date;
+  revokedAt?: Date;
 }
 
 export interface CreateSessionOptions {

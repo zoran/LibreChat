@@ -1,0 +1,291 @@
+import express from 'express';
+import { createServer, request } from 'node:http';
+import type { UploadOperation, UploadPrincipal } from 'librechat-data-provider';
+import type { Request, RequestHandler, Response } from 'express';
+import type { Server } from 'node:http';
+import { createUploadBodyRouter, createUploadHttpRouter } from './http';
+import { UploadManagementError } from './errors';
+
+const origin = 'https://uploads.example.test';
+const user: UploadPrincipal = {
+  tenantId: 'tenant',
+  userId: 'user',
+  authentication: 'verified-email',
+};
+const operation: UploadOperation = {
+  version: 1,
+  id: 'operation',
+  revision: 1,
+  scope: { kind: 'personal' },
+  filename: 'note.txt',
+  mediaType: 'text/plain',
+  declaredBytes: 5,
+  state: 'waiting',
+  createdAt: new Date(0).toISOString(),
+  cleanupPending: false,
+  canUseInComposer: false,
+  canRetryProcessing: false,
+};
+const usage = {
+  limitBytes: 100,
+  usedBytes: 0,
+  reservedBytes: 5,
+  availableBytes: 95,
+  retainedBytes: 0,
+  nextReleaseAt: null,
+  nextReleaseBytes: 0,
+};
+
+describe('upload HTTP boundary', () => {
+  let server: Server;
+  let port: number;
+  let strongPrincipal: jest.Mock;
+  let management: Record<string, jest.Mock>;
+  let projectAttachments: jest.Mock;
+  let live: { open: jest.Mock };
+  let body: jest.Mock;
+
+  beforeEach(async () => {
+    strongPrincipal = jest.fn(async (req: Request) => {
+      if (req.headers.authorization !== 'Bearer verified')
+        throw new UploadManagementError('unauthorized');
+      return user;
+    });
+    management = {
+      list: jest.fn(async () => [operation]),
+      usage: jest.fn(async () => usage),
+      reserve: jest.fn(async () => operation),
+      cancel: jest.fn(async () => operation),
+      delete: jest.fn(async () => operation),
+      retryProcessing: jest.fn(async () => operation),
+    };
+    projectAttachments = jest.fn(async () => new Map());
+    live = {
+      open: jest.fn(async (_req: Request, res: Response) => {
+        res.status(200).end();
+      }),
+    };
+    body = jest.fn(async (req: Request, res: Response) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      res.status(202).json({ bytes: Buffer.concat(chunks).length, parsed: req.body !== undefined });
+    });
+    const options = {
+      management: management as never,
+      principal: strongPrincipal,
+      allowedOrigins: [origin],
+      projectAttachments,
+      live,
+      status: () => ({ throttled: false, waitingReason: null }),
+    };
+    const app = express();
+    app.use(
+      '/api/uploads',
+      createUploadBodyRouter({
+        principal: strongPrincipal,
+        allowedOrigins: [origin],
+        body: body as RequestHandler,
+      }),
+    );
+    app.use('/api/uploads', createUploadHttpRouter(options));
+    app.use(express.json({ limit: '1mb' }));
+    server = createServer(app);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    port = (server.address() as { port: number }).port;
+  });
+  afterEach(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      server.close((error) => (error ? reject(error) : resolve())),
+    );
+  });
+
+  function call(
+    method: string,
+    path = '/api/uploads',
+    payload?: unknown,
+    headers: Record<string, string> = {},
+  ) {
+    let bytes: string | undefined;
+    if (typeof payload === 'string') bytes = payload;
+    else if (payload !== undefined) bytes = JSON.stringify(payload);
+    return new Promise<{ status: number; data: unknown }>((resolve, reject) => {
+      const req = request(
+        {
+          host: '127.0.0.1',
+          port,
+          path,
+          method,
+          headers: {
+            Origin: origin,
+            Authorization: 'Bearer verified',
+            ...(bytes === undefined
+              ? {}
+              : { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(bytes) }),
+            ...headers,
+          },
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk) => chunks.push(chunk));
+          res.on('error', reject);
+          res.on('end', () => {
+            const text = Buffer.concat(chunks).toString();
+            resolve({ status: res.statusCode!, data: text ? JSON.parse(text) : null });
+          });
+        },
+      );
+      req.on('error', reject);
+      req.end(bytes);
+    });
+  }
+
+  it('serves only the authenticated snapshot and strips private adapter fields', async () => {
+    management.list.mockResolvedValue([
+      { ...operation, storageKey: 'private/key', tenantId: 'private' },
+    ]);
+    management.usage.mockResolvedValue({ ...usage, privateCounter: 'hidden' });
+    const result = await call('GET');
+    expect(result.status).toBe(200);
+    expect(result.data).toEqual({
+      version: 1,
+      operations: [operation],
+      usage,
+      throttled: false,
+      waitingReason: null,
+    });
+    expect(strongPrincipal).toHaveBeenCalledTimes(2);
+    expect(management.list).toHaveBeenCalledWith(user);
+  });
+
+  it('rechecks the current grant after asynchronous projection and before disclosure', async () => {
+    projectAttachments.mockImplementationOnce(async () => {
+      strongPrincipal.mockRejectedValueOnce(new UploadManagementError('unauthorized'));
+      return new Map();
+    });
+    const result = await call('GET');
+    expect(result).toEqual({ status: 401, data: { code: 'unauthorized' } });
+  });
+
+  it('requires File-authority projection before allowing composer use', async () => {
+    management.list.mockResolvedValue([
+      { ...operation, state: 'ready', fileId: 'file', canUseInComposer: true },
+    ]);
+    expect((await call('GET')).data).toHaveProperty('operations.0.canUseInComposer', false);
+    const attachment = {
+      file_id: 'file',
+      filename: 'note.txt',
+      filepath: '/api/files/file',
+      type: 'text/plain',
+      bytes: 5,
+      source: 's3',
+      privateKey: 'secret',
+    };
+    projectAttachments.mockResolvedValue(new Map([['file', attachment]]));
+    const result = (await call('GET')).data;
+    expect(result).toHaveProperty('operations.0.canUseInComposer', true);
+    expect(result).toHaveProperty('operations.0.attachment.file_id', 'file');
+    expect(result).not.toHaveProperty('operations.0.attachment.privateKey');
+  });
+
+  it('rejects guests, forged authority fields, queries, unknown metadata and oversized JSON', async () => {
+    const input = {
+      filename: 'note.txt',
+      mediaType: 'text/plain',
+      declaredBytes: 5,
+      idempotencyKey: 'key',
+    };
+    strongPrincipal.mockResolvedValueOnce({ ...user, authentication: 'guest' });
+    expect((await call('GET')).status).toBe(401);
+    for (const extra of [
+      { tenantId: 'other' },
+      { userId: 'other' },
+      { generation: 9 },
+      { unknown: true },
+      {
+        integrity: {
+          version: 1,
+          algorithm: 'sha256',
+          sha256: '0'.repeat(64),
+          chunkBytes: 262144,
+          chunkSha256: ['0'.repeat(64)],
+        },
+      },
+    ]) {
+      expect((await call('POST', '/api/uploads/operations', { ...input, ...extra })).status).toBe(
+        400,
+      );
+    }
+    expect((await call('GET', '/api/uploads?userId=other')).status).toBe(400);
+    expect(
+      (await call('POST', '/api/uploads/operations', { ...input, filename: 'x'.repeat(5000) }))
+        .status,
+    ).toBe(400);
+    expect(management.reserve).not.toHaveBeenCalled();
+    expect((await call('POST', '/api/uploads/operations', input)).status).toBe(202);
+    expect(management.reserve).toHaveBeenCalledWith(user, input);
+  });
+
+  it('applies exact origins and same-origin fetch metadata only to reads', async () => {
+    expect(
+      (await call('GET', '/api/uploads', undefined, { Origin: 'https://attacker.test' })).status,
+    ).toBe(403);
+    expect(
+      (
+        await call('GET', '/api/uploads', undefined, {
+          Origin: '',
+          'Sec-Fetch-Site': 'same-origin',
+        })
+      ).status,
+    ).toBe(200);
+    expect(
+      (await call('GET', '/api/uploads', undefined, { Origin: '', 'Sec-Fetch-Site': 'cross-site' }))
+        .status,
+    ).toBe(403);
+    expect(
+      (
+        await call(
+          'POST',
+          '/api/uploads/operations/operation/cancel',
+          {},
+          { Origin: '', 'Sec-Fetch-Site': 'same-origin' },
+        )
+      ).status,
+    ).toBe(403);
+    expect((await call('HEAD')).status).toBe(405);
+  });
+
+  it('maps actions to their existing owner with no supplied principal and sanitizes failure codes', async () => {
+    expect((await call('POST', '/api/uploads/operations/operation/cancel', {})).status).toBe(202);
+    expect((await call('POST', '/api/uploads/operations/operation/retry', {})).status).toBe(202);
+    expect((await call('DELETE', '/api/uploads/operations/operation')).status).toBe(202);
+    expect(management.cancel).toHaveBeenCalledWith(user, 'operation');
+    expect(management.retryProcessing).toHaveBeenCalledWith(user, 'operation');
+    expect(management.delete).toHaveBeenCalledWith(user, 'operation');
+    management.list.mockRejectedValueOnce(new Error('mongodb://private-credential'));
+    expect(await call('GET')).toEqual({ status: 503, data: { code: 'unavailable' } });
+  });
+
+  it('uses the separate raw body router before a global parser and authenticates before reading', async () => {
+    const payload = 'x'.repeat(5000);
+    expect(
+      await call('PUT', '/api/uploads/operations/operation/body', payload, {
+        'Content-Type': 'application/octet-stream',
+      }),
+    ).toEqual({ status: 202, data: { bytes: 5000, parsed: false } });
+    expect(
+      (
+        await call('PUT', '/api/uploads/operations/operation/body', payload, {
+          Authorization: 'Bearer forged',
+        })
+      ).status,
+    ).toBe(401);
+    expect(body).toHaveBeenCalledTimes(1);
+  });
+
+  it('routes events through the shared authenticated hub without projecting a per-connection snapshot', async () => {
+    expect((await call('GET', '/api/uploads/events')).status).toBe(200);
+    expect(live.open).toHaveBeenCalledWith(expect.anything(), expect.anything(), user);
+    expect(management.list).not.toHaveBeenCalled();
+  });
+});

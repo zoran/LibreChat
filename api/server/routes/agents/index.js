@@ -2,6 +2,7 @@ const express = require('express');
 const {
   reportLocatorTraversalFailure,
   isEnabled,
+  getAuthMode,
   GenerationJobManager,
   readFileSourceRetention,
   deserializeQuoteRetention,
@@ -76,6 +77,7 @@ const skills = require('./skills');
 const openai = require('./openai');
 const { v1 } = require('./v1');
 const chat = require('./chat');
+const { createStreamAuthorization } = require('./streamAuthorization');
 
 const { LIMIT_MESSAGE_IP, LIMIT_MESSAGE_USER } = process.env ?? {};
 
@@ -211,11 +213,28 @@ router.get('/chat/stream/:streamId', async (req, res) => {
     expectedGenerationCreatedAt = Number(rawGenerationCreatedAt);
   }
   let result;
+  let streamAuthorization;
+  let attachmentClosed = false;
+  let unsubscribed = false;
   const attachmentAbortController = new AbortController();
+  const unsubscribeOnce = () => {
+    if (!result || unsubscribed) return;
+    unsubscribed = true;
+    try {
+      result.unsubscribe();
+    } catch {
+      logger.warn('[AgentStream] Attachment unsubscribe failed');
+    }
+  };
+  const closeAttachment = () => {
+    attachmentClosed = true;
+    unsubscribeOnce();
+    attachmentAbortController.abort();
+  };
   req.on('close', () => {
     logger.debug(`[AgentStream] Client disconnected from ${streamId}`);
-    attachmentAbortController.abort();
-    result?.unsubscribe();
+    closeAttachment();
+    streamAuthorization?.close();
   });
 
   const job = await GenerationJobManager.getJob(streamId);
@@ -291,105 +310,146 @@ router.get('/chat/stream/:streamId', async (req, res) => {
 
   logger.debug(`[AgentStream] Client subscribed to ${streamId}, resume: ${isResume}`);
 
+  const writePayload = (payload, options = {}) => {
+    const accepted = res.write(payload);
+    streamTelemetry.recordWrite(payload, { final: options.final });
+    if (typeof res.flush === 'function') res.flush();
+    return accepted;
+  };
+  // This latch comes from the native JWT strategy. Guest/default streams retain
+  // their existing path; verified streams reuse the current grant/account owner.
+  if (getAuthMode() !== 'default' && req.authenticationClass === 'verified-email') {
+    streamAuthorization = createStreamAuthorization({
+      req,
+      res,
+      write: writePayload,
+      onClose: closeAttachment,
+    });
+    if (streamAuthorization.closed) return;
+  }
+
   const writeEvent = (event, options = {}) => {
     if (generationProtocolVersion < GENERATION_PROTOCOL_V2 && event?.event === 'on_steer_updated') {
       return true;
     }
+    if (streamAuthorization) return streamAuthorization.write(event, options);
     if (!res.writableEnded) {
       const eventName = options.eventName ?? 'message';
       const payload = `event: ${eventName}\ndata: ${JSON.stringify(event)}\n\n`;
-      res.write(payload);
-      streamTelemetry.recordWrite(payload, { final: options.final });
-      if (typeof res.flush === 'function') {
-        res.flush();
-      }
+      writePayload(payload, options);
       return true;
     }
 
     return false;
   };
 
+  const finishEvent = (event, options) => {
+    if (streamAuthorization) return streamAuthorization.finish(event, options);
+    writeEvent(event, options);
+    res.end();
+  };
+  const attachmentEnded = () =>
+    attachmentClosed ||
+    res.writableEnded ||
+    res.destroyed ||
+    streamAuthorization?.closed ||
+    streamAuthorization?.ending;
+
   const onDone = (event) => {
+    if (attachmentEnded()) return;
     streamTelemetry.recordFinalEventEmitted();
     if (event?.reconcile === true && generationProtocolVersion < GENERATION_PROTOCOL_V2) {
       /** Legacy clients treat an ordinary `final: true` as the completion of
        * their optimistic submission. A reconciliation frame has no response
        * payload and may describe a replacement, so expose it only as a
        * transport error; the v1 reconnect/status path will refetch safely. */
-      writeEvent(
+      finishEvent(
         {
           error: 'Generation state changed; reconnect to load the saved response.',
           generationProtocolVersion,
         },
         { eventName: 'error', final: true },
       );
-      res.end();
       return;
     }
-    writeEvent(
+    finishEvent(
       event != null && typeof event === 'object'
         ? { ...event, generationProtocolVersion }
         : { final: true, generationProtocolVersion },
       { final: true },
     );
-    res.end();
   };
 
   const onError = (error) => {
-    if (!res.writableEnded) {
+    if (!attachmentEnded()) {
       streamTelemetry.recordErrorEventEmitted();
       if (error === TERMINAL_PUBLICATION_RECONNECT_ERROR) {
         /** A durable terminal payload exists, but cross-replica DONE publish
          * failed. Tear down the HTTP stream without an application error frame:
          * sse.js treats the transport close as reconnectable, and the retained
          * terminal job then replays its authoritative final payload. */
-        res.destroy();
+        if (streamAuthorization) streamAuthorization.close();
+        else res.destroy();
         return;
       }
-      writeEvent({ error, generationProtocolVersion }, { eventName: 'error' });
-      res.end();
+      finishEvent({ error, generationProtocolVersion }, { eventName: 'error' });
     }
   };
 
-  if (isResume) {
-    const { subscription, resumeState, pendingEvents } =
-      await GenerationJobManager.subscribeWithResume(streamId, writeEvent, onDone, onError, {
+  try {
+    if (isResume) {
+      const { subscription, resumeState, pendingEvents } =
+        await GenerationJobManager.subscribeWithResume(streamId, writeEvent, onDone, onError, {
+          signal: attachmentAbortController.signal,
+          expectedCreatedAt: authorizedGenerationCreatedAt,
+        });
+      // Own the attachment before any awaited flush so close/timeout can detach it.
+      result = subscription;
+      if (subscription && !attachmentEnded()) {
+        if (resumeState) {
+          writeEvent({ sync: true, resumeState, pendingEvents });
+        } else if (pendingEvents.length > 0) {
+          for (const event of pendingEvents) {
+            if (!writeEvent(event)) break;
+          }
+        }
+        if (streamAuthorization && !(await streamAuthorization.flush())) return;
+        if (attachmentEnded()) {
+          unsubscribeOnce();
+          return;
+        }
+        if (resumeState) {
+          GenerationJobManager.markSyncSent(streamId, authorizedGenerationCreatedAt);
+          logger.debug(
+            `[AgentStream] Sent sync event for ${streamId} with ${resumeState.runSteps.length} run steps, ${pendingEvents.length} pending events`,
+          );
+        } else if (pendingEvents.length > 0) {
+          logger.warn(
+            `[AgentStream] Resume state null for ${streamId}, replayed ${pendingEvents.length} gap events directly`,
+          );
+        }
+        subscription.activate();
+      } else {
+        unsubscribeOnce();
+      }
+    } else {
+      result = await GenerationJobManager.subscribe(streamId, writeEvent, onDone, onError, {
         signal: attachmentAbortController.signal,
         expectedCreatedAt: authorizedGenerationCreatedAt,
       });
-
-    if (subscription && !attachmentAbortController.signal.aborted && !res.writableEnded) {
-      if (resumeState) {
-        writeEvent({ sync: true, resumeState, pendingEvents });
-        GenerationJobManager.markSyncSent(streamId, authorizedGenerationCreatedAt);
-        logger.debug(
-          `[AgentStream] Sent sync event for ${streamId} with ${resumeState.runSteps.length} run steps, ${pendingEvents.length} pending events`,
-        );
-      } else if (pendingEvents.length > 0) {
-        for (const event of pendingEvents) {
-          writeEvent(event);
-        }
-        logger.warn(
-          `[AgentStream] Resume state null for ${streamId}, replayed ${pendingEvents.length} gap events directly`,
-        );
-      }
-      subscription.activate();
-    } else {
-      subscription?.unsubscribe();
     }
-
-    result = subscription;
-  } else {
-    result = await GenerationJobManager.subscribe(streamId, writeEvent, onDone, onError, {
-      signal: attachmentAbortController.signal,
-      expectedCreatedAt: authorizedGenerationCreatedAt,
-    });
+  } catch (error) {
+    if (!streamAuthorization) throw error;
+    streamTelemetry.recordSubscribeFailed();
+    streamAuthorization.close();
+    return;
   }
 
   if (attachmentAbortController.signal.aborted) {
-    result?.unsubscribe();
+    unsubscribeOnce();
     return;
   }
+  if (streamAuthorization?.ending) return;
   if (!result) {
     streamTelemetry.recordSubscribeFailed();
     {

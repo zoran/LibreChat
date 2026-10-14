@@ -8,8 +8,14 @@ type CopyMessage = {
   readonly text?: string;
   readonly privacyRevision?: string;
   readonly privateTextTokens?: readonly string[];
+  readonly user?: unknown;
+  readonly __v?: number;
+  readonly sourceFileIds?: readonly string[];
+  readonly sourceContentRemovedAt?: unknown;
 };
 const copiedTokens = new WeakMap<object, readonly string[]>();
+type NativeSource = { messageId: string; messageVersion: number | null };
+const copiedSources = new WeakMap<object, NativeSource>();
 
 /** Only native callers supply server-loaded source rows. External imports use the default. */
 export function saveCopiedMessage<T extends object>(
@@ -22,6 +28,17 @@ export function saveCopiedMessage<T extends object>(
   if (!nativeCopy) {
     return;
   }
+  const retained = source.sourceFileIds?.length || source.sourceContentRemovedAt;
+  const sameOwner =
+    source.user != null && message.user != null && String(source.user) === String(message.user);
+  if (retained && !sameOwner)
+    throw new Error('Document-dependent history cannot be copied to another owner.');
+  const sourceRef =
+    copiedSources.get(source) ??
+    (sameOwner && source.messageId
+      ? { messageId: source.messageId, messageVersion: source.__v ?? null }
+      : undefined);
+  if (sourceRef) copiedSources.set(message, sourceRef);
   const trusted = copiedTokens.get(source) ?? [...getPrivateTextInspectionTokens([source])];
   const tokens = trusted.filter((token) => message.text?.includes(token));
   if (tokens.length > 0) {
@@ -31,15 +48,19 @@ export function saveCopiedMessage<T extends object>(
 
 export function getNativeCopyProvenance(messages: readonly CopyMessage[]): {
   privateTextTokens: ReadonlyMap<string, readonly string[]>;
+  nativeSources: ReadonlyMap<string, NativeSource>;
 } {
   const tokens = new Map<string, readonly string[]>();
+  const nativeSources = new Map<string, NativeSource>();
   for (const message of messages) {
     const trusted = copiedTokens.get(message);
     if (message.messageId && trusted != null) {
       tokens.set(message.messageId, trusted);
     }
+    const source = copiedSources.get(message);
+    if (message.messageId && source) nativeSources.set(message.messageId, source);
   }
-  return { privateTextTokens: tokens };
+  return { privateTextTokens: tokens, nativeSources };
 }
 
 export function getNativeCopyInspectionTokens(
@@ -60,7 +81,7 @@ export function saveNativeCopyMessages(
   messages: Parameters<MessageMethods['bulkSaveMessages']>[0],
 ): Promise<unknown> {
   const provenance = getNativeCopyProvenance(messages);
-  return provenance.privateTextTokens.size > 0
+  return provenance.privateTextTokens.size > 0 || provenance.nativeSources.size > 0
     ? save(messages, true, provenance)
     : save(messages, true);
 }
@@ -70,6 +91,8 @@ export function transferNativeCopyProvenance<T extends object>(source: object, t
   if (tokens != null) {
     copiedTokens.set(target, tokens);
   }
+  const sourceRef = copiedSources.get(source);
+  if (sourceRef) copiedSources.set(target, sourceRef);
   return target;
 }
 

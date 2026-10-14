@@ -35,6 +35,7 @@ const {
   createOpenIDSessionIdentity,
   resolveAppConfigForUser,
   commitPasswordReset,
+  getAuthMode,
 } = require('@librechat/api');
 const {
   findUser,
@@ -52,6 +53,7 @@ const {
   generateToken,
   deleteUserById,
   generateRefreshToken,
+  revokeEmailCodeSession,
 } = require('~/models');
 const { registerSchema } = require('~/strategies/validators');
 const { getAppConfig } = require('~/server/services/Config');
@@ -230,6 +232,14 @@ const clearOpenIDAuthTokens = (req, res, userId, tenantId) => {
  */
 const logoutUser = async (req, refreshToken) => {
   try {
+    if (getAuthMode() !== 'default' && req.user?.provider === 'email_code') {
+      const grant = req.emailCodeGrant;
+      if (!grant || grant.userId !== String(req.user._id)) {
+        return { status: 401, message: 'Authentication required' };
+      }
+      await authWrite(() => revokeEmailCodeSession(grant.sessionId, grant.userId, grant.tenantId));
+      return { status: 200, message: 'Logout successful' };
+    }
     const userId = req.user._id;
     const session = await findSession({ userId: userId, refreshToken });
 
@@ -257,6 +267,9 @@ const logoutUser = async (req, refreshToken) => {
 
     return { status: 200, message: 'Logout successful' };
   } catch (err) {
+    if (getAuthMode() !== 'default' && req.user?.provider === 'email_code') {
+      return { status: 503, message: 'AUTH_SESSION_UNAVAILABLE' };
+    }
     return { status: 500, message: err.message };
   }
 };
@@ -727,6 +740,9 @@ const setCloudFrontAuthCookies = (req, res, user, options = {}) => {
  * @returns
  */
 const setAuthTokens = async (userId, res, _session = null, req = null) => {
+  if (getAuthMode() !== 'default') {
+    throw new Error('Legacy session issuance is disabled in this authentication mode');
+  }
   try {
     let session = _session;
     let refreshToken;

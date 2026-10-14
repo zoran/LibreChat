@@ -6,6 +6,7 @@ const {
   continueAfterOptionalAuth,
   tenantContextMiddleware,
   isTwoFactorEnrollmentRequired,
+  getAuthMode,
 } = require('@librechat/api');
 
 const hasPassportStrategy = (strategy) =>
@@ -18,6 +19,7 @@ const optionalJwtAuth = (req, res, next) => {
   const cookieHeader = req.headers.cookie;
   const tokenProvider = cookieHeader ? cookies.parse(cookieHeader).token_provider : null;
   const useOpenIdJwt =
+    getAuthMode() === 'default' &&
     tokenProvider === 'openid' &&
     isEnabled(process.env.OPENID_REUSE_TOKENS) &&
     hasPassportStrategy('openidJwt');
@@ -33,7 +35,11 @@ const optionalJwtAuth = (req, res, next) => {
         user,
         useOpenIdJwt ? 'openidJwt' : 'jwt',
         tenantContextMiddleware,
-        { clearCloudFrontCookies, enrollmentRequired: isTwoFactorEnrollmentRequired },
+        {
+          clearCloudFrontCookies,
+          enrollmentRequired:
+            getAuthMode() === 'default' ? isTwoFactorEnrollmentRequired : () => false,
+        },
       );
     }
     next();

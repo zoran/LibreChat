@@ -6,6 +6,7 @@ import { RedisEventTransport } from '~/stream/implementations/RedisEventTranspor
 import { GenerationPublicationFencedError } from '~/stream/interfaces/IJobStore';
 import { InMemoryJobStore } from '~/stream/implementations/InMemoryJobStore';
 import { GenerationJobManagerClass } from '~/stream/GenerationJobManager';
+import { prepareSourceReplayForTest } from './helpers/sourceReplay';
 import { createMockPublisher } from './helpers/publisher';
 
 logger.silent = true;
@@ -48,10 +49,7 @@ describe('RedisEventTransport', () => {
     transport.setSourceRetentionReader((id) => store.getJob(id));
     const job = await store.createJob('source-expiry', 'owner');
     const now = Date.now();
-    await store.bindSourceRetention(job.streamId, job.createdAt, {
-      sourceFileIds: ['file-a'],
-      sourceExpiresAt: now + 1000,
-    });
+    await prepareSourceReplayForTest(store, job, now + 1000);
     const onDone = jest.fn();
     const sub = transport.subscribe(job.streamId, { onChunk: () => undefined, onDone });
     const clock = jest.spyOn(Date, 'now').mockReturnValue(now + 1001);

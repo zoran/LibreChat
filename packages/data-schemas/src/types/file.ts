@@ -88,10 +88,20 @@ export type FileOwnerScope = {
 };
 
 export type FileRetentionAdmission = Readonly<{ acceptedAt: Date; expiredAt: Date }>;
+/** Private stream receipt or exact pre-reserve intent; release refunds only the stored amount. */
+export type FileSourceCopyReservation = {
+  fileId: string;
+  reservationId: string;
+  bytes: number;
+  state: 'held' | 'released';
+};
 
 export interface IMongoFile extends Omit<Document, 'model'> {
   retentionAcceptedAt?: Date;
   retentionRevision?: number;
+  /** Includes liabilities whose Message has expired; released by this File's cleanup. */
+  retainedDerivativeBytes?: number;
+  retainedDerivativeReservations?: Array<Omit<FileSourceCopyReservation, 'fileId'>>;
   deletionRequestedAt?: Date;
   deletionCompletedAt?: Date;
   user: Types.ObjectId;

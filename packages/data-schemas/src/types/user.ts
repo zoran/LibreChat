@@ -25,6 +25,9 @@ export interface IUser extends Document {
   password?: string;
   avatar?: string;
   provider: string;
+  /** Email-code grants bind this epoch; incrementing it revokes every device. */
+  authVersion?: number;
+  authDisabled?: boolean;
   role?: string;
   googleId?: string;
   facebookId?: string;

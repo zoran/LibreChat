@@ -9,6 +9,7 @@ import type { LocatorTraversalFailure } from '../protection/diagnostics';
 import { agentStartupMilestones, agentStartupResults } from '~/agents/phases';
 
 const PATH_NORMALIZATIONS: [RegExp, string][] = [
+  [/^\/api\/uploads\/operations\/[^/]+(?=\/|$)/, '/api/uploads/operations/#id'],
   [/^\/api\/agents\/chat\/stream\/[^/]+(?=\/|$)/, '/api/agents/chat/stream/#id'],
   [/^\/api\/agents\/chat\/status\/[^/]+(?=\/|$)/, '/api/agents/chat/status/#id'],
   [/^\/api\/files\/code\/download\/[^/]+\/[^/]+(?=\/|$)/, '/api/files/code/download/#id/#id'],
@@ -34,6 +35,11 @@ const PATH_NORMALIZATIONS: [RegExp, string][] = [
 ];
 
 const STATIC_PATHS = new Set([
+  '/api/uploads',
+  '/api/uploads/events',
+  '/api/uploads/operations',
+  '/api/auth/email-code/request',
+  '/api/auth/email-code/verify',
   '/',
   '/health',
   '/metrics',
@@ -51,6 +57,7 @@ const STATIC_PATHS = new Set([
 ]);
 
 const UPLOAD_PATHS = new Set([
+  '/api/uploads/operations/#id/body',
   '/api/files',
   '/api/files/images',
   '/api/files/images/avatar',
@@ -61,6 +68,7 @@ const UPLOAD_PATHS = new Set([
 const UPLOAD_METHODS = new Set(['POST', 'PUT', 'PATCH']);
 
 const LOW_CARDINALITY_PATHS: RegExp[] = [
+  /^\/api\/uploads\/operations\/#id(?:\/(body|cancel|retry))?$/,
   /^\/api\/agents\/chat\/stream\/#id$/,
   /^\/api\/agents\/chat\/status\/#id$/,
   /^\/api\/files\/#id\/preview$/,
@@ -126,6 +134,7 @@ export const normalizePath = (rawPath: string): string => {
 };
 
 export interface PrometheusMetrics {
+  registry: Registry;
   metricsMiddleware: (req: Request, res: Response, next: NextFunction) => void;
   metricsRouter: Router;
 }
@@ -534,6 +543,7 @@ export function createMetrics(options: MetricsOptions = {}): PrometheusMetrics {
   if (!isMetricsConfigured()) {
     resetMetricRecorders();
     return {
+      registry: new Registry(),
       metricsMiddleware: (_req: Request, _res: Response, next: NextFunction) => next(),
       metricsRouter: createUnauthorizedMetricsRouter(),
     };
@@ -1085,5 +1095,5 @@ export function createMetrics(options: MetricsOptions = {}): PrometheusMetrics {
 
   metricsRouter.get('/', metricsHandler);
 
-  return { metricsMiddleware, metricsRouter };
+  return { metricsMiddleware, metricsRouter, registry };
 }

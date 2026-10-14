@@ -6,6 +6,9 @@ export {
   type TerminalJobClaim,
   type GenerationSettledEvent,
   type GenerationSettledListener,
+  type SourceReplayConfiguration,
+  type SourceReplayObservation,
+  SourceReplayError,
   GENERATION_RECOVERY_FAILED_ERROR,
   TERMINAL_PUBLICATION_RECONNECT_ERROR,
 } from './GenerationJobManager';

@@ -2,7 +2,9 @@ import { atom } from 'jotai';
 import { Button, Spinner } from '@librechat/client';
 import { apiBaseUrl, BROWSER_SESSION_MARKER, request } from 'librechat-data-provider';
 import useClearStates from '~/hooks/Config/useClearStates';
+import useAuthMode from '~/hooks/Auth/useAuthMode';
 import useLocalize from '~/hooks/useLocalize';
+import EmailCodeLogin from './EmailCodeLogin';
 
 /** Feature-owned recovery state; no authenticator or user identity is persisted here. */
 export const browserSessionState = atom<string | null>(null);
@@ -16,6 +18,7 @@ export default function BrowserSession({
 }) {
   const localize = useLocalize();
   const clearStates = useClearStates();
+  const authMode = useAuthMode();
   const busy = code === 'busy';
   const canStart = code === 'BROWSER_SESSION_EXPIRED' || code === 'BROWSER_SESSION_FORGOTTEN';
   let messageKey:
@@ -46,6 +49,14 @@ export default function BrowserSession({
       onState('BROWSER_SESSION_UNAVAILABLE');
     }
   };
+  if (authMode.data && authMode.data.authMode !== 'default')
+    return (
+      <main className="bg-surface-primary flex min-h-screen items-center justify-center p-6">
+        <div className="text-text-primary w-full max-w-md">
+          <EmailCodeLogin config={authMode.data} />
+        </div>
+      </main>
+    );
   return (
     <main className="bg-surface-primary flex min-h-screen items-center justify-center p-6">
       <section className="text-text-primary w-full max-w-md space-y-4" aria-live="polite">

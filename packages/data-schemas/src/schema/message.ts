@@ -12,6 +12,7 @@ export function publicMessageProjection<
   },
 >(value: T): T {
   delete value.quoteSourceRetention;
+  delete (value as Record<string, unknown>).retainedTextAllocations;
   if (typeof value.messageId === 'string' && Array.isArray(value.quotes)) {
     Object.assign(value, {
       quoteSourceRefs: value.quotes.map((_, quoteIndex) => ({
@@ -351,6 +352,17 @@ const messageSchema: Schema<IMessage> = new Schema(
     sourceFileIds: { type: [String], default: undefined },
     sourceExpiresAt: { type: Date },
     sourceContentRemovedAt: { type: Date },
+    retainedTextAllocations: {
+      type: [
+        {
+          _id: false,
+          fileId: { type: String, required: true },
+          bytes: { type: Number, required: true },
+        },
+      ],
+      default: undefined,
+      select: false,
+    },
     expiredAt: {
       type: Date,
     },

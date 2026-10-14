@@ -22,6 +22,41 @@ jest.mock('~/server/services/Config', () => ({
   getAppConfig: jest.fn(),
 }));
 
+describe('Cortex multipart admission', () => {
+  const originalAuthMode = process.env.AUTH_MODE;
+
+  afterEach(() => {
+    if (originalAuthMode === undefined) delete process.env.AUTH_MODE;
+    else process.env.AUTH_MODE = originalAuthMode;
+    jest.restoreAllMocks();
+  });
+
+  test.each([
+    ['single', ['file']],
+    ['array', ['file', 1]],
+    ['fields', [[{ name: 'file', maxCount: 1 }]]],
+    ['any', []],
+    ['none', []],
+  ])('rejects %s before consuming bytes or creating staging directories', async (method, args) => {
+    process.env.AUTH_MODE = 'transition';
+    const mkdir = jest.spyOn(fs, 'mkdirSync');
+    const upload = await createMulterInstance({ fileConfig: null });
+    const req = {
+      method: 'POST',
+      headers: { 'content-type': 'multipart/form-data; boundary=test' },
+      pipe: jest.fn(),
+    };
+    const next = jest.fn();
+
+    upload[method](...args)(req, {}, next);
+
+    expect(next).toHaveBeenCalledTimes(1);
+    expect(next.mock.calls[0][0]).toMatchObject({ statusCode: 403 });
+    expect(req.pipe).not.toHaveBeenCalled();
+    expect(mkdir).not.toHaveBeenCalled();
+  });
+});
+
 describe('Multer Configuration', () => {
   let tempDir;
   let mockReq;

@@ -1,5 +1,7 @@
 const express = require('express');
 const request = require('supertest');
+const { EventEmitter } = require('node:events');
+const jwt = require('jsonwebtoken');
 
 const mockGenerationJobManager = {
   getJob: jest.fn(),
@@ -17,6 +19,7 @@ const mockGenerationJobManager = {
 const mockCaptureAgentCheckpointGeneration = jest.fn();
 const mockDeleteAgentCheckpoint = jest.fn();
 const mockSaveMessage = jest.fn();
+const mockValidateEmailCodeBearer = jest.fn();
 
 jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
@@ -32,6 +35,7 @@ jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
   isEnabled: jest.fn().mockReturnValue(false),
   GenerationJobManager: mockGenerationJobManager,
+  validateEmailCodeBearer: (...args) => mockValidateEmailCodeBearer(...args),
   captureAgentCheckpointGeneration: (...args) => mockCaptureAgentCheckpointGeneration(...args),
   deleteAgentCheckpoint: (...args) => mockDeleteAgentCheckpoint(...args),
 }));
@@ -1245,4 +1249,235 @@ describe('SSE stream tenant isolation', () => {
       });
     });
   });
+});
+
+describe('actual chat HTTP disclosure after email-session revocation', () => {
+  const handler = agentsRouter.stack.find((layer) => layer.route?.path === '/chat/stream/:streamId')
+    .route.stack[0].handle;
+  let previous;
+  let requests;
+  let identity;
+
+  beforeEach(() => {
+    jest.useFakeTimers({ now: new Date('2026-10-13T23:30:00Z') });
+    jest.clearAllMocks();
+    previous = { ...process.env };
+    process.env.AUTH_MODE = 'transition';
+    process.env.JWT_SECRET = 'stream-revocation-fixture-only';
+    requests = [];
+    identity = {
+      user: { id: '222222222222222222222222', tenantId: 'cortex-bwi', provider: 'email_code' },
+      grant: {
+        sessionId: '111111111111111111111111',
+        userId: '222222222222222222222222',
+        tenantId: 'cortex-bwi',
+        authVersion: 0,
+        policyVersion: 1,
+        refreshGeneration: 0,
+        createdAt: Date.now() - 1000,
+        absoluteExpiresAt: Date.now() + 3600000,
+        idleExpiresAt: Date.now() + 600000,
+      },
+    };
+    mockValidateEmailCodeBearer.mockResolvedValue(identity);
+    mockGenerationJobManager.getJob.mockResolvedValue({
+      createdAt: 1000,
+      status: 'running',
+      conversationId: 'stream-123',
+      metadata: { userId: identity.user.id, tenantId: 'cortex-bwi' },
+    });
+  });
+  afterEach(() => {
+    for (const req of requests) req.emit('close');
+    jest.clearAllTimers();
+    jest.useRealTimers();
+    process.env = previous;
+  });
+
+  function connection(resume = false) {
+    const grant = identity.grant;
+    const token = jwt.sign(
+      {
+        id: grant.userId,
+        tenantId: grant.tenantId,
+        sessionId: grant.sessionId,
+        authMethod: 'email_code',
+        tokenUse: 'access',
+        authVersion: grant.authVersion,
+        policyVersion: grant.policyVersion,
+        generation: 0,
+        issuedAtMs: Date.now(),
+      },
+      process.env.JWT_SECRET,
+      { algorithm: 'HS256', expiresIn: 300 },
+    );
+    const req = Object.assign(new EventEmitter(), {
+      method: 'GET',
+      path: '/chat/stream/stream-123',
+      url: '/chat/stream/stream-123',
+      originalUrl: '/api/agents/chat/stream/stream-123',
+      params: { streamId: 'stream-123' },
+      query: resume ? { resume: 'true' } : {},
+      headers: { authorization: `Bearer ${token}` },
+      user: { ...identity.user },
+      authenticationClass: 'verified-email',
+      emailCodeGrant: { ...grant },
+      get(name) {
+        return this.headers[name.toLowerCase()];
+      },
+    });
+    const chunks = [];
+    const res = Object.assign(new EventEmitter(), {
+      writableEnded: false,
+      destroyed: false,
+      headersSent: false,
+      setHeader: jest.fn(),
+      set: jest.fn().mockReturnThis(),
+      status: jest.fn().mockReturnThis(),
+      flush: jest.fn(),
+      flushHeaders: jest.fn(function () {
+        this.headersSent = true;
+      }),
+      write: jest.fn((payload) => {
+        chunks.push(payload);
+        return true;
+      }),
+      end: jest.fn(function () {
+        this.writableEnded = true;
+        this.emit('finish');
+      }),
+      destroy: jest.fn(function () {
+        this.destroyed = true;
+        this.emit('close');
+      }),
+    });
+    requests.push(req);
+    return { req, res, chunks };
+  }
+
+  it('preserves explicitly admitted tenantless guest chat during transition', async () => {
+    const c = connection();
+    c.req.authenticationClass = 'guest';
+    delete c.req.emailCodeGrant;
+    delete c.req.headers.authorization;
+    delete c.req.user.tenantId;
+    mockGenerationJobManager.getJob.mockResolvedValue({
+      createdAt: 1000,
+      status: 'running',
+      conversationId: 'stream-123',
+      metadata: { userId: c.req.user.id },
+    });
+    mockGenerationJobManager.subscribe.mockImplementation((_id, write, done) => {
+      write({ text: 'existing-guest-chat' });
+      done({ final: true });
+      return { unsubscribe: jest.fn() };
+    });
+    await handler(c.req, c.res);
+    expect(c.chunks.join('')).toContain('existing-guest-chat');
+    expect(c.res.writableEnded).toBe(true);
+    expect(mockValidateEmailCodeBearer).not.toHaveBeenCalled();
+  });
+
+  it('withholds queued live and final payloads after the admitted email grant is revoked', async () => {
+    const c = connection();
+    const unsubscribe = jest.fn();
+    mockValidateEmailCodeBearer.mockResolvedValue(null);
+    mockGenerationJobManager.subscribe.mockImplementation((_id, write, done) => {
+      write({ text: 'private-after-revoke' });
+      done({ final: true, text: 'private-final-after-revoke' });
+      return { unsubscribe };
+    });
+    const work = handler(c.req, c.res);
+    await jest.advanceTimersByTimeAsync(500);
+    await work;
+    expect(c.chunks).toEqual([]);
+    expect(mockValidateEmailCodeBearer).toHaveBeenCalled();
+    expect(c.res.destroy).toHaveBeenCalledTimes(1);
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+    expect(mockGenerationJobManager.abortJob).not.toHaveBeenCalled();
+  });
+
+  it('checks the current grant before resume disclosure and never activates a revoked attachment', async () => {
+    const c = connection(true);
+    const subscription = { unsubscribe: jest.fn(), activate: jest.fn() };
+    mockValidateEmailCodeBearer.mockResolvedValue(null);
+    mockGenerationJobManager.subscribeWithResume.mockResolvedValue({
+      subscription,
+      resumeState: { runSteps: [], aggregatedContent: ['private-resume'] },
+      pendingEvents: [{ text: 'private-gap' }],
+    });
+    const work = handler(c.req, c.res);
+    await jest.advanceTimersByTimeAsync(500);
+    await work;
+    expect(c.chunks).toEqual([]);
+    expect(subscription.activate).not.toHaveBeenCalled();
+    expect(subscription.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(mockGenerationJobManager.markSyncSent).not.toHaveBeenCalled();
+  });
+
+  it('drains an authorized sync frame before activation and preserves live/final order and epoch', async () => {
+    const c = connection(true);
+    const subscription = { unsubscribe: jest.fn(), activate: jest.fn() };
+    mockGenerationJobManager.subscribeWithResume.mockImplementation(async (_id, write, done) => {
+      subscription.activate.mockImplementation(() => {
+        expect(c.chunks.join('')).toContain('"sync":true');
+        write({ text: 'live' });
+        done({ final: true });
+      });
+      return {
+        subscription,
+        resumeState: { runSteps: [], aggregatedContent: [] },
+        pendingEvents: [],
+      };
+    });
+    const work = handler(c.req, c.res);
+    await jest.advanceTimersByTimeAsync(1000);
+    await work;
+    const text = c.chunks.join('');
+    expect(text.indexOf('"sync":true')).toBeLessThan(text.indexOf('"text":"live"'));
+    expect(text.indexOf('"text":"live"')).toBeLessThan(text.indexOf('"final":true'));
+    expect(subscription.activate).toHaveBeenCalledTimes(1);
+    expect(subscription.unsubscribe).toHaveBeenCalledTimes(1);
+    expect(mockGenerationJobManager.subscribeWithResume).toHaveBeenCalledWith(
+      'stream-123',
+      expect.any(Function),
+      expect.any(Function),
+      expect.any(Function),
+      expect.objectContaining({ expectedCreatedAt: 1000 }),
+    );
+    expect(c.res.writableEnded).toBe(true);
+  });
+
+  it('unsubscribes a late attachment once after authorization already closed the response', async () => {
+    const c = connection();
+    const subscription = { unsubscribe: jest.fn() };
+    let release;
+    mockValidateEmailCodeBearer.mockResolvedValue(null);
+    mockGenerationJobManager.subscribe.mockImplementation((_id, write) => {
+      write({ text: 'late-private-data' });
+      return new Promise((resolve) => {
+        release = resolve;
+      });
+    });
+    const work = handler(c.req, c.res);
+    await jest.advanceTimersByTimeAsync(500);
+    release(subscription);
+    await work;
+    c.req.emit('close');
+    expect(c.chunks).toEqual([]);
+    expect(subscription.unsubscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['subscribe', 'subscribeWithResume'])(
+    'closes authorization state on %s failure',
+    async (method) => {
+      const c = connection(method === 'subscribeWithResume');
+      mockGenerationJobManager[method].mockRejectedValue(new Error('private internal failure'));
+      const work = handler(c.req, c.res).catch(() => undefined);
+      await jest.advanceTimersByTimeAsync(500);
+      await work;
+      expect(c.res.destroy).toHaveBeenCalledTimes(1);
+      expect(c.chunks.join('')).not.toContain('private internal failure');
+    },
+  );
 });

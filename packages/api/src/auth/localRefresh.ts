@@ -11,6 +11,7 @@ import {
   isTwoFactorEnrollmentRequired,
   TOKEN_RETIREMENT_FIELDS,
 } from './twoFactor';
+import { getAuthMode } from './authMode';
 
 const EXPIRED_REFRESH_MESSAGE = 'Refresh token expired or not found for this user';
 
@@ -113,6 +114,10 @@ export function createLocalRefreshHandler(deps: LocalRefreshDependencies) {
     res: Response,
     refreshToken: string | undefined,
   ): Promise<Response | void> => {
+    // Cortex owns a grant-bound refresh path; no CI or legacy minting branch may bypass it.
+    if (getAuthMode() !== 'default') {
+      return res.status(401).json({ code: 'AUTH_SESSION_REQUIRED' });
+    }
     if (!refreshToken) {
       return res.status(200).send('Refresh token not provided');
     }

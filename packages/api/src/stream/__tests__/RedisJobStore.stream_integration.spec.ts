@@ -14,6 +14,7 @@ import {
   keyvRedisClientReady,
 } from '~/cache/redisClients';
 import { serializeQuoteRetention, deserializeQuoteRetention } from '~/files/retention';
+import { prepareSourceReplayForTest } from './helpers/sourceReplay';
 import { SteeringLifecycle } from '../SteeringLifecycle';
 import { clearRedisTestPrefix } from './helpers/redis';
 
@@ -220,12 +221,7 @@ describe('RedisJobStore Integration Tests', () => {
       providerExecutionId: 'source-provider',
     });
     try {
-      expect(
-        await owner.bindSourceRetention(job.streamId, job.createdAt, {
-          sourceFileIds: ['file-a'],
-          sourceExpiresAt: Date.now() + 60000,
-        }),
-      ).toBe(true);
+      const intent = await prepareSourceReplayForTest(owner, job);
       expect(await peer.revokeSourceRetention(job.streamId, job.createdAt)).toBe(true);
       expect(
         await owner.appendChunk(
@@ -247,6 +243,7 @@ describe('RedisJobStore Integration Tests', () => {
         providerExecutionId: 'source-provider',
         providerDrained: true,
       });
+      expect(await owner.acknowledgeSourceReplayRelease(intent)).toBe(true);
       const successor = await peer.createJob(job.streamId, 'owner');
       expect(await owner.revokeSourceRetention(job.streamId, job.createdAt)).toBe(false);
       expect((await peer.getJob(job.streamId))?.createdAt).toBe(successor.createdAt);

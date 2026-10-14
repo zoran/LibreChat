@@ -5,6 +5,7 @@ import type { ServerSentEvent } from '~/types';
 import { InMemoryEventTransport } from '~/stream/implementations/InMemoryEventTransport';
 import { InMemoryJobStore } from '~/stream/implementations/InMemoryJobStore';
 import { GenerationJobManagerClass } from '~/stream/GenerationJobManager';
+import { configureSourceReplayForTest } from './helpers/sourceReplay';
 import { createToolTimingTracker } from '~/agents/toolTiming';
 import { serializeQuoteRetention } from '~/files/retention';
 
@@ -21,6 +22,7 @@ function createManagerWithStore(store: InMemoryJobStore): GenerationJobManagerCl
     eventTransport: new InMemoryEventTransport(),
     isRedis: false,
   });
+  configureSourceReplayForTest(manager, store);
   manager.initialize();
   return manager;
 }
@@ -144,10 +146,8 @@ describe('GenerationJobManager resume replay events', () => {
     const store = new InMemoryJobStore({ ttlAfterComplete: 60000 });
     manager = createManagerWithStore(store);
     const old = await store.createJob('reused', 'owner', 'reused');
-    await store.bindSourceRetention('reused', old.createdAt, {
-      sourceFileIds: ['file-a'],
-      sourceExpiresAt: Date.now() + 60000,
-    });
+    // Explicit prior-version record: current source admission does not permit steers.
+    old.sourceRetention = { sourceFileIds: ['file-a'], sourceExpiresAt: Date.now() + 60000 };
     await store.parkSteers(
       'reused',
       JSON.stringify({

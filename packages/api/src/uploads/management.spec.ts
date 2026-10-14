@@ -1,0 +1,267 @@
+/** Public authorization and retry boundaries; persistence has its own real Mongo suite. */
+import { UPLOAD_MAX_FILE_BYTES } from 'librechat-data-provider';
+import type {
+  UploadOperation,
+  UploadPrincipal,
+  UploadRequest,
+  UploadLease,
+} from 'librechat-data-provider';
+import type { UploadRepository, TelemetryPort } from './contract';
+import { isUploadManagementError, UploadManagementError } from './errors';
+import { createUploadManagement } from './management';
+
+const principal: UploadPrincipal = {
+  tenantId: 'tenant',
+  userId: 'user',
+  authentication: 'verified-email',
+};
+const request: UploadRequest = {
+  filename: 'example.txt',
+  mediaType: 'text/plain',
+  declaredBytes: 8,
+  idempotencyKey: 'key',
+};
+const operation: UploadOperation = {
+  version: 1,
+  id: 'operation',
+  revision: 1,
+  scope: { kind: 'personal' },
+  filename: request.filename,
+  mediaType: request.mediaType,
+  declaredBytes: 8,
+  state: 'waiting',
+  createdAt: new Date(1000).toISOString(),
+  cleanupPending: false,
+  canUseInComposer: false,
+  canRetryProcessing: false,
+};
+
+function fixture(telemetry?: TelemetryPort) {
+  const reserve = jest.fn().mockResolvedValue(operation);
+  const findReservation = jest.fn().mockResolvedValue(null);
+  const get = jest.fn().mockResolvedValue(operation);
+  const renew = jest.fn();
+  const retryProcessing = jest
+    .fn()
+    .mockResolvedValue({ ...operation, state: 'queued_processing', revision: 3 });
+  const publish = jest.fn().mockResolvedValue({ ...operation, state: 'ready', revision: 5 });
+  const methods: Partial<UploadRepository> = {
+    reserve,
+    findReservation,
+    get,
+    renew,
+    retryProcessing,
+    publish,
+  };
+  const repository = new Proxy({} as UploadRepository, {
+    get: (_target, key) =>
+      methods[key as keyof UploadRepository] ??
+      (() => {
+        throw new Error(`Unexpected repository method ${String(key)}`);
+      }),
+  });
+  const authorize = jest.fn().mockResolvedValue(true);
+  const assertSafe = jest.fn().mockResolvedValue(undefined);
+  const management = createUploadManagement({
+    repository,
+    identity: { authorize },
+    resources: { assertSafe },
+    telemetry,
+    now: () => 1000,
+    newId: () => 'operation',
+  });
+  return {
+    management,
+    reserve,
+    findReservation,
+    get,
+    renew,
+    retryProcessing,
+    publish,
+    authorize,
+    assertSafe,
+  };
+}
+
+describe('managed upload public boundary', () => {
+  it('rejects guests before identity, storage or capacity access', async () => {
+    const f = fixture();
+    await expect(
+      f.management.reserve({ ...principal, authentication: 'guest' }, request),
+    ).rejects.toMatchObject({ code: 'unauthorized' });
+    expect(f.authorize).not.toHaveBeenCalled();
+    expect(f.reserve).not.toHaveBeenCalled();
+  });
+  it('keeps workspace admission closed even if an identity adapter recognizes it', async () => {
+    const f = fixture();
+    await expect(
+      f.management.reserve(principal, {
+        ...request,
+        scope: { kind: 'workspace', workspaceId: 'future' },
+      }),
+    ).rejects.toMatchObject({ code: 'forbidden' });
+    expect(f.reserve).not.toHaveBeenCalled();
+  });
+  it.each([0, -1, 1.5, UPLOAD_MAX_FILE_BYTES + 1])(
+    'rejects declared size %s',
+    async (declaredBytes) => {
+      const f = fixture();
+      await expect(
+        f.management.reserve(principal, { ...request, declaredBytes }),
+      ).rejects.toMatchObject({ code: 'invalid_request' });
+      expect(f.assertSafe).not.toHaveBeenCalled();
+    },
+  );
+  it('preserves exact safe metadata and guards a new admission', async () => {
+    const f = fixture();
+    expect(await f.management.reserve(principal, request)).toEqual(operation);
+    expect(f.assertSafe).toHaveBeenCalledWith({ phase: 'admission' });
+    expect(f.reserve).toHaveBeenCalledWith(
+      principal,
+      {
+        ...request,
+        operationId: 'operation',
+        scope: { kind: 'personal' },
+        fingerprint: JSON.stringify([
+          { kind: 'personal' },
+          request.filename,
+          request.mediaType,
+          request.declaredBytes,
+        ]),
+      },
+      1000,
+    );
+  });
+  it('returns an authorized durable replay during a resource outage without another reservation', async () => {
+    const f = fixture();
+    f.findReservation.mockResolvedValue({ ...operation, state: 'queued_processing' });
+    f.assertSafe.mockRejectedValue(new UploadManagementError('unavailable'));
+    expect((await f.management.reserve(principal, request)).state).toBe('queued_processing');
+    expect(f.authorize).toHaveBeenCalled();
+    expect(f.assertSafe).not.toHaveBeenCalled();
+    expect(f.reserve).not.toHaveBeenCalled();
+  });
+  it('denies transfer before a resource guard when current ownership denies access', async () => {
+    const f = fixture();
+    f.authorize.mockResolvedValue(false);
+    await expect(
+      f.management.claimTransfer(principal, 'operation', { hostId: 'host', instanceId: 'app' }),
+    ).rejects.toMatchObject({ code: 'forbidden' });
+    expect(f.get).not.toHaveBeenCalled();
+    expect(f.assertSafe).not.toHaveBeenCalled();
+  });
+  it('does not classify arbitrary driver details as a safe upload error', () => {
+    expect(
+      isUploadManagementError(
+        Object.assign(new Error('sensitive details'), {
+          name: 'UploadManagementError',
+          code: 'query-secret',
+        }),
+      ),
+    ).toBe(false);
+    expect(isUploadManagementError(new UploadManagementError('quota_exceeded'))).toBe(true);
+  });
+  it.each(['transfer', 'processing'] as const)(
+    'stops %s renewal at a hard resource failure before extending its lease',
+    async (kind) => {
+      const f = fixture();
+      const lease: UploadLease = {
+        ...principal,
+        operationId: 'operation',
+        generation: 1,
+        kind,
+        hostId: 'host',
+        instanceId: 'app',
+        expiresAt: new Date(46_000).toISOString(),
+      };
+      f.assertSafe.mockRejectedValueOnce(new UploadManagementError('unavailable'));
+      await expect(f.management.renew(lease)).rejects.toMatchObject({ code: 'unavailable' });
+      expect(f.assertSafe).toHaveBeenCalledWith({ phase: kind, hostId: 'host', lease });
+      expect(f.renew).not.toHaveBeenCalled();
+      f.renew.mockResolvedValueOnce(lease);
+      expect(await f.management.renew(lease)).toEqual(lease);
+      expect(f.renew).toHaveBeenCalledWith(lease, 1000);
+    },
+  );
+
+  it.each(['sync', 'async'])(
+    'keeps %s telemetry failures from hiding committed results or budget errors',
+    async (mode) => {
+      const broken = jest.fn(() => {
+        if (mode === 'sync') throw new Error('telemetry unavailable');
+        return Promise.reject(new Error('telemetry unavailable'));
+      });
+      const f = fixture({ transition: broken, retry: broken, rejectQuota: broken });
+      await expect(f.management.reserve(principal, request)).resolves.toEqual(operation);
+      const lease: UploadLease = {
+        ...principal,
+        operationId: 'operation',
+        generation: 1,
+        kind: 'processing',
+        hostId: 'host',
+        instanceId: 'app',
+        expiresAt: new Date(46_000).toISOString(),
+      };
+      await expect(
+        f.management.publish(lease, { text: 'ready content', writerStopped: true }),
+      ).resolves.toMatchObject({ state: 'ready' });
+      const failure = new UploadManagementError('quota_exceeded');
+      f.reserve.mockRejectedValueOnce(failure);
+      await expect(f.management.reserve(principal, request)).rejects.toBe(failure);
+      expect(broken).toHaveBeenCalledTimes(3);
+    },
+  );
+
+  it.each([
+    ['quota_exceeded', 'window'],
+    ['capacity_exceeded', 'capacity'],
+    ['queue_full', 'queue'],
+  ] as const)(
+    'reports only the known %s budget category without replacing its error',
+    async (code, reason) => {
+      const telemetry = { transition: jest.fn(), retry: jest.fn(), rejectQuota: jest.fn() };
+      const f = fixture(telemetry);
+      const error = new UploadManagementError(code);
+      f.reserve.mockRejectedValueOnce(error);
+      await expect(f.management.reserve(principal, request)).rejects.toBe(error);
+      expect(telemetry.rejectQuota).toHaveBeenCalledWith(reason);
+      expect(telemetry.transition).not.toHaveBeenCalled();
+      f.reserve.mockRejectedValueOnce(new UploadManagementError('unavailable'));
+      await expect(f.management.reserve(principal, request)).rejects.toMatchObject({
+        code: 'unavailable',
+      });
+      expect(telemetry.rejectQuota).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('reports an acknowledged processing requeue without counting ordinary idempotent retries', async () => {
+    const telemetry = { transition: jest.fn(), retry: jest.fn(), rejectQuota: jest.fn() };
+    const f = fixture(telemetry);
+    f.get.mockResolvedValue({
+      ...operation,
+      state: 'failed',
+      revision: 2,
+      canRetryProcessing: true,
+    });
+    await f.management.retryProcessing(principal, operation.id);
+    expect(telemetry.retry).toHaveBeenCalledWith('processing');
+    f.get.mockResolvedValue({ ...operation, state: 'queued_processing', revision: 3 });
+    await f.management.retryProcessing(principal, operation.id);
+    expect(telemetry.retry).toHaveBeenCalledTimes(1);
+    f.get.mockResolvedValue({ ...operation, state: 'failed', revision: 2 });
+    f.retryProcessing.mockRejectedValueOnce(new UploadManagementError('queue_full'));
+    await expect(f.management.retryProcessing(principal, operation.id)).rejects.toMatchObject({
+      code: 'queue_full',
+    });
+    expect(telemetry.retry).toHaveBeenCalledTimes(1);
+    expect(telemetry.rejectQuota).toHaveBeenCalledWith('queue');
+  });
+
+  it('does not emit or recount a replayed admission', async () => {
+    const telemetry = { transition: jest.fn(), retry: jest.fn(), rejectQuota: jest.fn() };
+    const f = fixture(telemetry);
+    f.findReservation.mockResolvedValue(operation);
+    await expect(f.management.reserve(principal, request)).resolves.toEqual(operation);
+    for (const callback of Object.values(telemetry)) expect(callback).not.toHaveBeenCalled();
+  });
+});

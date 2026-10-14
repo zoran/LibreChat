@@ -1,4 +1,7 @@
 jest.mock('uuid', () => ({ v4: jest.fn(() => 'mock-uuid') }));
+jest.mock('~/server/services/Uploads', () => ({ getUploadRuntime: jest.fn(() => undefined) }), {
+  virtual: true,
+});
 
 jest.mock('@librechat/data-schemas', () => ({
   logger: { warn: jest.fn(), debug: jest.fn(), error: jest.fn(), info: jest.fn() },
@@ -171,6 +174,11 @@ jest.mock('@librechat/api', () => {
     }),
     sweepExpiredFiles: jest.fn().mockResolvedValue({ scanned: 0, deleted: 0, failed: 0 }),
     startExpiredFileSweep: jest.fn().mockReturnValue('sweep-interval'),
+    createExpiredFileSweepRequest: jest.fn(({ appConfig, file, userId }) => ({
+      config: appConfig,
+      body: {},
+      user: { id: userId, tenantId: file.tenantId },
+    })),
     isLeader: jest.fn().mockResolvedValue(true),
     GenerationJobManager: { revokeFileSourceGenerations: jest.fn() },
   };
@@ -3483,5 +3491,172 @@ describe('managed source deletion composition', () => {
     expect(result.failedFileIds).toEqual(['managed']);
     expect(db.finalizeFileSourceDeletion).not.toHaveBeenCalled();
     expect(db.deleteFiles).not.toHaveBeenCalled();
+  });
+});
+
+describe('upload ledger joins the existing File deletion owner', () => {
+  const { getUploadRuntime } = require('~/server/services/Uploads');
+  const { GenerationJobManager } = require('@librechat/api');
+  const req = { body: {}, config: {}, user: { id: 'owner', tenantId: 'tenant' } };
+  const file = {
+    file_id: 'upload',
+    uploadOperationId: 'upload',
+    retentionAcceptedAt: new Date(0),
+    source: FileSources.s3,
+    filepath: 'signed-original',
+    storageKey: 'canonical-original',
+  };
+  const task = {
+    operationId: 'upload',
+    generation: 2,
+    fileId: 'upload',
+    state: 'deleted',
+    principal: { tenantId: 'tenant', userId: 'owner', authentication: 'verified-email' },
+  };
+  const proof = {
+    operationId: 'upload',
+    generation: 2,
+    writerStopped: true,
+    localCopiesAbsent: true,
+    originalAbsent: true,
+    textAndHistoryRemoved: false,
+  };
+  let cleanup;
+  let events;
+  beforeEach(() => {
+    jest.clearAllMocks();
+    events = [];
+    cleanup = {
+      beginFileDeletion: jest.fn(async () => {
+        events.push('ledger-fence');
+        return task;
+      }),
+      removeFileOriginal: jest.fn(async () => {
+        events.push('version-absence');
+        return proof;
+      }),
+      finishFileDeletion: jest.fn(async () => {
+        events.push('ledger-confirm');
+      }),
+      sweep: jest.fn(),
+    };
+    getUploadRuntime.mockReturnValue({ cleanup });
+    db.revokeFileSources.mockImplementation(async () => {
+      events.push('file-revoke');
+    });
+    GenerationJobManager.revokeFileSourceGenerations.mockImplementation(async () => {
+      events.push('generation-revoke');
+      return { complete: true, pending: [] };
+    });
+    db.redactFileSourceContent.mockImplementation(async () => {
+      events.push('history-redact');
+    });
+    db.getFileSourceDeletionCandidates.mockResolvedValue([file]);
+    db.finalizeFileSourceDeletion.mockImplementation(async () => {
+      events.push('file-finalize');
+      return { completedFileIds: ['upload'] };
+    });
+    db.removeAgentResourceFilesFromAllAgents.mockImplementation(async () => {
+      events.push('reference-cleanup');
+    });
+    getStrategyFunctions.mockReturnValue({
+      deleteFile: jest
+        .fn()
+        .mockRejectedValue(new Error('Legacy delete must not handle managed originals')),
+    });
+  });
+  afterEach(() => getUploadRuntime.mockReturnValue(undefined));
+
+  it('confirms actual object and history absence only after the complete existing lifecycle', async () => {
+    await expect(processDeleteRequest({ req, files: [file] })).resolves.toEqual({
+      deletedFileIds: ['upload'],
+      failedFileIds: [],
+    });
+    expect(events).toEqual([
+      'ledger-fence',
+      'file-revoke',
+      'generation-revoke',
+      'history-redact',
+      'version-absence',
+      'file-finalize',
+      'reference-cleanup',
+      'ledger-confirm',
+    ]);
+    expect(cleanup.finishFileDeletion).toHaveBeenCalledWith(task, proof);
+    expect(getStrategyFunctions).not.toHaveBeenCalled();
+    expect(db.deleteFiles).not.toHaveBeenCalled();
+  });
+
+  it('retains the File and ledger reservation when remote writer stop is unknown', async () => {
+    cleanup.removeFileOriginal.mockResolvedValue({
+      ...proof,
+      writerStopped: false,
+      originalAbsent: false,
+    });
+    await expect(processDeleteRequest({ req, files: [file] })).resolves.toEqual({
+      deletedFileIds: [],
+      failedFileIds: ['upload'],
+    });
+    expect(db.finalizeFileSourceDeletion).not.toHaveBeenCalled();
+    expect(cleanup.finishFileDeletion).not.toHaveBeenCalled();
+  });
+
+  it('does not confirm history while a generation replay is still pending', async () => {
+    GenerationJobManager.revokeFileSourceGenerations.mockResolvedValue({
+      complete: false,
+      pending: [{}],
+    });
+    const result = await processDeleteRequest({ req, files: [file] });
+    expect(result.failedFileIds).toEqual(['upload']);
+    expect(db.finalizeFileSourceDeletion).not.toHaveBeenCalled();
+    expect(cleanup.finishFileDeletion).not.toHaveBeenCalled();
+  });
+
+  it('retries quota confirmation after File finalization already left a tombstone', async () => {
+    db.getFileSourceDeletionCandidates.mockResolvedValue([]);
+    const tombstone = { file_id: 'upload', retentionAcceptedAt: new Date(0) };
+    await expect(processDeleteRequest({ req, files: [tombstone] })).resolves.toEqual({
+      deletedFileIds: ['upload'],
+      failedFileIds: [],
+    });
+    expect(cleanup.beginFileDeletion).toHaveBeenCalledWith(
+      { userId: 'owner', tenantId: 'tenant' },
+      'upload',
+    );
+    expect(cleanup.removeFileOriginal).toHaveBeenCalledWith(task);
+    expect(cleanup.finishFileDeletion).toHaveBeenCalledWith(task, proof);
+  });
+
+  it('keeps a lost final accounting acknowledgement pending for the same lifecycle retry', async () => {
+    cleanup.finishFileDeletion.mockRejectedValue(new Error('unknown accounting commit'));
+    await expect(processDeleteRequest({ req, files: [file] })).resolves.toEqual({
+      deletedFileIds: [],
+      failedFileIds: ['upload'],
+    });
+    expect(db.finalizeFileSourceDeletion).toHaveBeenCalled();
+  });
+
+  it('never falls back to legacy S3 deletion when the managed runtime is unavailable', async () => {
+    getUploadRuntime.mockReturnValue(undefined);
+    await expect(processDeleteRequest({ req, files: [file] })).rejects.toThrow(
+      'MANAGED_UPLOAD_CLEANUP_UNAVAILABLE',
+    );
+    expect(getStrategyFunctions).not.toHaveBeenCalled();
+  });
+
+  it('calls managed recovery only through the existing File sweep dependency', async () => {
+    await sweepExpiredFiles({ appConfig: {}, limit: 3 });
+    const dependencies = sweepExpiredFilesWithDeps.mock.calls[0][1];
+    cleanup.sweep.mockImplementation(async ({ limit, deleteAcceptedFile }) => {
+      expect(limit).toBe(3);
+      expect(await deleteAcceptedFile(task)).toBe(true);
+      return { scanned: 1, cleaned: 1, pending: 0 };
+    });
+    await expect(dependencies.sweepManagedUploads()).resolves.toEqual({
+      scanned: 1,
+      cleaned: 1,
+      pending: 0,
+    });
+    expect(cleanup.finishFileDeletion).toHaveBeenCalledWith(task, proof);
   });
 });

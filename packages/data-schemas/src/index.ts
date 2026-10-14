@@ -1,4 +1,7 @@
 export { FileSourceUnavailableError } from './methods/fileRetention';
+export { createUploadManagementRepository } from './methods/uploadManagement';
+export { createEmailCodeMethods } from './methods/emailCode';
+export type * from './types/emailCode';
 export * from './app';
 export * from './admin';
 export * from './common';

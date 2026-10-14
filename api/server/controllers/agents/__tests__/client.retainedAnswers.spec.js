@@ -218,6 +218,74 @@ describe('AgentClient retained answers', () => {
     getMessages.mockResolvedValue([]);
   });
 
+  it.each([
+    [
+      'current document with tools',
+      (client) => {
+        client.modelBoundCurrentFiles = [
+          { file_id: 'retained-file', retentionAcceptedAt: new Date() },
+        ];
+        client.options.agent.tools = ['web_search'];
+      },
+    ],
+    [
+      'retained history with a checkpoint',
+      (client) => {
+        client.modelBoundStoredMessages = [
+          { messageId: 'prior', sourceFileIds: ['retained-file'] },
+        ];
+        client.options.agent.tools = ['ask_user_question'];
+      },
+    ],
+    [
+      'retained quotation in a scheduled run',
+      (client) => {
+        client.options.req._quoteRetention = { quoteSourceRetention: [{}] };
+        client.options.req._isScheduledFire = true;
+      },
+    ],
+    [
+      'prebound source in a triggered run',
+      (client) => {
+        client.options.req._fileSourceRetention = { sourceFileIds: ['retained-file'] };
+        client.options.req._isAgentTrigger = true;
+      },
+    ],
+    [
+      'retained history in an event continuation',
+      (client) => {
+        client.modelBoundStoredMessages = [
+          { messageId: 'prior', sourceFileIds: ['retained-file'] },
+        ];
+        client.eventActorInvocationId = 'event-invocation';
+      },
+    ],
+    [
+      'retained quotation with background tasks',
+      (client) => {
+        client.modelBoundStoredMessages = [{ messageId: 'prior', quotes: [{}] }];
+        client.options.subagentTasks = {};
+      },
+    ],
+    [
+      'current document in a multi-agent graph',
+      (client) => {
+        client.modelBoundCurrentFiles = [
+          { file_id: 'retained-file', retentionAcceptedAt: new Date() },
+        ];
+        client.options.agent.edges = [{ from: 'agent-123', to: 'another-agent' }];
+      },
+    ],
+  ])('refuses unsupported source copies before run or sandbox creation: %s', async (_, arrange) => {
+    const client = makeClient();
+    arrange(client);
+    await expect(client.chatCompletion({ payload: [] })).rejects.toMatchObject({
+      code: 'DOCUMENT_SOURCE_UNSUPPORTED',
+    });
+    expect(mockCreateRun).not.toHaveBeenCalled();
+    expect(require('@librechat/api').maybePrewarmCodeSandbox).not.toHaveBeenCalled();
+  });
+
   it('completes the branch the history read cut at the summary and quotes the answer in the user turn', async () => {
     const client = makeClient();
     client.user = 'user-123';
