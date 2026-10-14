@@ -204,6 +204,7 @@ async function createUploadComposition({
     repository,
     principal,
     tenantId: tenant,
+    admissionStatus: () => controller.status().admissionsPaused,
     observe({ connections, outcome }) {
       metrics.liveConnections(connections);
       if (['changed', 'reset'].includes(outcome)) metrics.event('update');
@@ -219,6 +220,7 @@ async function createUploadComposition({
     observe(event) {
       if (event.kind === 'metrics') metrics.observeSnapshot(event.snapshot);
       if (event.kind === 'control') metrics.observeControl(event.decision);
+      if (event.kind === 'unavailable') metrics.observeAdmissionUnavailable();
     },
   });
   platform.bindMetrics?.(metrics);

@@ -78,6 +78,7 @@ describe('private finite upload metrics', () => {
     const metrics = createUploadMetrics(registry, ['cpu-2']).bind('cpu-2');
     metrics.observeSnapshot({
       observedAt: 1800000000000,
+      admissionsPaused: false,
       control: {
         limits: { transferPermits: 1, processingPermits: 1, transferBytesPerSecond: 1048576 },
         mode: 'fallback',
@@ -103,6 +104,59 @@ describe('private finite upload metrics', () => {
     expect(text).toContain('cortex_upload_staging_reserved_bytes{slot="cpu-2"} 200');
     expect(text).toContain('cortex_upload_active_work{slot="cpu-2",kind="transfer"} 1');
     expect(text).toContain('cortex_upload_quota_bytes{slot="cpu-2",kind="used"} 300');
+  });
+
+  it('exports admission only while known and source-fresh, without scrape-time renewal or replica summation', async () => {
+    jest.useFakeTimers().setSystemTime(1800000000000);
+    try {
+      const registry = new Registry();
+      const metrics = createUploadMetrics(registry, ['cpu-1']).bind('cpu-1');
+      const sample = {
+        observedAt: 1800000000000,
+        admissionsPaused: false as boolean | null,
+        states: {},
+        originalBytes: 0,
+        objectBytes: 0,
+        textBytes: 0,
+        recordBytes: 0,
+        bundles: 0,
+        cleanupPending: 0,
+        transfers: 0,
+        processors: 0,
+        queue: { count: 0, bytes: 0, oldestAgeSeconds: 0 },
+        quota: { usedBytes: 0, reservedBytes: 0, retainedBytes: 0 },
+        staging: { count: 0, bytes: 0 },
+        control: {
+          mode: 'blocked' as const,
+          enabled: true,
+          limits: { transferPermits: 0, processingPermits: 0, transferBytesPerSecond: 0 },
+          sourceExpiresAt: 1800000000000,
+          leaseExpiresAt: 1800000000000,
+        },
+      };
+      expect(await registry.metrics()).not.toContain('cortex_upload_admissions_paused{');
+      metrics.observeSnapshot(sample);
+      expect(await registry.metrics()).toContain('cortex_upload_admissions_paused{slot="cpu-1"} 0');
+      jest.advanceTimersByTime(15_000);
+      expect(await registry.metrics()).not.toContain('cortex_upload_admissions_paused{');
+      sample.observedAt += 15_000;
+      sample.admissionsPaused = true;
+      metrics.observeSnapshot(sample);
+      let text = await registry.metrics();
+      expect(text).toContain('cortex_upload_admissions_paused{slot="cpu-1"} 1');
+      expect(text).toContain('cortex_upload_ledger_observed_at_seconds{slot="cpu-1"} 1800000015');
+      sample.admissionsPaused = null;
+      metrics.observeSnapshot(sample);
+      expect(await registry.metrics()).not.toContain('cortex_upload_admissions_paused{');
+      sample.admissionsPaused = false;
+      metrics.observeSnapshot(sample);
+      metrics.observeAdmissionUnavailable();
+      text = await registry.metrics();
+      expect(text).not.toContain('cortex_upload_admissions_paused{');
+      expect(text).toContain('cortex_upload_ledger_observed_at_seconds{slot="cpu-1"} 1800000015');
+    } finally {
+      jest.useRealTimers();
+    }
   });
   it('exports measured reservation occupancy and removes unknown cgroup headroom', async () => {
     const registry = new Registry();

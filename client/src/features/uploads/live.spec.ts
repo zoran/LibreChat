@@ -1,5 +1,5 @@
 import { QueryClient } from '@tanstack/react-query';
-import { acquireUploadLive } from './live';
+import { acquireUploadLive, readManagedUploadSnapshot, getUploadAdmission } from './live';
 import { readUploadSnapshot } from './api';
 
 jest.mock('./api', () => ({ uploadsUrl: '/api/uploads', readUploadSnapshot: jest.fn() }));
@@ -35,8 +35,11 @@ describe('authenticated upload live lifecycle', () => {
     jest.useFakeTimers();
     streams.length = 0;
     Object.defineProperty(document, 'hidden', { configurable: true, value: false });
-    read.mockResolvedValue({ version: 1, operations: [], usage: {} });
-    client = new QueryClient({ defaultOptions: { queries: { retry: false, cacheTime: 0 } } });
+    read.mockResolvedValue({ version: 1, operations: [], usage: {}, admissionsPaused: false });
+    client = new QueryClient({
+      defaultOptions: { queries: { retry: false, cacheTime: Infinity } },
+      logger: { log: console.log, warn: console.warn, error: jest.fn() },
+    });
   });
   afterEach(() => {
     client.clear();
@@ -111,7 +114,205 @@ describe('authenticated upload live lifecycle', () => {
     await flush();
     expect(read).toHaveBeenCalledTimes(2);
     expect(streams).toHaveLength(2);
-    expect(client.getQueryData(key)).toEqual({ version: 1, operations: [], usage: {} });
+    expect(client.getQueryData(key)).toEqual({
+      version: 1,
+      operations: [],
+      usage: {},
+      admissionsPaused: false,
+    });
+    stop();
+  });
+
+  const admission = () =>
+    client.getQueryData<{ admissionsPaused: boolean | null }>(key)?.admissionsPaused;
+  const status = (value: boolean | null, index = streams.length - 1) =>
+    streams[index].listeners.status?.({ data: JSON.stringify({ admissionsPaused: value }) });
+  const refresh = () =>
+    client.fetchQuery(key, ({ signal }) => readManagedUploadSnapshot(client, key, signal), {
+      staleTime: 0,
+      retry: false,
+    });
+
+  it('applies status without fetching or rejuvenating file data and preserves a refetch error', async () => {
+    const stop = acquireUploadLive(client, key);
+    await flush();
+    const updatedAt = client.getQueryState(key)!.dataUpdatedAt;
+    jest.advanceTimersByTime(1000);
+    status(true);
+    expect(admission()).toBe(true);
+    expect(client.getQueryState(key)!.dataUpdatedAt).toBe(updatedAt);
+    expect(read).toHaveBeenCalledTimes(1);
+    read.mockRejectedValueOnce(new Error('offline'));
+    await expect(refresh()).rejects.toThrow('offline');
+    expect(admission()).toBeNull();
+    status(false);
+    expect(admission()).toBe(false);
+    expect(client.getQueryState(key)!.status).toBe('error');
+    expect(client.getQueryState(key)!.dataUpdatedAt).toBe(updatedAt);
+    stop();
+  });
+
+  it.each([
+    '{}',
+    '[]',
+    '{"admissionsPaused":"false"}',
+    '{"admissionsPaused":false,"extra":true}',
+    'null',
+    '{',
+    ' '.repeat(129),
+  ])('treats an invalid closed status frame as unknown: %s', async (data) => {
+    const stop = acquireUploadLive(client, key);
+    await flush();
+    status(false);
+    streams[0].listeners.status?.({ data });
+    expect(admission()).toBeNull();
+    expect(read).toHaveBeenCalledTimes(1);
+    stop();
+  });
+
+  it('lets a newer status defeat an older HTTP success while still accepting file data', async () => {
+    const stop = acquireUploadLive(client, key);
+    await flush();
+    let finish!: (value: unknown) => void;
+    read.mockImplementationOnce(() => new Promise((resolve) => (finish = resolve)));
+    const pending = refresh();
+    status(true);
+    finish({ operations: [{ id: 'new-file' }], admissionsPaused: false });
+    await pending;
+    expect(admission()).toBe(true);
+    expect(client.getQueryData(key)).toMatchObject({ operations: [{ id: 'new-file' }] });
+    stop();
+  });
+
+  it('does not let an older HTTP failure erase a newer status', async () => {
+    const stop = acquireUploadLive(client, key);
+    await flush();
+    let fail!: (error: Error) => void;
+    read.mockImplementationOnce(() => new Promise((_resolve, reject) => (fail = reject)));
+    const pending = refresh();
+    status(false);
+    fail(new Error('late failure'));
+    await expect(pending).rejects.toThrow('late failure');
+    expect(admission()).toBe(false);
+    expect(client.getQueryState(key)!.status).toBe('error');
+    stop();
+  });
+
+  it('expires a missing live heartbeat once, rejects old callbacks and reuses reconnect scheduling', async () => {
+    const stop = acquireUploadLive(client, key);
+    await flush();
+    status(false);
+    jest.advanceTimersByTime(19_999);
+    expect(admission()).toBe(false);
+    jest.advanceTimersByTime(1);
+    expect(admission()).toBeNull();
+    expect(streams[0].close).toHaveBeenCalledTimes(1);
+    status(false, 0);
+    expect(admission()).toBeNull();
+    expect(read).toHaveBeenCalledTimes(1);
+    jest.advanceTimersByTime(15_000);
+    await flush();
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(streams).toHaveLength(2);
+    stop();
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('expires readiness during a held hint fetch without starting another fetch', async () => {
+    const stop = acquireUploadLive(client, key);
+    await flush();
+    status(false);
+    let finish!: (value: unknown) => void;
+    read.mockImplementationOnce(() => new Promise((resolve) => (finish = resolve)));
+    streams[0].listeners.change();
+    jest.advanceTimersByTime(5000);
+    await flush();
+    expect(read).toHaveBeenCalledTimes(2);
+    jest.advanceTimersByTime(15_000);
+    expect(admission()).toBeNull();
+    jest.advanceTimersByTime(15_000);
+    await flush();
+    expect(read).toHaveBeenCalledTimes(2);
+    finish({ operations: [], admissionsPaused: false });
+    await flush();
+    expect(admission()).toBeNull();
+    stop();
+  });
+
+  it('keeps fresh HTTP fallback through 60-second SSE retries without false unknown intervals', async () => {
+    const stop = acquireUploadLive(client, key);
+    await flush();
+    for (const delay of [15_000, 30_000, 45_000, 60_000]) {
+      streams.at(-1)!.listeners.error();
+      jest.advanceTimersByTime(delay - 1);
+      expect(admission()).toBe(false);
+      jest.advanceTimersByTime(1);
+      await flush();
+      expect(admission()).toBe(false);
+    }
+    expect(read).toHaveBeenCalledTimes(5);
+    stop();
+  });
+
+  it('does not renew an HTTP lease when its reconnect read is held', async () => {
+    const stop = acquireUploadLive(client, key);
+    await flush();
+    let finish!: (value: unknown) => void;
+    read.mockImplementationOnce(() => new Promise((resolve) => (finish = resolve)));
+    streams[0].listeners.error();
+    jest.advanceTimersByTime(15_000);
+    await flush();
+    jest.advanceTimersByTime(59_999);
+    expect(admission()).toBe(false);
+    jest.advanceTimersByTime(1);
+    expect(admission()).toBeNull();
+    expect(getUploadAdmission(client, key)).toBeNull();
+    expect(read).toHaveBeenCalledTimes(2);
+    finish({ operations: [], admissionsPaused: false });
+    await flush();
+    expect(admission()).toBeNull();
+    stop();
+  });
+
+  it('invalidates a failed stream observation without resurrecting its superseded HTTP status', async () => {
+    const stop = acquireUploadLive(client, key);
+    await flush();
+    status(true);
+    streams[0].listeners.error();
+    expect(admission()).toBeNull();
+    status(false, 0);
+    expect(admission()).toBeNull();
+    stop();
+  });
+
+  it('keeps a newer independent HTTP observation after a stream failure', async () => {
+    const stop = acquireUploadLive(client, key);
+    await flush();
+    status(true);
+    await refresh();
+    streams[0].listeners.error();
+    expect(admission()).toBe(false);
+    stop();
+  });
+
+  it('makes hidden mode unknown and cannot revive an old response after visibility changes', async () => {
+    const stop = acquireUploadLive(client, key);
+    await flush();
+    let finish!: (value: unknown) => void;
+    read.mockImplementationOnce(() => new Promise((resolve) => (finish = resolve)));
+    const pending = refresh();
+    Object.defineProperty(document, 'hidden', { configurable: true, value: true });
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect(admission()).toBeNull();
+    status(false, 0);
+    Object.defineProperty(document, 'hidden', { configurable: true, value: false });
+    document.dispatchEvent(new Event('visibilitychange'));
+    finish({ operations: [], admissionsPaused: false });
+    await pending;
+    expect(admission()).toBeNull();
+    jest.advanceTimersByTime(0);
+    await flush();
+    expect(admission()).toBe(false);
     stop();
   });
 });

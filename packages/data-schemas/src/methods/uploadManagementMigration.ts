@@ -29,6 +29,7 @@ import {
   FALLBACK_LIMITS,
   reject,
 } from './uploadManagementStore';
+import { readUploadAdmission } from './uploadManagementAdmission';
 
 export type UploadMigrationMethods = {
   exportSnapshot(input: {
@@ -230,6 +231,7 @@ export function createUploadMigrationMethods(store: UploadStore): UploadMigratio
               queueBytes: global.queueBytes,
               turn: global.turn,
               byteGrants: global.byteGrants.map((grant) => ({ ...grant })),
+              admission: readUploadAdmission(global),
             },
           };
           global.enabled = false;
@@ -315,6 +317,7 @@ export function createUploadMigrationMethods(store: UploadStore): UploadMigratio
           if (record?.type !== 'global' || !record.value || typeof record.value !== 'object')
             reject('migration_conflict');
           const header = record.value as SnapshotHeader;
+          const admission = readUploadAdmission(header);
           validateTotals(header.totals);
           validateTotals(header.baseline);
           if (
@@ -347,12 +350,13 @@ export function createUploadMigrationMethods(store: UploadStore): UploadMigratio
             policyUntil: 0,
             migrationEpoch: page.epoch,
             byteGrants: header.byteGrants.map((grant) => ({ ...grant })),
+            admission,
           });
           global.migration = {
             epoch: page.epoch,
             role: 'import',
             phase: 'paging',
-            header,
+            header: { ...header, admission: { ...admission } },
             cursor: null,
             digest: '',
             operations: 0,

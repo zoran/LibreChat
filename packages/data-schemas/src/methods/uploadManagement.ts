@@ -35,6 +35,7 @@ import type {
   UploadActivationMethods,
 } from './uploadManagementStore';
 import type { UploadMigrationMethods } from './uploadManagementMigration';
+import type { UploadAdmissionMethods } from './uploadManagementAdmission';
 import type { UploadControlMethods } from './uploadManagementControl';
 import {
   createUploadStore,
@@ -51,12 +52,14 @@ import {
   PROCESS_MS,
   RESOURCE_MAX,
 } from './uploadManagementStore';
+import { createUploadAdmissionMethods, readUploadAdmission } from './uploadManagementAdmission';
 import { createUploadMigrationMethods } from './uploadManagementMigration';
 import { createUploadControlMethods } from './uploadManagementControl';
 import { createFileRetentionMethods } from './fileRetention';
 
 export type UploadManagementRepository = UploadControlMethods &
   UploadMigrationMethods &
+  UploadAdmissionMethods &
   UploadActivationMethods & {
     initialize(): Promise<void>;
     findReservation(
@@ -260,6 +263,7 @@ export function createUploadManagementRepository(
         return project(previous, now);
       }
       if (!global.enabled || !global.reconciled || global.mode === 'blocked') reject('unavailable');
+      if (readUploadAdmission(global).paused) reject('admission_paused');
       await store.touchPrincipal(principal, session);
       if (
         (await store.Operation.countDocuments({ ...owner, queueCharged: true }).session(session)) >=
@@ -442,6 +446,7 @@ export function createUploadManagementRepository(
     ...createUploadControlMethods(store),
     ...createUploadMigrationMethods(store),
     ...createUploadActivationMethods(store),
+    ...createUploadAdmissionMethods(store),
     reserve,
     usage,
     async findReservation(principal, key, fingerprint, now) {
@@ -1023,6 +1028,12 @@ export function createUploadManagementRepository(
       const counter = await store.Counter.findById('global').lean();
       if (!counter) reject('unavailable');
       const g = counter.value as GlobalState;
+      let admissionsPaused: boolean | null;
+      try {
+        admissionsPaused = readUploadAdmission(g).paused;
+      } catch {
+        admissionsPaused = null;
+      }
       type Group = {
         _id: StoredUpload['state'];
         count: number;
@@ -1087,6 +1098,7 @@ export function createUploadManagementRepository(
       const oldest = Math.min(Number.MAX_SAFE_INTEGER, ...grouped.map((row) => row.oldest));
       return {
         observedAt: now,
+        admissionsPaused,
         control: {
           mode: g.mode,
           limits: { ...g.limits },

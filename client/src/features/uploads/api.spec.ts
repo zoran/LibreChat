@@ -1,9 +1,10 @@
-import { sendUploadBody } from './api';
+import { request } from 'librechat-data-provider';
+import { readUploadSnapshot, reserveUpload, sendUploadBody } from './api';
 
 jest.mock('librechat-data-provider', () => ({
   apiBaseUrl: () => '',
   getTokenHeader: () => 'Bearer verified',
-  request: {},
+  request: { authenticatedFetch: jest.fn() },
 }));
 
 class BrowserTransfer {
@@ -62,10 +63,50 @@ describe('browser upload transport', () => {
       new AbortController().signal,
       jest.fn(),
     );
-    const failure = await expect(operation).rejects.toMatchObject({ code: 'unavailable' });
     BrowserTransfer.last.onerror?.();
-    await failure;
+    await expect(operation).rejects.toMatchObject({ code: 'unavailable' });
     expect(BrowserTransfer.last.send).toHaveBeenCalledTimes(1);
     expect(jest.getTimerCount()).toBe(0);
+  });
+});
+
+describe('managed snapshot admission boundary', () => {
+  const respond = (body: object, status = 200) => {
+    const read = jest
+      .fn()
+      .mockResolvedValueOnce({ done: false, value: new TextEncoder().encode(JSON.stringify(body)) })
+      .mockResolvedValueOnce({ done: true });
+    (request.authenticatedFetch as jest.Mock).mockResolvedValueOnce({
+      ok: status === 200,
+      status,
+      body: { getReader: () => ({ read, cancel: jest.fn().mockResolvedValue(undefined) }) },
+    });
+  };
+
+  it.each([true, false, null])('preserves the explicit admission value %s', async (value) => {
+    respond({ operations: [], admissionsPaused: value });
+    expect((await readUploadSnapshot()).admissionsPaused).toBe(value);
+  });
+
+  it.each([undefined, 'false', 0, {}, []])(
+    'does not infer open admission from %s',
+    async (value) => {
+      respond({ operations: [{ id: 'retained' }], admissionsPaused: value });
+      expect(await readUploadSnapshot()).toMatchObject({
+        operations: [{ id: 'retained' }],
+        admissionsPaused: null,
+      });
+    },
+  );
+
+  it('preserves the server pause error and never automatically replays a reservation', async () => {
+    respond({ code: 'admission_paused' }, 503);
+    await expect(
+      reserveUpload(
+        { filename: 'a.txt', mediaType: 'text/plain', declaredBytes: 4, idempotencyKey: 'one' },
+        new AbortController().signal,
+      ),
+    ).rejects.toMatchObject({ code: 'admission_paused', status: 503 });
+    expect(request.authenticatedFetch).toHaveBeenCalledTimes(1);
   });
 });

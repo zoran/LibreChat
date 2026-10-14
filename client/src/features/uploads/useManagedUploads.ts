@@ -2,9 +2,8 @@ import { useCallback, useEffect, useMemo } from 'react';
 import { useRecoilValue } from 'recoil';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import type { ManagedUploadSnapshot, ManagedUploadView } from 'librechat-data-provider';
+import { acquireUploadLive, getUploadAdmission, readManagedUploadSnapshot } from './live';
 import { useGetStartupConfig } from '~/data-provider';
-import { readUploadSnapshot } from './api';
-import { acquireUploadLive } from './live';
 import store from '~/store';
 
 export function useManagedUploads() {
@@ -17,15 +16,23 @@ export function useManagedUploads() {
     () => ['managed-uploads', user?.tenantId ?? '', user?.id ?? ''],
     [user?.tenantId, user?.id],
   );
-  const query = useQuery<ManagedUploadSnapshot>(key, ({ signal }) => readUploadSnapshot(signal), {
-    enabled: eligible,
-    staleTime: 15_000,
-    cacheTime: 0,
-    retry: 1,
-    refetchOnWindowFocus: true,
-    refetchOnReconnect: true,
-  });
+  const query = useQuery<ManagedUploadSnapshot>(
+    key,
+    ({ signal }) => readManagedUploadSnapshot(client, key, signal),
+    {
+      enabled: eligible,
+      staleTime: 15_000,
+      cacheTime: 0,
+      retry: 1,
+      refetchOnWindowFocus: true,
+      refetchOnReconnect: true,
+    },
+  );
   useEffect(() => (eligible ? acquireUploadLive(client, key) : undefined), [client, key, eligible]);
+  const getAdmissionsPaused = useCallback(
+    () => (eligible ? getUploadAdmission(client, key) : null),
+    [client, key, eligible],
+  );
   const refresh = useCallback(
     () => client.invalidateQueries({ queryKey: key, exact: true }),
     [client, key],
@@ -68,5 +75,14 @@ export function useManagedUploads() {
       }),
     [client, key],
   );
-  return { enabled, eligible, sessionKey: JSON.stringify(key), ...query, refresh, waitForReady };
+  return {
+    enabled,
+    eligible,
+    sessionKey: JSON.stringify(key),
+    ...query,
+    admissionsPaused: getAdmissionsPaused(),
+    getAdmissionsPaused,
+    refresh,
+    waitForReady,
+  };
 }

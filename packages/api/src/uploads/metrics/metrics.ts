@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks';
 import { Counter, Gauge, Histogram } from 'prom-client';
 import type { UploadMetricsSnapshot, UploadState } from 'librechat-data-provider';
 import type { Registry } from 'prom-client';
@@ -20,6 +21,7 @@ export interface UploadMetricObserver {
     observedAtMs: number;
   }): void;
   observeSnapshot(snapshot: UploadMetricsSnapshot): void;
+  observeAdmissionUnavailable(): void;
   observeSourceReplay(observation: SourceReplayObservation): void;
   observeQueue(input: {
     stage: 'transfer' | 'processing' | 'all';
@@ -100,6 +102,34 @@ export function createUploadMetrics(
   )
     throw new Error('invalid_upload_metric_slots');
   const registers = [registry];
+  const admissionObservations = new Map<
+    string,
+    { paused: boolean; observedAt: number; receivedAt: number; monotonicMs: number }
+  >();
+  const admissionsPaused = new Gauge({
+    name: 'cortex_upload_admissions_paused',
+    help: 'Known global admission policy within 15s of ledger observation; absence is unknown. Do not sum replicas.',
+    labelNames: ['slot'],
+    registers,
+    collect() {
+      this.reset();
+      const now = Date.now();
+      const monotonic = performance.now();
+      for (const [slot, observation] of admissionObservations) {
+        const age = Math.max(
+          now - observation.observedAt,
+          monotonic - observation.monotonicMs + observation.receivedAt - observation.observedAt,
+        );
+        if (
+          now >= observation.receivedAt &&
+          monotonic >= observation.monotonicMs &&
+          age >= 0 &&
+          age < 15_000
+        )
+          this.labels(slot).set(observation.paused ? 1 : 0);
+      }
+    },
+  });
   const backendDuration = new Histogram({
     name: 'cortex_upload_backend_duration_seconds',
     help: 'Observed storage operation durations; absence is unknown.',
@@ -425,8 +455,24 @@ export function createUploadMetrics(
         ].forEach(finite);
         stagingHeld.labels(slot).set(snapshot.staging.bytes);
         snapshotObserved.labels(slot).set(snapshot.observedAt / 1000);
+        if (
+          typeof snapshot.admissionsPaused === 'boolean' &&
+          Number.isSafeInteger(snapshot.observedAt) &&
+          snapshot.observedAt <= Date.now()
+        ) {
+          admissionObservations.set(slot, {
+            paused: snapshot.admissionsPaused,
+            observedAt: snapshot.observedAt,
+            receivedAt: Date.now(),
+            monotonicMs: performance.now(),
+          });
+        } else admissionObservations.delete(slot);
         work.labels(slot, 'transfer').set(snapshot.transfers);
         work.labels(slot, 'processing').set(snapshot.processors);
+      },
+      observeAdmissionUnavailable(): void {
+        admissionObservations.delete(slot);
+        admissionsPaused.remove(slot);
       },
       observeQueue(input: {
         stage: 'transfer' | 'processing' | 'all';

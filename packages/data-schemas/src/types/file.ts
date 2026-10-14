@@ -102,6 +102,7 @@ export interface IMongoFile extends Omit<Document, 'model'> {
   /** Includes liabilities whose Message has expired; released by this File's cleanup. */
   retainedDerivativeBytes?: number;
   retainedDerivativeReservations?: Array<Omit<FileSourceCopyReservation, 'fileId'>>;
+  uploadOperationId?: string;
   deletionRequestedAt?: Date;
   deletionCompletedAt?: Date;
   user: Types.ObjectId;

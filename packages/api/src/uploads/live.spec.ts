@@ -51,9 +51,19 @@ function fixture() {
     async (req: Request) => (req as unknown as { identity: UploadPrincipal }).identity,
   );
   const observe = jest.fn();
-  const options = { repository, principal, observe, tenantId: owner.tenantId };
+  const admissionStatus = jest.fn<boolean | null, []>(() => false);
+  const options = { repository, principal, observe, admissionStatus, tenantId: owner.tenantId };
   const hub = createUploadLiveHub(options);
-  return { hub, repository, principal, observe, closeWatch, options, changes: () => changes };
+  return {
+    hub,
+    repository,
+    principal,
+    observe,
+    admissionStatus,
+    closeWatch,
+    options,
+    changes: () => changes,
+  };
 }
 
 describe('bounded authenticated upload event hints', () => {
@@ -79,7 +89,9 @@ describe('bounded authenticated upload event hints', () => {
     for (let i = 0; i < 50; i++) f.changes().onChanged(owner);
     await jest.advanceTimersByTimeAsync(5_000);
     expect(a.response.write).toHaveBeenCalledTimes(1);
-    expect(a.response.write).toHaveBeenCalledWith('event: change\ndata: {}\n\n');
+    expect(a.response.write).toHaveBeenCalledWith(
+      'event: change\ndata: {}\n\nevent: status\ndata: {"admissionsPaused":false}\n\n',
+    );
     expect(b.response.write).not.toHaveBeenCalled();
     f.hub.close();
     expect(f.closeWatch).toHaveBeenCalledTimes(1);
@@ -185,12 +197,80 @@ describe('bounded authenticated upload event hints', () => {
     f.changes().onReset();
     await jest.advanceTimersByTimeAsync(5_000);
     expect(f.closeWatch).toHaveBeenCalledTimes(1);
-    expect(a.response.write).toHaveBeenCalledWith('event: reset\ndata: {}\n\n');
+    expect(a.response.write).toHaveBeenCalledWith(
+      'event: reset\ndata: {}\n\nevent: status\ndata: {"admissionsPaused":false}\n\n',
+    );
     expect(f.repository.watchChanges).toHaveBeenCalledTimes(2);
     expect(f.repository.watchChanges.mock.calls.map(([input]) => input.tenantId)).toEqual([
       owner.tenantId,
       owner.tenantId,
     ]);
     f.hub.close();
+  });
+
+  it('delivers current admission on initial, busy and idle writes without an extra watch or auth read', async () => {
+    const f = fixture();
+    const a = connection();
+    try {
+      await f.hub.open(a.req, a.res, owner);
+      expect(a.response.write).toHaveBeenLastCalledWith(
+        'event: reset\ndata: {}\n\nevent: status\ndata: {"admissionsPaused":false}\n\n',
+      );
+      f.admissionStatus.mockReturnValue(true);
+      for (let i = 0; i < 4; i++) {
+        f.changes().onChanged(owner);
+        await jest.advanceTimersByTimeAsync(5000);
+        expect(a.response.write).toHaveBeenLastCalledWith(
+          'event: change\ndata: {}\n\nevent: status\ndata: {"admissionsPaused":true}\n\n',
+        );
+      }
+      f.admissionStatus.mockReturnValue(null);
+      await jest.advanceTimersByTimeAsync(15_000);
+      expect(a.response.write).toHaveBeenLastCalledWith(
+        'event: status\ndata: {"admissionsPaused":null}\n\n',
+      );
+      expect(f.principal).toHaveBeenCalledTimes(6);
+      expect(f.admissionStatus).toHaveBeenCalledTimes(6);
+      expect(f.repository.watchChanges).toHaveBeenCalledTimes(1);
+    } finally {
+      f.hub.close();
+    }
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('reads status after reauthorization and keeps invalid getter values private and unknown', async () => {
+    const f = fixture();
+    const a = connection();
+    try {
+      await f.hub.open(a.req, a.res, owner);
+      f.principal.mockImplementationOnce(async () => {
+        f.admissionStatus.mockReturnValue(true);
+        return owner;
+      });
+      await jest.advanceTimersByTimeAsync(15_000);
+      expect(a.response.write).toHaveBeenLastCalledWith(
+        'event: status\ndata: {"admissionsPaused":true}\n\n',
+      );
+      f.admissionStatus.mockImplementationOnce(() => {
+        throw new Error('private connection');
+      });
+      await jest.advanceTimersByTimeAsync(15_000);
+      expect(a.response.write).toHaveBeenLastCalledWith(
+        'event: status\ndata: {"admissionsPaused":null}\n\n',
+      );
+      f.admissionStatus.mockReturnValueOnce('private owner' as never);
+      await jest.advanceTimersByTimeAsync(15_000);
+      expect(a.response.write).toHaveBeenLastCalledWith(
+        'event: status\ndata: {"admissionsPaused":null}\n\n',
+      );
+      f.admissionStatus.mockClear();
+      f.principal.mockRejectedValueOnce(new UploadManagementError('unauthorized'));
+      a.response.write.mockClear();
+      await jest.advanceTimersByTimeAsync(15_000);
+      expect(f.admissionStatus).not.toHaveBeenCalled();
+      expect(a.response.write).not.toHaveBeenCalled();
+    } finally {
+      f.hub.close();
+    }
   });
 });

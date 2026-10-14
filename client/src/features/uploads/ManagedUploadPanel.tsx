@@ -90,6 +90,24 @@ export function ManagedUploadPanel() {
         {localize('com_upload_limits_summary')}
       </summary>
       {content}
+      {uploads.eligible && uploads.data && (
+        <>
+          {uploads.admissionsPaused !== false && (
+            <p role="status" className="mt-2">
+              {localize(
+                uploads.admissionsPaused === true
+                  ? 'com_upload_admission_paused'
+                  : 'com_upload_status_unavailable',
+              )}
+            </p>
+          )}
+          {uploads.isError && (
+            <p role="alert" className="mt-2">
+              {localize('com_upload_refresh_failed')}
+            </p>
+          )}
+        </>
+      )}
     </details>
   );
 }
@@ -122,6 +140,8 @@ export function ManagedUploadCard({
     errorKey = 'com_upload_capacity_unavailable';
   } else if (local.error === 'size_mismatch') {
     errorKey = 'com_upload_size_mismatch';
+  } else if (local.error === 'admission_paused') {
+    errorKey = 'com_upload_admission_paused';
   }
   const action = async (kind: 'cancel' | 'delete' | 'retry') => {
     if (pending || !operation) return;

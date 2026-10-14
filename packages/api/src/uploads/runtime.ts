@@ -15,7 +15,7 @@ import type {
 import type { UploadRepository } from './contract';
 import { advanceUploadController, createUploadControllerState } from './control';
 
-type UploadStatus = Pick<ManagedUploadSnapshot, 'throttled' | 'waitingReason'>;
+type UploadStatus = Pick<ManagedUploadSnapshot, 'throttled' | 'waitingReason' | 'admissionsPaused'>;
 export interface UploadRuntimeOptions {
   ownerId: string;
   repository: Pick<
@@ -164,16 +164,25 @@ export function createUploadRuntime(options: UploadRuntimeOptions): UploadRuntim
     }
     if (stopped) return;
     try {
-      const snapshot = await options.repository.metrics(clock().nowMs);
+      const requested = clock();
+      const snapshot = await options.repository.metrics(requested.nowMs);
       const received = clock();
-      if (!clockValid(received, at)) throw new Error('invalid_upload_metrics_clock');
+      if (
+        !clockValid(requested, at) ||
+        !clockValid(received, requested) ||
+        !Number.isSafeInteger(snapshot.observedAt) ||
+        snapshot.observedAt < 0 ||
+        snapshot.observedAt > requested.nowMs
+      )
+        throw new Error('invalid_upload_metrics_clock');
       // Copy the private global policy so later adapter mutation cannot restamp this receipt.
       cached = {
         snapshot: {
           ...snapshot,
           control: { ...snapshot.control, limits: { ...snapshot.control.limits } },
         },
-        at: received,
+        // Age starts before the read, including any earlier source age, never at receipt.
+        at: requested,
       };
       observe({ kind: 'metrics', snapshot: cached.snapshot });
     } catch {
@@ -196,17 +205,22 @@ export function createUploadRuntime(options: UploadRuntimeOptions): UploadRuntim
       stopped ||
       !cached ||
       !clockValid(at, cached.at) ||
-      at.monotonicMs - cached.at.monotonicMs >= 15_000
+      at.monotonicMs - cached.at.monotonicMs + cached.at.nowMs - cached.snapshot.observedAt >=
+        15_000
     ) {
-      return { throttled: true, waitingReason: 'unavailable' };
+      return { throttled: true, waitingReason: 'unavailable', admissionsPaused: null };
     }
+    const admissionsPaused =
+      typeof cached.snapshot.admissionsPaused === 'boolean'
+        ? cached.snapshot.admissionsPaused
+        : null;
     const policy = cached.snapshot.control;
     if (
       !policy.enabled ||
       policy.mode === 'blocked' ||
       Object.values(policy.limits).some((value) => !Number.isSafeInteger(value) || value <= 0)
     ) {
-      return { throttled: true, waitingReason: 'unavailable' };
+      return { throttled: true, waitingReason: 'unavailable', admissionsPaused };
     }
     const throttled =
       policy.mode !== 'normal' ||
@@ -215,7 +229,7 @@ export function createUploadRuntime(options: UploadRuntimeOptions): UploadRuntim
       policy.limits.transferPermits < 6 ||
       policy.limits.processingPermits < 3 ||
       policy.limits.transferBytesPerSecond < 8 * 1048576;
-    return { throttled, waitingReason: throttled ? 'capacity' : null };
+    return { throttled, waitingReason: throttled ? 'capacity' : null, admissionsPaused };
   }
   return {
     tick,

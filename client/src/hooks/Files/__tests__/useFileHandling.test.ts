@@ -57,6 +57,24 @@ const mockProcessFileForUpload = jest.fn(
 const mockResizeImageIfNeeded = jest.fn(async (file: File) => ({ file, resized: false }));
 const mockWaitForConfig = jest.fn((): Promise<void> => Promise.resolve());
 const mockLocalize = jest.fn((key: string) => key);
+let mockManagedEnabled = false;
+let mockManagedEligible = true;
+let mockAdmissionsPaused: boolean | null = false;
+const mockManagedSelection = jest.fn();
+jest.mock('~/features/uploads/useManagedUploads', () => ({
+  useManagedUploads: () => ({
+    enabled: mockManagedEnabled,
+    eligible: mockManagedEligible,
+    sessionKey: 'tenant/user',
+    admissionsPaused: mockAdmissionsPaused,
+    getAdmissionsPaused: () => mockAdmissionsPaused,
+    refresh: jest.fn(),
+    waitForReady: jest.fn(),
+  }),
+}));
+jest.mock('~/features/uploads/transfer', () => ({
+  runManagedSelection: (...args: unknown[]) => mockManagedSelection(...args),
+}));
 
 const makeSizedFile = (name: string, type: string, size: number): File => {
   const file = new File(['content'], name, { type });
@@ -218,9 +236,94 @@ describe('useFileHandling', () => {
     mockIsTemporary = false;
     mockImageDecodes = true;
     mockUploadOptions = {};
+    mockManagedEnabled = false;
+    mockManagedEligible = true;
+    mockAdmissionsPaused = false;
+    mockManagedSelection.mockReset().mockResolvedValue(undefined);
   });
 
   const loadHook = async () => (await import('../useFileHandling')).default;
+
+  describe('managed admission selection', () => {
+    it.each([true, null])('rejects a new local retry while admission is %s', async (paused) => {
+      mockManagedEnabled = true;
+      mockAdmissionsPaused = paused;
+      const useFileHandling = await loadHook();
+      const { result } = renderHook(() => useFileHandling());
+      let accepted: boolean | undefined;
+      await act(async () => {
+        accepted = await result.current.handleFiles([new File(['text'], 'note.txt')], undefined, {
+          fileId: 'old-local-card',
+        });
+      });
+      expect(accepted).toBe(false);
+      expect(mockManagedSelection).not.toHaveBeenCalled();
+      expect(mockAddFile).not.toHaveBeenCalled();
+      expect(mockSetFilesLoading).toHaveBeenCalledWith(false);
+      await waitFor(() =>
+        expect(mockShowToast).toHaveBeenCalledWith(
+          expect.objectContaining({
+            message: paused ? 'com_upload_admission_paused' : 'com_upload_status_unavailable',
+          }),
+        ),
+      );
+    });
+
+    it('rechecks admission after the existing queue without interrupting the admitted selection', async () => {
+      mockManagedEnabled = true;
+      let finish!: () => void;
+      mockManagedSelection.mockImplementationOnce(
+        () => new Promise<void>((resolve) => (finish = resolve)),
+      );
+      const useFileHandling = await loadHook();
+      const fileSetter = jest.fn();
+      const { result } = renderHook(() => useFileHandling({ fileSetter }));
+      let first!: Promise<boolean>;
+      let second!: Promise<boolean>;
+      await act(async () => {
+        first = result.current.handleFiles([new File(['one'], 'first.txt')]);
+        await Promise.resolve();
+        await Promise.resolve();
+        second = result.current.handleFiles([new File(['two'], 'second.txt')]);
+      });
+      expect(mockManagedSelection).toHaveBeenCalledTimes(1);
+      mockAdmissionsPaused = true;
+      await act(async () => {
+        finish();
+        expect(await first).toBe(true);
+        expect(await second).toBe(false);
+      });
+      expect(mockManagedSelection).toHaveBeenCalledTimes(1);
+      expect(mockAddFile).toHaveBeenCalledTimes(1);
+      expect(mockAddFile.mock.calls[0][0].filename).toBe('first.txt');
+      expect(mockManagedSelection.mock.calls[0][1].signal.aborted).toBe(false);
+    });
+
+    it('rechecks after config waits and permits a later explicit selection after resume', async () => {
+      mockManagedEnabled = true;
+      mockIsConfigPending = true;
+      let finish!: () => void;
+      mockWaitForConfig.mockImplementationOnce(
+        () => new Promise<void>((resolve) => (finish = resolve)),
+      );
+      const useFileHandling = await loadHook();
+      const { result } = renderHook(() => useFileHandling());
+      let waiting!: Promise<boolean>;
+      await act(async () => {
+        waiting = result.current.handleFiles([new File(['text'], 'note.txt')]);
+      });
+      mockAdmissionsPaused = null;
+      await act(async () => {
+        finish();
+        expect(await waiting).toBe(false);
+      });
+      mockAdmissionsPaused = false;
+      await act(async () => {
+        expect(await result.current.handleFiles([new File(['text'], 'note.txt')])).toBe(true);
+      });
+      expect(mockManagedSelection).toHaveBeenCalledTimes(1);
+    });
+  });
 
   it('requests recovery for the caught HEIC helper import failure without starting an upload', async () => {
     mockHeicModuleError = new TypeError(

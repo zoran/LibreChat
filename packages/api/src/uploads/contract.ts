@@ -25,6 +25,8 @@ import type {
   UploadActivationProof,
   UploadLocalReservations,
   UploadOriginalIntegrity,
+  UploadAdmissionPolicy,
+  UploadAdmissionCommand,
 } from 'librechat-data-provider';
 
 export interface IdentityPort {
@@ -102,6 +104,9 @@ export type UploadAttemptPort = {
 };
 export interface UploadRepository {
   initialize(): Promise<void>;
+  /** Private operator port: reads never initialize; mutation retains its original deadline. */
+  getAdmissionPolicy(): Promise<UploadAdmissionPolicy>;
+  setAdmissionPolicy(command: UploadAdmissionCommand): Promise<UploadAdmissionPolicy>;
   reconciliationSnapshot(now: number): Promise<UploadReconciliationSnapshot>;
   activateReconciled(proof: UploadActivationProof, now: number): Promise<void>;
   findReservation(

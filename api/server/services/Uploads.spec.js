@@ -10,6 +10,7 @@ jest.mock('@librechat/api', () => ({
   ),
   createUploadWorkers: jest.fn(jest.requireActual('@librechat/api').createUploadWorkers),
   createUploadLiveHub: jest.fn(jest.requireActual('@librechat/api').createUploadLiveHub),
+  createUploadRuntime: jest.fn(jest.requireActual('@librechat/api').createUploadRuntime),
 }));
 const {
   initializeS3,
@@ -17,6 +18,7 @@ const {
   createRawUploadBodyHandler,
   createUploadWorkers,
   createUploadLiveHub,
+  createUploadRuntime,
   UploadManagementError,
 } = require('@librechat/api');
 const {
@@ -176,6 +178,30 @@ describe('Cortex upload adapter trust boundaries', () => {
     const failed = { id: 'operation', revision: 2, scope: { kind: 'personal' }, state: 'failed' };
     const repository = {
       get: jest.fn(async () => failed),
+      claimController: jest.fn(async () => null),
+      metrics: jest.fn(async (observedAt) => ({
+        observedAt,
+        admissionsPaused: true,
+        states: {},
+        originalBytes: 0,
+        objectBytes: 0,
+        textBytes: 0,
+        recordBytes: 0,
+        bundles: 0,
+        cleanupPending: 0,
+        transfers: 0,
+        processors: 0,
+        queue: { count: 0, bytes: 0, oldestAgeSeconds: 0 },
+        quota: { usedBytes: 0, reservedBytes: 0, retainedBytes: 0 },
+        staging: { count: 0, bytes: 0 },
+        control: {
+          mode: 'blocked',
+          enabled: true,
+          limits: { transferPermits: 0, processingPermits: 0, transferBytesPerSecond: 0 },
+          sourceExpiresAt: observedAt,
+          leaseExpiresAt: observedAt,
+        },
+      })),
       findReservation: jest.fn(async () => null),
       reserve: jest.fn(async () => {
         throw new UploadManagementError('quota_exceeded');
@@ -209,6 +235,11 @@ describe('Cortex upload adapter trust boundaries', () => {
       expect(createUploadLiveHub).toHaveBeenCalledWith(
         expect.objectContaining({ tenantId: 'tenant-a' }),
       );
+      const liveOptions = createUploadLiveHub.mock.calls.at(-1)[0];
+      expect(liveOptions.admissionStatus()).toBeNull();
+      await createUploadRuntime.mock.results.at(-1).value.tick();
+      expect(liveOptions.admissionStatus()).toBe(true);
+      expect(repository.metrics).toHaveBeenCalledTimes(1);
       await expect(
         composition.management.reserve(owner, {
           filename: 'tiny.txt',
@@ -225,6 +256,7 @@ describe('Cortex upload adapter trust boundaries', () => {
       processing.observe({ stage: 'processing', seconds: 2, outcome: 'success' });
       processing.observe({ stage: 'total', seconds: 9, outcome: 'success' });
       const text = await registry.metrics();
+      expect(text).toContain('cortex_upload_admissions_paused{slot="cpu-1"} 1');
       expect(text).toContain(
         'cortex_upload_quota_rejections_total{slot="cpu-1",reason="window"} 1',
       );

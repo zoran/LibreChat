@@ -161,10 +161,12 @@ export function assertSourceJobSize(key: string, fields: Readonly<Record<string,
 }
 
 /** Same wire accounting for the process-local store, without sharing its mutable job map. */
-export function assertSourceObjectSize(job: {
-  streamId: string;
-  sourceReplayIntent?: SourceReplayIntent;
-}): void {
+export function assertSourceObjectSize<
+  T extends {
+    streamId: string;
+    sourceReplayIntent?: SourceReplayIntent;
+  },
+>(job: T): void {
   if (!job.sourceReplayIntent) return;
   const fields: Record<string, string> = {};
   for (const [key, value] of Object.entries(job)) {

@@ -49,6 +49,11 @@ export const RESOURCE_MAX: {
   bundles: 100_000,
 };
 export type ResourceTotals = typeof RESOURCE_MAX;
+export type StoredUploadAdmissionPolicy = {
+  paused: boolean;
+  revision: number;
+  lastRequestSha256?: string;
+};
 export type SnapshotHeader = {
   sourceId: string;
   totals: ResourceTotals;
@@ -58,6 +63,7 @@ export type SnapshotHeader = {
   queueBytes: number;
   turn: number;
   byteGrants: GlobalState['byteGrants'];
+  admission?: StoredUploadAdmissionPolicy;
 };
 export type MigrationState = {
   epoch: string;
@@ -127,6 +133,7 @@ export type GlobalState = ResourceTotals & {
   byteGrants: { at: number; bytes: number; host: string }[];
   migrationEpoch?: string;
   storeId: string;
+  admission?: StoredUploadAdmissionPolicy;
   baseline: ResourceTotals;
   migration?: MigrationState;
   cleanupCursor?: string;
@@ -408,6 +415,7 @@ export function createUploadStore(
       mode: 'fallback',
       byteGrants: [],
       storeId: randomUUID(),
+      admission: { paused: false, revision: 0 },
       baseline,
     };
     await Counter.updateOne(

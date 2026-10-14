@@ -54,8 +54,13 @@ export async function uploadRequest<T>(suffix: string, options?: RequestInit): P
   }
 }
 
-export const readUploadSnapshot = (signal?: AbortSignal) =>
-  uploadRequest<ManagedUploadSnapshot>('', { signal });
+export const readUploadSnapshot = async (signal?: AbortSignal): Promise<ManagedUploadSnapshot> => {
+  const data = await uploadRequest<ManagedUploadSnapshot>('', { signal });
+  return {
+    ...data,
+    admissionsPaused: typeof data.admissionsPaused === 'boolean' ? data.admissionsPaused : null,
+  };
+};
 export const reserveUpload = (body: UploadRequest, signal: AbortSignal) =>
   uploadRequest<UploadOperation>('/operations', {
     method: 'POST',

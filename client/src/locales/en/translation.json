@@ -3452,7 +3452,7 @@
   "com_upload_remove": "Remove from selection",
   "com_upload_retry_processing": "Retry processing",
   "com_upload_loading": "Loading quota…",
-  "com_upload_status_unavailable": "Upload status is currently unavailable. New uploads wait until limits can be checked safely.",
+  "com_upload_status_unavailable": "Upload status is currently unavailable. New files cannot be added. Please select them again once the status is available.",
   "com_upload_throttled": "New uploads are limited due to high load. Current transfers may take longer.",
   "com_upload_unsupported": "Supported formats are TXT, text-bearing PDF, DOCX and PPTX, up to 30 MiB per file.",
   "com_auth_email_code_choice": "Choose how to continue",
@@ -3484,5 +3484,7 @@
   "com_upload_retrying": "Requesting processing again",
   "com_upload_quota_exceeded": "There is not enough upload allowance for this file. The allowance display shows when you can upload more.",
   "com_upload_capacity_unavailable": "No upload capacity is available at the moment. Please try again later.",
-  "com_upload_size_mismatch": "The received file size does not match. Please select the file again."
+  "com_upload_size_mismatch": "The received file size does not match. Please select the file again.",
+  "com_upload_admission_paused": "New uploads are temporarily paused. Uploads already admitted can continue.",
+  "com_upload_refresh_failed": "The file and quota display could not be refreshed. The last known values are shown."
 }

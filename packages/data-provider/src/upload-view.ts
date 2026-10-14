@@ -19,6 +19,8 @@ export type ManagedUploadSnapshot = {
   version: 1;
   operations: ManagedUploadView[];
   usage: UploadUsage;
+  /** Advisory only; the shared reservation transaction remains authoritative. */
+  admissionsPaused: boolean | null;
   throttled: boolean;
   waitingReason: 'capacity' | 'unavailable' | null;
 };

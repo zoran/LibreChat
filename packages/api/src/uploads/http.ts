@@ -26,7 +26,7 @@ export interface UploadHttpOptions extends AuthorityOptions {
     principal: UploadPrincipal,
     operations: readonly UploadOperation[],
   ): Promise<ReadonlyMap<string, Attachment>>;
-  status(): Pick<ManagedUploadSnapshot, 'throttled' | 'waitingReason'>;
+  status(): Pick<ManagedUploadSnapshot, 'throttled' | 'waitingReason' | 'admissionsPaused'>;
   live: Pick<UploadLiveHub, 'open'>;
 }
 const safeStatuses: Partial<Record<UploadErrorCode, number>> = {
@@ -39,6 +39,7 @@ const safeStatuses: Partial<Record<UploadErrorCode, number>> = {
   quota_exceeded: 429,
   capacity_exceeded: 429,
   queue_full: 429,
+  admission_paused: 503,
   not_ready: 409,
   lease_lost: 409,
   size_mismatch: 400,
@@ -224,6 +225,7 @@ export function createUploadHttpRouter(options: UploadHttpOptions): Router {
           return { ...row, canUseInComposer: false };
         return { ...row, attachment: publicAttachment(attachment) };
       });
+      await authenticate(request, owner);
       const status = options.status();
       const snapshot: ManagedUploadSnapshot = {
         version: 1,
@@ -231,8 +233,9 @@ export function createUploadHttpRouter(options: UploadHttpOptions): Router {
         usage: publicUsage(usage),
         throttled: status.throttled,
         waitingReason: status.waitingReason,
+        admissionsPaused:
+          typeof status.admissionsPaused === 'boolean' ? status.admissionsPaused : null,
       };
-      await authenticate(request, owner);
       response.json(snapshot);
     }),
   );

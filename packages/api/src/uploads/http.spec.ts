@@ -44,8 +44,10 @@ describe('upload HTTP boundary', () => {
   let projectAttachments: jest.Mock;
   let live: { open: jest.Mock };
   let body: jest.Mock;
+  let admissionsPaused: boolean | null;
 
   beforeEach(async () => {
+    admissionsPaused = false;
     strongPrincipal = jest.fn(async (req: Request) => {
       if (req.headers.authorization !== 'Bearer verified')
         throw new UploadManagementError('unauthorized');
@@ -76,7 +78,7 @@ describe('upload HTTP boundary', () => {
       allowedOrigins: [origin],
       projectAttachments,
       live,
-      status: () => ({ throttled: false, waitingReason: null }),
+      status: () => ({ throttled: false, waitingReason: null, admissionsPaused }),
     };
     const app = express();
     app.use(
@@ -153,9 +155,33 @@ describe('upload HTTP boundary', () => {
       usage,
       throttled: false,
       waitingReason: null,
+      admissionsPaused: false,
     });
     expect(strongPrincipal).toHaveBeenCalledTimes(2);
     expect(management.list).toHaveBeenCalledWith(user);
+  });
+
+  it('keeps retained operations and accepted actions available while admission is paused or unknown', async () => {
+    for (const value of [true, null]) {
+      admissionsPaused = value;
+      const result = await call('GET');
+      expect(result).toMatchObject({
+        status: 200,
+        data: { admissionsPaused: value, operations: [operation] },
+      });
+      expect((await call('POST', '/api/uploads/operations/operation/retry', {})).status).toBe(202);
+      expect((await call('POST', '/api/uploads/operations/operation/cancel', {})).status).toBe(202);
+      expect((await call('DELETE', '/api/uploads/operations/operation')).status).toBe(202);
+    }
+    management.reserve.mockRejectedValueOnce(new UploadManagementError('admission_paused'));
+    expect(
+      await call('POST', '/api/uploads/operations', {
+        filename: 'note.txt',
+        mediaType: 'text/plain',
+        declaredBytes: 5,
+        idempotencyKey: 'new',
+      }),
+    ).toEqual({ status: 503, data: { code: 'admission_paused' } });
   });
 
   it('rechecks the current grant after asynchronous projection and before disclosure', async () => {

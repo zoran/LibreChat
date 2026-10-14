@@ -12,6 +12,7 @@ function fixture(leader = true) {
   const clock = () => ({ nowMs: epoch + elapsed, monotonicMs: elapsed });
   const metrics: UploadMetricsSnapshot = {
     observedAt: epoch,
+    admissionsPaused: false,
     states: {},
     originalBytes: 0,
     objectBytes: 0,
@@ -52,7 +53,10 @@ function fixture(leader = true) {
     activeWorkers: jest.fn(async () => [worker]),
     metrics: jest.fn(async () => metrics),
   };
-  const snapshots = { refresh: jest.fn(async () => undefined), current: jest.fn(() => []) };
+  const snapshots = {
+    refresh: jest.fn(async (): Promise<void> => undefined),
+    current: jest.fn(() => []),
+  };
   const hardGuards = jest.fn(async () => ({ safe: true, durability: 'safe' as const }));
   const observe = jest.fn();
   const runtime = createUploadRuntime({
@@ -80,13 +84,25 @@ function fixture(leader = true) {
 describe('fenced upload controller runtime', () => {
   it('never refreshes collectors as follower and reports the shared authoritative policy', async () => {
     const f = fixture(false);
-    expect(f.runtime.status()).toEqual({ throttled: true, waitingReason: 'unavailable' });
+    expect(f.runtime.status()).toEqual({
+      throttled: true,
+      waitingReason: 'unavailable',
+      admissionsPaused: null,
+    });
     await f.runtime.tick();
     expect(f.snapshots.refresh).not.toHaveBeenCalled();
     expect(f.repository.publishControl).not.toHaveBeenCalled();
-    expect(f.runtime.status()).toEqual({ throttled: false, waitingReason: null });
+    expect(f.runtime.status()).toEqual({
+      throttled: false,
+      waitingReason: null,
+      admissionsPaused: false,
+    });
     f.advance(16_000);
-    expect(f.runtime.status()).toEqual({ throttled: true, waitingReason: 'unavailable' });
+    expect(f.runtime.status()).toEqual({
+      throttled: true,
+      waitingReason: 'unavailable',
+      admissionsPaused: null,
+    });
     await f.runtime.stop();
   });
 
@@ -175,10 +191,72 @@ describe('fenced upload controller runtime', () => {
     f.metrics.control.sourceExpiresAt = epoch;
     f.advance(10_000);
     await f.runtime.tick();
-    expect(f.runtime.status()).toEqual({ throttled: true, waitingReason: 'capacity' });
+    expect(f.runtime.status()).toEqual({
+      throttled: true,
+      waitingReason: 'capacity',
+      admissionsPaused: false,
+    });
     for (let i = 0; i < 5; i++) f.runtime.status();
     expect(f.repository.metrics).toHaveBeenCalledTimes(2);
     expect(f.snapshots.refresh).not.toHaveBeenCalled();
+    await f.runtime.stop();
+  });
+
+  it('projects pause independently of critical control without a status-time database read', async () => {
+    const f = fixture(false);
+    f.metrics.admissionsPaused = true;
+    f.metrics.control.mode = 'blocked';
+    await f.runtime.tick();
+    expect(f.runtime.status()).toEqual({
+      admissionsPaused: true,
+      throttled: true,
+      waitingReason: 'unavailable',
+    });
+    for (let i = 0; i < 10; i++) expect(f.runtime.status().admissionsPaused).toBe(true);
+    expect(f.repository.metrics).toHaveBeenCalledTimes(1);
+    f.metrics.admissionsPaused = false;
+    expect(f.runtime.status().admissionsPaused).toBe(true);
+    await f.runtime.stop();
+  });
+
+  it('does not rejuvenate an old admission observation when a slow metrics read finishes', async () => {
+    const f = fixture(false);
+    f.repository.metrics.mockImplementationOnce(async () => {
+      f.advance(14_000);
+      return f.metrics;
+    });
+    await f.runtime.tick();
+    expect(f.runtime.status().admissionsPaused).toBe(false);
+    f.advance(1000);
+    expect(f.runtime.status().admissionsPaused).toBeNull();
+    await f.runtime.stop();
+  });
+
+  it.each([null, undefined, 'false', 0])(
+    'treats unavailable or malformed admission %p as unknown',
+    async (value) => {
+      const f = fixture(false);
+      Object.assign(f.metrics, { admissionsPaused: value });
+      await f.runtime.tick();
+      expect(f.runtime.status().admissionsPaused).toBeNull();
+      expect(f.runtime.status().throttled).toBe(false);
+      await f.runtime.stop();
+    },
+  );
+
+  it('rejects a future source timestamp and clears readiness after a failed refresh', async () => {
+    const f = fixture(false);
+    f.metrics.observedAt = epoch + 1;
+    await f.runtime.tick();
+    expect(f.runtime.status().admissionsPaused).toBeNull();
+    f.advance(10_000);
+    f.metrics.observedAt = epoch + 10_000;
+    await f.runtime.tick();
+    expect(f.runtime.status().admissionsPaused).toBe(false);
+    f.advance(10_000);
+    f.repository.metrics.mockRejectedValueOnce(new Error('unavailable'));
+    await f.runtime.tick();
+    expect(f.runtime.status().admissionsPaused).toBeNull();
     await f.runtime.stop();
   });
 });

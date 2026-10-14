@@ -10,6 +10,8 @@ export interface UploadLiveOptions {
   tenantId: string;
   /** Strong current grant check; this background read must never extend foreground idle life. */
   principal: UploadRequestPrincipal;
+  /** Synchronous cached advisory status; this port must perform no I/O or grant authority. */
+  admissionStatus(): boolean | null;
   observe?: (event: {
     connections: number;
     outcome: 'connected' | 'changed' | 'reset' | 'heartbeat' | 'closed' | 'rejected';
@@ -38,7 +40,7 @@ const same = (a: UploadPrincipal, b: UploadPrincipal) =>
 const keyOf = (owner: { tenantId: string; userId: string }) =>
   JSON.stringify([owner.tenantId, owner.userId]);
 
-/** One replica watch; hints contain no operation, file, tenant, user, or storage data. */
+/** One replica watch and existing heartbeat; frames contain no private ownership or file data. */
 export function createUploadLiveHub(options: UploadLiveOptions) {
   const tenantId = options.tenantId;
   if (typeof tenantId !== 'string' || !tenantId || tenantId.length > 128)
@@ -91,7 +93,17 @@ export function createUploadLiveHub(options: UploadLiveOptions) {
       return;
     }
     try {
-      if (!connection.res.write(hint ? `event: ${hint}\ndata: {}\n\n` : ': heartbeat\n\n')) {
+      let admissionsPaused: boolean | null = null;
+      try {
+        const value = options.admissionStatus();
+        if (typeof value === 'boolean') admissionsPaused = value;
+      } catch {
+        /* An unavailable advisory cache cannot become an open policy. */
+      }
+      // Busy hints postpone idle heartbeats, so every authenticated write carries status.
+      const status = `event: status\ndata: ${JSON.stringify({ admissionsPaused })}\n\n`;
+      const frames = (hint ? `event: ${hint}\ndata: {}\n\n` : '') + status;
+      if (!connection.res.write(frames)) {
         close(connection, true);
         return;
       }

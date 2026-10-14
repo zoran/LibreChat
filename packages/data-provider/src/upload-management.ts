@@ -114,6 +114,7 @@ export const UPLOAD_ERROR_CODES = [
   'expired',
   'cancelled',
   'unavailable',
+  'admission_paused',
   'migration_conflict',
 ] as const;
 export type UploadErrorCode = (typeof UPLOAD_ERROR_CODES)[number];
@@ -265,6 +266,8 @@ export type UploadControlPolicy = {
 export type UploadByteLease = { bytes: number; expiresAt: string; generation: number };
 export type UploadMetricsSnapshot = {
   observedAt: number;
+  /** Independent admission policy; null means the observation cannot establish policy. */
+  admissionsPaused: boolean | null;
   /** Private global view; consumers must preserve these source/lease deadlines. */
   control: UploadControlPolicy & { leaseExpiresAt: number; enabled: boolean };
   queue: { count: number; bytes: number; oldestAgeSeconds: number };
@@ -279,6 +282,19 @@ export type UploadMetricsSnapshot = {
   cleanupPending: number;
   transfers: number;
   processors: number;
+};
+/** Private operator contract. Neither the policy revision nor commands are employee input. */
+export type UploadAdmissionPolicy = {
+  storeId: string;
+  revision: number;
+  paused: boolean;
+};
+export type UploadAdmissionCommand = {
+  storeId: string;
+  expectedRevision: number;
+  paused: boolean;
+  /** Retained verbatim across retries; confirmation cannot grant a fresh mutation window. */
+  originalDeadline: string;
 };
 /** Private migration data is paged, never exposed by employee HTTP handlers. */
 export type UploadMigrationPage = {

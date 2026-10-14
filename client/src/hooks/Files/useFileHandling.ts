@@ -533,6 +533,17 @@ const useFileHandlingCore = (params: UseFileHandling | undefined, fileState: Fil
         setFilesLoading(false);
         return false;
       }
+      // This runs after queue/config waits. A local recovery id is not an admitted reservation.
+      const admissionsPaused = managedUploads.getAdmissionsPaused();
+      if (admissionsPaused !== false) {
+        setError(
+          admissionsPaused === true
+            ? 'com_upload_admission_paused'
+            : 'com_upload_status_unavailable',
+        );
+        setFilesLoading(false);
+        return false;
+      }
       const formats: Record<string, string> = {
         txt: 'text/plain',
         pdf: 'application/pdf',
