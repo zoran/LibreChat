@@ -60,7 +60,7 @@ export interface StoragePort {
   remove(input: {
     operationId: string;
     generation: number;
-    tenantId: string;
+    tenantId: string | null;
     userId: string;
     signal: AbortSignal;
   }): Promise<'absent' | 'unknown'>;
@@ -150,14 +150,15 @@ export interface UploadRepository {
   ): Promise<void>;
   cleanupTasks(limit?: number): Promise<UploadCleanupTask[]>;
   cleanupForFile(
-    owner: { tenantId: string; userId: string },
+    owner: { tenantId: string | null; userId: string },
     fileId: string,
   ): Promise<UploadCleanupTask | null>;
   activeWorkers(): Promise<UploadWorker[]>;
   localReservations(worker: UploadWorker, now: number): Promise<UploadLocalReservations>;
   watchChanges(input: {
     tenantId: string;
-    onChanged: (principal: { tenantId: string; userId: string }) => void;
+    includeGuests?: boolean;
+    onChanged: (principal: { tenantId: string | null; userId: string }) => void;
     onReset: () => void;
   }): () => void;
   claimController(input: { ownerId: string; now: number }): Promise<UploadControllerLease | null>;

@@ -142,6 +142,17 @@ describe('upload HTTP boundary', () => {
     });
   }
 
+  it('serves the same private snapshot for an admitted explicit-null guest and refuses identity drift', async () => {
+    const guest = { authentication: 'guest', tenantId: null, userId: 'guest' } as const;
+    strongPrincipal.mockResolvedValue(guest);
+    expect((await call('GET')).status).toBe(200);
+    expect(management.list).toHaveBeenCalledWith(guest);
+    strongPrincipal
+      .mockResolvedValueOnce(guest)
+      .mockResolvedValueOnce({ ...guest, userId: 'other-guest' });
+    expect((await call('GET')).status).toBe(401);
+  });
+
   it('serves only the authenticated snapshot and strips private adapter fields', async () => {
     management.list.mockResolvedValue([
       { ...operation, storageKey: 'private/key', tenantId: 'private' },

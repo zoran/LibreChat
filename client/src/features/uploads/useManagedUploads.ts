@@ -78,6 +78,8 @@ export function useManagedUploads() {
   return {
     enabled,
     eligible,
+    // Presentation only: the server eligibility bit remains the admission authority.
+    isGuestAccount: eligible && user?.provider === 'browser',
     sessionKey: JSON.stringify(key),
     ...query,
     admissionsPaused: getAdmissionsPaused(),

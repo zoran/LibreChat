@@ -8,6 +8,8 @@ import type {
 import type { Request, RequestHandler, Response } from 'express';
 import type { Store } from 'express-rate-limit';
 import type { ApplicationWorkPort } from '~/app';
+import { getAuthSelection, guestUploadTransitionEnabled } from './authMode';
+import { isTokenRetired } from './twoFactor';
 
 export const BROWSER_COOKIE = '__Host-librechat-browser';
 const cookieOptions = { httpOnly: true, secure: true, sameSite: 'strict', path: '/' } as const;
@@ -31,6 +33,66 @@ function browserCookie(req: Request): string | undefined {
     return value;
   }
   return matches.length ? '' : undefined;
+}
+
+export type BrowserGrant = { userId: string; sessionId: string; tenantId: null };
+
+/** Signature/expiry verification belongs to the bearer owner; this binds the same current cookie account. */
+export async function validateBrowserBearer(
+  payload: unknown,
+  request: Request,
+  repository: Pick<BrowserMethods, 'findBrowserIdentity'>,
+): Promise<{ user: BrowserUser; grant: BrowserGrant } | null> {
+  if (
+    request.tenantId != null ||
+    !guestUploadTransitionEnabled() ||
+    !['guest', undefined].includes(getAuthSelection(request)) ||
+    !payload ||
+    typeof payload !== 'object' ||
+    Array.isArray(payload)
+  )
+    return null;
+  const claim = payload as Record<string, unknown>;
+  if (
+    claim.provider !== 'browser' ||
+    typeof claim.id !== 'string' ||
+    !/^[a-f0-9]{24}$/.test(claim.id) ||
+    claim.tenantId != null ||
+    claim.scope !== undefined ||
+    claim.authMethod !== undefined ||
+    claim.tokenUse !== undefined ||
+    typeof claim.iat !== 'number' ||
+    !Number.isFinite(claim.iat) ||
+    typeof claim.exp !== 'number' ||
+    !Number.isFinite(claim.exp) ||
+    claim.exp * 1000 <= Date.now()
+  )
+    return null;
+  const credential = browserCookie(request);
+  if (!credential || !credential.startsWith(`${claim.id}.`)) return null;
+  const identity = await repository.findBrowserIdentity(credential);
+  if (
+    !identity ||
+    identity.user.id !== claim.id ||
+    identity.user.provider !== 'browser' ||
+    identity.user.role !== 'USER' ||
+    !identity.sessionId ||
+    !/^[a-f0-9]{24}$/.test(identity.sessionId) ||
+    identity.expiration.getTime() <= Date.now() ||
+    claim.exp * 1000 <= Date.now() ||
+    isTokenRetired(
+      {
+        issuedAt: claim.iat,
+        issuedAtMs: typeof claim.issuedAtMs === 'number' ? claim.issuedAtMs : undefined,
+      },
+      identity.retirement,
+    )
+  )
+    return null;
+  return {
+    user: identity.user,
+    grant: { userId: identity.user.id, sessionId: identity.sessionId, tenantId: null },
+  };
 }
 
 function hasRegularSession(req: Request): boolean {

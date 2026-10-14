@@ -22,6 +22,13 @@ export function getAuthMode(): AuthMode {
   throw new Error('Invalid AUTH_MODE');
 }
 
+/** Explicit temporary personal-guest policy; other auth modes retain verified-email-only uploads. */
+export function guestUploadTransitionEnabled(): boolean {
+  return (
+    getAuthMode() === 'transition' && process.env.CORTEX_UPLOAD_GUEST_TRANSITION_ENABLED === 'true'
+  );
+}
+
 export function getEmailCodeSettings(): {
   tenantId: string;
   domains: string[];

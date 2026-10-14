@@ -66,6 +66,32 @@ describe('managed S3 adapter preserves lifecycle and uncertainty', () => {
     expect(managedOriginalKey(lease)).toBe(expectedKey);
     expect(() => managedOriginalKey({ ...lease, userId: '../escape' })).toThrow();
   });
+  it('preserves canonical email bytes and uses only the existing explicit guest key namespace', async () => {
+    expect(managedOriginalKey(lease)).toBe(expectedKey);
+    const guest = { ...lease, tenantId: null };
+    const key = 'managed-uploads/user/operation.2__original';
+    expect(managedOriginalKey(guest)).toBe(key);
+    expect(() => managedOriginalKey({ ...guest, tenantId: undefined } as never)).toThrow();
+    const send = jest.fn(async (command) => {
+      expect(command.input.Key).toBe(key);
+      if (command instanceof PutObjectCommand) {
+        for await (const _chunk of command.input.Body) {
+          /* real stream consumed */
+        }
+        return {};
+      }
+      if (command instanceof GetObjectCommand)
+        return { Body: Readable.from([Buffer.from('hello')]) };
+      throw new Error('Unexpected command');
+    });
+    const { storage } = fixture(send);
+    const original = await storage.put({ ...put(), lease: guest });
+    expect(original.outcome).toBe('durable');
+    const received = [];
+    for await (const chunk of storage.read({ original, signal: signal() })) received.push(chunk);
+    expect(Buffer.concat(received).toString()).toBe('hello');
+  });
+
   it('returns durable receipt only after exact bytes finish and passes abort to SDK', async () => {
     const send = jest.fn(async (command, options) => {
       expect(command).toBeInstanceOf(PutObjectCommand);
@@ -372,13 +398,14 @@ describe('managed S3 adapter preserves lifecycle and uncertainty', () => {
       })
       [Symbol.asyncIterator]();
     const first = reader.next();
-    const rejected = await expect(first).rejects.toThrow();
+    // Handle an early rejection before the abort trigger; assert the original promise after it.
+    void first.catch(() => undefined);
     await new Promise<void>((resolve) => setImmediate(resolve));
     controller.abort();
     // Ensure the RED version cannot leave a pending fixture stream after its assertion fails.
     const closedAtAbort = body.destroyed;
     body.destroy(new Error('Synthetic abort'));
-    await rejected;
+    await expect(first).rejects.toThrow();
     expect(closedAtAbort).toBe(true);
   });
 });

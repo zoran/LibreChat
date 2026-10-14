@@ -36,12 +36,19 @@ jest.mock('@librechat/data-schemas', () => ({
 
 jest.mock('@librechat/api', () => ({
   AGENT_TRIGGER_SCOPE: 'agent_trigger',
+  getAuthMode: jest.requireActual('@librechat/api').getAuthMode,
+  getAuthSelection: jest.requireActual('@librechat/api').getAuthSelection,
+  getEmailCodeSettings: jest.requireActual('@librechat/api').getEmailCodeSettings,
+  guestUploadTransitionEnabled: jest.requireActual('@librechat/api').guestUploadTransitionEnabled,
+  validateBrowserBearer: jest.requireActual('@librechat/api').validateBrowserBearer,
+  validateEmailCodeBearer: jest.fn(async () => null),
   isTokenRetired: jest.requireActual('@librechat/api').isTokenRetired,
   continueAfterBearerRetirement: jest.requireActual('@librechat/api').continueAfterBearerRetirement,
 }));
 
 jest.mock('~/models', () => ({
   getUserById: jest.fn(),
+  findBrowserIdentity: jest.fn(),
   updateUser: jest.fn(),
 }));
 
@@ -73,6 +80,78 @@ describe('jwtStrategy', () => {
     jest.clearAllMocks();
     updateUser.mockResolvedValue({});
     jwtLogin();
+  });
+
+  it('returns the current guest role when a previous user read predates a role demotion', async () => {
+    const previous = { ...process.env };
+    const { findBrowserIdentity } = require('~/models');
+    const { BROWSER_COOKIE } = jest.requireActual('@librechat/api');
+    process.env.AUTH_MODE = 'transition';
+    process.env.CORTEX_UPLOAD_GUEST_TRANSITION_ENABLED = 'true';
+    const id = 'a'.repeat(24);
+    const cookie = `${id}.${'b'.repeat(43)}`;
+    const user = { _id: id, id, provider: 'browser', role: 'ADMIN', emailVerified: false };
+    getUserById.mockResolvedValue(user);
+    findBrowserIdentity.mockResolvedValue({
+      user: { ...user, role: 'USER' },
+      sessionId: 'c'.repeat(24),
+      expiration: new Date(Date.now() + 60000),
+    });
+    try {
+      const result = await invokeVerify(
+        {
+          id,
+          provider: 'browser',
+          iat: Math.floor(Date.now() / 1000),
+          exp: Math.floor(Date.now() / 1000) + 60,
+        },
+        request({
+          headers: { cookie: `${BROWSER_COOKIE}=${cookie}` },
+          cookies: { [BROWSER_COOKIE]: cookie },
+        }),
+      );
+      expect(findBrowserIdentity).toHaveBeenCalledWith(cookie);
+      expect(result.user.role).toBe('USER');
+    } finally {
+      process.env = previous;
+    }
+  });
+
+  it('binds native guest Passport to its current cookie grant and fails after revocation', async () => {
+    const previous = { ...process.env };
+    const { findBrowserIdentity } = require('~/models');
+    const { BROWSER_COOKIE } = jest.requireActual('@librechat/api');
+    process.env.AUTH_MODE = 'transition';
+    process.env.CORTEX_UPLOAD_GUEST_TRANSITION_ENABLED = 'true';
+    const id = 'a'.repeat(24),
+      cookie = `${id}.${'b'.repeat(43)}`;
+    const user = { _id: id, id, provider: 'browser', role: 'USER', emailVerified: false };
+    getUserById.mockResolvedValue(user);
+    findBrowserIdentity.mockResolvedValue({
+      user,
+      sessionId: 'c'.repeat(24),
+      expiration: new Date(Date.now() + 60000),
+    });
+    const req = request({
+      headers: { cookie: `${BROWSER_COOKIE}=${cookie}` },
+      cookies: { [BROWSER_COOKIE]: cookie },
+    });
+    const payload = {
+      id,
+      provider: 'browser',
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 60,
+    };
+    try {
+      expect((await invokeVerify(payload, req)).user.id).toBe(id);
+      expect(req.browserGrant).toEqual({ sessionId: 'c'.repeat(24), userId: id, tenantId: null });
+      expect(req.authenticationClass).toBe('guest');
+      expect(req.tenantId).toBeUndefined();
+      findBrowserIdentity.mockResolvedValueOnce(null);
+      expect((await invokeVerify(payload, req)).user).toBe(false);
+    } finally {
+      process.env = previous;
+    }
   });
 
   it('coerces missing idOnTheSource to null for local users', async () => {

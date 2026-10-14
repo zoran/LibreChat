@@ -1,9 +1,11 @@
+import jwt from 'jsonwebtoken';
 import mongoose from 'mongoose';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import { createBrowserMethods } from './browser';
 import { createSessionMethods } from './session';
 import balanceSchema from '~/schema/balance';
 import sessionSchema from '~/schema/session';
+import { createUserMethods } from './user';
 import userSchema from '~/schema/user';
 
 describe('browser enrollment in native User/Session storage', () => {
@@ -11,7 +13,7 @@ describe('browser enrollment in native User/Session storage', () => {
   let methods: ReturnType<typeof createBrowserMethods>;
   beforeAll(async () => {
     mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
-    await mongoose.connect(mongo.getUri());
+    await mongoose.connect(mongo.getUri(), { monitorCommands: true });
     mongoose.model('User', userSchema);
     mongoose.model('Balance', balanceSchema);
     mongoose.model('Session', sessionSchema);
@@ -41,9 +43,10 @@ describe('browser enrollment in native User/Session storage', () => {
     }>();
     expect(stored?.refreshTokenHash).toMatch(/^[a-f0-9]{64}$/);
     expect(JSON.stringify(stored)).not.toContain(a.credential);
-    expect(await methods.findBrowserIdentity(a.credential)).toEqual({
+    expect(await methods.findBrowserIdentity(a.credential)).toMatchObject({
       user: a.user,
       expiration: expiry,
+      sessionId: expect.stringMatching(/^[a-f0-9]{24}$/),
     });
     expect(await methods.findBrowserIdentity(`${b.user.id}.${a.credential.slice(25)}`)).toBeNull();
   });
@@ -58,6 +61,76 @@ describe('browser enrollment in native User/Session storage', () => {
     expect(restored.map((record) => record?.user.id)).toEqual([issued.user.id, issued.user.id]);
     await createSessionMethods(mongoose).deleteAllUserSessions(issued.user.id);
     expect(await otherReplica.findBrowserIdentity(issued.credential)).toBeNull();
+  });
+
+  it('rejects disabled and credential-retired guest sessions through the current native owner', async () => {
+    const issued = await methods.enrollBrowserIdentity(new Date(Date.now() + 60_000));
+    await mongoose.models.User.updateOne({ _id: issued.user.id }, { authDisabled: true });
+    expect(await methods.findBrowserIdentity(issued.credential)).toBeNull();
+    await mongoose.models.User.updateOne(
+      { _id: issued.user.id },
+      { authDisabled: false, credentialsChangedAt: new Date(Date.now() + 1000) },
+    );
+    expect(await methods.findBrowserIdentity(issued.credential)).toBeNull();
+  });
+
+  it('does not announce an unacknowledged account-deletion fence as acquired', async () => {
+    const issued = await methods.enrollBrowserIdentity(new Date(Date.now() + 60000));
+    const update = jest
+      .spyOn(mongoose.models.User, 'updateOne')
+      .mockResolvedValueOnce({ acknowledged: false, modifiedCount: 1 } as never);
+    try {
+      await expect(
+        createUserMethods(mongoose).beginAgentTriggerUserDeletion(issued.user.id, new Date()),
+      ).rejects.toThrow();
+    } finally {
+      update.mockRestore();
+    }
+  });
+
+  it('binds a real native guest cookie and signed bearer through the public auth port until confirmed revocation', async () => {
+    const { validateBrowserBearer, BROWSER_COOKIE } = await import('@librechat/api');
+    const previous = { ...process.env };
+    const commands: { commandName: string; command: Record<string, unknown> }[] = [];
+    const observe = (event: { commandName: string; command: Record<string, unknown> }) =>
+      commands.push(event);
+    process.env.AUTH_MODE = 'transition';
+    process.env.CORTEX_UPLOAD_GUEST_TRANSITION_ENABLED = 'true';
+    process.env.JWT_SECRET = 'isolated-guest-token';
+    try {
+      const a = await methods.enrollBrowserIdentity(new Date(Date.now() + 60000));
+      const b = await methods.enrollBrowserIdentity(new Date(Date.now() + 60000));
+      const bearer = (id: string) =>
+        jwt.verify(
+          jwt.sign({ id, provider: 'browser' }, process.env.JWT_SECRET, { expiresIn: 60 }),
+          process.env.JWT_SECRET,
+          { algorithms: ['HS256'] },
+        );
+      const req = {
+        headers: { cookie: `${BROWSER_COOKIE}=${a.credential}` },
+        cookies: { [BROWSER_COOKIE]: a.credential },
+      };
+      mongoose.connection.getClient().on('commandStarted', observe);
+      expect(await validateBrowserBearer(bearer(a.user.id), req, methods)).toMatchObject({
+        grant: { userId: a.user.id, tenantId: null, sessionId: expect.any(String) },
+      });
+      expect(await validateBrowserBearer(bearer(b.user.id), req, methods)).toBeNull();
+      const reads = commands.filter((event) => event.commandName === 'find');
+      expect(reads).toHaveLength(2);
+      for (const event of reads)
+        expect(event.command).toMatchObject({
+          readConcern: { level: 'linearizable' },
+          maxTimeMS: 2000,
+        });
+      await methods.revokeBrowserIdentity(a.credential);
+      expect(await validateBrowserBearer(bearer(a.user.id), req, methods)).toBeNull();
+      expect(commands.find((event) => event.commandName === 'delete')?.command).toMatchObject({
+        writeConcern: { w: 'majority', wtimeout: 2000 },
+      });
+    } finally {
+      mongoose.connection.getClient().off('commandStarted', observe);
+      process.env = previous;
+    }
   });
 
   it('rolls back principal and initial balance when session persistence fails', async () => {

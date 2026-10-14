@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { UPLOAD_MAX_FILE_BYTES } from 'librechat-data-provider';
+import { UPLOAD_MAX_FILE_BYTES, isUploadPrincipal } from 'librechat-data-provider';
 import type {
   UploadPrincipal,
   UploadRequest,
@@ -77,11 +77,7 @@ export function createUploadManagement(deps: UploadManagementDependencies): Uplo
     principal: UploadPrincipal,
     scope = { kind: 'personal' } as UploadOperation['scope'],
   ) {
-    if (
-      !principal?.tenantId ||
-      !principal.userId ||
-      principal.authentication !== 'verified-email'
-    ) {
+    if (!isUploadPrincipal(principal)) {
       throw new UploadManagementError('unauthorized');
     }
     if (!(await identity.authorize(principal, scope))) throw new UploadManagementError('forbidden');

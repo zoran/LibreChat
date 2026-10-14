@@ -4,6 +4,7 @@ import {
   UPLOAD_MAX_FILE_BYTES,
   isUploadOriginalIntegrity,
   isUploadStorageReceipt,
+  isUploadPrincipal,
 } from './upload-management';
 
 const hash = 'a'.repeat(64);
@@ -118,4 +119,25 @@ describe('managed original integrity contract', () => {
       ),
     ).toBe(false);
   });
+});
+
+describe('explicit personal upload principal namespaces', () => {
+  it.each([
+    { authentication: 'guest', tenantId: null, userId: 'guest' },
+    { authentication: 'verified-email', tenantId: 'tenant-a', userId: 'email' },
+  ])('accepts only the declared namespace %j', (value) =>
+    expect(isUploadPrincipal(value)).toBe(true),
+  );
+  it.each([
+    { authentication: 'guest', userId: 'guest' },
+    { authentication: 'guest', tenantId: 'tenant-a', userId: 'guest' },
+    { authentication: 'verified-email', tenantId: null, userId: 'email' },
+    { authentication: 'verified-email', tenantId: '', userId: 'email' },
+    { authentication: 'verified-email', tenantId: '__SYSTEM__', userId: 'email' },
+    { authentication: 'service', tenantId: 'tenant-a', userId: 'email' },
+    { authentication: 'guest', tenantId: null, userId: '' },
+    { authentication: 'guest', tenantId: null, userId: { $ne: null } },
+  ])('rejects ambiguous or foreign authority %j', (value) =>
+    expect(isUploadPrincipal(value)).toBe(false),
+  );
 });

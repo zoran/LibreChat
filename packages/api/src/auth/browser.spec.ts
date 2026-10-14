@@ -2,7 +2,8 @@ import express from 'express';
 import request from 'supertest';
 import type { AppConfig, BrowserIdentity } from '@librechat/data-schemas';
 import type { Store } from 'express-rate-limit';
-import { BROWSER_COOKIE, createBrowserAuth } from './browser';
+import { BROWSER_COOKIE, createBrowserAuth, validateBrowserBearer } from './browser';
+import { AUTH_SELECTION_COOKIE, setAuthSelection } from './authMode';
 
 const parseCookies: (header: string) => Record<string, string> = jest.requireActual('cookie').parse;
 
@@ -21,6 +22,88 @@ const identity: BrowserIdentity = {
     role: 'USER',
   },
 };
+
+describe('temporary managed guest identity', () => {
+  const previous = { ...process.env };
+  beforeEach(() => {
+    process.env.AUTH_MODE = 'transition';
+    process.env.CORTEX_UPLOAD_GUEST_TRANSITION_ENABLED = 'true';
+    process.env.JWT_SECRET = 'isolated-signing-key';
+  });
+  afterEach(() => {
+    process.env = { ...previous };
+  });
+  const payload = () => ({
+    id: identity.user.id,
+    provider: 'browser',
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 60,
+  });
+  const req = () =>
+    ({
+      headers: { cookie: `${BROWSER_COOKIE}=${credential}` },
+      cookies: { [BROWSER_COOKIE]: credential },
+    }) as express.Request;
+  const repository = () => ({
+    findBrowserIdentity: jest.fn(
+      async (): Promise<BrowserIdentity | null> => ({ ...identity, sessionId: 'c'.repeat(24) }),
+    ),
+  });
+  it('binds the current cookie session to the same signed browser account without exposing credentials', async () => {
+    const db = repository();
+    const result = await validateBrowserBearer(payload(), req(), db);
+    expect(result?.grant).toEqual({
+      userId: identity.user.id,
+      sessionId: 'c'.repeat(24),
+      tenantId: null,
+    });
+    expect(JSON.stringify(result)).not.toContain(credential);
+  });
+  it.each(['default', 'email_code'])('does not enable guests in %s mode', async (mode) => {
+    process.env.AUTH_MODE = mode;
+    const db = repository();
+    expect(await validateBrowserBearer(payload(), req(), db)).toBeNull();
+    expect(db.findBrowserIdentity).not.toHaveBeenCalled();
+  });
+  it.each(['false', undefined])('requires explicit flag %s', async (value) => {
+    if (value === undefined) delete process.env.CORTEX_UPLOAD_GUEST_TRANSITION_ENABLED;
+    else process.env.CORTEX_UPLOAD_GUEST_TRANSITION_ENABLED = value;
+    expect(await validateBrowserBearer(payload(), req(), repository())).toBeNull();
+  });
+  it.each([
+    { id: 'd'.repeat(24) },
+    { tenantId: 'tenant' },
+    { scope: 'agent-trigger' },
+    { authMethod: 'email_code' },
+    { exp: 0 },
+  ])('rejects mismatched or foreign claims %j', async (change) => {
+    expect(
+      await validateBrowserBearer({ ...payload(), ...change }, req(), repository()),
+    ).toBeNull();
+  });
+  it('rejects missing/duplicate cookies, revocation and the durable email-selection latch', async () => {
+    const db = repository();
+    const missing = req();
+    missing.cookies = {};
+    missing.headers.cookie = '';
+    expect(await validateBrowserBearer(payload(), missing, db)).toBeNull();
+    const duplicate = req();
+    duplicate.headers.cookie += `; ${BROWSER_COOKIE}=${credential}`;
+    expect(await validateBrowserBearer(payload(), duplicate, db)).toBeNull();
+    const selected = req();
+    setAuthSelection(
+      {
+        cookie: (_name: string, value: string) => {
+          selected.cookies[AUTH_SELECTION_COOKIE] = value;
+        },
+      } as express.Response,
+      'email',
+    );
+    expect(await validateBrowserBearer(payload(), selected, db)).toBeNull();
+    db.findBrowserIdentity.mockResolvedValueOnce(null);
+    expect(await validateBrowserBearer(payload(), req(), db)).toBeNull();
+  });
+});
 
 function fixture(enabled = true, max = 100, store?: Store) {
   const deps = {

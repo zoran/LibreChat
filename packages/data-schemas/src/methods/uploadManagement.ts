@@ -40,6 +40,7 @@ import type { UploadControlMethods } from './uploadManagementControl';
 import {
   createUploadStore,
   principalFilter,
+  storedUploadPrincipal,
   project,
   leaseFor,
   assertLease,
@@ -103,14 +104,15 @@ export type UploadManagementRepository = UploadControlMethods &
     ): Promise<void>;
     cleanupTasks(limit?: number): Promise<UploadCleanupTask[]>;
     cleanupForFile(
-      owner: { tenantId: string; userId: string },
+      owner: { tenantId: string | null; userId: string },
       fileId: string,
     ): Promise<UploadCleanupTask | null>;
     activeWorkers(): Promise<UploadWorker[]>;
     localReservations(worker: UploadWorker, now: number): Promise<UploadLocalReservations>;
     watchChanges(input: {
       tenantId: string;
-      onChanged: (principal: { tenantId: string; userId: string }) => void;
+      includeGuests?: boolean;
+      onChanged: (principal: { tenantId: string | null; userId: string }) => void;
       onReset: () => void;
     }): () => void;
     metrics(now: number): Promise<UploadMetricsSnapshot>;
@@ -122,11 +124,7 @@ export function createUploadManagementRepository(
 ): UploadManagementRepository {
   const store = createUploadStore(mongoose, options);
   const lifecycle = createFileRetentionMethods(mongoose);
-  const principalOf = (row: StoredUpload): UploadPrincipal => ({
-    tenantId: row.tenantId,
-    userId: row.userId,
-    authentication: 'verified-email',
-  });
+  const principalOf = storedUploadPrincipal;
   const cleanupTask = (row: StoredUpload): UploadCleanupTask => ({
     operationId: row._id,
     generation: row.workerGeneration ?? row.generation,
@@ -281,7 +279,8 @@ export function createUploadManagementRepository(
         reject('capacity_exceeded');
       const row: StoredUpload = {
         _id: input.operationId,
-        ...owner,
+        tenantId: principal.tenantId,
+        userId: principal.userId,
         scope,
         idempotencyKey: input.idempotencyKey,
         fingerprint,
@@ -548,7 +547,7 @@ export function createUploadManagementRepository(
           bytes > UPLOAD_MAX_FILE_BYTES
         )
           reject('size_mismatch');
-        const expectedKey = `t/${row.tenantId}/managed-uploads/${row.userId}/${row._id}.${row.attemptGeneration}__original`;
+        const expectedKey = `${row.tenantId === null ? '' : `t/${row.tenantId}/`}managed-uploads/${row.userId}/${row._id}.${row.attemptGeneration}__original`;
         if (
           !original ||
           original.source !== 's3' ||
@@ -778,7 +777,7 @@ export function createUploadManagementRepository(
     },
     async cleanupForFile(owner, fileId) {
       if (typeof fileId !== 'string' || !fileId || fileId.length > 128) reject('invalid_request');
-      const principal: UploadPrincipal = { ...owner, authentication: 'verified-email' };
+      const principal = storedUploadPrincipal(owner);
       const row = await store.Operation.findOne({
         ...principalFilter(principal),
         fileId,
@@ -842,8 +841,13 @@ export function createUploadManagementRepository(
         heldBytes: attempts.reduce((sum, attempt) => sum + attempt.declaredBytes, 0),
       };
     },
-    watchChanges({ tenantId, onChanged, onReset }) {
-      if (typeof tenantId !== 'string' || !tenantId || tenantId.length > 128)
+    watchChanges({ tenantId, includeGuests = false, onChanged, onReset }) {
+      if (
+        typeof tenantId !== 'string' ||
+        !/^[a-zA-Z0-9_.-]{1,128}$/.test(tenantId) ||
+        tenantId === '__SYSTEM__' ||
+        typeof includeGuests !== 'boolean'
+      )
         reject('invalid_request');
       // A missing document or collection invalidation is a reset-only system signal, never tenant data authority.
       // eslint-disable-next-line no-restricted-syntax -- Server hub uses an explicit tenantId $match and metadata-only projection; unroutable lifecycle events can only reset.
@@ -853,6 +857,7 @@ export function createUploadManagementRepository(
             $match: {
               $or: [
                 { 'fullDocument.tenantId': tenantId },
+                ...(includeGuests ? [{ 'fullDocument.tenantId': { $type: 10 } }] : []),
                 {
                   fullDocument: null,
                   operationType: {
@@ -881,7 +886,7 @@ export function createUploadManagementRepository(
         ],
         { fullDocument: 'updateLookup' },
       );
-      const pending = new Map<string, { tenantId: string; userId: string }>();
+      const pending = new Map<string, { tenantId: string | null; userId: string }>();
       let timer: ReturnType<typeof setTimeout> | undefined;
       let closed = false;
       const close = () => {
@@ -907,7 +912,7 @@ export function createUploadManagementRepository(
           onReset();
           return;
         }
-        if (row.tenantId !== tenantId) return;
+        if (row.tenantId !== tenantId && !(includeGuests && row.tenantId === null)) return;
         if (typeof row.userId !== 'string' || !row.userId) {
           pending.clear();
           onReset();

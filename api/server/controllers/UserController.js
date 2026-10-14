@@ -156,14 +156,10 @@ const acceptTermsController = async (req, res) => {
 };
 
 const deleteUserFiles = async (req) => {
-  try {
-    const userFiles = await db.getFiles({ user: req.user.id });
-    await processDeleteRequest({
-      req,
-      files: userFiles,
-    });
-  } catch (error) {
-    logger.error('[deleteUserFiles]', error);
+  const userFiles = await db.getFiles({ user: req.user.id });
+  const result = await processDeleteRequest({ req, files: userFiles });
+  if (!result || !Array.isArray(result.failedFileIds) || result.failedFileIds.length) {
+    throw new Error('Account file cleanup is not confirmed');
   }
 };
 
@@ -530,6 +526,9 @@ const deleteUserController = async (req, res) => {
     await checkpointDeletion.cleanup();
     await checkpointDeletion.acknowledge();
 
+    // Preserve a retryable account/session and all retained custody until physical cleanup is confirmed.
+    await deleteUserFiles(req);
+    await db.deleteFiles(null, user.id);
     await db.deleteMessages({ user: user.id });
     await db.deleteAllUserSessions({ userId: user.id });
     await db.deletePasskeysByUser(user.id);
@@ -539,8 +538,6 @@ const deleteUserController = async (req, res) => {
     await db.deletePresets(user.id);
     await deleteUserPluginAuth(user.id, null, true);
     await deleteAllSharedLinksWithCleanup(user.id);
-    await deleteUserFiles(req);
-    await db.deleteFiles(null, user.id);
     await db.deleteToolCalls(user.id);
     await db.deleteUserAgents(user.id);
     await db.deleteAllAgentApiKeys(user._id);

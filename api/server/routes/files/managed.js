@@ -1,3 +1,4 @@
+const { isUploadPrincipal } = require('librechat-data-provider');
 const { once } = require('node:events');
 const { performance } = require('node:perf_hooks');
 const { getAuthMode } = require('@librechat/api');
@@ -90,10 +91,11 @@ function createManagedFileHandlers(options = {}) {
     }
     const result = await owner.principal(req);
     if (
-      !result?.tenantId ||
-      !result.userId ||
-      result.authentication !== 'verified-email' ||
-      (expected && (result.tenantId !== expected.tenantId || result.userId !== expected.userId))
+      !isUploadPrincipal(result) ||
+      (expected &&
+        (result.authentication !== expected.authentication ||
+          result.tenantId !== expected.tenantId ||
+          result.userId !== expected.userId))
     ) {
       throw unavailable('unauthorized');
     }

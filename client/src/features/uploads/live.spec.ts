@@ -123,6 +123,45 @@ describe('authenticated upload live lifecycle', () => {
     stop();
   });
 
+  it('isolates two guest accounts with no tenant when the old response arrives after reset', async () => {
+    const oldKey = ['managed-uploads', '', 'guest-old'];
+    const newKey = ['managed-uploads', '', 'guest-new'];
+    let finishOld!: (value: unknown) => void;
+    read.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishOld = resolve;
+        }),
+    );
+    const stopOld = acquireUploadLive(client, oldKey);
+    window.dispatchEvent(new CustomEvent('librechat:auth-session-ending'));
+    stopOld();
+    read.mockResolvedValueOnce({
+      version: 1,
+      operations: [{ id: 'new-private' }],
+      usage: {},
+      admissionsPaused: false,
+    });
+    const stopNew = acquireUploadLive(client, newKey);
+    await flush();
+    finishOld({
+      version: 1,
+      operations: [{ id: 'old-private' }],
+      usage: {},
+      admissionsPaused: true,
+    });
+    await flush();
+    expect(client.getQueryData(oldKey)).toBeUndefined();
+    expect(client.getQueryData(newKey)).toMatchObject({
+      operations: [{ id: 'new-private' }],
+      admissionsPaused: false,
+    });
+    expect(streams).toHaveLength(1);
+    expect(read).toHaveBeenCalledTimes(2);
+    stopNew();
+    expect(streams[0].close).toHaveBeenCalledTimes(1);
+  });
+
   const admission = () =>
     client.getQueryData<{ admissionsPaused: boolean | null }>(key)?.admissionsPaused;
   const status = (value: boolean | null, index = streams.length - 1) =>

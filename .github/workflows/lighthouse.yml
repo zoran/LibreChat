@@ -37,6 +37,8 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run e2e:prepare
+      - name: Verify managed documents reach model-neutral chat context
+        run: npm run test:managed-documents
       - run: google-chrome --version
       - name: Preserve configured presentation and upstream defaults
         run: npm run test:presentation

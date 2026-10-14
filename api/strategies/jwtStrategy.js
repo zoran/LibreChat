@@ -9,6 +9,8 @@ const {
   getAuthMode,
   getAuthSelection,
   validateEmailCodeBearer,
+  validateBrowserBearer,
+  guestUploadTransitionEnabled,
   getEmailCodeSettings,
 } = require('@librechat/api');
 const models = require('~/models');
@@ -81,6 +83,17 @@ const jwtLogin = () =>
                 payload?.provider === 'browser' &&
                 ['guest', undefined].includes(getAuthSelection(req))
               ) {
+                if (guestUploadTransitionEnabled()) {
+                  const identity = await runAsSystem(() =>
+                    validateBrowserBearer(payload, req, models),
+                  );
+                  if (!identity || identity.user.id !== String(user._id)) {
+                    done(null, false, { code: 'AUTH_SESSION_REQUIRED' });
+                    return;
+                  }
+                  req.browserGrant = identity.grant;
+                  user.role = identity.user.role;
+                }
                 req.authenticationClass = 'guest';
                 delete req.tenantId;
               } else {

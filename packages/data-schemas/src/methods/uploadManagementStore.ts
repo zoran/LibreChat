@@ -2,6 +2,7 @@
 import { performance } from 'perf_hooks';
 import { setTimeout as delay } from 'timers/promises';
 import { createHash, randomInt, randomUUID } from 'crypto';
+import { isUploadPrincipal } from 'librechat-data-provider';
 import type {
   UploadPrincipal,
   UploadScope,
@@ -77,7 +78,7 @@ export type MigrationState = {
 };
 export type StoredUpload = {
   _id: string;
-  tenantId: string;
+  tenantId: string | null;
   userId: string;
   scope: UploadScope;
   idempotencyKey: string;
@@ -207,16 +208,33 @@ export function reject(code: UploadErrorCode): never {
   const error = Object.assign(new Error(code), { name: 'UploadManagementError', code });
   throw error;
 }
-export function principalFilter(principal: UploadPrincipal): { tenantId: string; userId: string } {
+/** Missing tenant data is never admitted as an explicit guest row. */
+export function principalFilter(principal: UploadPrincipal): {
+  tenantId: string | null;
+  userId: string;
+  $and?: { tenantId: { $exists: true } }[];
+} {
   const tenant = tenantStorage.getStore()?.tenantId;
   if (
-    !principal?.tenantId ||
-    !principal.userId ||
-    principal.authentication !== 'verified-email' ||
+    !isUploadPrincipal(principal) ||
     (tenant && tenant !== SYSTEM_TENANT_ID && tenant !== principal.tenantId)
   )
     reject('unauthorized');
-  return { tenantId: principal.tenantId, userId: principal.userId };
+  return {
+    tenantId: principal.tenantId,
+    userId: principal.userId,
+    ...(principal.tenantId === null ? { $and: [{ tenantId: { $exists: true as const } }] } : {}),
+  };
+}
+export function storedUploadPrincipal(
+  row: Pick<StoredUpload, 'tenantId' | 'userId'>,
+): UploadPrincipal {
+  const principal =
+    row.tenantId === null
+      ? { tenantId: null, userId: row.userId, authentication: 'guest' as const }
+      : { tenantId: row.tenantId, userId: row.userId, authentication: 'verified-email' as const };
+  if (!isUploadPrincipal(principal)) reject('unavailable');
+  return principal;
 }
 export function project(row: StoredUpload, now: number): UploadOperation {
   return {
@@ -325,7 +343,14 @@ export function createUploadStore(
   const operationSchema = new S<StoredUpload>(
     {
       _id: String,
-      tenantId: { type: String, required: true },
+      tenantId: {
+        type: String,
+        validate: (value: unknown) =>
+          value === null ||
+          (typeof value === 'string' &&
+            /^[a-zA-Z0-9_.-]{1,128}$/.test(value) &&
+            value !== SYSTEM_TENANT_ID),
+      },
       userId: { type: String, required: true },
       scope: S.Types.Mixed,
       idempotencyKey: String,

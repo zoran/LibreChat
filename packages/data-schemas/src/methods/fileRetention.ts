@@ -1,5 +1,9 @@
 /** File lifecycle authority shared by File CRUD and transactional Message admission. */
-import { UPLOAD_MAX_TEXT_BYTES, UPLOAD_RETENTION_MS } from 'librechat-data-provider';
+import {
+  UPLOAD_MAX_TEXT_BYTES,
+  UPLOAD_RETENTION_MS,
+  isUploadPrincipal,
+} from 'librechat-data-provider';
 import type { UploadPrincipal, UploadStorageReceipt } from 'librechat-data-provider';
 import type { ClientSession, FilterQuery, Model } from 'mongoose';
 import type { FileOwnerScope, FileSourceCopyReservation } from '~/types/file';
@@ -45,7 +49,7 @@ export async function resizeMessageDerivatives(
   if (!changes.size) return;
   const File = mongoose.models.File as Model<IMongoFile>;
   const rows = await File.find({
-    ...fileSourceScope(owner),
+    ...managedFileScope(owner),
     file_id: { $in: [...changes.keys()] },
     retentionAcceptedAt: { $ne: null },
   })
@@ -77,7 +81,7 @@ export async function resizeMessageDerivatives(
   );
   for (const row of rows) {
     await File.updateOne(
-      { _id: row._id, ...fileSourceScope(owner) },
+      { _id: row._id, ...managedFileScope(owner) },
       {
         $inc: { retainedDerivativeBytes: changes.get(row.file_id)!, retentionRevision: 1 },
       },
@@ -95,10 +99,26 @@ export class FileSourceUnavailableError extends Error {
 
 export function fileSourceScope(owner: FileOwnerScope): { user: string; tenantId: string | null } {
   const tenant = tenantStorage.getStore()?.tenantId;
-  if (!owner.userId || (tenant && tenant !== SYSTEM_TENANT_ID && tenant !== owner.tenantId)) {
+  if (
+    !owner.userId ||
+    (owner.tenantId != null &&
+      (typeof owner.tenantId !== 'string' ||
+        !/^[a-zA-Z0-9_.-]{1,128}$/.test(owner.tenantId) ||
+        owner.tenantId === SYSTEM_TENANT_ID)) ||
+    (tenant && tenant !== SYSTEM_TENANT_ID && tenant !== owner.tenantId)
+  ) {
     throw new FileSourceUnavailableError();
   }
-  return { user: owner.userId, tenantId: owner.tenantId || null };
+  return { user: owner.userId, tenantId: owner.tenantId ?? null };
+}
+
+/** Retained rows must carry the namespace explicitly; Mongo null equality also matches missing fields. */
+function managedFileScope(owner: FileOwnerScope): FilterQuery<IMongoFile> {
+  const scope = fileSourceScope(owner);
+  return {
+    ...scope,
+    ...(scope.tenantId === null ? { tenantId: { $eq: null, $exists: true } } : {}),
+  };
 }
 
 /** Unmanaged files keep upstream semantics. Managed files never outlive original admission. */
@@ -108,6 +128,20 @@ export function liveFileFilter(): FilterQuery<IMongoFile> {
       { retentionAcceptedAt: null },
       {
         retentionAcceptedAt: { $ne: null },
+        $and: [
+          {
+            $or: [
+              { tenantId: { $type: 10 } },
+              {
+                tenantId: {
+                  $type: 'string',
+                  $regex: /^[a-zA-Z0-9_.-]{1,128}$/,
+                  $ne: SYSTEM_TENANT_ID,
+                },
+              },
+            ],
+          },
+        ],
         deletionRequestedAt: null,
         deletionCompletedAt: null,
         expiredAt: { $gt: new Date() },
@@ -244,7 +278,7 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
           const context = await touchFileSources(mongoose, owner, ids, session);
           if (context?.sourceFileIds.length !== ids.length) throw new FileSourceUnavailableError();
           const existing = await File.findOne({
-            ...fileSourceScope(owner),
+            ...managedFileScope(owner),
             'retainedDerivativeReservations.reservationId': input.reservationId,
           })
             .select('file_id +retainedDerivativeReservations +retainedDerivativeBytes')
@@ -268,7 +302,7 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
             receipt = { fileId: existing.file_id, ...prior };
             return;
           }
-          const file = await File.findOne({ ...fileSourceScope(owner), file_id: ids[0] })
+          const file = await File.findOne({ ...managedFileScope(owner), file_id: ids[0] })
             .select('file_id +retainedDerivativeReservations +retainedDerivativeBytes')
             .session(session)
             .lean<IMongoFile>();
@@ -294,7 +328,7 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
           const charged = input.bytes + COPY_RECEIPT_BYTES;
           await adjustRetainedTextBytes(mongoose, charged, session);
           await File.updateOne(
-            { ...fileSourceScope(owner), _id: file._id },
+            { ...managedFileScope(owner), _id: file._id },
             {
               $inc: { retainedDerivativeBytes: charged, retentionRevision: 1 },
               $push: { retainedDerivativeReservations: stored },
@@ -327,7 +361,7 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
     try {
       await session.withTransaction(
         async () => {
-          const file = await File.findOne({ ...fileSourceScope(owner), file_id: receipt.fileId })
+          const file = await File.findOne({ ...managedFileScope(owner), file_id: receipt.fileId })
             .select(
               'file_id retentionAcceptedAt deletionCompletedAt +retainedDerivativeReservations +retainedDerivativeBytes',
             )
@@ -355,7 +389,7 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
             }
             await adjustRetainedTextBytes(mongoose, COPY_RECEIPT_BYTES, session);
             await File.updateOne(
-              { ...fileSourceScope(owner), _id: file._id },
+              { ...managedFileScope(owner), _id: file._id },
               {
                 $inc: { retainedDerivativeBytes: COPY_RECEIPT_BYTES, retentionRevision: 1 },
                 $push: {
@@ -380,7 +414,7 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
             unreconciledDocumentStorage();
           await adjustRetainedTextBytes(mongoose, -stored.bytes, session);
           await File.updateOne(
-            { ...fileSourceScope(owner), _id: file._id },
+            { ...managedFileScope(owner), _id: file._id },
             {
               $inc: { retainedDerivativeBytes: -stored.bytes, retentionRevision: 1 },
               $set: { 'retainedDerivativeReservations.$[receipt].state': 'released' },
@@ -406,6 +440,7 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
     const owner = fileSourceScope(input.principal);
     if (
       !session.inTransaction() ||
+      !isUploadPrincipal(input.principal) ||
       input.expiresAt !== input.acceptedAt + UPLOAD_RETENTION_MS ||
       input.receipt.outcome !== 'durable'
     )
@@ -436,7 +471,7 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
   }
   function managedFilter(owner: FileOwnerScope, operationId: string, now: number) {
     return {
-      ...fileSourceScope(owner),
+      ...managedFileScope(owner),
       file_id: operationId,
       uploadOperationId: operationId,
       retentionAcceptedAt: { $ne: null },
@@ -498,7 +533,7 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
     const File = mongoose.models.File as Model<IMongoFile>;
     await File.updateOne(
       {
-        ...fileSourceScope(owner),
+        ...managedFileScope(owner),
         file_id: operationId,
         uploadOperationId: operationId,
         deletionRequestedAt: null,
@@ -517,7 +552,7 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
   ): Promise<{ fileId: string; ready: boolean }[]> {
     const File = mongoose.models.File as Model<IMongoFile>;
     const rows = await File.find({
-      ...fileSourceScope(owner),
+      ...managedFileScope(owner),
       uploadOperationId: { $in: operationIds },
       expiredAt: { $gt: new Date(now) },
       deletionRequestedAt: null,
@@ -544,7 +579,7 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
   async function loadFileSourceRecords(owner: FileOwnerScope, fileIds: readonly string[]) {
     const File = mongoose.models.File as Model<IMongoFile>;
     return File.find({
-      ...fileSourceScope(owner),
+      ...managedFileScope(owner),
       file_id: { $in: [...new Set(fileIds)] },
       retentionAcceptedAt: { $ne: null },
     }).lean<IMongoFile[]>();
@@ -568,7 +603,7 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
     const File = mongoose.models.File as Model<IMongoFile>;
     await File.updateMany(
       {
-        ...fileSourceScope(owner),
+        ...managedFileScope(owner),
         file_id: { $in: ids },
         retentionAcceptedAt: { $ne: null },
         deletionRequestedAt: null,
@@ -606,7 +641,7 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
       try {
         await session.withTransaction(
           async () => {
-            const current = await File.findOne({ ...fileSourceScope(owner), _id: row._id })
+            const current = await File.findOne({ ...managedFileScope(owner), _id: row._id })
               .select('+retainedDerivativeBytes +retainedDerivativeReservations')
               .session(session)
               .lean<IMongoFile>();
@@ -623,7 +658,7 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
                 .map((key) => [key, 1]),
             );
             await File.updateOne(
-              { ...fileSourceScope(owner), _id: row._id, deletionRequestedAt: { $ne: null } },
+              { ...managedFileScope(owner), _id: row._id, deletionRequestedAt: { $ne: null } },
               {
                 $unset: unset,
                 $set: {

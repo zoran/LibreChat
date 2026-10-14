@@ -104,6 +104,7 @@
     "e2e:github": "act -W .github/workflows/playwright.yml --secret-file my.secrets",
     "test:client": "cd client && npm run test:ci",
     "test:api": "cd api && npm run test:ci",
+    "test:managed-documents": "jest --config packages/api/jest.config.mjs --runInBand --runTestsByPath packages/api/src/files/documents/managed.spec.ts packages/api/src/uploads/processing/document-flow.integration.spec.ts && npm --prefix api run test:ci -- --runInBand --runTestsByPath app/clients/specs/BaseClient.test.js -t \"managed document facts at the model-neutral chat boundary\"",
     "test:packages:api": "cd packages/api && npm run test:ci",
     "test:packages:data-provider": "cd packages/data-provider && npm run test:ci",
     "test:packages:data-schemas": "cd packages/data-schemas && npm run test:ci",

@@ -241,7 +241,11 @@ export function createSessionMethods(mongoose: typeof import('mongoose')): {
         query._id = params.sessionId;
       }
 
-      const result = await Session.deleteOne(query);
+      const result = await Session.deleteOne(query, {
+        writeConcern: { w: 'majority', wtimeout: 2000 },
+        maxTimeMS: 2000,
+      });
+      if (!result.acknowledged) throw new Error('Session revocation unconfirmed');
 
       if (result.deletedCount === 0) {
         logger.warn('[deleteSession] No session found to delete');
@@ -280,7 +284,11 @@ export function createSessionMethods(mongoose: typeof import('mongoose')): {
         query._id = { $ne: options.currentSessionId };
       }
 
-      const result = await Session.deleteMany(query);
+      const result = await Session.deleteMany(query, {
+        writeConcern: { w: 'majority', wtimeout: 2000 },
+        maxTimeMS: 2000,
+      });
+      if (!result.acknowledged) throw new Error('Session revocation unconfirmed');
 
       if (result.deletedCount && result.deletedCount > 0) {
         logger.debug(

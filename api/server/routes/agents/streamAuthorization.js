@@ -1,5 +1,5 @@
 const jwt = require('jsonwebtoken');
-const { validateEmailCodeBearer } = require('@librechat/api');
+const { validateEmailCodeBearer, validateBrowserBearer } = require('@librechat/api');
 const { runAsSystem } = require('@librechat/data-schemas');
 const models = require('~/models');
 
@@ -70,6 +70,27 @@ function boundedJson(value, available) {
 }
 
 function expectedIdentity(req) {
+  if (req.authenticationClass === 'guest') {
+    const grant = req.browserGrant;
+    if (
+      !grant ||
+      grant.tenantId !== null ||
+      typeof grant.sessionId !== 'string' ||
+      !/^[a-f0-9]{24}$/.test(grant.sessionId) ||
+      typeof grant.userId !== 'string' ||
+      !/^[a-f0-9]{24}$/.test(grant.userId) ||
+      req.user?.id !== grant.userId ||
+      req.user?.provider !== 'browser' ||
+      req.user.tenantId != null
+    )
+      return null;
+    return {
+      authentication: 'guest',
+      sessionId: grant.sessionId,
+      userId: grant.userId,
+      tenantId: null,
+    };
+  }
   const grant = req.emailCodeGrant;
   if (
     req.authenticationClass !== 'verified-email' ||
@@ -92,6 +113,7 @@ function expectedIdentity(req) {
   )
     return null;
   return {
+    authentication: 'verified-email',
     sessionId: grant.sessionId,
     userId: grant.userId,
     tenantId: grant.tenantId,
@@ -103,8 +125,12 @@ function expectedIdentity(req) {
 function matchesIdentity(identity, expected) {
   return (
     identity?.user?.id === expected.userId &&
-    identity.user.tenantId === expected.tenantId &&
-    Object.keys(expected).every((key) => identity.grant?.[key] === expected[key])
+    (expected.authentication === 'guest'
+      ? identity.user.provider === 'browser' && identity.user.tenantId == null
+      : identity.user.tenantId === expected.tenantId) &&
+    Object.keys(expected)
+      .filter((key) => key !== 'authentication')
+      .every((key) => identity.grant?.[key] === expected[key])
   );
 }
 
@@ -274,7 +300,11 @@ function createStreamAuthorizationController(limits = STREAM_AUTHORIZATION_LIMIT
       authTimer.unref?.();
       try {
         const payload = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ['HS256'] });
-        const identity = await runAsSystem(() => validateEmailCodeBearer(payload, models));
+        const identity = await runAsSystem(() =>
+          expected.authentication === 'guest'
+            ? validateBrowserBearer(payload, req, models)
+            : validateEmailCodeBearer(payload, models),
+        );
         if (closed) return;
         if (
           !matchesIdentity(identity, expected) ||

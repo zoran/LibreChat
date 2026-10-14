@@ -10,6 +10,7 @@ import { readManagedUploadSnapshot } from './live';
 
 let mockLocale = 'en';
 let mockEligible = true;
+let mockUser: { id: string; tenantId?: string; provider: string };
 const mockStreams: { listeners: Record<string, (event?: unknown) => void> }[] = [];
 jest.mock('sse.js', () => ({
   SSE: class {
@@ -27,7 +28,10 @@ jest.mock('sse.js', () => ({
   },
 }));
 jest.mock('librechat-data-provider', () => ({ getTokenHeader: () => 'Bearer verified' }));
-jest.mock('recoil', () => ({ useRecoilValue: () => ({ id: 'user', tenantId: 'tenant' }) }));
+jest.mock('recoil', () => ({ useRecoilValue: () => mockUser }));
+jest.mock('react-i18next', () => ({
+  useTranslation: () => ({ i18n: { resolvedLanguage: mockLocale, language: mockLocale } }),
+}));
 jest.mock('~/store', () => ({ __esModule: true, default: { user: {} } }));
 jest.mock('~/data-provider', () => ({
   useGetStartupConfig: () => ({
@@ -36,9 +40,11 @@ jest.mock('~/data-provider', () => ({
 }));
 jest.mock('~/hooks/useLocalize', () => ({
   __esModule: true,
-  default: () => (key: string) => {
+  default: () => (key: string, options?: Record<string, unknown>) => {
     const translations: Record<string, string> = mockLocale === 'de' ? mockGerman : mockEnglish;
-    return translations[key] ?? key;
+    return (translations[key] ?? key).replace(/\{\{(\d+)\}\}/g, (match, index) =>
+      options?.[index] === undefined ? match : String(options[index]),
+    );
   },
 }));
 jest.mock('./api', () => ({
@@ -97,6 +103,7 @@ describe('managed upload admission UI', () => {
   beforeEach(() => {
     mockLocale = 'en';
     mockEligible = true;
+    mockUser = { id: 'user', tenantId: 'tenant', provider: 'email_code' };
     mockStreams.length = 0;
     Object.defineProperty(document, 'hidden', { configurable: true, value: false });
     read.mockReset().mockResolvedValue(snapshot);
@@ -227,10 +234,107 @@ describe('managed upload admission UI', () => {
 
   it('keeps the guest sign-in explanation without opening an upload stream', async () => {
     mockEligible = false;
+    mockUser = { id: 'guest-user', provider: 'browser' };
     const rendered = view();
     expect(screen.getByText(/Chats remain available without signing in/)).toBeInTheDocument();
     expect(read).not.toHaveBeenCalled();
     expect(mockStreams).toHaveLength(0);
+    rendered.unmount();
+  });
+
+  it.each(['en', 'de'])('explains the eligible guest account allowance in %s', async (locale) => {
+    mockLocale = locale;
+    mockUser = { id: 'guest-user', provider: 'browser' };
+    const rendered = view();
+    await waitFor(() => expect(mockStreams).toHaveLength(1));
+    expect(
+      screen.getByText(
+        locale === 'de'
+          ? 'Gastkonto: 30 MiB je Datei · 300 MiB in 30 Tagen'
+          : 'Guest account: 30 MiB per file · 300 MiB in 30 days',
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        locale === 'de'
+          ? /Das Kontingent gilt für dieses Gastkonto/
+          : /This allowance applies to this guest account/,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(locale === 'de' ? /kannst du den Zugriff verlieren/ : /you may lose access/),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        locale === 'de'
+          ? mockGerman.com_upload_rolling_explained
+          : mockEnglish.com_upload_rolling_explained,
+      ),
+    ).toBeNull();
+    expect(client.getQueryData(['managed-uploads', '', 'guest-user'])).toMatchObject({
+      usage: snapshot.usage,
+    });
+    expect(
+      screen.getByRole('button', {
+        name: locale === 'de' ? 'Verarbeitung wiederholen' : 'Retry processing',
+      }),
+    ).toBeEnabled();
+    rendered.unmount();
+  });
+
+  it('keeps the verified account explanation for eligible email users', async () => {
+    const rendered = view();
+    expect(await screen.findByText(mockEnglish.com_upload_rolling_explained)).toBeInTheDocument();
+    expect(screen.getByText(mockEnglish.com_upload_limits_summary)).toBeInTheDocument();
+    expect(screen.queryByText(/This allowance applies to this guest account/)).toBeNull();
+    rendered.unmount();
+  });
+
+  it('formats quota, transfer and retention with German UI despite English browser language', async () => {
+    mockLocale = 'de';
+    mockUser = { id: 'guest-user', provider: 'browser' };
+    jest.spyOn(navigator, 'language', 'get').mockReturnValue('en-US');
+    const releaseAt = '2026-10-15T13:14:15.000Z';
+    const transferring = {
+      ...operation,
+      state: 'transferring' as const,
+      canRetryProcessing: false,
+    };
+    read.mockResolvedValue({
+      ...snapshot,
+      operations: [transferring],
+      usage: {
+        ...snapshot.usage,
+        usedBytes: 1.5 * 1_048_576,
+        nextReleaseAt: releaseAt,
+        nextReleaseBytes: 4 * 1_048_576,
+      },
+    });
+    const rendered = view({
+      ...file,
+      managedUpload: {
+        phase: 'transferring',
+        operation: transferring,
+        transfer: {
+          loaded: 1.5 * 1_048_576,
+          total: 3 * 1_048_576,
+          percent: 50,
+          bytesPerSecond: 0.5 * 1_048_576,
+          remainingSeconds: 3,
+        },
+      },
+    });
+    expect(await screen.findByText('1,5 MiB')).toBeInTheDocument();
+    expect(screen.getByText('1,5 / 3 MiB · 50 %')).toBeInTheDocument();
+    expect(screen.getByText('0,5 MiB/s · noch etwa 3 Sekunden')).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        `Als Nächstes werden 4 MiB am ${new Date(releaseAt).toLocaleString('de')} wieder verfügbar.`,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(`Aufbewahrung bis ${new Date(operation.expiresAt!).toLocaleString('de')}`),
+    ).toBeInTheDocument();
     rendered.unmount();
   });
 });

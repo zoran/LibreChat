@@ -73,11 +73,27 @@ export function isUploadOriginalIntegrity(
   );
 }
 
-export type UploadPrincipal = {
-  tenantId: string;
-  userId: string;
-  authentication: 'verified-email' | 'guest';
-};
+/** Explicit null is the existing personal guest namespace, never a wildcard or missing tenant. */
+export type UploadPrincipal =
+  | { authentication: 'verified-email'; tenantId: string; userId: string }
+  | { authentication: 'guest'; tenantId: null; userId: string };
+
+/** Structural ownership only; the current server identity adapter still authenticates every request. */
+export function isUploadPrincipal(value: unknown): value is UploadPrincipal {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const principal = value as Record<string, unknown>;
+  return (
+    typeof principal.userId === 'string' &&
+    principal.userId.length > 0 &&
+    principal.userId.length <= 128 &&
+    (principal.authentication === 'guest'
+      ? principal.tenantId === null
+      : principal.authentication === 'verified-email' &&
+        typeof principal.tenantId === 'string' &&
+        /^[a-zA-Z0-9_.-]{1,128}$/.test(principal.tenantId) &&
+        principal.tenantId !== '__SYSTEM__')
+  );
+}
 export type UploadScope = { kind: 'personal' } | { kind: 'workspace'; workspaceId: string };
 export type UploadRequest = {
   filename: string;
@@ -164,7 +180,7 @@ export type UploadLocalReservations = {
 /** Inert parser preparation, durably bound to a processing lease before execution. */
 export type UploadParserExecution = { attemptId: string; instanceId: string; expiresAt: string };
 export type UploadLease = UploadWorker & {
-  tenantId: string;
+  tenantId: string | null;
   userId: string;
   operationId: string;
   generation: number;

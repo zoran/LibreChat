@@ -653,7 +653,9 @@ export function createUserMethods(
     const result = await User.updateOne(
       { _id: userId, agentTriggerDeletionStartedAt: { $exists: false } },
       { $set: { agentTriggerDeletionStartedAt: startedAt } },
+      { writeConcern: { w: 'majority', wtimeout: 2000 }, maxTimeMS: 2000 },
     );
+    if (!result.acknowledged) throw new Error('Account deletion fence unconfirmed');
     if (result.modifiedCount === 1) {
       await invalidateAuthUserDocCache(userId);
       return 'acquired';
@@ -675,7 +677,9 @@ export function createUserMethods(
     const result = await User.updateOne(
       { _id: userId, agentTriggerDeletionStartedAt: { $lte: staleBefore } },
       { $set: { agentTriggerDeletionStartedAt: recoveredAt } },
+      { writeConcern: { w: 'majority', wtimeout: 2000 }, maxTimeMS: 2000 },
     );
+    if (!result.acknowledged) throw new Error('Account deletion fence unconfirmed');
     if (result.modifiedCount === 1) {
       await invalidateAuthUserDocCache(userId);
       return 'acquired';
@@ -689,7 +693,9 @@ export function createUserMethods(
     const result = await User.updateOne(
       { _id: userId, agentTriggerDeletionStartedAt: startedAt },
       { $unset: { agentTriggerDeletionStartedAt: 1 } },
+      { writeConcern: { w: 'majority', wtimeout: 2000 }, maxTimeMS: 2000 },
     );
+    if (!result.acknowledged) throw new Error('Account deletion fence release unconfirmed');
     if (result.modifiedCount === 1) {
       await invalidateAuthUserDocCache(userId);
       return true;

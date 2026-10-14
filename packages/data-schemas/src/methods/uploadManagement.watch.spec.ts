@@ -58,9 +58,11 @@ describe('tenant-bound upload change stream', () => {
     await mongo?.stop();
   });
 
-  async function watch() {
+  async function watch(includeGuests = false) {
     const signals = new EventEmitter();
-    const changed = jest.fn((principal: typeof owner) => signals.emit('owner', principal));
+    const changed = jest.fn((principal: { tenantId: string | null; userId: string }) =>
+      signals.emit('owner', principal),
+    );
     const reset = jest.fn(() => signals.emit('reset', undefined));
     const observed: Record<string, unknown>[] = [];
     const factory = jest.spyOn(a.models.UploadOperation, 'watch');
@@ -69,7 +71,12 @@ describe('tenant-bound upload change stream', () => {
       'commandSucceeded',
       (event) => event.commandName === 'aggregate',
     );
-    const close = repository.watchChanges({ tenantId, onChanged: changed, onReset: reset });
+    const close = repository.watchChanges({
+      tenantId,
+      includeGuests,
+      onChanged: changed,
+      onReset: reset,
+    });
     const stream = factory.mock.results[0].value;
     stream.on('change', (event: Record<string, unknown>) => {
       observed.push(event);
@@ -118,6 +125,39 @@ describe('tenant-bound upload change stream', () => {
     expect(f.reset).not.toHaveBeenCalled();
     expect(f.observed).toHaveLength(1);
     expect(f.observed[0].fullDocument).toEqual(owner);
+  });
+
+  it('shares one fixed email/guest watch and never routes missing tenant rows as guest', async () => {
+    const f = await watch(true);
+    await b.models.UploadOperation.collection.insertOne({
+      _id: 'missing',
+      userId: owner.userId,
+      idempotencyKey: 'missing',
+    });
+    await b.models.UploadOperation.collection.insertOne({
+      _id: 'malformed',
+      userId: owner.userId,
+      tenantId: '',
+      idempotencyKey: 'malformed',
+    });
+    const received = next<{ tenantId: null; userId: string }>(
+      f.signals,
+      'owner',
+      (value) => value.tenantId === null,
+    );
+    await b.models.UploadOperation.collection.insertOne({
+      _id: 'guest',
+      userId: owner.userId,
+      tenantId: null,
+      filename: 'private',
+      idempotencyKey: 'guest',
+    });
+    expect(await received).toEqual({ tenantId: null, userId: owner.userId });
+    const barrier = next<typeof owner>(f.signals, 'owner', (value) => value.tenantId === tenantId);
+    await insert('email-barrier');
+    await barrier;
+    expect(f.changed.mock.calls).toEqual([[{ tenantId: null, userId: owner.userId }], [owner]]);
+    expect(JSON.stringify(f.observed)).not.toContain('private');
   });
 
   it('projects only routing identity before the driver receives the change', async () => {

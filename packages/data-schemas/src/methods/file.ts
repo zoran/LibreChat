@@ -18,6 +18,7 @@ import {
   createFileRetentionMethods,
   FileSourceUnavailableError,
   liveFileFilter,
+  fileSourceScope,
 } from './fileRetention';
 import { tenantSafeBulkWrite } from '~/utils/tenantBulkWrite';
 import { escapeRegExp } from '~/utils/string';
@@ -1145,6 +1146,12 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
       )
         throw new FileSourceUnavailableError();
       delete fileData.expiresAt;
+      // New retained rows carry explicit null; ordinary legacy files preserve their original shape.
+      const namespace = fileSourceScope({
+        userId: String(data.user ?? ''),
+        tenantId: data.tenantId,
+      });
+      fileData.tenantId = namespace.tenantId;
       fileData.retentionAcceptedAt = acceptedAt;
       fileData.expiredAt = expiredAt;
       fileData.retentionRevision = 0;
@@ -1447,7 +1454,12 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
   ): Promise<{ deletedCount?: number }> {
     const File = mongoose.models.File as Model<IMongoFile>;
     if (user) {
-      const result = await File.deleteMany({ user });
+      if (
+        await File.exists({ user, retentionAcceptedAt: { $ne: null }, deletionCompletedAt: null })
+      )
+        throw new FileSourceUnavailableError();
+      // Finalized managed tombstones/receipts remain with their lifecycle owner.
+      const result = await File.deleteMany({ user, retentionAcceptedAt: null });
       await detachAllUserFilesFromProjects(user);
       return result;
     }

@@ -59,13 +59,14 @@ const mockWaitForConfig = jest.fn((): Promise<void> => Promise.resolve());
 const mockLocalize = jest.fn((key: string) => key);
 let mockManagedEnabled = false;
 let mockManagedEligible = true;
+let mockManagedSessionKey = 'tenant/user';
 let mockAdmissionsPaused: boolean | null = false;
 const mockManagedSelection = jest.fn();
 jest.mock('~/features/uploads/useManagedUploads', () => ({
   useManagedUploads: () => ({
     enabled: mockManagedEnabled,
     eligible: mockManagedEligible,
-    sessionKey: 'tenant/user',
+    sessionKey: mockManagedSessionKey,
     admissionsPaused: mockAdmissionsPaused,
     getAdmissionsPaused: () => mockAdmissionsPaused,
     refresh: jest.fn(),
@@ -238,6 +239,7 @@ describe('useFileHandling', () => {
     mockUploadOptions = {};
     mockManagedEnabled = false;
     mockManagedEligible = true;
+    mockManagedSessionKey = 'tenant/user';
     mockAdmissionsPaused = false;
     mockManagedSelection.mockReset().mockResolvedValue(undefined);
   });
@@ -245,6 +247,56 @@ describe('useFileHandling', () => {
   const loadHook = async () => (await import('../useFileHandling')).default;
 
   describe('managed admission selection', () => {
+    it('does not route an ineligible guest selection through managed or legacy uploads', async () => {
+      mockManagedEnabled = true;
+      mockManagedEligible = false;
+      mockManagedSessionKey = JSON.stringify(['managed-uploads', '', 'guest']);
+      const useFileHandling = await loadHook();
+      const { result } = renderHook(() => useFileHandling());
+      await act(async () => {
+        expect(await result.current.handleFiles([new File(['text'], 'note.txt')])).toBe(false);
+      });
+      expect(mockManagedSelection).not.toHaveBeenCalled();
+      expect(mockMutate).not.toHaveBeenCalled();
+      expect(mockAddFile).not.toHaveBeenCalled();
+      await waitFor(() =>
+        expect(mockShowToast).toHaveBeenCalledWith(
+          expect.objectContaining({ message: 'com_upload_login_needed' }),
+        ),
+      );
+    });
+
+    it('invalidates an admitted guest selection when the active guest account changes', async () => {
+      mockManagedEnabled = true;
+      mockManagedSessionKey = JSON.stringify(['managed-uploads', '', 'guest-old']);
+      let finish!: () => void;
+      mockManagedSelection.mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            finish = resolve;
+          }),
+      );
+      const useFileHandling = await loadHook();
+      const { result, rerender } = renderHook(() => useFileHandling());
+      let selected!: Promise<boolean>;
+      await act(async () => {
+        selected = result.current.handleFiles([new File(['text'], 'note.txt')]);
+      });
+      expect(mockManagedSelection).toHaveBeenCalledTimes(1);
+      const lifecycle = mockManagedSelection.mock.calls[0][1];
+      expect(lifecycle.current()).toBe(true);
+      mockManagedSessionKey = JSON.stringify(['managed-uploads', '', 'guest-new']);
+      rerender();
+      expect(lifecycle.current()).toBe(false);
+      expect(lifecycle.signal.aborted).toBe(true);
+      await act(async () => {
+        finish();
+        await selected;
+      });
+      expect(mockManagedSelection).toHaveBeenCalledTimes(1);
+      expect(mockMutate).not.toHaveBeenCalled();
+    });
+
     it.each([true, null])('rejects a new local retry while admission is %s', async (paused) => {
       mockManagedEnabled = true;
       mockAdmissionsPaused = paused;

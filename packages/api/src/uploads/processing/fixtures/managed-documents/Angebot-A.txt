@@ -1,0 +1,4 @@
+Angebot A
+Monatspreis pro Platz: 140 EUR
+Einrichtung einmalig: 80 EUR
+Erster Monat = Plaetze mal Monatspreis plus Einrichtung.

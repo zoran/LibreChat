@@ -68,6 +68,38 @@ describe('source-dependent message retention', () => {
   const context = () =>
     messages.resolveFileRetentionContext(owner, { fileIds: [sourceId], historyMessageIds: [] });
 
+  it('requires explicit null on managed guest sources while retaining ordinary tenantless files', async () => {
+    await mongoose.models.File.collection.updateOne(
+      { file_id: sourceId },
+      { $set: { tenantId: null } },
+    );
+    await expect(context()).resolves.toMatchObject({ sourceFileIds: [sourceId] });
+    await mongoose.models.File.collection.updateOne(
+      { file_id: sourceId },
+      { $unset: { tenantId: '' } },
+    );
+    await expect(context()).rejects.toBeInstanceOf(FileSourceUnavailableError);
+    await mongoose.models.File.collection.updateOne(
+      { file_id: sourceId },
+      { $unset: { retentionAcceptedAt: '', expiredAt: '' } },
+    );
+    await expect(context()).resolves.toBeUndefined();
+  });
+
+  it('preserves pending managed File custody through account bulk delete and retains finalized tombstones', async () => {
+    await expect(files.deleteFiles([], user)).rejects.toBeInstanceOf(FileSourceUnavailableError);
+    expect(await mongoose.models.File.countDocuments({ file_id: sourceId })).toBe(1);
+    await files.revokeFileSources(owner, [sourceId]);
+    await files.finalizeFileSourceDeletion(owner, [sourceId]);
+    await expect(files.deleteFiles([], user)).resolves.toMatchObject({ deletedCount: 0 });
+    expect(
+      await mongoose.models.File.countDocuments({
+        file_id: sourceId,
+        deletionCompletedAt: { $ne: null },
+      }),
+    ).toBe(1);
+  });
+
   it.each(['list', 'cursor'] as const)(
     'keeps the canonical %s client projection readable without extra source-free queries',
     async (kind) => {

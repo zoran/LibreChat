@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "fixtures": [
+    {
+      "slot": "A",
+      "filename": "Angebot-A.txt",
+      "mediaType": "text/plain",
+      "bytes": 127,
+      "sha256": "3170e615aaee63c5373775e04e3a7f040729334aa4db188ab170fdfee0a67352",
+      "markers": ["Angebot A", "Monatspreis pro Platz: 140 EUR", "Einrichtung einmalig: 80 EUR"],
+      "monthly": 140,
+      "setup": 80
+    },
+    {
+      "slot": "B",
+      "filename": "Angebot-B.pdf",
+      "mediaType": "application/pdf",
+      "bytes": 736,
+      "sha256": "a5e74b89bf4a1d1abb9a4d12cb11d5b4a3d58c608a40e452ed06aed42b3fefe2",
+      "markers": ["Angebot B", "Monatspreis pro Platz: 135 EUR", "Einrichtung einmalig: 200 EUR"],
+      "monthly": 135,
+      "setup": 200
+    },
+    {
+      "slot": "C",
+      "filename": "Angebot-C.docx",
+      "mediaType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+      "bytes": 898,
+      "sha256": "714a54982804f70d9355fc1e252ec89f328f4dc5b1376f6707f5a383b41ea875",
+      "markers": ["Angebot C", "Monatspreis pro Platz: 125 EUR", "Einrichtung einmalig: 250 EUR"],
+      "monthly": 125,
+      "setup": 250
+    },
+    {
+      "slot": "D",
+      "filename": "Angebot-D.pptx",
+      "mediaType": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+      "bytes": 1946,
+      "sha256": "f3d8293ac0df933fc90ee235c3d68244787a916ee7a2cb5c7f0fa069af937529",
+      "markers": [
+        "Angebot D",
+        "Monatspreis pro Platz: 130 EUR",
+        "Einrichtung einmalig: 100 EUR",
+        "Reihenfolge Anfang",
+        "Reihenfolge Ende"
+      ],
+      "monthly": 130,
+      "setup": 100
+    }
+  ],
+  "purpose": "Synthetic document facts for real parser IPC and model-neutral chat delivery tests; no personal data, macros, external resources or OCR.",
+  "provenance": "Byte-for-byte copies of Nodex qualification synthetic goldens, independently specified expected prices and declared slide order. Tests depend only on this component-owned directory."
+}

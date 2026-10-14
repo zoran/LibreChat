@@ -1,3 +1,4 @@
+import { isUploadPrincipal } from 'librechat-data-provider';
 import type { UploadPrincipal } from 'librechat-data-provider';
 import type { Request, Response } from 'express';
 import type { UploadRepository } from './contract';
@@ -8,6 +9,7 @@ export interface UploadLiveOptions {
   repository: Pick<UploadRepository, 'watchChanges'>;
   /** Immutable server configuration, never selected from a request or browser identity. */
   tenantId: string;
+  includeGuests?: boolean;
   /** Strong current grant check; this background read must never extend foreground idle life. */
   principal: UploadRequestPrincipal;
   /** Synchronous cached advisory status; this port must perform no I/O or grant authority. */
@@ -32,12 +34,11 @@ type Connection = {
   close: () => void;
 };
 const same = (a: UploadPrincipal, b: UploadPrincipal) =>
-  a?.authentication === 'verified-email' &&
-  !!a.tenantId &&
-  !!a.userId &&
+  isUploadPrincipal(a) &&
+  a.authentication === b.authentication &&
   a.tenantId === b.tenantId &&
   a.userId === b.userId;
-const keyOf = (owner: { tenantId: string; userId: string }) =>
+const keyOf = (owner: { tenantId: string | null; userId: string }) =>
   JSON.stringify([owner.tenantId, owner.userId]);
 
 /** One replica watch and existing heartbeat; frames contain no private ownership or file data. */
@@ -45,6 +46,8 @@ export function createUploadLiveHub(options: UploadLiveOptions) {
   const tenantId = options.tenantId;
   if (typeof tenantId !== 'string' || !tenantId || tenantId.length > 128)
     throw new UploadManagementError('unavailable');
+  const allowedTenant = (value: string | null) =>
+    value === tenantId || (options.includeGuests === true && value === null);
   const connections = new Set<Connection>();
   const counts = new Map<string, number>();
   let unwatch: (() => void) | undefined;
@@ -132,7 +135,7 @@ export function createUploadLiveHub(options: UploadLiveOptions) {
     connection.flight = (async () => {
       try {
         const principal = await options.principal(connection.req);
-        if (!same(principal, connection.principal) || principal.tenantId !== tenantId)
+        if (!same(principal, connection.principal) || !allowedTenant(principal.tenantId))
           throw new UploadManagementError('unauthorized');
         write(connection, hint);
       } catch {
@@ -166,8 +169,9 @@ export function createUploadLiveHub(options: UploadLiveOptions) {
     try {
       const stop = options.repository.watchChanges({
         tenantId,
+        ...(options.includeGuests === true ? { includeGuests: true } : {}),
         onChanged(owner) {
-          if (closed || generation !== watchGeneration || owner.tenantId !== tenantId) return;
+          if (closed || generation !== watchGeneration || !allowedTenant(owner.tenantId)) return;
           const key = keyOf(owner);
           for (const connection of connections)
             if (connection.key === key) queue(connection, 'change');
@@ -184,7 +188,7 @@ export function createUploadLiveHub(options: UploadLiveOptions) {
     async open(req: Request, res: Response, expectedPrincipal: UploadPrincipal): Promise<void> {
       if (closed) throw new UploadManagementError('unavailable');
       const principal = await options.principal(req);
-      if (!same(principal, expectedPrincipal) || principal.tenantId !== tenantId)
+      if (!same(principal, expectedPrincipal) || !allowedTenant(principal.tenantId))
         throw new UploadManagementError('unauthorized');
       if (closed || res.destroyed || res.writableEnded || req.aborted)
         throw new UploadManagementError('unavailable');

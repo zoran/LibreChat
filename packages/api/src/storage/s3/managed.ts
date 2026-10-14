@@ -46,11 +46,15 @@ async function closeStreams(...values: (Readable | undefined)[]): Promise<void> 
 export function managedOriginalKey(input: {
   operationId: string;
   generation: number;
-  tenantId: string;
+  tenantId: string | null;
   userId: string;
 }): string {
   uploadAttemptId(input);
-  if (!input.tenantId || !input.userId) throw new Error('Missing managed object principal');
+  if (
+    (input.tenantId !== null && (typeof input.tenantId !== 'string' || !input.tenantId)) ||
+    !input.userId
+  )
+    throw new Error('Missing managed object principal');
   return getS3Key({
     tenantId: input.tenantId,
     userId: input.userId,
@@ -62,7 +66,8 @@ export function managedOriginalKey(input: {
 function validKey(key: string): boolean {
   const parsed = parseS3Key(key);
   return (
-    !!parsed?.tenantId &&
+    !!parsed &&
+    key === getS3Key(parsed) &&
     parsed.basePath === 'managed-uploads' &&
     /^[a-zA-Z0-9_-]{1,128}\.[1-9][0-9]{0,14}__original$/.test(parsed.fileName)
   );

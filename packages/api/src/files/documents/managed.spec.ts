@@ -1,5 +1,6 @@
 import JSZip from 'jszip';
 import path from 'node:path';
+import { tmpdir } from 'node:os';
 import { mkdir, mkdtemp, writeFile, rm } from 'node:fs/promises';
 import { extractManagedDocument, MANAGED_DOCUMENT_TYPES } from './managed';
 
@@ -13,10 +14,9 @@ const NS = {
 describe('managed useful extraction and hard limits', () => {
   let root: string;
   beforeAll(async () => {
-    if (!process.env.UPLOAD_TEST_TMPDIR)
-      throw new Error('Explicit isolated upload test directory required');
-    await mkdir(process.env.UPLOAD_TEST_TMPDIR, { recursive: true });
-    root = await mkdtemp(path.join(process.env.UPLOAD_TEST_TMPDIR, 'documents-'));
+    const directory = process.env.UPLOAD_TEST_TMPDIR ?? tmpdir();
+    await mkdir(directory, { recursive: true });
+    root = await mkdtemp(path.join(directory, 'documents-'));
   });
   afterAll(async () => {
     if (root) await rm(root, { recursive: true, force: true });
@@ -132,6 +132,32 @@ describe('managed useful extraction and hard limits', () => {
         filePath,
         mediaType: MANAGED_DOCUMENT_TYPES[3],
         limits: { archiveEntries: 2 },
+      }),
+    ).rejects.toMatchObject({ code: 'resource_limit' });
+  });
+  it('enforces total inflation even when each unused part fits its own limit', async () => {
+    const filePath = await presentation({ extra: 2048 });
+    await expect(
+      extractManagedDocument({
+        filePath,
+        mediaType: MANAGED_DOCUMENT_TYPES[3],
+        limits: { inflatedBytes: 2048, entryBytes: 4096 },
+      }),
+    ).rejects.toMatchObject({ code: 'resource_limit' });
+  });
+  it('counts explicit DOCX page breaks before extracting text', async () => {
+    const zip = new JSZip();
+    zip.file(
+      'word/document.xml',
+      '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>first page</w:t><w:br w:type="page"/><w:t>second page</w:t></w:r></w:p></w:body></w:document>',
+    );
+    const filePath = path.join(root, 'too-many-pages.docx');
+    await writeFile(filePath, await zip.generateAsync({ type: 'nodebuffer' }));
+    await expect(
+      extractManagedDocument({
+        filePath,
+        mediaType: MANAGED_DOCUMENT_TYPES[2],
+        limits: { pages: 1 },
       }),
     ).rejects.toMatchObject({ code: 'resource_limit' });
   });

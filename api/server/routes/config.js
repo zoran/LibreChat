@@ -2,6 +2,7 @@ const express = require('express');
 const {
   isEnabled,
   getAuthMode,
+  guestUploadTransitionEnabled,
   getEmailCodeConfig,
   resolveEmailChangeSettings,
   checkEmailConfig,
@@ -350,7 +351,12 @@ router.get('/', async function (req, res) {
       managedUploads: {
         enabled: process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED === 'true',
         eligible:
-          req.authenticationClass === 'verified-email' && req.user.provider === 'email_code',
+          (req.authenticationClass === 'verified-email' && req.user.provider === 'email_code') ||
+          (guestUploadTransitionEnabled() &&
+            req.authenticationClass === 'guest' &&
+            req.user.provider === 'browser' &&
+            req.browserGrant?.userId === req.user.id &&
+            req.browserGrant?.tenantId === null),
       },
       ...getConversationTitleCapabilities(appConfig?.interfaceConfig),
       conversationListLimits,

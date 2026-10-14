@@ -14,6 +14,8 @@ const {
   createUploadMetrics,
   initializeS3,
   validateEmailCodeBearer,
+  validateBrowserBearer,
+  guestUploadTransitionEnabled,
   getEmailCodeSettings,
   UploadManagementError,
 } = require('@librechat/api');
@@ -90,12 +92,17 @@ function uploadPrincipal(repository) {
       const payload = jwt.verify(authorization.slice(7), process.env.JWT_SECRET, {
         algorithms: ['HS256'],
       });
-      const identity = await runAsSystem(() => validateEmailCodeBearer(payload, repository));
+      const guest = payload?.provider === 'browser';
+      const identity = await runAsSystem(() =>
+        guest
+          ? validateBrowserBearer(payload, request, repository)
+          : validateEmailCodeBearer(payload, repository),
+      );
       if (!identity) throw new Error('unauthorized');
       return {
         tenantId: identity.grant.tenantId,
         userId: identity.grant.userId,
-        authentication: 'verified-email',
+        authentication: guest ? 'guest' : 'verified-email',
       };
     } catch {
       throw new UploadManagementError('unauthorized');
@@ -168,9 +175,11 @@ async function createUploadComposition({
     identity: {
       authorize: async (owner, scope) =>
         scope.kind === 'personal' &&
-        owner.authentication === 'verified-email' &&
-        owner.tenantId === tenant &&
-        !!owner.userId,
+        !!owner.userId &&
+        ((owner.authentication === 'verified-email' && owner.tenantId === tenant) ||
+          (guestUploadTransitionEnabled() &&
+            owner.authentication === 'guest' &&
+            owner.tenantId === null)),
     },
     resources: platform.resources,
     telemetry: {
@@ -204,6 +213,7 @@ async function createUploadComposition({
     repository,
     principal,
     tenantId: tenant,
+    includeGuests: guestUploadTransitionEnabled(),
     admissionStatus: () => controller.status().admissionsPaused,
     observe({ connections, outcome }) {
       metrics.liveConnections(connections);

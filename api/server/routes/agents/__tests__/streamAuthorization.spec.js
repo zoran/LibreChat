@@ -2,9 +2,11 @@ const { EventEmitter } = require('node:events');
 const jwt = require('jsonwebtoken');
 
 const mockValidateEmailCodeBearer = jest.fn();
+const mockValidateBrowserBearer = jest.fn();
 const mockRepository = {};
 jest.mock('@librechat/api', () => ({
   validateEmailCodeBearer: (...args) => mockValidateEmailCodeBearer(...args),
+  validateBrowserBearer: (...args) => mockValidateBrowserBearer(...args),
 }));
 jest.mock('@librechat/data-schemas', () => ({ runAsSystem: (action) => action() }));
 jest.mock('~/models', () => mockRepository);
@@ -52,6 +54,7 @@ describe('bounded current-grant chat disclosure', () => {
     userId,
     token,
     write,
+    guest = false,
   } = {}) {
     const grant = { ...identity.grant, ...(userId && { userId }) };
     const claims = {
@@ -87,12 +90,44 @@ describe('bounded current-grant chat disclosure', () => {
         this.emit('close');
       }),
     });
+    if (guest) {
+      req.authenticationClass = 'guest';
+      delete req.emailCodeGrant;
+      req.user = { id: grant.userId, provider: 'browser' };
+      req.browserGrant = { userId: grant.userId, sessionId: grant.sessionId, tenantId: null };
+      req.headers.authorization = `Bearer ${jwt.sign({ id: grant.userId, provider: 'browser' }, process.env.JWT_SECRET, { expiresIn: 300 })}`;
+      mockValidateBrowserBearer.mockResolvedValue({ user: req.user, grant: req.browserGrant });
+    }
     const writer = jest.fn(write ?? (() => true));
     const onClose = jest.fn();
     const output = controller({ req, res, write: writer, onClose });
     opened.push(output);
     return { output, req, res, writer, onClose };
   }
+
+  it('rechecks the same guest session during document disclosure and rejects revoked reconnects', async () => {
+    const f = fixture({ guest: true });
+    expect(f.output.write({ text: 'private document answer' })).toBe(true);
+    await jest.advanceTimersByTimeAsync(250);
+    expect(f.writer).toHaveBeenCalledTimes(1);
+    expect(mockValidateBrowserBearer).toHaveBeenCalledWith(
+      expect.objectContaining({ provider: 'browser' }),
+      f.req,
+      mockRepository,
+    );
+    expect(mockValidateEmailCodeBearer).not.toHaveBeenCalled();
+    mockValidateBrowserBearer.mockResolvedValue(null);
+    f.output.write({ text: 'must not disclose' });
+    await jest.advanceTimersByTimeAsync(250);
+    expect(f.writer).toHaveBeenCalledTimes(1);
+    expect(f.output.closed).toBe(true);
+    const reconnect = fixture({ guest: true });
+    mockValidateBrowserBearer.mockResolvedValue(null);
+    reconnect.output.write({ text: 'replay' });
+    await jest.advanceTimersByTimeAsync(250);
+    expect(reconnect.writer).not.toHaveBeenCalled();
+    expect(reconnect.output.closed).toBe(true);
+  });
 
   it('authorizes one bounded batch rather than each token and ends only after its final frame', async () => {
     const f = fixture();

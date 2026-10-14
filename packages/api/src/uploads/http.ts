@@ -1,5 +1,5 @@
 import { json, Router } from 'express';
-import { UPLOAD_ERROR_CODES } from 'librechat-data-provider';
+import { UPLOAD_ERROR_CODES, isUploadPrincipal } from 'librechat-data-provider';
 import type {
   ManagedUploadSnapshot,
   ManagedUploadView,
@@ -137,11 +137,11 @@ function authority(options: AuthorityOptions) {
     }
     const principal = await options.principal(request);
     if (
-      !principal?.tenantId ||
-      !principal.userId ||
-      principal.authentication !== 'verified-email' ||
+      !isUploadPrincipal(principal) ||
       (expected &&
-        (expected.tenantId !== principal.tenantId || expected.userId !== principal.userId))
+        (expected.authentication !== principal.authentication ||
+          expected.tenantId !== principal.tenantId ||
+          expected.userId !== principal.userId))
     ) {
       throw new UploadManagementError('unauthorized');
     }

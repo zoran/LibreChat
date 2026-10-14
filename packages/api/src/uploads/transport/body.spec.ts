@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import type { UploadLease, UploadPrincipal } from 'librechat-data-provider';
 import type { Request, Response } from 'express';
 import type { RawUploadBodyDependencies, RawUploadObservation } from './body';
 import type { UploadAttemptPort } from '../contract';
@@ -113,8 +114,8 @@ describe('raw upload body admission and streaming', () => {
           declaredBytes: options.declared ?? 5,
         };
       }),
-      claimTransfer: jest.fn(async () => lease),
-      renew: jest.fn(async () => lease),
+      claimTransfer: jest.fn(async (): Promise<UploadLease> => lease),
+      renew: jest.fn(async (): Promise<UploadLease> => lease),
       accept: jest.fn(async () => ({ id: 'operation', state: 'queued_processing' })),
       fail: jest.fn(async () => ({})),
       cancel: jest.fn(async () => ({})),
@@ -313,18 +314,49 @@ describe('raw upload body admission and streaming', () => {
     expect(test.response.statusCode).toBe(401);
     expect(await readdir(root)).toEqual([]);
   });
-  it.each(['revoked', 'changed-owner'] as const)(
-    'rechecks %s after durable storage and keeps the original charged for cleanup',
-    async (change) => {
+  it('accepts a current explicit-null guest without changing its storage or cleanup ownership', async () => {
+    const guest: UploadPrincipal = { authentication: 'guest', tenantId: null, userId: 'guest' };
+    const guestLease = { ...lease, tenantId: null, userId: guest.userId };
+    const test = fixture('hello', { principal: async () => guest });
+    test.management.claimTransfer.mockResolvedValue(guestLease);
+    const done = test.run();
+    test.req.end('hello');
+    await done;
+    expect(test.response.statusCode).toBe(202);
+    expect(test.management.get).toHaveBeenCalledWith(guest, 'operation');
+    expect(test.management.accept).toHaveBeenCalledWith(
+      guest,
+      'operation',
+      guestLease,
+      expect.objectContaining({ outcome: 'durable' }),
+    );
+    expect(test.storage.put).toHaveBeenCalledWith(expect.objectContaining({ lease: guestLease }));
+    expect(await readdir(root)).toEqual([]);
+  });
+  it.each([
+    ['verified-email', 'revoked'],
+    ['verified-email', 'changed-owner'],
+    ['guest', 'revoked'],
+    ['guest', 'changed-owner'],
+  ] as const)(
+    'rechecks %s %s after durable storage and keeps the original charged for cleanup',
+    async (authentication, change) => {
+      const admitted: UploadPrincipal =
+        authentication === 'guest'
+          ? { authentication, tenantId: null, userId: 'guest' }
+          : principal;
+      const admittedLease = { ...lease, tenantId: admitted.tenantId, userId: admitted.userId };
       let completedPut = false;
       const test = fixture('hello', {
         principal: async () => {
           if (completedPut && change === 'revoked') throw new UploadManagementError('unauthorized');
-          return completedPut
-            ? { ...principal, tenantId: 'other-tenant', userId: 'other-user' }
-            : principal;
+          if (!completedPut) return admitted;
+          if (admitted.authentication === 'verified-email')
+            return { ...admitted, tenantId: 'other-tenant', userId: 'other-user' };
+          return { ...admitted, userId: 'other-user' };
         },
       });
+      test.management.claimTransfer.mockResolvedValue(admittedLease);
       const put = test.storage.put.getMockImplementation()!;
       test.storage.put.mockImplementationOnce(async (input) => {
         const receipt = await put(input);
@@ -336,7 +368,7 @@ describe('raw upload body admission and streaming', () => {
       await done;
       expect(test.management.accept).not.toHaveBeenCalled();
       expect(test.storage.remove).not.toHaveBeenCalled();
-      expect(test.management.fail).toHaveBeenCalledWith(lease, 'unauthorized');
+      expect(test.management.fail).toHaveBeenCalledWith(admittedLease, 'unauthorized');
       expect(test.management.confirmCleanup).toHaveBeenCalledWith(
         expect.objectContaining({
           writerStopped: true,

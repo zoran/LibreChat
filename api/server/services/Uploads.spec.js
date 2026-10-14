@@ -64,6 +64,54 @@ describe('Cortex upload adapter trust boundaries', () => {
     );
   });
 
+  it('uses actual browser-cookie bearer validation and never merges guest/email accounts', async () => {
+    const { BROWSER_COOKIE, setAuthSelection } = jest.requireActual('@librechat/api');
+    process.env.AUTH_MODE = 'transition';
+    process.env.CORTEX_UPLOAD_GUEST_TRANSITION_ENABLED = 'true';
+    const id = 'a'.repeat(24),
+      credential = `${id}.${'b'.repeat(43)}`;
+    const user = { id, _id: id, provider: 'browser', role: 'USER', emailVerified: false };
+    const repository = {
+      findBrowserIdentity: jest.fn(async () => ({
+        user,
+        sessionId: 'c'.repeat(24),
+        expiration: new Date(Date.now() + 60000),
+      })),
+    };
+    const token = jwt.sign({ id, provider: 'browser' }, process.env.JWT_SECRET, {
+      algorithm: 'HS256',
+      expiresIn: 60,
+    });
+    const request = {
+      headers: { authorization: `Bearer ${token}`, cookie: `${BROWSER_COOKIE}=${credential}` },
+      cookies: { [BROWSER_COOKIE]: credential },
+    };
+    const authorize = uploadPrincipal(repository);
+    expect(await authorize(request)).toEqual({
+      authentication: 'guest',
+      tenantId: null,
+      userId: id,
+    });
+    expect(validateEmailCodeBearer).not.toHaveBeenCalled();
+    const mixed = {
+      ...request,
+      cookies: { [BROWSER_COOKIE]: `${'d'.repeat(24)}.${'b'.repeat(43)}` },
+    };
+    await expect(authorize(mixed)).rejects.toMatchObject({ code: 'unauthorized' });
+    setAuthSelection(
+      {
+        cookie: (name, value) => {
+          request.cookies[name] = value;
+        },
+      },
+      'email',
+    );
+    await expect(authorize(request)).rejects.toMatchObject({ code: 'unauthorized' });
+    delete request.cookies['__Host-librechat-auth-selection'];
+    repository.findBrowserIdentity.mockResolvedValue(null);
+    await expect(authorize(request)).rejects.toMatchObject({ code: 'unauthorized' });
+  });
+
   it('rejects missing/revoked grants and unsupported token algorithms', async () => {
     const authorize = uploadPrincipal({});
     await expect(authorize({ headers: {} })).rejects.toMatchObject({ code: 'unauthorized' });

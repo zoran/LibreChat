@@ -80,6 +80,25 @@ describe('sole File owner managed cleanup adapter', () => {
     );
   });
 
+  it('normalizes only the existing tenantless File owner and retains unknown guest cleanup', async () => {
+    const guest = { authentication: 'guest', tenantId: null, userId: 'guest' } as const;
+    const task = { ...base, principal: guest, writerStopped: true, localCopiesAbsent: true };
+    const test = fixture(task);
+    await expect(test.cleanup.beginFileDeletion({ userId: 'guest' }, 'op')).resolves.toEqual(task);
+    expect(test.repository.cleanupForFile).toHaveBeenCalledWith(
+      { tenantId: null, userId: 'guest' },
+      'op',
+    );
+    test.storage.remove.mockResolvedValue('unknown');
+    const proof = await test.cleanup.removeFileOriginal(task);
+    expect(proof.originalAbsent).toBe(false);
+    await expect(test.cleanup.finishFileDeletion(task, proof)).rejects.toThrow();
+    expect(test.repository.confirmCleanup).not.toHaveBeenCalledWith(
+      expect.objectContaining({ textAndHistoryRemoved: true }),
+      expect.anything(),
+    );
+  });
+
   it('a legacy file lookup does not mutate upload state', async () => {
     const test = fixture();
     test.repository.cleanupForFile.mockResolvedValue(null);

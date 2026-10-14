@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { SystemRoles } from 'librechat-data-provider';
-import type { BalanceConfig, IUser } from '~/types';
+import type { BalanceConfig, IUser, ISession } from '~/types';
 import { createSessionMethods } from './session';
 import { createUserMethods } from './user';
 import { hashToken } from '~/crypto';
@@ -20,6 +20,9 @@ export interface BrowserUser {
 export interface BrowserIdentity {
   user: BrowserUser;
   expiration: Date;
+  /** Current-read only; sendIdentity deliberately publishes only user and minted token. */
+  sessionId?: string;
+  retirement?: { credentialsChangedAt?: Date; twoFactorEnrolledAt?: Date };
 }
 
 export interface BrowserMethods {
@@ -58,31 +61,41 @@ export function createBrowserMethods(mongoose: typeof import('mongoose')): Brows
       throw new Error('Invalid browser session expiration');
     }
     await sessions.ensureSessionIndexes();
-    return mongoose.connection.transaction(async (transaction) => {
-      const user = await users.createUser(
-        {
-          name: 'Browser',
-          email: `${randomBytes(24).toString('hex')}@browser.invalid`,
-          emailVerified: false,
-          provider: 'browser',
-          role: SystemRoles.USER,
-        },
-        balanceConfig,
-        true,
-        true,
-        transaction,
-      );
-      if (user instanceof mongoose.Types.ObjectId) {
-        throw new Error('Browser enrollment returned no user');
-      }
-      const safeUser = serialize(user);
-      const credential = `${safeUser.id}.${randomBytes(32).toString('base64url')}`;
-      await mongoose.models.Session.create(
-        [{ user: safeUser.id, refreshTokenHash: await hashToken(credential), expiration }],
-        { session: transaction },
-      );
-      return { user: safeUser, credential, expiration };
-    });
+    return mongoose.connection.transaction(
+      async (transaction) => {
+        const user = await users.createUser(
+          {
+            name: 'Browser',
+            email: `${randomBytes(24).toString('hex')}@browser.invalid`,
+            emailVerified: false,
+            provider: 'browser',
+            role: SystemRoles.USER,
+          },
+          balanceConfig,
+          true,
+          true,
+          transaction,
+        );
+        if (user instanceof mongoose.Types.ObjectId) {
+          throw new Error('Browser enrollment returned no user');
+        }
+        const safeUser = serialize(user);
+        const credential = `${safeUser.id}.${randomBytes(32).toString('base64url')}`;
+        await mongoose.models.Session.create(
+          [
+            {
+              user: safeUser.id,
+              refreshTokenHash: await hashToken(credential),
+              expiration,
+              authCreatedAt: new Date(),
+            },
+          ],
+          { session: transaction },
+        );
+        return { user: safeUser, credential, expiration };
+      },
+      { writeConcern: { w: 'majority' } },
+    );
   }
 
   async function findBrowserIdentity(credential: string): Promise<BrowserIdentity | null> {
@@ -90,24 +103,56 @@ export function createBrowserMethods(mongoose: typeof import('mongoose')): Brows
       return null;
     }
     const userId = credential.slice(0, 24);
-    const [session, user] = await Promise.all([
-      sessions.findSession({ userId, refreshToken: credential }),
-      users.getUserById(
-        userId,
-        '_id name username email provider role tenantId +agentTriggerDeletionStartedAt',
-      ),
-    ]);
+    // Linearizable primary reads observe confirmed native revocations; no cache or lease extension.
+    const session = await mongoose.models.Session.findOne({
+      user: userId,
+      refreshTokenHash: await hashToken(credential),
+    })
+      .read('primary')
+      .readConcern('linearizable')
+      .maxTimeMS(2000)
+      .lean<ISession>();
     if (
       !session ||
+      session.revokedAt ||
+      session.authMethod != null ||
+      session.tenantId != null ||
+      !(session.expiration instanceof Date) ||
+      session.expiration.getTime() <= Date.now()
+    )
+      return null;
+    const user = await mongoose.models.User.findById(userId)
+      .select(
+        '_id name username email provider role tenantId authDisabled credentialsChangedAt twoFactorEnrolledAt +agentTriggerDeletionStartedAt',
+      )
+      .read('primary')
+      .readConcern('linearizable')
+      .maxTimeMS(2000)
+      .lean<IUser>();
+    // Old native browser sessions have no authCreatedAt; their ObjectId is a conservative creation bound.
+    const createdAt =
+      session.authCreatedAt ?? new mongoose.Types.ObjectId(String(session._id)).getTimestamp();
+    if (
       !user ||
       user.provider !== 'browser' ||
       user.role !== SystemRoles.USER ||
-      user.tenantId ||
-      user.agentTriggerDeletionStartedAt
-    ) {
+      user.tenantId != null ||
+      user.authDisabled ||
+      user.agentTriggerDeletionStartedAt ||
+      (user.credentialsChangedAt && user.credentialsChangedAt >= createdAt) ||
+      (user.twoFactorEnrolledAt && user.twoFactorEnrolledAt > createdAt) ||
+      session.expiration.getTime() <= Date.now()
+    )
       return null;
-    }
-    return { user: serialize(user), expiration: session.expiration };
+    return {
+      user: serialize(user),
+      expiration: session.expiration,
+      sessionId: String(session._id),
+      retirement: {
+        credentialsChangedAt: user.credentialsChangedAt,
+        twoFactorEnrolledAt: user.twoFactorEnrolledAt,
+      },
+    };
   }
 
   async function revokeBrowserIdentity(credential: string): Promise<void> {

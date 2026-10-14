@@ -75,7 +75,12 @@ export function createUploadMigrationMethods(store: UploadStore): UploadMigratio
     if (
       Object.keys(row).some((key) => !store.Operation.schema.path(key)) ||
       !id(row._id) ||
-      !text(row.tenantId, 128) ||
+      !(
+        row.tenantId === null ||
+        (text(row.tenantId, 128) &&
+          /^[a-zA-Z0-9_.-]{1,128}$/.test(row.tenantId) &&
+          row.tenantId !== '__SYSTEM__')
+      ) ||
       !text(row.userId, 128) ||
       row.scope?.kind !== 'personal' ||
       !text(row.idempotencyKey, 128) ||
@@ -147,7 +152,7 @@ export function createUploadMigrationMethods(store: UploadStore): UploadMigratio
         row.original.bytes !== row.actualBytes ||
         !text(row.original.filepath, 4096) ||
         row.original.storageKey !==
-          `t/${row.tenantId}/managed-uploads/${row.userId}/${row._id}.${row.attemptGeneration}__original` ||
+          `${row.tenantId === null ? '' : `t/${row.tenantId}/`}managed-uploads/${row.userId}/${row._id}.${row.attemptGeneration}__original` ||
         ['waiting', 'cancelled'].includes(row.state)
       )
         reject('migration_conflict');
@@ -403,7 +408,9 @@ export function createUploadMigrationMethods(store: UploadStore): UploadMigratio
           if (existing && (existing.value as { turn: number }).turn !== record.principalTurn)
             reject('migration_conflict');
           await store.touchPrincipal(
-            { tenantId: row.tenantId, userId: row.userId, authentication: 'verified-email' },
+            row.tenantId === null
+              ? { tenantId: null, userId: row.userId, authentication: 'guest' }
+              : { tenantId: row.tenantId, userId: row.userId, authentication: 'verified-email' },
             session,
             record.principalTurn,
           );

@@ -84,6 +84,14 @@ function fixture(telemetry?: TelemetryPort) {
 }
 
 describe('managed upload public boundary', () => {
+  it('admits the explicit null guest namespace only through the existing identity policy', async () => {
+    const f = fixture();
+    const guest = { tenantId: null, userId: 'guest-a', authentication: 'guest' } as const;
+    await expect(f.management.reserve(guest, request)).resolves.toEqual(operation);
+    expect(f.authorize).toHaveBeenCalledWith(guest, { kind: 'personal' });
+    f.authorize.mockResolvedValue(false);
+    await expect(f.management.reserve(guest, request)).rejects.toMatchObject({ code: 'forbidden' });
+  });
   it('rejects guests before identity, storage or capacity access', async () => {
     const f = fixture();
     await expect(

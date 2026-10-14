@@ -4,7 +4,7 @@ import type { UploadCleanupTask, UploadCleanupProof, UploadWorker } from 'librec
 import type { UploadRepository, DocumentPort, StoragePort, UploadAttemptPort } from './contract';
 import { attemptOriginalPath, uploadAttemptId } from './processing/paths';
 
-type FileOwner = { tenantId?: string; userId?: string };
+type FileOwner = { tenantId?: string | null; userId?: string };
 type CleanupRepository = Pick<
   UploadRepository,
   'cleanupForFile' | 'delete' | 'reconcile' | 'cleanupTasks' | 'confirmCleanup'
@@ -125,8 +125,12 @@ export function createManagedUploadCleanup(options: {
 
   const api = {
     async beginFileDeletion(owner: FileOwner, fileId: string): Promise<UploadCleanupTask | null> {
-      if (!owner.tenantId || !owner.userId) return null;
-      const scope = { tenantId: owner.tenantId, userId: owner.userId };
+      if (
+        !owner.userId ||
+        (owner.tenantId != null && (typeof owner.tenantId !== 'string' || !owner.tenantId))
+      )
+        return null;
+      const scope = { tenantId: owner.tenantId ?? null, userId: owner.userId };
       const task = await options.repository.cleanupForFile(scope, fileId);
       if (!task) return null;
       await options.repository.delete(task.principal, task.operationId, now());

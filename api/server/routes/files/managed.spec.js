@@ -208,6 +208,28 @@ function storedOriginal(f, original, returned = original) {
 }
 
 describe('managed personal File consumers', () => {
+  it('requires explicit guest File ownership on download, including each revalidation', async () => {
+    const f = fixture();
+    const guest = { authentication: 'guest', tenantId: null, userId: user.userId };
+    f.owner.principal.mockResolvedValue(guest);
+    f.file.tenantId = null;
+    f.task.principal = guest;
+    await f.handlers.download(f.req, f.res);
+    expect(Buffer.concat(f.res.chunks).toString()).toBe('hello');
+    const missing = fixture();
+    missing.owner.principal.mockResolvedValue(guest);
+    delete missing.file.tenantId;
+    await missing.handlers.download(missing.req, missing.res);
+    expect(missing.res.statusCode).toBe(404);
+    expect(missing.owner.storage.read).not.toHaveBeenCalled();
+    const cross = fixture();
+    cross.owner.principal.mockResolvedValue(guest);
+    cross.file.tenantId = null;
+    cross.file.user = 'other';
+    await cross.handlers.download(cross.req, cross.res);
+    expect(cross.res.statusCode).toBe(404);
+  });
+
   it('streams the actual versioned original through explicit owner queries and safe metadata', async () => {
     const f = fixture();
     await f.handlers.download(f.req, f.res);

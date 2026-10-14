@@ -10,7 +10,7 @@ const owner: UploadPrincipal = {
   userId: 'one',
   authentication: 'verified-email',
 };
-function connection(principal = owner) {
+function connection(principal: UploadPrincipal = owner) {
   const request = Object.assign(new EventEmitter(), { identity: principal });
   const response = Object.assign(new EventEmitter(), {
     headersSent: false,
@@ -33,9 +33,9 @@ function connection(principal = owner) {
     res: response as unknown as Response,
   };
 }
-function fixture() {
+function fixture(includeGuests = false) {
   let changes!: {
-    onChanged: (principal: { tenantId: string; userId: string }) => void;
+    onChanged: (principal: { tenantId: string | null; userId: string }) => void;
     onReset: () => void;
   };
   const closeWatch = jest.fn();
@@ -52,7 +52,14 @@ function fixture() {
   );
   const observe = jest.fn();
   const admissionStatus = jest.fn<boolean | null, []>(() => false);
-  const options = { repository, principal, observe, admissionStatus, tenantId: owner.tenantId };
+  const options = {
+    repository,
+    principal,
+    observe,
+    admissionStatus,
+    tenantId: owner.tenantId,
+    includeGuests,
+  };
   const hub = createUploadLiveHub(options);
   return {
     hub,
@@ -72,6 +79,34 @@ describe('bounded authenticated upload event hints', () => {
   });
   afterEach(() => {
     jest.useRealTimers();
+  });
+
+  it('routes guest hints only to the exact current guest and closes on revoked heartbeat', async () => {
+    const f = fixture(true);
+    const guest = { authentication: 'guest', tenantId: null, userId: 'one' } as const;
+    const a = connection(guest),
+      b = connection({ ...guest, userId: 'two' }),
+      email = connection();
+    try {
+      await f.hub.open(a.req, a.res, guest);
+      await f.hub.open(b.req, b.res, b.request.identity);
+      await f.hub.open(email.req, email.res, owner);
+      expect(f.repository.watchChanges).toHaveBeenCalledTimes(1);
+      expect(f.repository.watchChanges).toHaveBeenCalledWith(
+        expect.objectContaining({ tenantId: 'tenant', includeGuests: true }),
+      );
+      for (const item of [a, b, email]) item.response.write.mockClear();
+      f.changes().onChanged(guest);
+      await jest.advanceTimersByTimeAsync(5000);
+      expect(a.response.write).toHaveBeenCalledTimes(1);
+      expect(b.response.write).not.toHaveBeenCalled();
+      expect(email.response.write).not.toHaveBeenCalled();
+      f.principal.mockRejectedValue(new UploadManagementError('unauthorized'));
+      await jest.advanceTimersByTimeAsync(15000);
+      expect(a.response.end).toHaveBeenCalled();
+    } finally {
+      f.hub.close();
+    }
   });
 
   it('shares one watch, routes only the exact principal and coalesces a burst into one content-free hint', async () => {

@@ -3,6 +3,7 @@ import { createReadStream } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { mkdir, open, rm } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
+import { isUploadPrincipal } from 'librechat-data-provider';
 import type {
   UploadPrincipal,
   UploadWorker,
@@ -158,7 +159,8 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
         const current = await deps.principal(req);
         if (
           !admittedPrincipal ||
-          current?.authentication !== 'verified-email' ||
+          !isUploadPrincipal(current) ||
+          current.authentication !== admittedPrincipal.authentication ||
           current.tenantId !== admittedPrincipal.tenantId ||
           current.userId !== admittedPrincipal.userId
         ) {

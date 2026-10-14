@@ -572,6 +572,29 @@ describe('deleteUserController', () => {
     mockQuiesceUserSchedules.mockResolvedValue(true);
   });
 
+  it.each(['throw', 'unconfirmed'])(
+    'preserves account and File custody when managed cleanup is %s',
+    async (failure) => {
+      const db = require('~/models');
+      const { processDeleteRequest } = require('~/server/services/Files/process');
+      if (failure === 'throw')
+        processDeleteRequest.mockRejectedValueOnce(new Error('original absence unknown'));
+      else
+        processDeleteRequest.mockResolvedValueOnce({
+          deletedFileIds: [],
+          failedFileIds: ['managed-file'],
+        });
+      const id = new mongoose.Types.ObjectId();
+      await deleteUserController(
+        { user: { id: String(id), _id: id, provider: 'browser' } },
+        mockRes,
+      );
+      expect(mockRes.status).toHaveBeenCalledWith(500);
+      expect(db.deleteFiles).not.toHaveBeenCalled();
+      expect(db.deleteUserById).not.toHaveBeenCalled();
+    },
+  );
+
   it('should return 200 on successful deletion', async () => {
     const userId = new mongoose.Types.ObjectId();
     const userIdStr = userId.toString();

@@ -3,6 +3,7 @@ const {
   reportLocatorTraversalFailure,
   isEnabled,
   getAuthMode,
+  guestUploadTransitionEnabled,
   GenerationJobManager,
   readFileSourceRetention,
   deserializeQuoteRetention,
@@ -316,9 +317,12 @@ router.get('/chat/stream/:streamId', async (req, res) => {
     if (typeof res.flush === 'function') res.flush();
     return accepted;
   };
-  // This latch comes from the native JWT strategy. Guest/default streams retain
-  // their existing path; verified streams reuse the current grant/account owner.
-  if (getAuthMode() !== 'default' && req.authenticationClass === 'verified-email') {
+  // Native JWT latches both grant classes. The transition guest policy uses the same bounded owner.
+  if (
+    getAuthMode() !== 'default' &&
+    (req.authenticationClass === 'verified-email' ||
+      (guestUploadTransitionEnabled() && req.authenticationClass === 'guest'))
+  ) {
     streamAuthorization = createStreamAuthorization({
       req,
       res,

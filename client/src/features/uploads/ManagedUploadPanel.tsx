@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import type { ReactNode } from 'react';
 import type { TranslationKeys } from '~/hooks/useLocalize';
 import type { ExtendedFile } from '~/common';
@@ -8,9 +9,9 @@ import { cancelManagedSelection } from './transfer';
 import useLocalize from '~/hooks/useLocalize';
 import { uploadPhase } from './progress';
 
-const mib = (bytes: number) =>
-  (bytes / 1_048_576).toLocaleString(undefined, { maximumFractionDigits: 2 });
-const date = (value: string) => new Date(value).toLocaleString();
+const mib = (bytes: number, locale?: string) =>
+  (bytes / 1_048_576).toLocaleString(locale, { maximumFractionDigits: 2 });
+const date = (value: string, locale?: string) => new Date(value).toLocaleString(locale);
 const phaseKeys: Record<string, TranslationKeys> = {
   selected: 'com_upload_selected',
   waiting: 'com_upload_waiting',
@@ -32,6 +33,8 @@ const actionClass =
 
 export function ManagedUploadPanel() {
   const localize = useLocalize();
+  const { i18n } = useTranslation();
+  const locale = i18n.resolvedLanguage ?? i18n.language;
   const uploads = useManagedUploads();
   if (!uploads.enabled) return null;
   let content: ReactNode;
@@ -43,29 +46,48 @@ export function ManagedUploadPanel() {
         <dl className="my-2 grid grid-cols-2 gap-x-3 gap-y-1 sm:grid-cols-4">
           <div>
             <dt>{localize('com_upload_used')}</dt>
-            <dd>{localize('com_upload_size_mib', { 0: mib(uploads.data.usage.usedBytes) })}</dd>
+            <dd>
+              {localize('com_upload_size_mib', { 0: mib(uploads.data.usage.usedBytes, locale) })}
+            </dd>
           </div>
           <div>
             <dt>{localize('com_upload_reserved')}</dt>
-            <dd>{localize('com_upload_size_mib', { 0: mib(uploads.data.usage.reservedBytes) })}</dd>
+            <dd>
+              {localize('com_upload_size_mib', {
+                0: mib(uploads.data.usage.reservedBytes, locale),
+              })}
+            </dd>
           </div>
           <div>
             <dt>{localize('com_upload_available')}</dt>
             <dd>
-              {localize('com_upload_size_mib', { 0: mib(uploads.data.usage.availableBytes) })}
+              {localize('com_upload_size_mib', {
+                0: mib(uploads.data.usage.availableBytes, locale),
+              })}
             </dd>
           </div>
           <div>
             <dt>{localize('com_upload_retained')}</dt>
-            <dd>{localize('com_upload_size_mib', { 0: mib(uploads.data.usage.retainedBytes) })}</dd>
+            <dd>
+              {localize('com_upload_size_mib', {
+                0: mib(uploads.data.usage.retainedBytes, locale),
+              })}
+            </dd>
           </div>
         </dl>
-        <p>{localize('com_upload_rolling_explained')}</p>
+        <p>
+          {localize(
+            uploads.isGuestAccount
+              ? 'com_upload_guest_rolling_explained'
+              : 'com_upload_rolling_explained',
+          )}
+        </p>
+        {uploads.isGuestAccount && <p className="mt-1">{localize('com_upload_guest_access')}</p>}
         {uploads.data.usage.nextReleaseAt && (
           <p className="mt-1">
             {localize('com_upload_next_release', {
-              0: mib(uploads.data.usage.nextReleaseBytes),
-              1: date(uploads.data.usage.nextReleaseAt),
+              0: mib(uploads.data.usage.nextReleaseBytes, locale),
+              1: date(uploads.data.usage.nextReleaseAt, locale),
             })}
           </p>
         )}
@@ -87,7 +109,9 @@ export function ManagedUploadPanel() {
   return (
     <details className="border-border-light text-text-secondary mb-2 w-full rounded-xl border px-3 py-2 text-sm">
       <summary className="cursor-pointer rounded focus-visible:outline focus-visible:outline-2">
-        {localize('com_upload_limits_summary')}
+        {localize(
+          uploads.isGuestAccount ? 'com_upload_guest_limits_summary' : 'com_upload_limits_summary',
+        )}
       </summary>
       {content}
       {uploads.eligible && uploads.data && (
@@ -120,6 +144,8 @@ export function ManagedUploadCard({
   onRemove: () => void;
 }) {
   const localize = useLocalize();
+  const { i18n } = useTranslation();
+  const locale = i18n.resolvedLanguage ?? i18n.language;
   const uploads = useManagedUploads();
   const [pending, setPending] = useState<'cancel' | 'delete' | 'retry' | null>(null);
   const [actionError, setActionError] = useState(false);
@@ -179,17 +205,17 @@ export function ManagedUploadCard({
           />
           <p>
             {localize('com_upload_transfer_progress', {
-              0: mib(progress.loaded),
-              1: mib(progress.total),
+              0: mib(progress.loaded, locale),
+              1: mib(progress.total, locale),
               2: progress.percent,
             })}
           </p>
           {progress.bytesPerSecond !== null && (
             <p>
               {progress.remainingSeconds === null
-                ? localize('com_upload_transfer_speed', { 0: mib(progress.bytesPerSecond) })
+                ? localize('com_upload_transfer_speed', { 0: mib(progress.bytesPerSecond, locale) })
                 : localize('com_upload_transfer_speed_remaining', {
-                    0: mib(progress.bytesPerSecond),
+                    0: mib(progress.bytesPerSecond, locale),
                     1: localize('com_upload_seconds_left', { 0: progress.remainingSeconds }),
                   })}
             </p>
@@ -199,7 +225,7 @@ export function ManagedUploadCard({
       {phase === 'storing' && <p>{localize('com_upload_transfer_complete')}</p>}
       {operation?.expiresAt && (
         <p className="text-text-secondary mt-1">
-          {localize('com_upload_expires', { 0: date(operation.expiresAt) })}
+          {localize('com_upload_expires', { 0: date(operation.expiresAt, locale) })}
         </p>
       )}
       {operation?.cleanupPending && (

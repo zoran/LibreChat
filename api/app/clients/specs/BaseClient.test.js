@@ -13,6 +13,142 @@ const {
 } = require('@librechat/api');
 const { FakeClient, initializeFakeClient } = require('./FakeClient');
 
+describe('managed document facts at the model-neutral chat boundary', () => {
+  const path = require('node:path');
+  const { tmpdir } = require('node:os');
+  const { mkdir, mkdtemp, readFile, rm, stat, writeFile } = require('node:fs/promises');
+  const { createUnixDocumentPort, startDocumentSidecar } = require('@librechat/api');
+  const fixtureRoot = path.resolve(
+    __dirname,
+    '../../../../packages/api/src/uploads/processing/fixtures/managed-documents',
+  );
+  const {
+    fixtures,
+  } = require('../../../../packages/api/src/uploads/processing/fixtures/managed-documents/manifest.json');
+  let root;
+  let sidecar;
+  let files;
+
+  beforeAll(async () => {
+    const childEntry = path.resolve(
+      __dirname,
+      '../../../../packages/api/dist/uploads/processing/parser-child.cjs',
+    );
+    await stat(childEntry).catch(() => {
+      throw new Error(
+        'Built managed parser unavailable; run npm run build:api from the repository root',
+      );
+    });
+    const directory = process.env.UPLOAD_TEST_TMPDIR ?? tmpdir();
+    await mkdir(directory, { recursive: true });
+    root = await mkdtemp(path.join(directory, 'chat-docs-'));
+    const socketPath = path.join(root, 'parser.sock');
+    if (Buffer.byteLength(socketPath) >= 100) {
+      throw new Error('Upload fixture root must allow a short Unix socket path');
+    }
+    sidecar = await startDocumentSidecar({
+      socketPath,
+      stagingRoot: root,
+      scratchRoot: root,
+      childEntry,
+      // Real parsing and IPC, but no claim about native resource/cgroup admission.
+      resourceOwner: {
+        start: async () => undefined,
+        claim: () => undefined,
+        release: () => undefined,
+        safe: () => true,
+        current: () => undefined,
+        close: () => undefined,
+      },
+    });
+    const documents = createUnixDocumentPort({ socketPath, stagingRoot: root });
+    files = [];
+    for (const fixture of fixtures) {
+      const attemptId = `chat-${fixture.slot}.1`;
+      const directory = path.join(root, attemptId);
+      await mkdir(directory, { mode: 0o700 });
+      await writeFile(
+        path.join(directory, 'original'),
+        await readFile(path.join(fixtureRoot, fixture.filename)),
+        { flag: 'wx', mode: 0o600 },
+      );
+      const signal = new AbortController().signal;
+      const execution = await documents.prepare({
+        attemptId,
+        mediaType: fixture.mediaType,
+        signal,
+      });
+      const result = await documents.extract({ execution, signal });
+      if (result.writerStopped !== true) {
+        throw new Error('Document fixture writer did not stop');
+      }
+      files.push({
+        file_id: `document-${fixture.slot}`,
+        filename: fixture.filename,
+        type: fixture.mediaType,
+        text: result.text,
+        textFormat: 'text',
+        llmDeliveryPath: 'text',
+        status: 'ready',
+        source: 's3',
+      });
+      await rm(directory, { recursive: true });
+    }
+  }, 30_000);
+
+  afterAll(async () => {
+    await sidecar?.close();
+    if (root) await rm(root, { recursive: true, force: true });
+  });
+
+  test.each(['configured-model-a', 'replacement-model-b'])(
+    'delivers all four extracted documents as ordinary text with %s',
+    async (model) => {
+      const client = new FakeClient(undefined, {
+        modelOptions: { model },
+        maxContextTokens: 32_768,
+        req: { body: { fileTokenLimit: 4096 } },
+      });
+      const userText = 'Vergleiche diese vier Angebote für 12 Plätze. Preserve my exact words.';
+      const getAuthorizedFiles = jest.fn(async () => files);
+      const assertFilesAllowed = jest.fn();
+      // Actual steering uses the same BaseClient extraction, SDK formatMessage and
+      // prependFileContext as a regular turn; only the database boundary is substituted.
+      const result = await buildSteerMedia({
+        client,
+        user: { id: 'fixture-owner' },
+        item: {
+          steerId: 'document-comparison',
+          text: userText,
+          files: files.map(({ file_id }) => ({ file_id })),
+        },
+        getFiles: getAuthorizedFiles,
+        assertFilesAllowed,
+      });
+      expect(getAuthorizedFiles).toHaveBeenCalledWith(
+        expect.objectContaining({ user: 'fixture-owner' }),
+        {},
+        {},
+      );
+      expect(assertFilesAllowed).toHaveBeenCalledTimes(1);
+      expect(result.content.every((part) => part.type === ContentTypes.TEXT)).toBe(true);
+      const modelBoundText = result.content.map((part) => part.text).join('\n');
+      for (const fixture of fixtures) {
+        expect(modelBoundText).toContain(fixture.filename);
+        for (const marker of fixture.markers) expect(modelBoundText).toContain(marker);
+      }
+      expect(modelBoundText).toContain(userText);
+      expect(modelBoundText.indexOf('Reihenfolge Anfang')).toBeLessThan(
+        modelBoundText.indexOf('Reihenfolge Ende'),
+      );
+      expect(result.files.map(({ file_id }) => file_id)).toEqual(
+        files.map(({ file_id }) => file_id),
+      );
+      expect(client.modelOptions.model).toBe(model);
+    },
+  );
+});
+
 function deferred() {
   let resolve;
   let reject;
