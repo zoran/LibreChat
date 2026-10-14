@@ -43,6 +43,52 @@ const endpointsConfig: TEndpointsConfig = {
   Gemini: { type: EModelEndpoint.custom, userProvide: false, order: 9999 },
 };
 
+describe('public presentation configuration', () => {
+  it('preserves optional upstream behavior and retains configured display values', () => {
+    const plain = interfaceSchema.parse({});
+    expect(plain).not.toHaveProperty('fixedLocale');
+    expect(plain).not.toHaveProperty('appVersion');
+    expect(plain).not.toHaveProperty('pwaIcons');
+    const configured = {
+      fixedLocale: 'de-DE',
+      appVersion: 'v0.8.8+bwi.1',
+      pwaIcons: [
+        { src: 'assets/logo.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' },
+        { src: '/assets/apple.png', sizes: '180x180', type: 'image/png' },
+      ],
+    };
+    expect(interfaceSchema.parse(configured)).toMatchObject(configured);
+  });
+
+  it.each(['', 'de_DE', 'de-DE<script>', 'x'.repeat(65), 42])(
+    'rejects malformed fixed locale %p',
+    (fixedLocale) => expect(interfaceSchema.safeParse({ fixedLocale }).success).toBe(false),
+  );
+
+  it.each(['', '0.8.8', 'v1.2.3<script>', 'v1.2.3+' + 'a'.repeat(80), 42])(
+    'rejects malformed display version %p',
+    (appVersion) => expect(interfaceSchema.safeParse({ appVersion }).success).toBe(false),
+  );
+
+  it.each(
+    [
+      [],
+      Array.from({ length: 9 }, () => ({ src: 'assets/logo.svg' })),
+      [{ src: 'https://external.example/logo.svg' }],
+      [{ src: '//external.example/logo.svg' }],
+      [{ src: 'data:image/svg+xml,example' }],
+      [{ src: 'assets/../private.svg' }],
+      [{ src: 'assets/%2e%2e/private.svg' }],
+      [{ src: 'assets/logo.svg', sizes: 'unlimited' }],
+      [{ src: 'assets/logo.svg', type: 'text/html' }],
+      [{ src: 'assets/logo.svg', purpose: 'unknown' }],
+      [{ src: 'assets/logo.svg', credentials: 'secret' }],
+    ].map((pwaIcons) => ({ pwaIcons })),
+  )('rejects unsafe or unbounded manifest icons $pwaIcons', ({ pwaIcons }) => {
+    expect(interfaceSchema.safeParse({ pwaIcons }).success).toBe(false);
+  });
+});
+
 describe('host-side file edit limits', () => {
   it('keeps configuration optional and resolves safe defaults when configured', () => {
     expect(agentsEndpointSchema.parse({}).hostFileEdits).toBeUndefined();

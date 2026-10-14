@@ -14,7 +14,7 @@ import { cleanupTimestampedStorage } from '~/utils/timestamps';
 import useSpeechSettingsInit from './useSpeechSettingsInit';
 import { useHasAccess, useCatalogReady } from '~/hooks';
 import { useMCPServersQuery } from '~/data-provider';
-import { setDocumentTitle } from '~/utils';
+import { getAppTitle, setDocumentTitle } from '~/utils';
 import store from '~/store';
 
 export default function useAppStartup({
@@ -43,10 +43,10 @@ export default function useAppStartup({
 
   /** Set the app title */
   useEffect(() => {
-    const appTitle = startupConfig?.appTitle ?? '';
-    if (!appTitle) {
+    if (!startupConfig?.appTitle) {
       return;
     }
+    const appTitle = getAppTitle(startupConfig.appTitle);
     setDocumentTitle(appTitle, true);
     localStorage.setItem(LocalStorageKeys.APP_TITLE, appTitle);
   }, [startupConfig]);

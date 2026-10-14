@@ -57,6 +57,7 @@ export * from './agentModelSelection';
 export * from './runStepDuration';
 export * from './toolCallPhase';
 export * from './documentTitle';
+export { getAppTitle, getAppVersion, getFixedLocale } from './presentation';
 export * from './reasoningLabels';
 export * from './numbers';
 export { default as cn } from './cn';

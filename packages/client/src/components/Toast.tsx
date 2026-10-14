@@ -15,16 +15,20 @@ const ToastViewport: React.ForwardRefExoticComponent<
 > = React.forwardRef<
   React.ElementRef<typeof RadixToast.Viewport>,
   React.ComponentPropsWithoutRef<typeof RadixToast.Viewport>
->(({ className, ...props }, ref) => (
-  <RadixToast.Viewport
-    ref={ref}
-    className={cn(
-      'pointer-events-none fixed inset-x-0 top-0 z-[1000] mx-auto my-2 flex max-w-[560px] flex-col items-stretch justify-start',
-      className,
-    )}
-    {...props}
-  />
-));
+>(({ className, ...props }, ref) => {
+  const localize = useLocalize();
+  return (
+    <RadixToast.Viewport
+      ref={ref}
+      label={localize('com_ui_notifications_hotkey', { defaultValue: 'Notifications ({hotkey})' })}
+      className={cn(
+        'pointer-events-none fixed inset-x-0 top-0 z-[1000] mx-auto my-2 flex max-w-[560px] flex-col items-stretch justify-start',
+        className,
+      )}
+      {...props}
+    />
+  );
+});
 ToastViewport.displayName = RadixToast.Viewport.displayName;
 
 export function Toast(): JSX.Element {

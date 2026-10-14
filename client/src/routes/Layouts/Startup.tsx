@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Outlet, useNavigate, useLocation } from 'react-router-dom';
 import type { TStartupConfig } from 'librechat-data-provider';
 import {
-  DEFAULT_APP_TITLE,
+  getAppTitle,
   setDocumentTitle,
   getPostLoginRedirect,
   isRequiredTwoFactorSetupRoute,
@@ -63,7 +63,7 @@ export default function StartupLayout({ isAuthenticated }: { isAuthenticated?: b
   }, [data]);
 
   useEffect(() => {
-    setDocumentTitle(startupConfig?.appTitle || DEFAULT_APP_TITLE, true);
+    setDocumentTitle(getAppTitle(startupConfig?.appTitle), true);
   }, [startupConfig?.appTitle]);
 
   useEffect(() => {

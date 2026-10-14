@@ -1,7 +1,9 @@
 import i18n from 'i18next';
 import { initReactI18next } from 'react-i18next';
+import { getAppTitle, getFixedLocale } from '~/utils/presentation';
 
 import translationEn from './en/translation.json';
+import translationDe from './de/translation.json';
 
 export const defaultNS = 'translation';
 
@@ -54,6 +56,7 @@ export type TranslationResource = Record<string, string>;
 
 export const resources = {
   en: { translation: translationEn },
+  de: { translation: translationDe },
 } as const;
 
 const localeLoaders: Record<
@@ -66,7 +69,7 @@ const localeLoaders: Record<
   ca: () => import('./ca/translation.json'),
   cs: () => import('./cs/translation.json'),
   da: () => import('./da/translation.json'),
-  de: () => import('./de/translation.json'),
+  de: () => Promise.resolve({ default: translationDe }),
   es: () => import('./es/translation.json'),
   et: () => import('./et/translation.json'),
   fa: () => import('./fa/translation.json'),
@@ -150,7 +153,7 @@ const localeAliases: Record<string, SupportedLocale> = {
   'zh-mo': 'zh-Hant',
 };
 
-const loadedLocales = new Set<SupportedLocale>(['en']);
+const loadedLocales = new Set<SupportedLocale>(['en', 'de']);
 const loadingLocales: Partial<Record<SupportedLocale, Promise<SupportedLocale>>> = {};
 let languageRequestId = 0;
 let latestRequestedLocale: SupportedLocale = 'en';
@@ -218,7 +221,7 @@ export function normalizeLocale(locale?: string | null): SupportedLocale {
 export function detectInitialLanguage() {
   const cookieLang = readCookie('lang');
   const storedLang = readStoredLanguage();
-  return normalizeLocale(cookieLang || storedLang || getNavigatorLanguage());
+  return normalizeLocale(getFixedLocale() || cookieLang || storedLang || getNavigatorLanguage());
 }
 
 export async function ensureLocale(locale?: string | null): Promise<SupportedLocale> {
@@ -226,6 +229,15 @@ export async function ensureLocale(locale?: string | null): Promise<SupportedLoc
 
   if (normalized === 'en') {
     return normalized;
+  }
+
+  // German is bundled so a fixed German deployment never depends on a second fetch.
+  if (normalized === 'de') {
+    if (!i18n.hasResourceBundle('de', defaultNS)) {
+      i18n.addResourceBundle('de', defaultNS, translationDe, true, true);
+    }
+    loadedLocales.add('de');
+    return 'de';
   }
 
   if (loadedLocales.has(normalized)) {
@@ -302,14 +314,18 @@ export const i18nInitPromise = i18n.use(initReactI18next).init({
   partialBundledLanguages: true,
   load: 'currentOnly',
   react: { useSuspense: false },
-  interpolation: { escapeValue: false },
+  interpolation: { escapeValue: false, defaultVariables: { appName: getAppTitle() } },
 });
 
 export async function changeLanguageSafely(locale?: string | null) {
   const requestId = ++languageRequestId;
-  const requestedLocale = normalizeLocale(locale);
+  const requestedLocale = normalizeLocale(getFixedLocale() ?? locale);
   latestRequestedLocale = requestedLocale;
   await i18nInitPromise;
+  i18n.options.interpolation = {
+    ...i18n.options.interpolation,
+    defaultVariables: { ...i18n.options.interpolation?.defaultVariables, appName: getAppTitle() },
+  };
 
   const loadedLocale = await ensureLocale(requestedLocale);
   if (requestId !== languageRequestId) {

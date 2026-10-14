@@ -203,3 +203,7 @@ scripts/activity-labels/results/
 
 # Disposable local build and test artifacts at any package depth
 .tmp/
+
+# Ephemeral local presentation fixture connection data.
+/e2e/presentation/.runtime/
+/e2e/presentation/.test-results/

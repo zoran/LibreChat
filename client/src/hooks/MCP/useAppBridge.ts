@@ -28,6 +28,8 @@ import {
   useMCPAppsPolicy,
 } from '~/Providers';
 import { logger } from '~/utils';
+import { getAppTitle, getAppVersion, getFixedLocale } from '~/utils/presentation';
+import i18n from '~/locales/i18n';
 
 type MessageContentBlock = { type?: string; text?: string };
 
@@ -211,7 +213,7 @@ export function useAppBridge({
     const { locale, timeZone } = Intl.DateTimeFormat().resolvedOptions();
     const bridge = new AppBridge(
       null,
-      { name: 'LibreChat', version: '1.0.0' },
+      { name: getAppTitle(), version: getAppVersion() },
       {
         openLinks: {},
         logging: {},
@@ -223,7 +225,7 @@ export function useAppBridge({
         hostContext: {
           theme: readHostTheme(),
           platform: 'web',
-          locale,
+          locale: getFixedLocale() ?? i18n.resolvedLanguage ?? locale,
           timeZone,
           displayMode: 'inline',
           availableDisplayModes: ['inline'],

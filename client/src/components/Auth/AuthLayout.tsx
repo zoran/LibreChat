@@ -8,7 +8,7 @@ import { BlinkAnimation } from './BlinkAnimation';
 import LegalConsent from './LegalConsent';
 import { Banner } from '../Banners';
 import Footer from './Footer';
-import { cn } from '~/utils';
+import { cn, getAppTitle } from '~/utils';
 
 function AuthLayout({
   children,
@@ -95,7 +95,7 @@ function AuthLayout({
           <img
             src="assets/logo.svg"
             className="h-full w-full object-contain"
-            alt={localize('com_ui_logo', { 0: startupConfig?.appTitle ?? 'LibreChat' })}
+            alt={localize('com_ui_logo', { 0: getAppTitle(startupConfig?.appTitle) })}
           />
         </div>
       </BlinkAnimation>

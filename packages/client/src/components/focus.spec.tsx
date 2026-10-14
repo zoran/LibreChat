@@ -39,8 +39,8 @@ describe('shared control keyboard focus', () => {
     }
 
     const buttons = [
-      screen.getByRole('button', { name: 'Show secret' }),
-      screen.getByRole('button', { name: 'Copy to clipboard' }),
+      screen.getByRole('button', { name: 'com_ui_show_secret' }),
+      screen.getByRole('button', { name: 'com_ui_copy_to_clipboard' }),
     ];
     buttons.forEach((button) => {
       expect(reached).toContain(button);

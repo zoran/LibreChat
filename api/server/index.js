@@ -29,7 +29,7 @@ const {
   applyCspNonce,
   createCspPolicy,
   shellCacheHeaders,
-  escapeHtmlAttribute,
+  createPresentation,
   ErrorController,
   memoryDiagnostics,
   createSecurityHeaders,
@@ -384,6 +384,13 @@ const startServer = async () => {
     customFooter: process.env.CUSTOM_FOOTER,
   });
 
+  const presentation = createPresentation({
+    html: indexHTML,
+    manifestRaw: fs.readFileSync(path.join(appConfig.paths.dist, 'manifest.webmanifest'), 'utf8'),
+    appTitle: process.env.APP_TITLE,
+    interfaceConfig: appConfig.interfaceConfig,
+  });
+
   const cspPolicy = createCspPolicy();
   const shellCache = shellCacheHeaders(cspPolicy != null);
 
@@ -392,8 +399,7 @@ const startServer = async () => {
     res.vary(QUERY_DEVTOOLS_HEADER);
 
     const lang = req.cookies.lang || req.headers['accept-language']?.split(',')[0] || 'en-US';
-    const saneLang = escapeHtmlAttribute(lang);
-    let updatedIndexHtml = indexHTML.replace(/lang="en-US"/g, () => `lang="${saneLang}"`);
+    let updatedIndexHtml = presentation.render(lang);
     updatedIndexHtml = maybeInjectQueryDevtoolsBootstrap(updatedIndexHtml, req);
 
     /* Nonce last: every injected script above must be stamped too. */
@@ -462,6 +468,7 @@ const startServer = async () => {
   }
 
   app.get('/index.html', sendIndexHtml);
+  app.get('/manifest.webmanifest', presentation.manifestHandler);
   app.use(staticCache(appConfig.paths.dist));
   app.use(staticCache(appConfig.paths.fonts));
   app.use(staticCache(appConfig.paths.assets));

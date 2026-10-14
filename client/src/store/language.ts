@@ -1,5 +1,6 @@
-import { atom } from 'recoil';
+import { atom, selector } from 'recoil';
 import Cookies from 'js-cookie';
+import { getFixedLocale } from '~/utils/presentation';
 import { atomWithLocalStorage } from './utils';
 
 const readStoredLang = () => {
@@ -27,7 +28,20 @@ const defaultLang = () => {
   return Cookies.get('lang') || readStoredLang() || userLang;
 };
 
-const lang = atomWithLocalStorage('lang', defaultLang());
+const preferredLang = atomWithLocalStorage('lang', defaultLang());
+/** Preserve the preference while this document's fixed policy owns the effective language. */
+const lang = selector<string>({
+  key: 'effectiveLanguage',
+  get: ({ get }) => {
+    const preferred = get(preferredLang);
+    return getFixedLocale() ?? preferred;
+  },
+  set: ({ set }, value) => {
+    if (!getFixedLocale()) {
+      set(preferredLang, value);
+    }
+  },
+});
 const languageLoading = atom<boolean>({
   key: 'languageLoading',
   default: false,

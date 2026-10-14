@@ -3,6 +3,22 @@ import type { TCustomConfig } from 'librechat-data-provider';
 import { loadDefaultInterface } from './interface';
 
 describe('loadDefaultInterface', () => {
+  it('preserves configured presentation for shell, startup and manifest consumers', async () => {
+    const presentation = {
+      fixedLocale: 'de-DE',
+      appVersion: 'v1.2.3+example.1',
+      pwaIcons: [{ src: 'assets/logo.svg', sizes: 'any', type: 'image/svg+xml' }],
+    };
+    const configDefaults = getConfigDefaults();
+    expect(
+      await loadDefaultInterface({ config: { interface: presentation }, configDefaults }),
+    ).toMatchObject(presentation);
+    const plain = await loadDefaultInterface({ config: {}, configDefaults });
+    for (const field of Object.keys(presentation)) {
+      expect(plain).not.toHaveProperty(field);
+    }
+  });
+
   it('uses the schema default for URL auto-submit when not configured', async () => {
     const interfaceConfig = await loadDefaultInterface({
       config: {},

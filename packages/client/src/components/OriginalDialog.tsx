@@ -6,6 +6,7 @@ import * as DialogPrimitive from '@radix-ui/react-dialog';
 import type { FocusOutline } from './Focus';
 import { focusOutlineVariants } from './Focus';
 import { cn } from '~/utils';
+import useLocalize from '~/hooks/useLocalize';
 
 const DialogDepthContext = React.createContext(0);
 
@@ -68,7 +69,7 @@ const escapeBelongsToPopup = (ownerDocument: Document): boolean => {
     return true;
   }
   const popovers = ownerDocument.querySelectorAll(
-    '[role="menu"], [role="listbox"], [role="combobox"]',
+    '[role="menu"], [role="listbox"], [role="combobox"][aria-expanded="true"]',
   );
   for (const popover of popovers) {
     if (popover.contains(activeElement)) {
@@ -236,6 +237,7 @@ const DialogContent: React.ForwardRefExoticComponent<
     },
     ref,
   ) => {
+    const localize = useLocalize();
     const depth = React.useContext(DialogDepthContext);
     const contentZIndex = 140 + (depth - 1) * 60;
     const contentRef = React.useRef<HTMLDivElement | null>(null);
@@ -383,7 +385,7 @@ const DialogContent: React.ForwardRefExoticComponent<
           {showCloseButton && (
             <DialogPrimitive.Close className="ring-ring-primary ring-offset-surface-dialog focus:ring-focus-control data-[state=open]:bg-surface-hover data-[state=open]:text-text-secondary min-h-theme-target min-w-theme-target absolute top-4 right-4 inline-flex items-center justify-center rounded-sm opacity-70 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-offset-2 focus:outline-hidden disabled:pointer-events-none">
               <X className="size-theme-icon-lg" aria-hidden="true" />
-              <span className="sr-only">Close</span>
+              <span className="sr-only">{localize('com_ui_close', { defaultValue: 'Close' })}</span>
             </DialogPrimitive.Close>
           )}
         </DialogPrimitive.Content>

@@ -35,6 +35,30 @@ function Harness({
 }
 
 describe('dialog Escape', () => {
+  it.each([false, true])('closes with a focused collapsed combobox (toast: %s)', async (toast) => {
+    const onOpenChange = jest.fn();
+    render(
+      <RadixToast.Provider>
+        <OGDialog open onOpenChange={onOpenChange}>
+          <OGDialogContent>
+            <button type="button" role="combobox" aria-expanded={false}>
+              Theme
+            </button>
+          </OGDialogContent>
+        </OGDialog>
+        {toast && (
+          <RadixToast.Root open duration={Infinity}>
+            <RadixToast.Description>Saved</RadixToast.Description>
+          </RadixToast.Root>
+        )}
+        <RadixToast.Viewport />
+      </RadixToast.Provider>,
+    );
+    screen.getByRole('combobox').focus();
+    await userEvent.keyboard('{Escape}');
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
   /** The fallback must not overrule the guards the dialog already honours: a
    *  popup inside it owns the first Escape (WCAG 2.1.1), and a layer that has
    *  already answered the event owns it outright. */

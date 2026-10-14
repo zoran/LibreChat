@@ -23,6 +23,19 @@ jest.mock('~/hooks', () => ({
 }));
 
 describe('Footer', () => {
+  afterEach(() => {
+    delete window.__LIBRECHAT_CONFIG__;
+  });
+
+  test('renders the configured identity as text without relabeling an upstream website', () => {
+    Object.assign(window, {
+      __LIBRECHAT_CONFIG__: { appTitle: 'Example Workspace', appVersion: 'v0.8.8+example.1' },
+    });
+    render(<Footer startupConfig={null} />);
+    expect(screen.getByText(/Example Workspace v0.8.8\+example.1/)).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: /Example Workspace/ })).not.toBeInTheDocument();
+    expect(screen.queryByText(/LibreChat/)).not.toBeInTheDocument();
+  });
   test('opens the default LibreChat site link in a new tab', () => {
     render(<Footer startupConfig={null} />);
     const link = screen.getByRole('link', { name: /LibreChat/ });

@@ -254,6 +254,10 @@ const latest = () => FakeAppBridge.instances[FakeAppBridge.instances.length - 1]
 describe('useAppBridge', () => {
   let client: QueryClient;
 
+  afterEach(() => {
+    delete window.__LIBRECHAT_CONFIG__;
+  });
+
   beforeEach(() => {
     FakeAppBridge.instances = [];
     AppBridge.mockImplementation(
@@ -269,6 +273,24 @@ describe('useAppBridge', () => {
     client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     document.body.innerHTML = '';
     document.documentElement.className = '';
+  });
+
+  it('advertises the configured product identity and fixed locale to embedded apps', () => {
+    window.__LIBRECHAT_CONFIG__ = {
+      appTitle: 'Example Workspace',
+      appVersion: 'v0.8.8+example.1',
+      fixedLocale: 'de-DE',
+    };
+    const { view, iframe } = mountBridge(makeResource(), client);
+    expect(AppBridge).toHaveBeenCalledWith(
+      null,
+      { name: 'Example Workspace', version: 'v0.8.8+example.1' },
+      expect.any(Object),
+      expect.objectContaining({ hostContext: expect.objectContaining({ locale: 'de-DE' }) }),
+    );
+    view.unmount();
+    iframe.remove();
+    client.clear();
   });
 
   describe('ordering', () => {

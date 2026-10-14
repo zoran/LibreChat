@@ -1,5 +1,6 @@
 import * as React from 'react';
 import { useState, useCallback } from 'react';
+import useLocalize from '~/hooks/useLocalize';
 import { Eye, EyeOff, Copy, Check } from 'lucide';
 import { cn, disabledInkClasses } from '~/utils';
 import { MorphIcon } from './MorphIcon';
@@ -48,6 +49,7 @@ const SecretInput: React.ForwardRefExoticComponent<
     },
     ref,
   ) => {
+    const localize = useLocalize();
     const [isVisible, setIsVisible] = useState(false);
     const [isCopied, setIsCopied] = useState(false);
 
@@ -123,7 +125,11 @@ const SecretInput: React.ForwardRefExoticComponent<
                 disabledInkClasses,
                 buttonClassName,
               )}
-              aria-label={isCopied ? 'Copied' : 'Copy to clipboard'}
+              aria-label={
+                isCopied
+                  ? localize('com_ui_copied', { defaultValue: 'Copied' })
+                  : localize('com_ui_copy_to_clipboard', { defaultValue: 'Copy to clipboard' })
+              }
             >
               <MorphIcon icon={isCopied ? Check : Copy} className="size-4" />
             </button>
@@ -140,7 +146,11 @@ const SecretInput: React.ForwardRefExoticComponent<
               disabledInkClasses,
               buttonClassName,
             )}
-            aria-label={isVisible ? 'Hide secret' : 'Show secret'}
+            aria-label={
+              isVisible
+                ? localize('com_ui_hide_secret', { defaultValue: 'Hide secret' })
+                : localize('com_ui_show_secret', { defaultValue: 'Show secret' })
+            }
           >
             <MorphIcon icon={isVisible ? EyeOff : Eye} className="size-4" />
           </button>

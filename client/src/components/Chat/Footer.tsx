@@ -1,11 +1,12 @@
 import React, { useEffect, memo } from 'react';
 import TagManager from 'react-gtm-module';
 import ReactMarkdown from 'react-markdown';
-import { Constants, hasConfiguredFooter } from 'librechat-data-provider';
+import { hasConfiguredFooter } from 'librechat-data-provider';
 import type { TStartupConfig } from 'librechat-data-provider';
 import { useGetStartupConfig } from '~/data-provider';
 import { policyUrls } from '~/utils/policies';
 import { useLocalize } from '~/hooks';
+import { DEFAULT_APP_TITLE, getAppTitle, getAppVersion } from '~/utils/presentation';
 
 type FooterProps = {
   className?: string;
@@ -19,7 +20,10 @@ type FooterProps = {
   configuredOnly?: boolean;
 };
 
-type FooterStartupConfig = Pick<Partial<TStartupConfig>, 'analyticsGtmId' | 'customFooter'> & {
+type FooterStartupConfig = Pick<
+  Partial<TStartupConfig>,
+  'analyticsGtmId' | 'customFooter' | 'appTitle' | 'appVersion'
+> & {
   interface?: Pick<NonNullable<TStartupConfig['interface']>, 'privacyPolicy' | 'termsOfService'>;
 };
 
@@ -77,15 +81,9 @@ function Footer({ className, startupConfig, configuredOnly = false }: FooterProp
   );
 
   const configuredFooter = typeof config?.customFooter === 'string' ? config.customFooter : null;
-  /** The generic disclaimer is the part a conversation drops; the operator's own footer is not. */
-  const genericFooter = configuredOnly
-    ? ''
-    : '[LibreChat ' +
-      Constants.VERSION +
-      '](https://librechat.ai) - ' +
-      localize('com_ui_latest_footer');
-  const mainContent = configuredFooter ?? genericFooter;
-  const mainContentParts = mainContent === '' ? [] : mainContent.split('|');
+  const appTitle = getAppTitle(config?.appTitle);
+  const version = getAppVersion(config?.appVersion);
+  const mainContentParts = configuredFooter ? configuredFooter.split('|') : [];
 
   useEffect(() => {
     if (config?.analyticsGtmId != null && typeof window.google_tag_manager === 'undefined') {
@@ -121,6 +119,28 @@ function Footer({ className, startupConfig, configuredOnly = false }: FooterProp
       </ReactMarkdown>
     </React.Fragment>
   ));
+
+  // Configured identity is plain text. Only the upstream identity links to its upstream site.
+  if (configuredFooter === null && !configuredOnly) {
+    mainContentRender.push(
+      <span key="presentation">
+        {appTitle === DEFAULT_APP_TITLE ? (
+          <a
+            className="text-text-muted underline"
+            href="https://librechat.ai"
+            target="_blank"
+            rel="noopener noreferrer"
+          >
+            {appTitle} {version}
+          </a>
+        ) : (
+          `${appTitle} ${version}`
+        )}
+        {' - '}
+        {localize('com_ui_latest_footer')}
+      </span>,
+    );
+  }
 
   const footerElements = [...mainContentRender, privacyPolicyRender, termsOfServiceRender].filter(
     Boolean,

@@ -124,6 +124,30 @@ afterEach(() => {
 });
 
 describe('GET /api/config', () => {
+  it.each([null, mockUser])(
+    'exposes the same public presentation before and after login (%p)',
+    async (user) => {
+      process.env.APP_TITLE = 'BWI Cortex';
+      mockGetAppConfig.mockResolvedValue({
+        ...baseAppConfig,
+        interfaceConfig: {
+          ...baseAppConfig.interfaceConfig,
+          fixedLocale: 'de-DE',
+          appVersion: 'v0.8.8+bwi.1',
+        },
+      });
+      const response = await request(createApp(user)).get('/api/config');
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toMatchObject({
+        appTitle: 'BWI Cortex',
+        appVersion: 'v0.8.8+bwi.1',
+        fixedLocale: 'de-DE',
+      });
+      expect(response.body).not.toHaveProperty('pwaIcons');
+      if (!user) expect(response.body).not.toHaveProperty('modelSpecs');
+    },
+  );
+
   it.each([undefined, 'false', 'true'])(
     'exposes only the configured entry status capability (%s)',
     async (enabled) => {

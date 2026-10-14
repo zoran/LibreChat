@@ -14,6 +14,20 @@ describe('LangSelector', () => {
     mockOnChange = jest.fn();
   });
 
+  afterEach(() => {
+    delete window.__LIBRECHAT_CONFIG__;
+  });
+
+  it('hides the whole selector under a fixed deployment locale', () => {
+    Object.assign(window, { __LIBRECHAT_CONFIG__: { fixedLocale: 'de-DE' } });
+    const { container } = render(
+      <RecoilRoot>
+        <LangSelector langcode="en-US" onChange={mockOnChange} />
+      </RecoilRoot>,
+    );
+    expect(container).toBeEmptyDOMElement();
+  });
+
   it('renders correctly', async () => {
     global.ResizeObserver = class MockedResizeObserver {
       observe = jest.fn();

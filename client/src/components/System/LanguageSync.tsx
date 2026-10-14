@@ -1,6 +1,7 @@
 import { useEffect } from 'react';
 import { useRecoilValue, useSetRecoilState } from 'recoil';
 import i18n, { changeLanguageSafely, normalizeLocale } from '~/locales/i18n';
+import { getFixedLocale } from '~/utils/presentation';
 import store from '~/store';
 
 export default function LanguageSync() {
@@ -8,7 +9,7 @@ export default function LanguageSync() {
   const setLanguageLoading = useSetRecoilState(store.languageLoading);
 
   useEffect(() => {
-    if (i18n.language === normalizeLocale(lang)) {
+    if (i18n.language === normalizeLocale(getFixedLocale() ?? lang)) {
       setLanguageLoading(false);
       return;
     }

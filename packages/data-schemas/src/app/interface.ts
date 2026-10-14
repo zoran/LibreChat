@@ -28,6 +28,10 @@ export async function loadDefaultInterface({
   const shouldDisableMemories = memoryConfig && !memoryEnabled;
 
   const loadedInterface: AppConfig['interfaceConfig'] = removeNullishValues({
+    // Deployment presentation must survive the loaded-interface projection.
+    fixedLocale: interfaceConfig?.fixedLocale,
+    appVersion: interfaceConfig?.appVersion,
+    pwaIcons: interfaceConfig?.pwaIcons,
     // UI elements - use schema defaults
     modelSelect:
       interfaceConfig?.modelSelect ??

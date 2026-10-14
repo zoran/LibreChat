@@ -101,3 +101,64 @@ test('startup supplies existing owner ports and routes readiness through mainten
   expect(source).not.toMatch(/app\.(?:use|get|post)\(['"]\/(?:api\/)?maintenance/);
   expect(source).toContain("registerShutdownTask('private maintenance listener'");
 });
+
+test('startup renders configured presentation before hydration from the existing loaded configuration', () => {
+  const api = require('@librechat/api');
+  const start = source.indexOf('  const indexPath =');
+  const end = source.indexOf("  app.get('/health'", start);
+  const html =
+    '<html lang="en-US"><head><title>LibreChat</title>' +
+    '<meta name="description" content="LibreChat description" /></head><body></body></html>';
+  const manifest = JSON.stringify({ name: 'LibreChat', short_name: 'LibreChat', start_url: '.' });
+  const send = vm.runInNewContext(`${source.slice(start, end)}; sendIndexHtml`, {
+    fs: { readFileSync: (file) => (file.endsWith('manifest.webmanifest') ? manifest : html) },
+    path,
+    appConfig: {
+      paths: { dist: '/dist' },
+      interfaceConfig: { fixedLocale: 'de-DE', appVersion: 'v1.2.3+example.1' },
+    },
+    process: { env: { APP_TITLE: 'Example Workplace' } },
+    createPresentation: api.createPresentation,
+    injectConfiguredFooterBootstrap: api.injectConfiguredFooterBootstrap,
+    createCspPolicy: () => null,
+    shellCacheHeaders: api.shellCacheHeaders,
+    escapeHtmlAttribute: api.escapeHtmlAttribute,
+    maybeInjectQueryDevtoolsBootstrap: (value) => value,
+    QUERY_DEVTOOLS_HEADER: 'x-query-devtools',
+  });
+  let body;
+  const response = {
+    set: jest.fn(),
+    vary: jest.fn(),
+    type: jest.fn(),
+    send: (value) => {
+      body = value;
+    },
+  };
+  send({ cookies: { lang: 'en-US' }, headers: { 'accept-language': 'en-US' } }, response);
+  expect(body).toContain('<title>Example Workplace</title>');
+  expect(body).toContain('<html lang="de-DE">');
+  expect(body).toContain('"appVersion":"v1.2.3+example.1"');
+  expect(response.type).toHaveBeenCalledWith('html');
+});
+
+test('startup registers the runtime manifest before static assets can return the compiled defaults', () => {
+  const start = source.indexOf("  app.get('/index.html'");
+  const end = source.indexOf('  if (telemetry.enabled)', start);
+  const events = [];
+  const manifestHandler = jest.fn();
+  vm.runInNewContext(source.slice(start, end), {
+    app: {
+      get: (...args) => events.push(['get', ...args]),
+      use: (...args) => events.push(['use', ...args]),
+    },
+    sendIndexHtml: jest.fn(),
+    presentation: { manifestHandler },
+    staticCache: (directory) => directory,
+    appConfig: { paths: { dist: '/dist', fonts: '/fonts', assets: '/assets' } },
+  });
+  const manifestIndex = events.findIndex((event) => event[1] === '/manifest.webmanifest');
+  expect(manifestIndex).toBeGreaterThan(-1);
+  expect(events[manifestIndex]).toEqual(['get', '/manifest.webmanifest', manifestHandler]);
+  expect(manifestIndex).toBeLessThan(events.findIndex((event) => event[0] === 'use'));
+});

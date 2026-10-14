@@ -1,0 +1,12 @@
+version: 1.3.6
+cache: true
+interface:
+  fixedLocale: de-DE
+  appVersion: v1.2.3+example.1
+  pwaIcons:
+    - src: assets/favicon-32x32.png
+      sizes: 32x32
+      type: image/png
+endpoints:
+  openAI:
+    titleConvo: false

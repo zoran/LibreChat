@@ -98,14 +98,25 @@ export default defineConfig(({ command }) => ({
       },
       useCredentials: true,
       includeManifestIcons: false,
+      integration: {
+        beforeBuildServiceWorker(options) {
+          // The plugin has added its manifest by this hook. Workbox applies additional
+          // entries AFTER manifestTransforms, so filtering there cannot remove this one.
+          options.workbox.additionalManifestEntries =
+            options.workbox.additionalManifestEntries?.filter(
+              (entry) =>
+                (typeof entry === 'string' ? entry : entry.url) !== options.manifestFilename,
+            );
+        },
+      },
       workbox: {
         globPatterns: [
           '**/*.{js,css,html}',
           'assets/favicon*.png',
           'assets/icon-*.png',
           'assets/apple-touch-icon*.png',
-          /** `manifest.webmanifest` is not listed: vite-plugin-pwa always appends it as an
-           * additional manifest entry, so globbing it too duplicates the precache entry. */
+          /** The runtime manifest is deliberately absent; the integration hook removes
+           * the extra entry vite-plugin-pwa appends independently of these globs. */
           'assets/maskable-icon.png',
         ],
         globIgnores: [

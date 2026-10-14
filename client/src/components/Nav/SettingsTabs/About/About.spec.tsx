@@ -33,7 +33,23 @@ beforeEach(() => {
   mockUseGetStartupConfig.mockReturnValue({ data: { buildInfo: populatedBuildInfo } });
 });
 
+afterEach(() => {
+  delete window.__LIBRECHAT_CONFIG__;
+});
+
 describe('About', () => {
+  it('shows and copies the configured display identity without changing build provenance', async () => {
+    Object.assign(window, {
+      __LIBRECHAT_CONFIG__: { appTitle: 'Example Workspace', appVersion: 'v0.8.8+example.1' },
+    });
+    const user = userEvent.setup();
+    render(<About />);
+    expect(screen.getByText('v0.8.8+example.1')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /com_nav_about_diagnostics_copy/i }));
+    expect(mockCopy.mock.calls[0][0]).toContain('Example Workspace version: v0.8.8+example.1');
+    expect(mockCopy.mock.calls[0][0]).toContain(populatedBuildInfo.commit);
+    expect(mockCopy.mock.calls[0][0]).not.toContain('LibreChat version:');
+  });
   describe('rendering', () => {
     it('renders version, commit (short), branch, and build date when buildInfo is populated', () => {
       render(<About />);

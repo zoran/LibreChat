@@ -11,6 +11,7 @@ const {
   getCloudFrontConfig,
   getAppConfigOptionsFromUser,
   resolveBuildInfo,
+  resolvePresentation,
   resolveTitleTiming,
   getConversationTitleCapabilities,
   sanitizeModelSpecs,
@@ -89,7 +90,6 @@ function buildPreLoginPayload() {
   /** @type {Partial<TStartupConfig>} */
   const payload = {
     ...getEmailCodeConfig(),
-    appTitle: process.env.APP_TITLE || 'LibreChat',
     maintenanceStatusEnabled: isEnabled(process.env.MAINTENANCE_STATUS_ENABLED),
     discordLoginEnabled: !!process.env.DISCORD_CLIENT_ID && !!process.env.DISCORD_CLIENT_SECRET,
     facebookLoginEnabled: !!process.env.FACEBOOK_CLIENT_ID && !!process.env.FACEBOOK_CLIENT_SECRET,
@@ -264,6 +264,10 @@ router.get('/', async function (req, res) {
       /** @type {Partial<TStartupConfig>} */
       const payload = {
         ...preLoginPayload,
+        ...resolvePresentation({
+          appTitle: process.env.APP_TITLE,
+          interfaceConfig: baseConfig?.interfaceConfig,
+        }),
         managedUploads: {
           enabled: process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED === 'true',
           eligible: false,
@@ -337,6 +341,10 @@ router.get('/', async function (req, res) {
     /** @type {TStartupConfig} */
     const payload = {
       ...preLoginPayload,
+      ...resolvePresentation({
+        appTitle: process.env.APP_TITLE,
+        interfaceConfig: appConfig?.interfaceConfig,
+      }),
       ...publicSharePayload,
       ...buildPostLoginPayload(appConfig),
       managedUploads: {

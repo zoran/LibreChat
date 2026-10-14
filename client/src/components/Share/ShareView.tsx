@@ -25,7 +25,13 @@ import {
   normalizeCodeHighlightThrottleMs,
 } from '~/components/Chat/Messages/Content/Parts/useLazyHighlight';
 import SharedSubagentActivityDialog from '~/components/Chat/Subagents/SharedSubagentActivityDialog';
-import { cn, DEFAULT_APP_TITLE, getResponseStatus, selectActiveBranchTail } from '~/utils';
+import {
+  cn,
+  getAppTitle,
+  getFixedLocale,
+  getResponseStatus,
+  selectActiveBranchTail,
+} from '~/utils';
 import { siblingIdxFamily, siblingKey } from '~/components/Chat/Messages/Thread/state';
 import { useDeploymentThemeOverride } from '~/Providers/DeploymentTheme';
 import { useLocalize, useDocumentTitle, useAuthContext } from '~/hooks';
@@ -133,18 +139,20 @@ function SharedView() {
 
   // configure document title
   const chatTitleInTab = useRecoilValue(store.chatTitleInTab);
+  const appTitle = getAppTitle(config?.appTitle);
   let docTitle = '';
   if (!chatTitleInTab) {
-    docTitle = config?.appTitle || DEFAULT_APP_TITLE;
+    docTitle = appTitle;
   } else if (config?.appTitle != null && data?.title != null) {
-    docTitle = `${data.title} | ${config.appTitle}`;
+    docTitle = `${data.title} | ${appTitle}`;
   } else {
-    docTitle = data?.title ?? config?.appTitle ?? document.title;
+    docTitle = data?.title ?? appTitle;
   }
 
   useDocumentTitle(docTitle);
 
   const locale =
+    getFixedLocale() ||
     langcode ||
     (typeof navigator !== 'undefined'
       ? navigator.language || navigator.languages?.[0] || 'en-US'
@@ -168,6 +176,9 @@ function SharedView() {
 
   const handleLangChange = useCallback(
     (value: string) => {
+      if (getFixedLocale()) {
+        return;
+      }
       let userLang = value;
       if (value === 'auto') {
         userLang =

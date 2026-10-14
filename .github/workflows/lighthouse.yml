@@ -38,6 +38,10 @@ jobs:
       - run: npm ci
       - run: npm run e2e:prepare
       - run: google-chrome --version
+      - name: Preserve configured presentation and upstream defaults
+        run: npm run test:presentation
+      - name: Verify fixed language and branding in rendered browsers
+        run: npm run e2e:presentation
       - name: Audit serial database latency
         id: audit
         shell: bash
@@ -68,5 +72,6 @@ jobs:
           path: |
             .lighthouse/
             lighthouse-ci.log
+            e2e/presentation/.test-results/
           include-hidden-files: true
           retention-days: 7

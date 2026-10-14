@@ -26,24 +26,26 @@ describe('SecretInput', () => {
 
   it('shows eye icon when hidden and eye-off when visible', () => {
     render(<SecretInput value="secret" readOnly aria-label="token" />);
-    const toggle = screen.getByRole('button', { name: 'Show secret' });
+    const toggle = screen.getByRole('button', { name: 'com_ui_show_secret' });
     expect(toggle.querySelector('[data-icon="eye"]')).not.toBeNull();
 
     fireEvent.click(toggle);
     expect(
-      screen.getByRole('button', { name: 'Hide secret' }).querySelector('[data-icon="eye-off"]'),
+      screen
+        .getByRole('button', { name: 'com_ui_hide_secret' })
+        .querySelector('[data-icon="eye-off"]'),
     ).not.toBeNull();
   });
 
   it('morphs copy to check after a successful copy', async () => {
     render(<SecretInput value="secret-value" showCopy readOnly aria-label="token" />);
-    const copyButton = screen.getByRole('button', { name: 'Copy to clipboard' });
+    const copyButton = screen.getByRole('button', { name: 'com_ui_copy_to_clipboard' });
     expect(copyButton.querySelector('[data-icon="copy"]')).not.toBeNull();
 
     fireEvent.click(copyButton);
     await waitFor(() => {
       expect(
-        screen.getByRole('button', { name: 'Copied' }).querySelector('[data-icon="check"]'),
+        screen.getByRole('button', { name: 'com_ui_copied' }).querySelector('[data-icon="check"]'),
       ).not.toBeNull();
     });
     expect(navigator.clipboard.writeText).toHaveBeenCalledWith('secret-value');

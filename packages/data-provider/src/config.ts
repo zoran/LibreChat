@@ -2638,8 +2638,63 @@ export const isAllDataRetention = (mode?: RetentionMode | null): boolean =>
 export const isForcedTemporaryRetention = (mode?: RetentionMode | null): boolean =>
   mode === RetentionMode.EPHEMERAL;
 
+/** Public deployment presentation; omitted fields preserve upstream behavior. */
+export const presentationSchema = z.object({
+  fixedLocale: z
+    .string()
+    .min(2)
+    .max(64)
+    .refine((value) => {
+      try {
+        return Intl.getCanonicalLocales(value).length === 1;
+      } catch {
+        return false;
+      }
+    }, 'Expected a BCP 47 locale')
+    .optional(),
+  /** Display metadata, not an image/source provenance or compatibility claim. */
+  appVersion: z
+    .string()
+    .max(64)
+    .regex(
+      /^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?(?:\+[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?$/,
+    )
+    .optional(),
+  /** Static same-origin assets; neither a download instruction nor executable markup. */
+  pwaIcons: z
+    .array(
+      z
+        .object({
+          src: z
+            .string()
+            .max(512)
+            .regex(/^\/?(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+$/),
+          sizes: z
+            .string()
+            .max(128)
+            .regex(/^(?:any|[1-9][0-9]{0,3}x[1-9][0-9]{0,3}(?: [1-9][0-9]{0,3}x[1-9][0-9]{0,3})*)$/)
+            .optional(),
+          type: z
+            .string()
+            .max(64)
+            .regex(/^image\/[a-zA-Z0-9.+-]+$/)
+            .optional(),
+          purpose: z
+            .string()
+            .max(32)
+            .regex(/^(?:any|maskable|monochrome)(?: (?:any|maskable|monochrome))*$/)
+            .optional(),
+        })
+        .strict(),
+    )
+    .min(1)
+    .max(8)
+    .optional(),
+});
+
 export const interfaceSchema = z
   .object({
+    ...presentationSchema.shape,
     theme: deploymentThemeSchema.optional(),
     privacyPolicy: z
       .object({
@@ -3142,6 +3197,9 @@ export type TStartupConfig = {
   managedUploads?: { enabled: boolean; eligible: boolean };
   conversationTitleOwnershipVersion?: typeof CONVERSATION_TITLE_OWNERSHIP_VERSION;
   appTitle: string;
+  /** Public deployment presentation; older servers may omit these fields. */
+  appVersion?: string;
+  fixedLocale?: string;
   socialLogins?: string[];
   langfuseFanoutEnabled?: boolean;
   langfuseConnectionAccess?: boolean;

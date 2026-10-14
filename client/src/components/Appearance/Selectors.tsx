@@ -1,7 +1,7 @@
 import { useRecoilValue } from 'recoil';
 import { Dropdown, Spinner } from '@librechat/client';
 import { useLocalize } from '~/hooks';
-import { cn } from '~/utils';
+import { cn, getFixedLocale } from '~/utils';
 import store from '~/store';
 
 type PortalElement = ((element: HTMLElement) => HTMLElement | null) | HTMLElement | null;
@@ -64,6 +64,10 @@ export const LangSelector = ({
 }) => {
   const localize = useLocalize();
   const isLanguageLoading = useRecoilValue(store.languageLoading);
+
+  if (getFixedLocale()) {
+    return null;
+  }
 
   const languageOptions = [
     { value: 'auto', label: localize('com_nav_lang_auto') },
