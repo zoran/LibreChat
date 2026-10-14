@@ -6,9 +6,9 @@ import { TranslationKeys, useLocalize } from '~/hooks';
 import SocialLoginRender from './SocialLoginRender';
 import { BlinkAnimation } from './BlinkAnimation';
 import LegalConsent from './LegalConsent';
+import { cn, getAppTitle } from '~/utils';
 import { Banner } from '../Banners';
 import Footer from './Footer';
-import { cn, getAppTitle } from '~/utils';
 
 function AuthLayout({
   children,

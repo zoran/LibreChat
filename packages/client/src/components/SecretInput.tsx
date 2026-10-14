@@ -1,8 +1,8 @@
 import * as React from 'react';
 import { useState, useCallback } from 'react';
-import useLocalize from '~/hooks/useLocalize';
 import { Eye, EyeOff, Copy, Check } from 'lucide';
 import { cn, disabledInkClasses } from '~/utils';
+import useLocalize from '~/hooks/useLocalize';
 import { MorphIcon } from './MorphIcon';
 import { fieldControl } from './Field';
 

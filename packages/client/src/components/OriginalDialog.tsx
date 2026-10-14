@@ -5,8 +5,8 @@ import { cx } from 'class-variance-authority';
 import * as DialogPrimitive from '@radix-ui/react-dialog';
 import type { FocusOutline } from './Focus';
 import { focusOutlineVariants } from './Focus';
-import { cn } from '~/utils';
 import useLocalize from '~/hooks/useLocalize';
+import { cn } from '~/utils';
 
 const DialogDepthContext = React.createContext(0);
 

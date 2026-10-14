@@ -27,9 +27,9 @@ import {
   useIsMessagesViewReadOnly,
   useMCPAppsPolicy,
 } from '~/Providers';
-import { logger } from '~/utils';
 import { getAppTitle, getAppVersion, getFixedLocale } from '~/utils/presentation';
 import i18n from '~/locales/i18n';
+import { logger } from '~/utils';
 
 type MessageContentBlock = { type?: string; text?: string };
 

@@ -1,7 +1,7 @@
 import { useRecoilValue } from 'recoil';
 import { Dropdown, Spinner } from '@librechat/client';
-import { useLocalize } from '~/hooks';
 import { cn, getFixedLocale } from '~/utils';
+import { useLocalize } from '~/hooks';
 import store from '~/store';
 
 type PortalElement = ((element: HTMLElement) => HTMLElement | null) | HTMLElement | null;

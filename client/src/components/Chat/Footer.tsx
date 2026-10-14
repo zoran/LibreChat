@@ -3,10 +3,10 @@ import TagManager from 'react-gtm-module';
 import ReactMarkdown from 'react-markdown';
 import { hasConfiguredFooter } from 'librechat-data-provider';
 import type { TStartupConfig } from 'librechat-data-provider';
+import { DEFAULT_APP_TITLE, getAppTitle, getAppVersion } from '~/utils/presentation';
 import { useGetStartupConfig } from '~/data-provider';
 import { policyUrls } from '~/utils/policies';
 import { useLocalize } from '~/hooks';
-import { DEFAULT_APP_TITLE, getAppTitle, getAppVersion } from '~/utils/presentation';
 
 type FooterProps = {
   className?: string;

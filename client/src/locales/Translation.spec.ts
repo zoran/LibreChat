@@ -8,8 +8,8 @@ import {
   normalizeLocale,
 } from './i18n';
 import English from './en/translation.json';
-import German from './de/translation.json';
 import Spanish from './es/translation.json';
+import German from './de/translation.json';
 import French from './fr/translation.json';
 import { TranslationKeys } from '~/hooks';
 import i18n from './i18n';

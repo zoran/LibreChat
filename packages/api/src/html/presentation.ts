@@ -1,9 +1,9 @@
 /** Owns deployment presentation shared by startup JSON, the HTML shell and the PWA manifest. */
 import { Constants, presentationSchema } from 'librechat-data-provider';
-import { injectBootstrapConfig } from './bootstrap';
-import { escapeHtmlAttribute } from '~/security/html';
-import type { RequestHandler } from 'express';
 import type { TInterfaceConfig, TStartupConfig } from 'librechat-data-provider';
+import type { RequestHandler } from 'express';
+import { escapeHtmlAttribute } from '~/security/html';
+import { injectBootstrapConfig } from './bootstrap';
 
 type PresentationSource = {
   appTitle?: string | null;

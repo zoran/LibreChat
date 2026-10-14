@@ -13,8 +13,8 @@ import type { TStartupConfig, TUser } from 'librechat-data-provider';
 import { cleanupTimestampedStorage } from '~/utils/timestamps';
 import useSpeechSettingsInit from './useSpeechSettingsInit';
 import { useHasAccess, useCatalogReady } from '~/hooks';
-import { useMCPServersQuery } from '~/data-provider';
 import { getAppTitle, setDocumentTitle } from '~/utils';
+import { useMCPServersQuery } from '~/data-provider';
 import store from '~/store';
 
 export default function useAppStartup({

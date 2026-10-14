@@ -9,11 +9,11 @@ import MarketplaceAdminSettings from './MarketplaceAdminSettings';
 import OpenSidebar from '~/components/Chat/Menus/OpenSidebar';
 import useDrawerViewport from '~/hooks/Nav/useDrawerViewport';
 import { SidePanelGroup } from '~/components/SidePanel';
+import { getAppTitle } from '~/utils/presentation';
 import MineFilterToggle from './MineFilterToggle';
 import CategoryTabs from './CategoryTabs';
 import SearchBar from './SearchBar';
 import AgentGrid from './AgentGrid';
-import { getAppTitle } from '~/utils/presentation';
 
 interface AgentMarketplaceProps {
   className?: string;

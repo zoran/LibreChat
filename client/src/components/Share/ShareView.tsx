@@ -24,7 +24,6 @@ import {
   CodeHighlightThrottleContext,
   normalizeCodeHighlightThrottleMs,
 } from '~/components/Chat/Messages/Content/Parts/useLazyHighlight';
-import SharedSubagentActivityDialog from '~/components/Chat/Subagents/SharedSubagentActivityDialog';
 import {
   cn,
   getAppTitle,
@@ -32,6 +31,7 @@ import {
   getResponseStatus,
   selectActiveBranchTail,
 } from '~/utils';
+import SharedSubagentActivityDialog from '~/components/Chat/Subagents/SharedSubagentActivityDialog';
 import { siblingIdxFamily, siblingKey } from '~/components/Chat/Messages/Thread/state';
 import { useDeploymentThemeOverride } from '~/Providers/DeploymentTheme';
 import { useLocalize, useDocumentTitle, useAuthContext } from '~/hooks';

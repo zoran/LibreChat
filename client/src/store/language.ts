@@ -1,5 +1,5 @@
-import { atom, selector } from 'recoil';
 import Cookies from 'js-cookie';
+import { atom, selector } from 'recoil';
 import { getFixedLocale } from '~/utils/presentation';
 import { atomWithLocalStorage } from './utils';
 

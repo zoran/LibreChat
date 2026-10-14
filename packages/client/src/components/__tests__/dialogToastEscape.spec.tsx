@@ -41,7 +41,12 @@ describe('dialog Escape', () => {
       <RadixToast.Provider>
         <OGDialog open onOpenChange={onOpenChange}>
           <OGDialogContent>
-            <button type="button" role="combobox" aria-expanded={false}>
+            <button
+              type="button"
+              role="combobox"
+              aria-expanded={false}
+              aria-controls="theme-options"
+            >
               Theme
             </button>
           </OGDialogContent>

@@ -2,9 +2,9 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import copy from 'copy-to-clipboard';
 import type { TStartupConfig } from 'librechat-data-provider';
 import CopyButton from '~/components/Messages/Content/CopyButton';
+import { getAppTitle, getAppVersion } from '~/utils/presentation';
 import { useGetStartupConfig } from '~/data-provider';
 import { useLocalize } from '~/hooks';
-import { getAppTitle, getAppVersion } from '~/utils/presentation';
 
 const UNKNOWN_PLACEHOLDER = '—';
 
