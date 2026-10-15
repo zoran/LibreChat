@@ -2513,6 +2513,18 @@ describe('processDeleteRequest', () => {
     jest.clearAllMocks();
   });
 
+  it('accepts a bodyless account deletion with no files', async () => {
+    const req = { config: {}, user: { id: 'guest', tenantId: null, provider: 'browser' } };
+
+    await expect(processDeleteRequest({ req, files: [] })).resolves.toEqual({
+      deletedFileIds: [],
+      failedFileIds: [],
+    });
+    expect(req).not.toHaveProperty('body');
+    expect(db.deleteFiles).not.toHaveBeenCalled();
+    expect(getStrategyFunctions).not.toHaveBeenCalled();
+  });
+
   it('reports uncertainty when agent-reference cleanup fails after metadata deletion', async () => {
     getStrategyFunctions.mockReturnValue({ deleteFile: jest.fn().mockResolvedValue(undefined) });
     db.deleteFiles.mockResolvedValue({ deletedCount: 1 });
@@ -3566,6 +3578,57 @@ describe('upload ledger joins the existing File deletion owner', () => {
     });
   });
   afterEach(() => getUploadRuntime.mockReturnValue(undefined));
+
+  it('completes managed cleanup for a bodyless account deletion', async () => {
+    const bodylessReq = { config: req.config, user: req.user };
+
+    await expect(processDeleteRequest({ req: bodylessReq, files: [file] })).resolves.toEqual({
+      deletedFileIds: ['upload'],
+      failedFileIds: [],
+    });
+    expect(cleanup.beginFileDeletion).toHaveBeenCalledWith(
+      { userId: 'owner', tenantId: 'tenant' },
+      'upload',
+    );
+    expect(events).toEqual([
+      'ledger-fence',
+      'file-revoke',
+      'generation-revoke',
+      'history-redact',
+      'version-absence',
+      'file-finalize',
+      'reference-cleanup',
+      'ledger-confirm',
+    ]);
+    expect(cleanup.finishFileDeletion).toHaveBeenCalledWith(task, proof);
+    expect(bodylessReq).not.toHaveProperty('body');
+    expect(getStrategyFunctions).not.toHaveBeenCalled();
+    expect(db.deleteFiles).not.toHaveBeenCalled();
+  });
+
+  it('retains uncertain managed cleanup for a bodyless account deletion', async () => {
+    const bodylessReq = { config: req.config, user: req.user };
+    cleanup.removeFileOriginal.mockResolvedValue({
+      ...proof,
+      writerStopped: false,
+      originalAbsent: false,
+    });
+
+    await expect(processDeleteRequest({ req: bodylessReq, files: [file] })).resolves.toEqual({
+      deletedFileIds: [],
+      failedFileIds: ['upload'],
+    });
+    expect(cleanup.beginFileDeletion).toHaveBeenCalledWith(
+      { userId: 'owner', tenantId: 'tenant' },
+      'upload',
+    );
+    expect(cleanup.removeFileOriginal).toHaveBeenCalledWith(task);
+    expect(db.finalizeFileSourceDeletion).not.toHaveBeenCalled();
+    expect(cleanup.finishFileDeletion).not.toHaveBeenCalled();
+    expect(bodylessReq).not.toHaveProperty('body');
+    expect(getStrategyFunctions).not.toHaveBeenCalled();
+    expect(db.deleteFiles).not.toHaveBeenCalled();
+  });
 
   it('confirms actual object and history absence only after the complete existing lifecycle', async () => {
     await expect(processDeleteRequest({ req, files: [file] })).resolves.toEqual({

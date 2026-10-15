@@ -226,7 +226,7 @@ const createDeleteFileWithSecondaryStorage = ({ source, deleteFile, deletionMeth
  * @param {Object} params - The params object.
  * @param {MongoFile[]} params.files - The file objects to delete.
  * @param {ServerRequest} params.req - The express request object.
- * @param {DeleteFilesBody} params.req.body - The request body.
+ * @param {DeleteFilesBody} [params.req.body] - Optional file association metadata.
  * @param {string} [params.req.body.agent_id] - The agent ID if file uploaded is associated to an agent.
  * @param {string} [params.req.body.assistant_id] - The assistant ID if file uploaded is associated to an assistant.
  * @param {string} [params.req.body.tool_resource] - The tool resource if assistant file uploaded is associated to a tool resource.
@@ -236,6 +236,7 @@ const createDeleteFileWithSecondaryStorage = ({ source, deleteFile, deletionMeth
  */
 const processDeleteRequest = async ({ req, files }) => {
   const appConfig = req.config;
+  const { assistant_id, tool_resource } = req.body ?? {};
   const owner = { userId: req.user?.id, tenantId: req.user?.tenantId };
   // Composition is initialized before the sole File sweep. Lazy lookup avoids a
   // second lifecycle registry and the Uploads -> Files composition cycle.
@@ -290,7 +291,7 @@ const processDeleteRequest = async ({ req, files }) => {
     client[FileSources.azure] = azureClient.openai;
   };
 
-  if (req.body.assistant_id !== undefined) {
+  if (assistant_id !== undefined) {
     await initializeClients();
   }
 
@@ -309,18 +310,18 @@ const processDeleteRequest = async ({ req, files }) => {
 
     const openai = client[source];
 
-    if (req.body.assistant_id && req.body.tool_resource) {
+    if (assistant_id && tool_resource) {
       promises.push(
         deleteResourceFileId({
           req,
           openai,
           file_id: file.file_id,
-          assistant_id: req.body.assistant_id,
-          tool_resource: req.body.tool_resource,
+          assistant_id,
+          tool_resource,
         }),
       );
-    } else if (req.body.assistant_id) {
-      promises.push(openai.beta.assistants.files.del(req.body.assistant_id, file.file_id));
+    } else if (assistant_id) {
+      promises.push(openai.beta.assistants.files.del(assistant_id, file.file_id));
     }
 
     const deleteFile = uploadTask
