@@ -1,5 +1,5 @@
-const path = require('path');
 const express = require('express');
+const { isStaticBootstrapFile } = require('@librechat/api');
 const expressStaticGzip = require('express-static-gzip');
 
 const oneDayInSeconds = 24 * 60 * 60;
@@ -48,15 +48,7 @@ function staticCache(staticPath, options = {}) {
     if (filePath && filePath.includes('/dist/images/')) {
       return;
     }
-    const fileName = filePath ? path.basename(filePath) : '';
-
-    if (
-      fileName === 'index.html' ||
-      fileName.endsWith('.webmanifest') ||
-      fileName === 'manifest.json' ||
-      fileName === 'sw.js' ||
-      fileName === 'sw-heal.js'
-    ) {
+    if (isStaticBootstrapFile(filePath)) {
       res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
     } else {
       res.setHeader('Cache-Control', `public, max-age=${maxAge}, s-maxage=${sMaxAge}`);

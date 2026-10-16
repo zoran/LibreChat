@@ -75,7 +75,9 @@ describe('managed S3 adapter preserves lifecycle and uncertainty', () => {
     const send = jest.fn(async (command) => {
       expect(command.input.Key).toBe(key);
       if (command instanceof PutObjectCommand) {
-        for await (const _chunk of command.input.Body) {
+        const body = command.input.Body;
+        if (!(body instanceof Readable)) throw new Error('Expected managed original stream');
+        for await (const _chunk of body) {
           /* real stream consumed */
         }
         return {};

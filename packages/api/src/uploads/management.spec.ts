@@ -92,10 +92,14 @@ describe('managed upload public boundary', () => {
     f.authorize.mockResolvedValue(false);
     await expect(f.management.reserve(guest, request)).rejects.toMatchObject({ code: 'forbidden' });
   });
-  it('rejects guests before identity, storage or capacity access', async () => {
+  it('rejects a guest carrying a tenant before identity, storage or capacity access', async () => {
     const f = fixture();
+    // Deliberately malformed JavaScript input outside the typed principal contract.
     await expect(
-      f.management.reserve({ ...principal, authentication: 'guest' }, request),
+      Reflect.apply(f.management.reserve, f.management, [
+        { ...principal, authentication: 'guest' },
+        request,
+      ]),
     ).rejects.toMatchObject({ code: 'unauthorized' });
     expect(f.authorize).not.toHaveBeenCalled();
     expect(f.reserve).not.toHaveBeenCalled();

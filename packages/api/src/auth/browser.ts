@@ -40,7 +40,7 @@ export type BrowserGrant = { userId: string; sessionId: string; tenantId: null }
 /** Signature/expiry verification belongs to the bearer owner; this binds the same current cookie account. */
 export async function validateBrowserBearer(
   payload: unknown,
-  request: Request,
+  request: Request & { tenantId?: string | null },
   repository: Pick<BrowserMethods, 'findBrowserIdentity'>,
 ): Promise<{ user: BrowserUser; grant: BrowserGrant } | null> {
   if (

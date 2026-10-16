@@ -107,6 +107,34 @@ describe('staticCache', () => {
       process.env.NODE_ENV = 'production';
     });
 
+    it.each(
+      ['sw.js', 'sw-heal.js', 'registerSW.js', 'site.webmanifest'].flatMap((name) =>
+        ['identity', 'gzip', 'br'].map((encoding) => [name, encoding]),
+      ),
+    )('revalidates deployment bootstrap %s with %s encoding', async (name, encoding) => {
+      const directory = fs.mkdtempSync(path.join(testDir, 'bootstrap-'));
+      const content = Buffer.from(
+        name.endsWith('.webmanifest') ? '{"name":"bootstrap"}' : '/* bootstrap */',
+      );
+      fs.writeFileSync(path.join(directory, name), content);
+      fs.writeFileSync(path.join(directory, name + '.gz'), zlib.gzipSync(content));
+      fs.writeFileSync(path.join(directory, name + '.br'), zlib.brotliCompressSync(content));
+      process.env.ENABLE_STATIC_ASSET_BROTLI = 'true';
+      app.use(staticCache(directory));
+
+      const response = await request(app)
+        .get('/' + name)
+        .set('Accept-Encoding', encoding)
+        .buffer(true)
+        .parse(binaryParser)
+        .expect(200);
+
+      expect(response.headers['content-encoding']).toBe(
+        encoding === 'identity' ? undefined : encoding,
+      );
+      expect(response.headers['cache-control']).toBe('no-store, no-cache, must-revalidate');
+    });
+
     it('should set standard cache headers for regular files', async () => {
       app.use(staticCache(testDir));
 

@@ -5,11 +5,11 @@ import type { UploadLiveOptions } from './live';
 import { UploadManagementError } from './errors';
 import { createUploadLiveHub } from './live';
 
-const owner: UploadPrincipal = {
+const owner = {
   tenantId: 'tenant',
   userId: 'one',
   authentication: 'verified-email',
-};
+} satisfies UploadPrincipal;
 function connection(principal: UploadPrincipal = owner) {
   const request = Object.assign(new EventEmitter(), { identity: principal });
   const response = Object.assign(new EventEmitter(), {
@@ -135,8 +135,9 @@ describe('bounded authenticated upload event hints', () => {
 
   it('refuses an initially valid grant for another server tenant before headers or a watch', async () => {
     const f = fixture();
-    const foreign = connection({ ...owner, tenantId: 'another' });
-    f.options.tenantId = foreign.request.identity.tenantId;
+    const foreignPrincipal = { ...owner, tenantId: 'another' };
+    const foreign = connection(foreignPrincipal);
+    f.options.tenantId = foreignPrincipal.tenantId;
     try {
       await expect(
         f.hub.open(foreign.req, foreign.res, foreign.request.identity),
