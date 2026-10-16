@@ -11,6 +11,15 @@ const {
   canonical,
   digest,
 } = require('./upload-management');
+// Keep the real public contract loaded before native adapter tests install filesystem doubles.
+const {
+  parseUploadActivationGatewayContext,
+  validateUploadActivationGateways,
+} = require('@librechat/api/upload-activation');
+
+const GATEWAYS = ['https://current-a.example:8333', 'https://current-b.example:8333'];
+const GATEWAY_CONTEXT = JSON.stringify(GATEWAYS);
+const GATEWAY_ENV = { CORTEX_UPLOAD_ACTIVATION_STORAGE_GATEWAYS: GATEWAY_CONTEXT };
 
 const NOW = Date.parse('2026-10-14T00:10:00.000Z');
 const DEADLINE = new Date(NOW + 120_000).toISOString();
@@ -78,9 +87,8 @@ function producer(owner) {
       saturatedCounts: { objects: 0, multipartUploads: 0, versions: 0, deleteMarkers: 0 },
       measuredBytes: { objectBytes: 0, multipartBytes: 0, versionBytes: 0 },
       buckets: ['cortex-managed-uploads', 'cortex-qualification'],
-      gateways: [1, 4].map((cpu) => ({
-        endpoint:
-          'https://cortex-object-s3-cpu-' + cpu + '.cortex-objectstore.svc.cluster.local:8333',
+      gateways: GATEWAYS.map((endpoint) => ({
+        endpoint,
         versioning: { 'cortex-managed-uploads': 'Disabled', 'cortex-qualification': 'Disabled' },
       })),
     };
@@ -118,7 +126,14 @@ function livePorts() {
     inspectCheckpoints: jest.fn().mockImplementation(async () => producer('agent-checkpoints')),
     close: jest.fn().mockResolvedValue(undefined),
   };
-  return { runtime, boundary: { now: () => NOW, open: jest.fn().mockResolvedValue(runtime) } };
+  return {
+    runtime,
+    boundary: {
+      storageGateways: GATEWAY_CONTEXT,
+      now: () => NOW,
+      open: jest.fn().mockResolvedValue(runtime),
+    },
+  };
 }
 function capture() {
   const chunks = [];
@@ -134,6 +149,45 @@ function capture() {
 }
 
 describe('finite initial activation envelope', () => {
+  test('missing independent gateway context rejects before opening a client', async () => {
+    const { boundary } = livePorts();
+    delete boundary.storageGateways;
+    await expect(runActivation(request(), boundary)).rejects.toMatchObject({
+      code: 'INVALID_INPUT',
+    });
+    expect(boundary.open).not.toHaveBeenCalled();
+  });
+
+  test.each(['historical', 'foreign', 'reordered'])(
+    'rejects %s receipt endpoints before any client',
+    async (kind) => {
+      const value = activation();
+      if (kind === 'reordered') value.inventory.storage.gateways.reverse();
+      else
+        value.inventory.storage.gateways[0].endpoint =
+          kind === 'historical' ? 'https://retired.example:8333' : 'https://foreign.invalid:8333';
+      const { boundary, runtime } = livePorts();
+      await expect(runActivation(value, boundary)).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+      expect(boundary.open).not.toHaveBeenCalled();
+      expect(runtime.repository.activateReconciled).not.toHaveBeenCalled();
+    },
+  );
+
+  test('raw CLI gateway context is required independently of receipt endpoints', async () => {
+    const { boundary } = livePorts();
+    const captured = capture();
+    const code = await main({
+      input: Readable.from([Buffer.from(canonical(activation()))]),
+      output: captured.output,
+      env: {},
+      now: boundary.now,
+      open: boundary.open,
+    });
+    expect(code).toBe(1);
+    expect(JSON.parse(captured.text()).code).toBe('INVALID_INPUT');
+    expect(boundary.open).not.toHaveBeenCalled();
+  });
+
   test('reads a real segmented UTF-8 stdin envelope without adding authority fields', async () => {
     const value = request();
     const bytes = Buffer.from(JSON.stringify(value));
@@ -144,7 +198,7 @@ describe('finite initial activation envelope', () => {
   test('bounds bytes rather than characters and destroys an oversized input', async () => {
     const input = new PassThrough();
     const pending = readEnvelope(input, { timeoutMs: 100 });
-    const rejected = await expect(pending).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    const rejected = expect(pending).rejects.toMatchObject({ code: 'INVALID_INPUT' });
     input.end(Buffer.alloc(INPUT_LIMIT + 1, 120));
     await rejected;
     expect(input.destroyed).toBe(true);
@@ -164,7 +218,7 @@ describe('finite initial activation envelope', () => {
     const input = new PassThrough();
     try {
       const pending = readEnvelope(input, { timeoutMs: 25 });
-      const rejected = await expect(pending).rejects.toMatchObject({ code: 'INPUT_TIMEOUT' });
+      const rejected = expect(pending).rejects.toMatchObject({ code: 'INPUT_TIMEOUT' });
       await jest.advanceTimersByTimeAsync(25);
       await rejected;
       expect(input.destroyed).toBe(true);
@@ -180,7 +234,7 @@ describe('finite initial activation envelope', () => {
     const before = cloneJson(value);
     expect(Object.getPrototypeOf(value.target)).toBe(Object.prototype);
     expect(Object.getPrototypeOf(value.target.coordination)).toBe(Object.prototype);
-    expect(validateEnvelope(value, NOW)).toEqual(value);
+    expect(validateEnvelope(value, NOW, GATEWAY_CONTEXT)).toEqual(value);
     expect(value).toEqual(before);
   });
 
@@ -277,9 +331,9 @@ describe('finite initial activation envelope', () => {
     ],
   ])('rejects %s before opening any connection', (_label, mutate) => {
     const value = request();
-    expect(validateEnvelope(value, NOW)).toEqual(value);
+    expect(validateEnvelope(value, NOW, GATEWAY_CONTEXT)).toEqual(value);
     mutate(value);
-    expect(() => validateEnvelope(value, NOW)).toThrow();
+    expect(() => validateEnvelope(value, NOW, GATEWAY_CONTEXT)).toThrow();
   });
 });
 
@@ -300,7 +354,11 @@ describe('initial preparation composes existing owners', () => {
     return {
       value,
       runtime,
-      boundary: { now: () => NOW, open: jest.fn().mockResolvedValue(runtime) },
+      boundary: {
+        storageGateways: GATEWAY_CONTEXT,
+        now: () => NOW,
+        open: jest.fn().mockResolvedValue(runtime),
+      },
     };
   }
 
@@ -532,7 +590,7 @@ describe('owner observations and immutable activation proof', () => {
     ],
   ])('refuses %s without opening clients or requesting activation', async (_label, mutate) => {
     const value = activation();
-    expect(validateEnvelope(value, NOW)).toEqual(value);
+    expect(validateEnvelope(value, NOW, GATEWAY_CONTEXT)).toEqual(value);
     mutate(value);
     const { boundary } = livePorts();
     await expect(runActivation(value, boundary)).rejects.toThrow();
@@ -685,6 +743,7 @@ describe('owner observations and immutable activation proof', () => {
       const result = await main({
         input: Readable.from([Buffer.from(canonical(envelope()))]),
         output: captured.output,
+        env: GATEWAY_ENV,
         now: boundary.now,
         open: boundary.open,
       });
@@ -715,6 +774,7 @@ describe('owner observations and immutable activation proof', () => {
     const pending = main({
       input: Readable.from([Buffer.from(canonical(envelope()))]),
       output: captured.output,
+      env: GATEWAY_ENV,
       now: boundary.now,
       open: boundary.open,
     });
@@ -743,6 +803,7 @@ describe('owner observations and immutable activation proof', () => {
     const result = await main({
       input: Readable.from([Buffer.from(canonical(value))]),
       output: captured.output,
+      env: GATEWAY_ENV,
       now: boundary.now,
       open: boundary.open,
     });
@@ -756,7 +817,7 @@ describe('owner observations and immutable activation proof', () => {
     const result = await main({
       input: Readable.from([Buffer.from(canonical(request()))]),
       output: captured.output,
-      env: {},
+      env: GATEWAY_ENV,
       now: () => NOW,
     });
     expect(result).toBe(1);
@@ -794,6 +855,7 @@ describe('one-shot adapter uses public owners and independently checked runtime 
       sentinelCaPath: '/synthetic/sentinel-ca',
     };
     env = {
+      ...GATEWAY_ENV,
       CORTEX_UPLOAD_ACTIVATION_TARGET: canonical(TARGET),
       CORTEX_UPLOAD_ACTIVATION_CHECKPOINTER: '{}',
       REDIS_KEY_PREFIX: 'cortex',
@@ -836,6 +898,8 @@ describe('one-shot adapter uses public owners and independently checked runtime 
     jest.doMock(
       '@librechat/api/upload-activation',
       () => ({
+        parseUploadActivationGatewayContext,
+        validateUploadActivationGateways,
         resolveCheckpointerConfig: jest.fn(() => CONFIG),
         RedisJobStore: class {
           initialize = initializeStore;

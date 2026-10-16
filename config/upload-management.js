@@ -39,9 +39,6 @@ const COMMON_KEYS = [
   'evidenceSha256',
 ];
 const BUCKETS = ['cortex-managed-uploads', 'cortex-qualification'];
-const GATEWAYS = [1, 4].map(
-  (cpu) => 'https://cortex-object-s3-cpu-' + cpu + '.cortex-objectstore.svc.cluster.local:8333',
-);
 const SHA = /^[a-f0-9]{64}$/;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const NAME = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -163,7 +160,7 @@ function validateSnapshot(snapshot, envelope, now) {
   zeroFields(snapshot.baseline, RESOURCE_KEYS);
   zeroFields(snapshot.initialInventory, ['operations', 'files', 'sourceMessages'], true);
 }
-function validateProducer(value, owner, envelope, observedAt, now) {
+function validateProducer(value, owner, envelope, observedAt, now, storageGateways) {
   let extra;
   let keys;
   if (owner === 'generation-stream') {
@@ -202,25 +199,10 @@ function validateProducer(value, owner, envelope, observedAt, now) {
   if (owner === 'object-storage') {
     zeroFields(value.measuredBytes, ['objectBytes', 'multipartBytes', 'versionBytes']);
     requireValue(
-      isHash(value.storageBindingSha256) &&
-        canonical(value.buckets) === canonical(BUCKETS) &&
-        Array.isArray(value.gateways) &&
-        value.gateways.length === 2,
+      isHash(value.storageBindingSha256) && canonical(value.buckets) === canonical(BUCKETS),
     );
-    value.gateways.forEach((gateway, index) => {
-      shape(gateway, ['endpoint', 'versioning']);
-      shape(gateway.versioning, BUCKETS);
-      requireValue(
-        gateway.endpoint === GATEWAYS[index] &&
-          BUCKETS.every((bucket) =>
-            ['Disabled', 'Enabled', 'Suspended'].includes(gateway.versioning[bucket]),
-          ),
-      );
-    });
-    requireValue(
-      canonical(value.gateways[0].versioning) === canonical(value.gateways[1].versioning),
-      'INCOMPLETE',
-    );
+    const { validateUploadActivationGateways } = require('@librechat/api/upload-activation');
+    validateUploadActivationGateways(value.gateways, storageGateways, BUCKETS);
   }
   if (owner === 'librechat-staging') {
     zeroFields(value.measuredBytes, ['heldBytes', 'stagedBytes']);
@@ -232,7 +214,9 @@ function validateProducer(value, owner, envelope, observedAt, now) {
 function snapshotFrom(preparation) {
   return Object.fromEntries(SNAPSHOT_KEYS.map((key) => [key, preparation[key]]));
 }
-function validateEnvelope(envelope, now = Date.now()) {
+function validateEnvelope(envelope, now = Date.now(), gatewayContext) {
+  const { parseUploadActivationGatewayContext } = require('@librechat/api/upload-activation');
+  const storageGateways = parseUploadActivationGatewayContext(gatewayContext);
   requireValue(Number.isSafeInteger(now) && object(envelope));
   requireValue(envelope.action === 'prepare' || envelope.action === 'activate');
   shape(envelope, [
@@ -273,6 +257,7 @@ function validateEnvelope(envelope, now = Date.now()) {
     envelope,
     snapshot.observedAt,
     now,
+    storageGateways,
   );
   validateProducer(
     envelope.inventory.staging,
@@ -350,7 +335,7 @@ function activationProof(envelope) {
 }
 async function runActivation(envelope, ports = {}) {
   const now = ports.now ?? Date.now;
-  validateEnvelope(envelope, now());
+  validateEnvelope(envelope, now(), ports.storageGateways);
   const expiredReplay =
     envelope.action === 'activate' && timestamp(envelope.originalDeadline) <= now();
   const deadline = expiredReplay
@@ -672,6 +657,7 @@ async function main({
     const envelope = await readEnvelope(input);
     result = await runActivation(envelope, {
       now,
+      storageGateways: env.CORTEX_UPLOAD_ACTIVATION_STORAGE_GATEWAYS,
       open: open ?? ((target, options) => openRuntime(target, options, env)),
     });
   } catch (error) {

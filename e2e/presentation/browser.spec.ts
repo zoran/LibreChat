@@ -72,7 +72,15 @@ test('German presentation survives old English preferences, login, settings, rel
   await expectGerman(page);
   await expect(page).toHaveTitle(appTitle);
   await expect(page.getByRole('heading', { name: 'Willkommen zurück', exact: true })).toBeVisible();
-  await expect(page.getByAltText(`${appTitle} Logo`)).toBeVisible();
+  const logo = page.getByRole('img', { name: appTitle, exact: true });
+  await expect(logo).toBeVisible();
+  await expect
+    .poll(() =>
+      logo.evaluate(
+        (image) => image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0,
+      ),
+    )
+    .toBe(true);
   await expect(page.getByRole('form', { name: 'Anmeldeformular' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Hohen Kontrast umschalten' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Wert anzeigen' })).toBeVisible();

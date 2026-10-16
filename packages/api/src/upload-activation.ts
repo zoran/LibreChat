@@ -2,3 +2,8 @@
 export { RedisJobStore } from './stream/implementations/RedisJobStore';
 export { inspectInitialCheckpointPopulation } from './agents/checkpoints/storage';
 export { resolveCheckpointerConfig } from './agents/checkpoints/config';
+export {
+  parseUploadActivationGatewayContext,
+  validateUploadActivationGateways,
+} from './uploads/activationGateways';
+export type { UploadActivationGatewayContext } from './uploads/activationGateways';
