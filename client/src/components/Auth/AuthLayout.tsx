@@ -6,7 +6,8 @@ import { TranslationKeys, useLocalize } from '~/hooks';
 import SocialLoginRender from './SocialLoginRender';
 import { BlinkAnimation } from './BlinkAnimation';
 import LegalConsent from './LegalConsent';
-import { cn, getAppTitle } from '~/utils';
+import { cn } from '~/utils';
+import AppLogo from '~/components/ui/AppLogo';
 import { Banner } from '../Banners';
 import Footer from './Footer';
 
@@ -92,10 +93,10 @@ function AuthLayout({
       <Banner />
       <BlinkAnimation active={isFetching}>
         <div className="mt-6 h-10 w-full bg-cover">
-          <img
-            src="assets/logo.svg"
+          <AppLogo
+            startupConfig={startupConfig}
+            fallbackSrc="assets/logo.svg"
             className="h-full w-full object-contain"
-            alt={localize('com_ui_logo', { 0: getAppTitle(startupConfig?.appTitle) })}
           />
         </div>
       </BlinkAnimation>

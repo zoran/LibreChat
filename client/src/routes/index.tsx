@@ -19,6 +19,7 @@ import LoginLayout from './Layouts/Login';
 import dashboardRoutes from './Dashboard';
 import WithRum from '~/lib/rum/WithRum';
 import ShareRoute from './ShareRoute';
+import EmailCodeLanding from '~/components/Auth/EmailCodeLanding';
 import ChatRoute from './ChatRoute';
 import Search from './Search';
 import Root from './Root';
@@ -62,6 +63,14 @@ const baseHref = baseEl?.getAttribute('href') || '/';
 
 export const router = createBrowserRouter(
   [
+    {
+      path: 'login/email-code',
+      element: (
+        <AuthContextProvider authConfig={{ optional: true, loginRedirect: '/login' }}>
+          <EmailCodeLanding />
+        </AuthContextProvider>
+      ),
+    },
     {
       path: 'share/:shareId',
       element: <ShareRoute />,

@@ -6,6 +6,7 @@ export interface EmailCodeSender {
   sendCode(input: {
     email: string;
     code: string;
+    attemptId?: string;
     expiresInMinutes: number;
     locale: 'de' | 'en';
   }): Promise<void>;

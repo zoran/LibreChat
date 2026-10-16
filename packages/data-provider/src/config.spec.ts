@@ -49,7 +49,14 @@ describe('public presentation configuration', () => {
     expect(plain).not.toHaveProperty('fixedLocale');
     expect(plain).not.toHaveProperty('appVersion');
     expect(plain).not.toHaveProperty('pwaIcons');
+    expect(plain).not.toHaveProperty('appLogo');
     const configured = {
+      appLogo: {
+        light: 'assets/cortex-logo.svg',
+        dark: '/assets/cortex-logo-dark.svg',
+        mark: 'assets/cortex-mark.svg',
+        markDark: 'assets/cortex-mark-dark.svg',
+      },
       fixedLocale: 'de-DE',
       appVersion: 'v0.8.8+bwi.1',
       pwaIcons: [
@@ -2860,5 +2867,32 @@ describe('GitHub comparison configuration', () => {
         githubCompare: { enabled: true, baseURL: 'https://other.test' },
       }).success,
     ).toBe(false);
+  });
+});
+
+describe('application logo paths', () => {
+  it.each([
+    'https://outside.example/logo.svg',
+    '//outside.example/logo.svg',
+    'data:image/svg+xml,x',
+    '../logo.svg',
+    'assets/%2e%2e/logo.svg',
+    'assets/logo.svg?x=1',
+    'assets/logo.svg#x',
+    'x'.repeat(513),
+    '',
+  ])('rejects unsafe path %p for every variant', (path) => {
+    for (const field of ['light', 'dark', 'mark', 'markDark']) {
+      expect(
+        interfaceSchema.safeParse({ appLogo: { light: 'assets/logo.svg', [field]: path } }).success,
+      ).toBe(false);
+    }
+  });
+  it('requires light and rejects unexpected fields', () => {
+    expect(interfaceSchema.safeParse({ appLogo: { dark: 'assets/logo.svg' } }).success).toBe(false);
+    expect(
+      interfaceSchema.safeParse({ appLogo: { light: 'assets/logo.svg', remote: true } }).success,
+    ).toBe(false);
+    expect(interfaceSchema.safeParse({ appLogo: { light: 'assets/logo.svg' } }).success).toBe(true);
   });
 });

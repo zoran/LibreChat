@@ -125,6 +125,25 @@ const AuthContextProvider = ({
   const [logoutFailure, setLogoutFailure] = useState(false);
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(false);
   const [isAuthReady, setIsAuthReady] = useState<boolean>(authConfig?.test === true);
+  const [authResolution, setAuthResolution] = useState<TAuthContext['authResolution']>({
+    status: 'pending',
+    generation: 0,
+  });
+  const isAuthGenerationCurrent = useCallback(
+    (generation: number) => generation === sessionGeneration.current,
+    [],
+  );
+  const resolveAuth = useCallback(
+    (status: TAuthContext['authResolution']['status']) => {
+      const generation = sessionGeneration.current;
+      setAuthResolution((previous) =>
+        previous.status === status && previous.generation === generation
+          ? previous
+          : { status, generation },
+      );
+    },
+    [],
+  );
   const setQueriesEnabled = useSetRecoilState<boolean>(store.queriesEnabled);
 
   const userRoleName = user?.role ?? '';
@@ -145,7 +164,13 @@ const AuthContextProvider = ({
   const setUserContext = useMemo(
     () =>
       debounce((userContext: TUserContext) => {
+        if (
+          userContext.generation !== undefined &&
+          userContext.generation !== sessionGeneration.current
+        )
+          return;
         const { token, isAuthenticated, user, redirect } = userContext;
+        resolveAuth(isAuthenticated && !user ? 'pending' : 'resolved');
         setUser(user);
         setToken(token);
         setTokenHeader(token);
@@ -286,6 +311,7 @@ const AuthContextProvider = ({
     (redirect?: string) => {
       setLogoutFailure(false);
       sessionGeneration.current++;
+      resolveAuth('pending');
       notifySessionEnding(sessionGeneration.current);
       clearPostLoginRedirect();
       clearTwoFactorSetupToken();
@@ -328,6 +354,7 @@ const AuthContextProvider = ({
   const settleCortexSession = useCallback(
     async (destination: string) => {
       sessionGeneration.current++;
+      resolveAuth('pending');
       notifySessionEnding(sessionGeneration.current);
       isExternalRedirectRef.current = true;
       setUserContext.cancel();
@@ -369,6 +396,7 @@ const AuthContextProvider = ({
       setToken(authenticatedToken);
       setTokenHeader(authenticatedToken);
       setIsAuthenticated(true);
+      resolveAuth('resolved');
       setIsAuthReady(true);
       setQueriesEnabled(true);
       openFileDeletionRetention();
@@ -387,6 +415,7 @@ const AuthContextProvider = ({
    */
   const clearAuthenticationForRedirect = useCallback(() => {
     sessionGeneration.current++;
+    resolveAuth('pending');
     notifySessionEnding(sessionGeneration.current);
     endSessionClientState();
     setUser(undefined);
@@ -416,6 +445,7 @@ const AuthContextProvider = ({
     }
     const generation = sessionGeneration.current;
     refreshPending.current = true;
+    resolveAuth('pending');
     refreshToken.mutate(undefined, {
       onSettled: () => {
         refreshPending.current = false;
@@ -445,6 +475,7 @@ const AuthContextProvider = ({
               setBrowserState(null);
             }
           } catch (error) {
+            resolveAuth('unavailable');
             setBrowserState(browserSessionErrorCode(error) ?? 'BROWSER_SESSION_UNAVAILABLE');
             setIsAuthReady(true);
             return;
@@ -452,7 +483,9 @@ const AuthContextProvider = ({
         }
         if (generation !== sessionGeneration.current || isExternalRedirectRef.current) return;
         const { user, token = '', twoFASetupRequired, tempToken } = data ?? {};
-        if (twoFASetupRequired && tempToken) {
+        if (twoFASetupRequired) {
+          resolveAuth('unavailable');
+          if (authConfig?.optional === true || !tempToken) return;
           persistTwoFactorSetupToken(tempToken);
           /**
            * Already on the setup route, reached by an enforcement redirect that parked the
@@ -485,10 +518,16 @@ const AuthContextProvider = ({
           const fallbackRedirect = isSafeRedirect(currentUrl) ? currentUrl : '/c/new';
           const redirect =
             getPostLoginRedirect(new URLSearchParams(window.location.search)) ?? fallbackRedirect;
-          setUserContext({ user, token, isAuthenticated: true, redirect });
+          setUserContext({
+            user,
+            token,
+            isAuthenticated: true,
+            generation,
+            redirect: authConfig?.optional ? undefined : redirect,
+          });
           return;
         }
-        console.log('Token is not present. User is not authenticated.');
+        setUserContext({ user: undefined, token: undefined, isAuthenticated: false, generation });
         endSessionClientState();
         setIsAuthReady(true);
         if (authConfig?.test === true) {
@@ -505,6 +544,7 @@ const AuthContextProvider = ({
         if (isExternalRedirectRef.current || generation !== sessionGeneration.current) {
           return;
         }
+        resolveAuth('unavailable');
         const browserCode = browserSessionErrorCode(error);
         if (browserCode) {
           setBrowserState(browserCode);
@@ -534,6 +574,7 @@ const AuthContextProvider = ({
       if (event.key !== 'librechat.auth.revision') return;
       // Do not rebroadcast: the cookie selection is shared, but no identity is stored in this event.
       sessionGeneration.current++;
+      resolveAuth('pending');
       notifySessionEnding(sessionGeneration.current);
       isExternalRedirectRef.current = true;
       setUserContext.cancel();
@@ -601,6 +642,7 @@ const AuthContextProvider = ({
     if (userQuery.data) {
       setUser(userQuery.data);
     } else if (userQuery.isError) {
+      resolveAuth('unavailable');
       const browserCode = browserSessionErrorCode(userQuery.error);
       if (
         authConfig?.optional !== true &&
@@ -694,6 +736,8 @@ const AuthContextProvider = ({
       },
       isAuthenticated,
       isAuthReady,
+      authResolution,
+      isAuthGenerationCurrent,
     }),
 
     [
@@ -701,6 +745,8 @@ const AuthContextProvider = ({
       error,
       isAuthenticated,
       isAuthReady,
+      authResolution,
+      isAuthGenerationCurrent,
       token,
       userRole,
       adminRole,

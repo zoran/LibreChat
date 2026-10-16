@@ -112,12 +112,8 @@ export default defineConfig(({ command }) => ({
       workbox: {
         globPatterns: [
           '**/*.{js,css,html}',
-          'assets/favicon*.png',
-          'assets/icon-*.png',
-          'assets/apple-touch-icon*.png',
           /** The runtime manifest is deliberately absent; the integration hook removes
            * the extra entry vite-plugin-pwa appends independently of these globs. */
-          'assets/maskable-icon.png',
         ],
         globIgnores: [
           'images/**/*',
@@ -127,14 +123,19 @@ export default defineConfig(({ command }) => ({
           'assets/rum.*.js',
           'assets/locale-*.js',
           'assets/query-devtools*.js',
+          // Deployment mounts replace these after the image build. A build-time
+          // revision would pin stale artwork across configuration-only rollouts.
+          'assets/favicon*.png',
+          'assets/icon-*.png',
+          'assets/apple-touch-icon*.png',
+          'assets/maskable-icon.png',
         ],
         maximumFileSizeToCacheInBytes: 4 * 1024 * 1024,
         /**
          * vite-plugin-pwa defaults this to `/^assets\//`, which is only true for the
-         * hashed bundle output: the icons live in `assets/` under stable filenames, so the
-         * default marks them immutable (`revision: null`) and an installed PWA would keep
-         * a rebranded icon forever. Match Vite's `[name].[hash].[ext]` shape instead so
-         * hashed chunks stay revision-free while the icons get content revisions.
+         * hashed bundle output. Match Vite's `[name].[hash].[ext]` shape so only hashed
+         * chunks stay revision-free. Runtime icons are excluded from precaching above
+         * because deployment configuration can replace them after the image build.
          */
         dontCacheBustURLsMatching: /\.[\w-]{8}\.(?:js|css)$/,
         /** LibreChat mutates index.html per request for subpath and language support. */

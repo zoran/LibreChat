@@ -15,10 +15,21 @@ const isEnabled = (value) => value === true || String(value).toLowerCase() === '
  * @param {Object} [options={}] - Configuration options
  * @param {boolean} [options.noCache=false] - If true, disables caching entirely for all files
  * @param {boolean} [options.skipGzipScan=false] - If true, skips expressStaticGzip middleware
+ * @param {string[]} [options.runtimeAssets=[]] - Deployment-owned paths: revalidate original bytes, never a prebuilt compressed sibling
  * @returns {ReturnType<expressStaticGzip>|ReturnType<express.static>} Express middleware function for serving static files
  */
 function staticCache(staticPath, options = {}) {
-  const { noCache = false, skipGzipScan = false } = options;
+  const { noCache = false, skipGzipScan = false, runtimeAssets = [] } = options;
+  if (runtimeAssets.length) {
+    const selected = new Set(runtimeAssets.map((value) => '/' + value.replace(/^\//, '')));
+    const mounted = express.static(staticPath, {
+      index: false,
+      setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache'),
+    });
+    const ordinary = staticCache(staticPath, { noCache, skipGzipScan });
+    return (req, res, next) =>
+      selected.has(req.path) ? mounted(req, res, next) : ordinary(req, res, next);
+  }
   const enableBrotli = isEnabled(process.env.ENABLE_STATIC_ASSET_BROTLI);
 
   const setHeaders = (res, filePath) => {

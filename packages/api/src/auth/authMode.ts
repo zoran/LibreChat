@@ -1,3 +1,4 @@
+export { EMAIL_CODE_IDLE_MS, EMAIL_CODE_ABSOLUTE_MS } from '@librechat/data-schemas';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { AuthMode, EmailCodeConfig } from 'librechat-data-provider';
 import type { Request, Response } from 'express';
@@ -6,8 +7,6 @@ import { getEmailCodeMailConfig } from './mailSender';
 export const AUTH_SELECTION_COOKIE = '__Host-librechat-auth-selection';
 export const EMAIL_ATTEMPT_COOKIE = '__Host-librechat-email-attempt';
 export const EMAIL_CODE_ACCESS_MS: number = 5 * 60_000;
-export const EMAIL_CODE_IDLE_MS: number = 60 * 60_000;
-export const EMAIL_CODE_ABSOLUTE_MS: number = 12 * 60 * 60_000;
 export const EMAIL_CODE_CHALLENGE_MS: number = 10 * 60_000;
 export const EMAIL_CODE_COOKIE_OPTIONS = {
   httpOnly: true,

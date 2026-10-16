@@ -1,3 +1,5 @@
+import { EMAIL_CODE_IDLE_MS, EMAIL_CODE_ABSOLUTE_MS } from '../emailCodePolicy';
+import { emailCodeProfileName } from '../utils/emailCodeProfile';
 import { timingSafeEqual } from 'node:crypto';
 import type { ClientSession } from 'mongoose';
 import type {
@@ -16,8 +18,6 @@ import { createUserMethods } from './user';
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
-const IDLE = HOUR;
-const ABSOLUTE = 12 * HOUR;
 const READ_TIMEOUT_MS = 2_000;
 
 export class EmailCodeStoreError extends Error {
@@ -262,6 +262,7 @@ export function createEmailCodeMethods(mongoose: typeof import('mongoose')): Ema
             user = (await users.createUser(
               {
                 email: c.email,
+                name: emailCodeProfileName(c.email),
                 emailVerified: true,
                 provider: 'email_code',
                 role: 'USER',
@@ -273,6 +274,20 @@ export function createEmailCodeMethods(mongoose: typeof import('mongoose')): Ema
               true,
               session,
             )) as IUser;
+          }
+          if (!user.name?.trim()) {
+            const updated = await mongoose.models.User.findOneAndUpdate(
+              {
+                _id: user._id,
+                email: c.email,
+                tenantId: c.tenantId,
+                provider: 'email_code',
+                $or: [{ name: { $exists: false } }, { name: null }, { name: /^\s*$/ }],
+              },
+              { $set: { name: emailCodeProfileName(c.email) } },
+              { session, new: true },
+            ).lean<IUser>();
+            if (updated) user = updated;
           }
           const grant = (
             await mongoose.models.Session.create(
@@ -286,8 +301,8 @@ export function createEmailCodeMethods(mongoose: typeof import('mongoose')): Ema
                   authVersion: user.authVersion ?? 0,
                   refreshGeneration: 0,
                   authCreatedAt: issuedAt,
-                  expiration: new Date(time + ABSOLUTE),
-                  idleExpiresAt: new Date(time + IDLE),
+                  expiration: new Date(time + EMAIL_CODE_ABSOLUTE_MS),
+                  idleExpiresAt: new Date(time + EMAIL_CODE_IDLE_MS),
                   refreshTokenHash: input.refreshTokenHash,
                 },
               ],
@@ -411,7 +426,9 @@ export function createEmailCodeMethods(mongoose: typeof import('mongoose')): Ema
         liveGrant(grant, now),
         {
           $max: {
-            idleExpiresAt: new Date(Math.min(now.getTime() + IDLE, grant.absoluteExpiresAt)),
+            idleExpiresAt: new Date(
+              Math.min(now.getTime() + EMAIL_CODE_IDLE_MS, grant.absoluteExpiresAt),
+            ),
           },
         },
         { writeConcern: { w: 'majority' }, maxTimeMS: READ_TIMEOUT_MS },

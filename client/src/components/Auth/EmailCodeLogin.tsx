@@ -50,6 +50,7 @@ export default function EmailCodeLogin({
   const [error, setError] = useState<TranslationKeys>();
   const [guestExpired, setGuestExpired] = useState(false);
   const [seconds, setSeconds] = useState(0);
+  const [minutesLeft, setMinutesLeft] = useState(10);
   const generation = useRef(0);
   const controller = useRef<AbortController>();
   const codeInput = useRef<HTMLInputElement>(null);
@@ -65,8 +66,12 @@ export default function EmailCodeLogin({
   useEffect(() => {
     if (!challenge) return;
     codeInput.current?.focus();
-    const update = () =>
+    const update = () => {
       setSeconds(Math.max(0, Math.ceil((Date.parse(challenge.resendAt) - Date.now()) / 1000)));
+      setMinutesLeft(
+        Math.max(0, Math.ceil((Date.parse(challenge.expiresAt) - Date.now()) / 60000)),
+      );
+    };
     update();
     const timer = window.setInterval(update, 1000);
     return () => window.clearInterval(timer);
@@ -194,7 +199,8 @@ export default function EmailCodeLogin({
           {challenge && (
             <div className="space-y-2">
               <p role="status" className="text-sm">
-                {localize('com_auth_email_code_sent')}
+                {localize('com_auth_email_code_sent')}{' '}
+                {localize('com_auth_email_link_remaining', { 0: String(minutesLeft) })}
               </p>
               <label htmlFor={`${id}-code`} className="block text-sm font-medium">
                 {localize('com_auth_email_code_code')}

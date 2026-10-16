@@ -2638,8 +2638,22 @@ export const isAllDataRetention = (mode?: RetentionMode | null): boolean =>
 export const isForcedTemporaryRetention = (mode?: RetentionMode | null): boolean =>
   mode === RetentionMode.EPHEMERAL;
 
+const staticAssetPathSchema = z
+  .string()
+  .max(512)
+  .regex(/^\/?(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+$/);
+
 /** Public deployment presentation; omitted fields preserve upstream behavior. */
 export const presentationSchema = z.object({
+  appLogo: z
+    .object({
+      light: staticAssetPathSchema,
+      dark: staticAssetPathSchema.optional(),
+      mark: staticAssetPathSchema.optional(),
+      markDark: staticAssetPathSchema.optional(),
+    })
+    .strict()
+    .optional(),
   fixedLocale: z
     .string()
     .min(2)
@@ -2665,10 +2679,7 @@ export const presentationSchema = z.object({
     .array(
       z
         .object({
-          src: z
-            .string()
-            .max(512)
-            .regex(/^\/?(?:[A-Za-z0-9_-]+\/)*[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)+$/),
+          src: staticAssetPathSchema,
           sizes: z
             .string()
             .max(128)

@@ -1,6 +1,8 @@
 import { URL } from 'node:url';
 import { Socket, isIP } from 'node:net';
 import { X509Certificate } from 'node:crypto';
+import { emailCodeLink, mailClientUrl } from './emailCodeLink';
+import { emailCodeMessage } from './emailCodeMessage';
 import type { EmailCodeSender } from './emailCode.types';
 
 const DEADLINE_MS = 20_000;
@@ -15,6 +17,9 @@ export interface EmailCodeMailConfig {
   from: string;
   appTitle: string;
   allowedDomains: readonly string[];
+  clientUrl?: string;
+  /** Trusted deployment artwork, copied once; never a URL or a mail-client file path. */
+  logoPng?: Buffer;
 }
 
 type SocketCallback = (error: Error | null, value?: { connection: Socket }) => void;
@@ -47,6 +52,14 @@ export interface EmailCodeMailMessage {
   envelope: { from: string; to: string[] };
   subject: string;
   text: string;
+  html?: string;
+  attachments?: Array<{
+    filename: 'application-logo.png';
+    content: Buffer;
+    contentType: 'image/png';
+    contentDisposition: 'inline';
+    cid: 'application-logo@local';
+  }>;
   disableFileAccess: true;
   disableUrlAccess: true;
 }
@@ -170,6 +183,21 @@ function snapshotMailConfig(value: unknown): EmailCodeMailConfig {
   if (!Array.isArray(input.allowedDomains) || input.allowedDomains.length === 0)
     return invalidMailConfig();
   const allowedDomains = input.allowedDomains.map(dnsName);
+  const logo = input.logoPng;
+  if (
+    logo !== undefined &&
+    (!Buffer.isBuffer(logo) ||
+      logo.length < 33 ||
+      logo.length > 65536 ||
+      !logo.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) ||
+      logo.readUInt32BE(8) !== 13 ||
+      logo.toString('ascii', 12, 16) !== 'IHDR' ||
+      logo.readUInt32BE(16) < 1 ||
+      logo.readUInt32BE(16) > 1200 ||
+      logo.readUInt32BE(20) < 1 ||
+      logo.readUInt32BE(20) > 600)
+  )
+    return invalidMailConfig();
   try {
     if (!new X509Certificate(ca).ca) return invalidMailConfig();
   } catch {
@@ -184,6 +212,8 @@ function snapshotMailConfig(value: unknown): EmailCodeMailConfig {
     from,
     appTitle: title.trim(),
     allowedDomains: Object.freeze(allowedDomains),
+    ...(logo === undefined ? {} : { logoPng: Buffer.from(logo as Buffer) }),
+    ...(input.clientUrl === undefined ? {} : { clientUrl: mailClientUrl(input.clientUrl) }),
   });
 }
 
@@ -221,6 +251,7 @@ export function getEmailCodeMailConfig(
     from: env.EMAIL_CODE_SMTP_FROM,
     appTitle: env.APP_TITLE == null || env.APP_TITLE === '' ? 'LibreChat' : env.APP_TITLE,
     allowedDomains,
+    ...(env.DOMAIN_CLIENT ? { clientUrl: env.DOMAIN_CLIENT } : {}),
   });
 }
 
@@ -242,17 +273,33 @@ export function createBoundedEmailCodeSender(
       ) {
         throw new SubmissionUnavailable();
       }
-      const german = input.locale === 'de';
+      const link = config.clientUrl
+        ? emailCodeLink(config.clientUrl, input.attemptId, input.code)
+        : undefined;
       const message: EmailCodeMailMessage = {
         from: { name: config.appTitle, address: config.from },
         to: { address: input.email },
         envelope: { from: config.from, to: [input.email] },
-        subject: german
-          ? `Ihr Anmeldecode für ${config.appTitle}`
-          : `Your ${config.appTitle} sign-in code`,
-        text: german
-          ? `Ihr Anmeldecode lautet: ${input.code}\n\nDer Code ist zehn Minuten gültig. Falls Sie ihn nicht angefordert haben, können Sie diese E-Mail ignorieren.`
-          : `Your sign-in code is: ${input.code}\n\nThe code is valid for ten minutes. If you did not request it, you can ignore this email.`,
+        ...emailCodeMessage({
+          appTitle: config.appTitle,
+          code: input.code,
+          locale: input.locale,
+          link,
+          embeddedLogo: Boolean(config.logoPng && link),
+        }),
+        ...(config.logoPng && link
+          ? {
+              attachments: [
+                {
+                  filename: 'application-logo.png' as const,
+                  content: Buffer.from(config.logoPng),
+                  contentType: 'image/png' as const,
+                  contentDisposition: 'inline' as const,
+                  cid: 'application-logo@local' as const,
+                },
+              ],
+            }
+          : {}),
         disableFileAccess: true,
         disableUrlAccess: true,
       };

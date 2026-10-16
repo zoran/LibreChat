@@ -1,3 +1,5 @@
+import AppLogo from '~/components/ui/AppLogo';
+import { emailCodeGreeting } from '~/utils/emailCodeGreeting';
 import { useMemo, useCallback, useState, useEffect, useRef } from 'react';
 import { HatGlasses } from 'lucide-react';
 import { easings } from '@react-spring/web';
@@ -92,7 +94,7 @@ export default function Landing({ centerFormOnLanding }: { centerFormOnLanding: 
       ? startupConfig.interface.customWelcome
       : undefined;
 
-  const scheduledGreeting = useGreeting(user?.name);
+  const scheduledGreeting = useGreeting(emailCodeGreeting(user));
 
   const handleLineCountChange = useCallback((count: number) => {
     setTextHasMultipleLines(count > 1);
@@ -138,6 +140,7 @@ export default function Landing({ centerFormOnLanding }: { centerFormOnLanding: 
     <div
       className={`flex h-full transform-gpu flex-col items-center justify-center pb-16 transition-all duration-200 ${centerFormOnLanding ? 'max-h-full sm:max-h-0' : 'max-h-full'} ${getDynamicMargin}`}
     >
+      <AppLogo startupConfig={startupConfig} className="mb-4 h-7 max-w-full object-contain" />
       <div ref={contentRef} className="flex flex-col items-center gap-0 p-2">
         <div
           className={`flex ${textHasMultipleLines ? 'flex-col' : 'flex-col md:flex-row'} items-center justify-center gap-2`}

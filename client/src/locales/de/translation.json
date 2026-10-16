@@ -3573,5 +3573,15 @@
   "com_ui_tool_approval_connection_unavailable": "Für diese Verbindung kann die Genehmigung nicht gespeichert werden. Jeder Aufruf muss einzeln geprüft werden.",
   "com_ui_tool_approval_remember_disabled": "Gespeicherte Genehmigungen sind deaktiviert. Jeder Aufruf muss geprüft werden.",
   "com_ui_tool_approval_storage_unavailable": "Eine dauerhafte Genehmigung ist derzeit nicht verfügbar. Diese Genehmigung gilt nur für diesen Aufruf.",
-  "com_ui_tool_approval_background_unavailable": "Aufrufe im Hintergrund können keine Genehmigung speichern. Genehmige einen erfolgreichen Aufruf im Vordergrund, um die Genehmigung für dieses Tool zu speichern."
+  "com_ui_tool_approval_background_unavailable": "Aufrufe im Hintergrund können keine Genehmigung speichern. Genehmige einen erfolgreichen Aufruf im Vordergrund, um die Genehmigung für dieses Tool zu speichern.",
+  "com_auth_email_link_title": "Anmelden mit E-Mail-Code",
+  "com_auth_email_link_invalid": "Dieser Link ist nicht mehr gültig. Fordern Sie einen neuen Code an.",
+  "com_auth_email_link_unavailable": "Ihre aktuelle Anmeldung konnte nicht geprüft werden. Es wurde kein Code eingelöst.",
+  "com_auth_email_link_working": "Anmeldung wird geprüft …",
+  "com_auth_email_link_switch": "Sie sind bereits angemeldet. Möchten Sie die Anmeldung aus dieser E-Mail verwenden?",
+  "com_auth_email_link_confirm": "Melden Sie sich mit dem Code aus dieser E-Mail an.",
+  "com_auth_email_link_continue": "Anmelden",
+  "com_auth_email_link_browser": "Öffnen Sie den Link in dem Browser, in dem Sie den Code angefordert haben. Auf einem anderen Gerät können Sie einen neuen Code anfordern.",
+  "com_auth_email_link_new": "Neuen Code anfordern",
+  "com_auth_email_link_remaining": "Nur der neueste Code ist gültig. Verbleibende Zeit: {0} Minuten."
 }

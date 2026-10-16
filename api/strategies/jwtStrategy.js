@@ -108,10 +108,14 @@ const jwtLogin = () =>
                 user.tenantId = identity.grant.tenantId;
                 // Never inherit a browser header or old pre-auth tenant on verified paths.
                 req.tenantId = identity.grant.tenantId;
-                if (
-                  ['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) &&
-                  !req.originalUrl?.includes('/api/auth/')
-                ) {
+                // Express routes ignore case/trailing slash; query strings are not route identity.
+                const activityPath = new URL(req.originalUrl ?? '', 'http://localhost').pathname
+                  .replace(/\/+$/, '')
+                  .toLowerCase();
+                const background =
+                  /(?:^|\/)api\/auth(?:\/|$)/.test(activityPath) ||
+                  /(?:^|\/)api\/files\/usage$/.test(activityPath);
+                if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method) && !background) {
                   await authWrite(() => models.touchEmailCodeSession(identity.grant, new Date()));
                 }
               }

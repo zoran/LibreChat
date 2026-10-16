@@ -19,6 +19,28 @@ describe('staticCache', () => {
   let manifestFile;
   let swFile;
 
+  it('serves current deployment artwork instead of stale compressed siblings and revalidates it', async () => {
+    const name = 'runtime-logo.svg';
+    fs.writeFileSync(path.join(testDir, name), '<svg>selected</svg>');
+    fs.writeFileSync(path.join(testDir, name + '.gz'), zlib.gzipSync('<svg>old</svg>'));
+    fs.writeFileSync(path.join(testDir, name + '.br'), zlib.brotliCompressSync('<svg>old</svg>'));
+    app.use(staticCache(testDir, { runtimeAssets: [name] }));
+    const first = await request(app)
+      .get('/' + name)
+      .set('Accept-Encoding', 'br,gzip')
+      .expect(200);
+    expect(first.headers['content-encoding']).toBeUndefined();
+    expect(first.headers['cache-control']).toBe('no-cache');
+    expect(first.headers['content-type']).toMatch(/image\/svg\+xml/);
+    expect(first.body.toString()).toBe('<svg>selected</svg>');
+    fs.writeFileSync(path.join(testDir, name), '<svg>newly selected artwork</svg>');
+    const second = await request(app)
+      .get('/' + name)
+      .set('If-None-Match', first.headers.etag)
+      .expect(200);
+    expect(second.body.toString()).toBe('<svg>newly selected artwork</svg>');
+  });
+
   beforeAll(() => {
     // Create a test directory and files
     testDir = path.join(__dirname, 'test-static');

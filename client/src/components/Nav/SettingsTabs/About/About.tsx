@@ -1,3 +1,4 @@
+import AppLogo from '~/components/ui/AppLogo';
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import copy from 'copy-to-clipboard';
 import type { TStartupConfig } from 'librechat-data-provider';
@@ -84,6 +85,10 @@ function About() {
 
   return (
     <div className="text-text-primary flex flex-col text-sm">
+      <AppLogo
+        startupConfig={startupConfig}
+        className="mb-4 h-7 max-w-full self-start object-contain"
+      />
       <dl className="divide-border-light flex flex-col divide-y">
         <Row label={localize('com_nav_about_version')} value={version} />
         <Row

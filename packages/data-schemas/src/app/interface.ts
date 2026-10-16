@@ -32,6 +32,7 @@ export async function loadDefaultInterface({
     fixedLocale: interfaceConfig?.fixedLocale,
     appVersion: interfaceConfig?.appVersion,
     pwaIcons: interfaceConfig?.pwaIcons,
+    appLogo: interfaceConfig?.appLogo,
     // UI elements - use schema defaults
     modelSelect:
       interfaceConfig?.modelSelect ??

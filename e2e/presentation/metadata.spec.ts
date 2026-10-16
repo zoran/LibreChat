@@ -50,4 +50,5 @@ test('served shell and manifest use configured presentation and the built worker
   const worker = await fs.readFile(path.resolve(__dirname, '../../client/dist/sw.js'), 'utf8');
   expect(worker).toContain('precacheAndRoute');
   expect(worker).not.toContain('manifest.webmanifest');
+  expect(worker).not.toMatch(/assets\/(?:favicon|icon-|apple-touch-icon|maskable-icon)/);
 });

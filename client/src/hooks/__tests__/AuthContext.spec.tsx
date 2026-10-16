@@ -33,6 +33,8 @@ import {
 } from '~/utils';
 import { AuthContextProvider, useAuthContext } from '../AuthContext';
 
+jest.mock('~/hooks/Auth/useAuthMode', () => () => ({ data: { authMode: 'default' } }));
+
 const mockNavigate = jest.fn();
 jest.mock('react-router-dom', () => ({
   ...jest.requireActual('react-router-dom'),
@@ -917,6 +919,37 @@ describe('AuthContextProvider — optional authentication', () => {
 
   afterEach(() => {
     window.history.replaceState({}, '', '/');
+  });
+
+  it('resolves optional identity without redirect, and separates failure from anonymous', async () => {
+    window.history.replaceState({}, '', '/login/email-code');
+    renderOptionalProvider();
+    expect(capturedAuthContext?.authResolution.status).toBe('pending');
+    const options = mockRefreshMutate.mock.calls[0][1];
+    await act(async () => {
+      options.onSuccess({ user: { id: '1', provider: 'email_code', role: 'USER' }, token: 'tok' });
+      await new Promise((resolve) => setTimeout(resolve, 80));
+    });
+    expect(capturedAuthContext?.authResolution.status).toBe('resolved');
+    expect(capturedAuthContext?.isAuthenticated).toBe(true);
+    expect(mockNavigate).not.toHaveBeenCalled();
+    act(() => options.onError(new Error('unavailable')));
+    expect(capturedAuthContext?.authResolution.status).toBe('unavailable');
+  });
+
+  it('fences a scheduled refresh after the authentication generation changes', async () => {
+    renderOptionalProvider();
+    const options = mockRefreshMutate.mock.calls[0][1];
+    await act(async () => {
+      options.onSuccess({ user: { id: 'old', role: 'USER' }, token: 'old' });
+      window.dispatchEvent(
+        new CustomEvent('authRedirectStarted', { detail: { inDocument: true } }),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 80));
+    });
+    expect(capturedAuthContext?.isAuthenticated).toBe(false);
+    expect(capturedAuthContext?.authResolution.status).toBe('pending');
+    expect(capturedAuthContext?.isAuthGenerationCurrent(0)).toBe(false);
   });
 
   it('keeps a public route visible when no refresh token exists', () => {

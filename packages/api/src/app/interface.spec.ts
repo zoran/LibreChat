@@ -1,3 +1,6 @@
+// Exercise the current schema source while shared package builds remain independent.
+jest.mock('librechat-data-provider', () => jest.requireActual('../../../data-provider/src/config'));
+
 import { buildPreLoginInterface } from './interface';
 
 describe('buildPreLoginInterface', () => {
@@ -36,4 +39,22 @@ describe('buildPreLoginInterface', () => {
     };
     expect(buildPreLoginInterface({ theme })).toEqual({ theme });
   });
+});
+
+it('projects only a validated public application logo before login', () => {
+  const appLogo = {
+    light: '/assets/logo.svg',
+    dark: '/assets/logo-dark.svg',
+    mark: '/assets/mark.svg',
+    markDark: '/assets/mark-dark.svg',
+  };
+  expect(buildPreLoginInterface({ appLogo, modelSelect: true })).toEqual({ appLogo });
+  for (const invalid of [
+    { light: 'https://outside.example/logo.svg' },
+    { light: '//outside.example/logo.svg' },
+    { light: 'assets/%2e%2e/private.svg' },
+    { light: '/assets/logo.svg', privateIdentity: 'not-public' },
+  ]) {
+    expect(buildPreLoginInterface({ appLogo: invalid })).toBeUndefined();
+  }
 });

@@ -3493,5 +3493,15 @@
   "com_auth_login_form": "Login form",
   "com_ui_show_secret": "Show secret",
   "com_ui_hide_secret": "Hide secret",
-  "com_ui_notifications_hotkey": "Notifications ({hotkey})"
+  "com_ui_notifications_hotkey": "Notifications ({hotkey})",
+  "com_auth_email_link_title": "Sign in with an email code",
+  "com_auth_email_link_invalid": "This link is no longer valid. Request a new code.",
+  "com_auth_email_link_unavailable": "Your current sign-in could not be checked. No code was redeemed.",
+  "com_auth_email_link_working": "Checking your sign-in …",
+  "com_auth_email_link_switch": "You are already signed in. Use the sign-in from this email instead?",
+  "com_auth_email_link_confirm": "Sign in using the code from this email.",
+  "com_auth_email_link_continue": "Sign in",
+  "com_auth_email_link_browser": "Open this link in the browser where you requested the code. On another device, request a new code.",
+  "com_auth_email_link_new": "Request a new code",
+  "com_auth_email_link_remaining": "Only the newest code is valid. Time remaining: {0} minutes."
 }

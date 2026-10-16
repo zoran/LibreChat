@@ -3,6 +3,7 @@ import { rootCertificates } from 'node:tls';
 import type { Socket } from 'node:net';
 import type {
   EmailCodeMailConfig,
+  EmailCodeMailMessage,
   EmailCodeMailDependencies,
   EmailCodeSMTPOptions,
 } from './mailSender';
@@ -88,6 +89,74 @@ describe('bounded approved SMTP submission', () => {
     jest.useRealTimers();
   });
 
+  it('copies a bounded PNG into an inline CID attachment with all external access disabled', async () => {
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aOBsAAAAASUVORK5CYII=',
+      'base64',
+    );
+    const original = Buffer.from(png);
+    const f = fixture({ ...config, clientUrl: 'https://portal.example.test', logoPng: png });
+    png.fill(0);
+    const pending = f.sender.sendCode({ ...input, attemptId: 'a'.repeat(43) });
+    f.sockets[0].emit('connect');
+    f.callbacks[0](null, { accepted: [input.email], response: '250 queued' });
+    await pending;
+    const message = f.messages[0] as EmailCodeMailMessage;
+    expect(message.attachments).toEqual([
+      {
+        filename: 'application-logo.png',
+        content: original,
+        contentType: 'image/png',
+        contentDisposition: 'inline',
+        cid: 'application-logo@local',
+      },
+    ]);
+    expect(message.html).toContain('src="cid:application-logo@local"');
+    expect(message).toMatchObject({ disableFileAccess: true, disableUrlAccess: true });
+    expect(f.options[0]).toMatchObject({ disableFileAccess: true, disableUrlAccess: true });
+    for (const invalid of [
+      Buffer.alloc(65537),
+      Buffer.from('<svg/>'),
+      'https://example.test/logo.png',
+    ]) {
+      expect(() => fixture({ ...config, logoPng: invalid as Buffer })).toThrow();
+    }
+  });
+
+  it('links the displayed code to the configured HTTPS origin with escaped HTML', async () => {
+    const f = fixture({
+      ...config,
+      clientUrl: 'https://portal.example.test/chat/',
+      appTitle: '<Portal & friends>',
+    });
+    const pending = f.sender.sendCode({ ...input, attemptId: 'a'.repeat(43) });
+    f.sockets[0].emit('connect');
+    f.callbacks[0](null, { accepted: [input.email], response: '250 queued' });
+    await pending;
+    const message = f.messages[0] as { html: string; text: string };
+    expect(message.html).toContain('https://portal.example.test/chat/login/email-code#attemptId=');
+    expect(message.html).toContain('&amp;code=01234567">01234567</a>');
+    expect(message.html).toContain('&lt;Portal &amp; friends&gt;');
+    expect(message.text).toContain('01234567');
+    expect(message.text).toContain('https://portal.example.test/chat/login/email-code#attemptId=');
+    expect(message.text).toContain('zehn Minuten');
+    expect(message.html).toContain('lang="de"');
+    expect(() => fixture({ ...config, clientUrl: 'http://untrusted.test' })).toThrow();
+    expect(() => fixture({ ...config, clientUrl: 'https://portal.test/?redirect=evil' })).toThrow();
+  });
+
+  it('uses the second relay after definite first-socket refusal and accepts only once', async () => {
+    const f = fixture();
+    const pending = f.sender.sendCode(input);
+    f.sockets[0].emit('error', new Error('connection refused'));
+    expect(f.options).toHaveLength(2);
+    f.sockets[1].emit('connect');
+    f.callbacks[1](null, { accepted: [input.email], response: '250 queued' });
+    await pending;
+    expect(f.sockets.every((socket) => socket.destroyed)).toBe(true);
+    expect(f.options.map((option) => option.host)).toEqual(config.hosts);
+  });
+
   it('owns the socket and resolves only after positive DATA acknowledgement for the expected recipient', async () => {
     const f = fixture();
     const pending = f.sender.sendCode(input);
@@ -118,7 +187,7 @@ describe('bounded approved SMTP submission', () => {
   it('tries the second relay after TCP non-acceptance, without extending the overall deadline', async () => {
     const f = fixture();
     const pending = f.sender.sendCode(input);
-    const rejected = await expect(pending).rejects.toMatchObject({
+    const rejected = expect(pending).rejects.toMatchObject({
       code: 'EMAIL_CODE_UNAVAILABLE',
     });
     jest.advanceTimersByTime(5_000);
@@ -293,7 +362,7 @@ describe('bounded approved SMTP submission', () => {
   it('uses the configured title in English and does not invent a second relay', async () => {
     const f = fixture({ ...config, hosts: ['smtp.example.test'], appTitle: 'Another Portal' });
     const pending = f.sender.sendCode({ ...input, locale: 'en' });
-    const rejected = await expect(pending).rejects.toMatchObject({
+    const rejected = expect(pending).rejects.toMatchObject({
       code: 'EMAIL_CODE_UNAVAILABLE',
     });
     jest.advanceTimersByTime(20_000);

@@ -263,6 +263,7 @@ export function createEmailCodeAuth(deps: EmailCodeDependencies): {
         deps.sender!.sendCode({
           email,
           code,
+          attemptId: challenge._id,
           expiresInMinutes: 10,
           locale: req.acceptsLanguages('de', 'en') === 'en' ? 'en' : 'de',
         }),

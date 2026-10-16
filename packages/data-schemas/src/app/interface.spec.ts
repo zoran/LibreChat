@@ -5,6 +5,12 @@ import { loadDefaultInterface } from './interface';
 describe('loadDefaultInterface', () => {
   it('preserves configured presentation for shell, startup and manifest consumers', async () => {
     const presentation = {
+      appLogo: {
+        light: 'assets/cortex-logo.svg',
+        dark: '/assets/cortex-logo-dark.svg',
+        mark: 'assets/cortex-mark.svg',
+        markDark: 'assets/cortex-mark-dark.svg',
+      },
       fixedLocale: 'de-DE',
       appVersion: 'v1.2.3+example.1',
       pwaIcons: [{ src: 'assets/logo.svg', sizes: 'any', type: 'image/svg+xml' }],

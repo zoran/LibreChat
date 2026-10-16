@@ -30,6 +30,7 @@ const {
   createCspPolicy,
   shellCacheHeaders,
   createPresentation,
+  emailCodeLandingHtml,
   ErrorController,
   memoryDiagnostics,
   createSecurityHeaders,
@@ -400,12 +401,23 @@ const startServer = async () => {
 
     const lang = req.cookies.lang || req.headers['accept-language']?.split(',')[0] || 'en-US';
     let updatedIndexHtml = presentation.render(lang);
-    updatedIndexHtml = maybeInjectQueryDevtoolsBootstrap(updatedIndexHtml, req);
+    const emailLanding = /\/login\/email-code\/?$/.test(req.path);
+    if (emailLanding) {
+      res.set({
+        'Cache-Control': 'no-store',
+        'Referrer-Policy': 'no-referrer',
+        'X-Frame-Options': 'DENY',
+      });
+      res.append('Content-Security-Policy', "frame-ancestors 'none'; connect-src 'self'");
+      updatedIndexHtml = emailCodeLandingHtml(updatedIndexHtml, req.headers);
+    } else {
+      updatedIndexHtml = maybeInjectQueryDevtoolsBootstrap(updatedIndexHtml, req);
+    }
 
     /* Nonce last: every injected script above must be stamped too. */
     if (cspPolicy) {
       const csp = issueCsp(cspPolicy);
-      res.set(csp.headerName, csp.headerValue);
+      res.append(csp.headerName, csp.headerValue);
       updatedIndexHtml = applyCspNonce(updatedIndexHtml, csp.nonce);
     }
 
@@ -469,7 +481,19 @@ const startServer = async () => {
 
   app.get('/index.html', sendIndexHtml);
   app.get('/manifest.webmanifest', presentation.manifestHandler);
-  app.use(staticCache(appConfig.paths.dist));
+  app.use(
+    staticCache(appConfig.paths.dist, {
+      runtimeAssets: appConfig.interfaceConfig?.appLogo
+        ? [
+            ...Object.values(appConfig.interfaceConfig.appLogo),
+            ...(appConfig.interfaceConfig.pwaIcons ?? []).map((icon) => icon.src),
+            'assets/favicon-16x16.png',
+            'assets/favicon-32x32.png',
+            'assets/apple-touch-icon-180x180.png',
+          ]
+        : [],
+    }),
+  );
   app.use(staticCache(appConfig.paths.fonts));
   app.use(staticCache(appConfig.paths.assets));
 

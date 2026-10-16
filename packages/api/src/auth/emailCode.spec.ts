@@ -1,3 +1,7 @@
+jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
+  ...jest.requireActual('../../../data-schemas/src/emailCodePolicy'),
+}));
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import request from 'supertest';
@@ -7,6 +11,10 @@ import type {
   EmailCodeRepository,
 } from '@librechat/data-schemas';
 import {
+  EMAIL_CODE_IDLE_MS,
+  EMAIL_CODE_ABSOLUTE_MS,
+  EMAIL_CODE_ACCESS_MS,
+  EMAIL_CODE_CHALLENGE_MS,
   EMAIL_ATTEMPT_COOKIE,
   AUTH_SELECTION_COOKIE,
   getAuthSelection,
@@ -151,6 +159,11 @@ describe('email-code authentication composition', () => {
   });
   afterAll(() => {
     process.env = original;
+  });
+
+  it('exports the shared90/270 policy while access/challenge stay short', () => {
+    expect([EMAIL_CODE_IDLE_MS, EMAIL_CODE_ABSOLUTE_MS]).toEqual([90 * 86400000, 270 * 86400000]);
+    expect([EMAIL_CODE_ACCESS_MS, EMAIL_CODE_CHALLENGE_MS]).toEqual([300000, 600000]);
   });
 
   it.each(['person@employees.example.test', 'person@partners.example.test'])(

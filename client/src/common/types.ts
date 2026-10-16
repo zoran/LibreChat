@@ -506,6 +506,8 @@ export type TAuthContext = {
   token: string | undefined;
   isAuthenticated: boolean;
   isAuthReady: boolean;
+  authResolution: { status: 'pending' | 'resolved' | 'unavailable'; generation: number };
+  isAuthGenerationCurrent: (generation: number) => boolean;
   error: string | undefined;
   login: (data: t.TLoginUser) => void;
   logout: (redirect?: string) => void;
@@ -515,6 +517,7 @@ export type TAuthContext = {
 };
 
 export type TUserContext = {
+  generation?: number;
   user?: t.TUser | undefined;
   token: string | undefined;
   isAuthenticated: boolean;

@@ -66,6 +66,118 @@ describe('email-code native transactional authority', () => {
     now: new Date(),
   });
 
+  it('creates the verified profile and90/270 day deadlines', async () => {
+    const value = await a.redeemEmailCode(redeem(await accepted('marc.vonderlinden@bwi.de')));
+    expect(value.user.name).toBe('Marc von der Linden');
+    expect(value.grant.idleExpiresAt - value.grant.createdAt).toBe(90 * 86400000);
+    expect(value.grant.absoluteExpiresAt - value.grant.createdAt).toBe(270 * 86400000);
+  });
+
+  it.each(['', '   ', 'Self Selected'])('fills only blank legacy names: %j', async (name) => {
+    const email = 'anna-lena.mueller-schmidt@bwi.de';
+    await runAsSystem(() =>
+      mongoose.models.User.create({
+        email,
+        tenantId: 'cortex-bwi',
+        provider: 'email_code',
+        emailVerified: true,
+        name,
+      }),
+    );
+    const value = await a.redeemEmailCode(redeem(await accepted(email)));
+    expect(value.user.name).toBe(name.trim() ? name : 'Anna-Lena Mueller-Schmidt');
+  });
+
+  it('preserves a custom name racing legacy fill', async () => {
+    const email = 'marc.vonderlinden@bwi.de';
+    const user = await runAsSystem(() =>
+      mongoose.models.User.create({
+        email,
+        tenantId: 'cortex-bwi',
+        provider: 'email_code',
+        emailVerified: true,
+        name: '',
+      }),
+    );
+    const c = await accepted(email);
+    await Promise.all([
+      a.redeemEmailCode(redeem(c)),
+      runAsSystem(() =>
+        mongoose.models.User.updateOne({ _id: user._id }, { $set: { name: 'My chosen name' } }),
+      ),
+    ]);
+    expect((await runAsSystem(() => mongoose.models.User.findById(user._id).lean())).name).toBe(
+      'My chosen name',
+    );
+  });
+
+  it('refresh/read do not extend idle and a foreground touch retains original absolute cap', async () => {
+    const value = await a.redeemEmailCode(redeem(await accepted()));
+    await b.readEmailCodeIdentity(value.grant.sessionId, 'cortex-bwi');
+    await a.rotateEmailCodeRefresh({
+      grant: value.grant,
+      oldHash: '3'.repeat(64),
+      newHash: '4'.repeat(64),
+      now: new Date(),
+    });
+    expect(
+      (await b.readEmailCodeIdentity(value.grant.sessionId, 'cortex-bwi'))?.grant.idleExpiresAt,
+    ).toBe(value.grant.idleExpiresAt);
+    const oldCap = Date.now() + 12 * 3600000;
+    await runAsSystem(() =>
+      mongoose.models.Session.updateOne(
+        { _id: value.grant.sessionId },
+        { $set: { expiration: new Date(oldCap), idleExpiresAt: new Date(Date.now() + 3600000) } },
+      ),
+    );
+    const old = (await b.readEmailCodeIdentity(value.grant.sessionId, 'cortex-bwi'))!;
+    await a.touchEmailCodeSession(old.grant, new Date());
+    const current = (await b.readEmailCodeIdentity(value.grant.sessionId, 'cortex-bwi'))!;
+    expect(current.grant.absoluteExpiresAt).toBe(oldCap);
+    expect(current.grant.idleExpiresAt).toBe(oldCap);
+    await runAsSystem(() =>
+      mongoose.models.Session.updateOne(
+        { _id: value.grant.sessionId },
+        { $set: { expiration: new Date(0) } },
+      ),
+    );
+    await a.touchEmailCodeSession(current.grant, new Date());
+    expect(await b.readEmailCodeIdentity(value.grant.sessionId, 'cortex-bwi')).toBeNull();
+    await expect(
+      a.rotateEmailCodeRefresh({
+        grant: current.grant,
+        oldHash: '4'.repeat(64),
+        newHash: '5'.repeat(64),
+        now: new Date(),
+      }),
+    ).rejects.toMatchObject({ code: 'REFRESH_REPLACED' });
+  });
+
+  it('rejects exact idle and absolute boundaries without resurrection', async () => {
+    const value = await a.redeemEmailCode(redeem(await accepted()));
+    const clock = jest.spyOn(Date, 'now');
+    try {
+      clock.mockReturnValue(value.grant.idleExpiresAt - 1);
+      expect(await b.readEmailCodeIdentity(value.grant.sessionId, 'cortex-bwi')).not.toBeNull();
+      clock.mockReturnValue(value.grant.idleExpiresAt);
+      expect(await b.readEmailCodeIdentity(value.grant.sessionId, 'cortex-bwi')).toBeNull();
+      await a.touchEmailCodeSession(value.grant, new Date(value.grant.idleExpiresAt));
+      expect(await b.readEmailCodeIdentity(value.grant.sessionId, 'cortex-bwi')).toBeNull();
+      await runAsSystem(() =>
+        mongoose.models.Session.updateOne(
+          { _id: value.grant.sessionId },
+          { $set: { idleExpiresAt: new Date(value.grant.absoluteExpiresAt + 86400000) } },
+        ),
+      );
+      clock.mockReturnValue(value.grant.absoluteExpiresAt - 1);
+      expect(await b.readEmailCodeIdentity(value.grant.sessionId, 'cortex-bwi')).not.toBeNull();
+      clock.mockReturnValue(value.grant.absoluteExpiresAt);
+      expect(await b.readEmailCodeIdentity(value.grant.sessionId, 'cortex-bwi')).toBeNull();
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
   it('commits one consume and one USER identity under concurrent proof', async () => {
     const c = await accepted();
     const results = await Promise.allSettled([

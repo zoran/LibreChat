@@ -2,6 +2,22 @@
 <html lang="en-US">
   <head>
     <meta charset="utf-8" />
+    <script>
+      (function () {
+        if (!/\/login\/email-code\/?$/.test(location.pathname)) return;
+        var fragment = location.hash;
+        history.replaceState(null, '', location.pathname);
+        var match = /^#attemptId=([A-Za-z0-9_-]{43})&code=(\d{8})$/.exec(fragment);
+        window.__emailCodeLink = match
+          ? {
+              attemptId: match[1],
+              code: match[2],
+              activated:
+                document.documentElement.getAttribute('data-email-click-navigation') === 'true',
+            }
+          : null;
+      })();
+    </script>
     <base href="/" />
     <meta name="theme-color" content="#171717" />
     <meta name="mobile-web-app-capable" content="yes" />
@@ -169,6 +185,7 @@
     </script>
     <script>
       (function () {
+        if (/\/login\/email-code\/?$/.test(location.pathname)) return;
         var KEY = 'lc-asset-recovery-at';
         var RUM_QUEUE_KEY = 'lc-rum-queue';
         var MAX_RUM_QUEUE = 20;
