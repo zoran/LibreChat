@@ -1,4 +1,5 @@
 import { atom } from 'jotai';
+import { useEffect, useRef } from 'react';
 import { Button, Spinner } from '@librechat/client';
 import { apiBaseUrl, BROWSER_SESSION_MARKER, request } from 'librechat-data-provider';
 import useClearStates from '~/hooks/Config/useClearStates';
@@ -19,37 +20,55 @@ export default function BrowserSession({
   const localize = useLocalize();
   const clearStates = useClearStates();
   const authMode = useAuthMode();
+  const confirmedMode =
+    authMode.isSuccess && !authMode.isError ? authMode.data?.authMode : undefined;
+  const defaultMode = useRef(false);
+  defaultMode.current = confirmedMode === 'default';
+  useEffect(() => {
+    defaultMode.current = confirmedMode === 'default';
+    return () => {
+      defaultMode.current = false;
+    };
+  }, [confirmedMode]);
   const busy = code === 'busy';
-  const canStart = code === 'BROWSER_SESSION_EXPIRED' || code === 'BROWSER_SESSION_FORGOTTEN';
+  const canStart =
+    confirmedMode === 'default' &&
+    (code === 'BROWSER_SESSION_EXPIRED' || code === 'BROWSER_SESSION_FORGOTTEN');
   let messageKey:
     | 'com_auth_browser_expired'
     | 'com_auth_browser_unavailable'
     | 'com_auth_browser_unsupported' = 'com_auth_browser_unavailable';
   if (canStart) {
     messageKey = 'com_auth_browser_expired';
-  } else if (code === 'BROWSER_SESSION_UNSUPPORTED') {
+  } else if (confirmedMode === 'default' && code === 'BROWSER_SESSION_UNSUPPORTED') {
     messageKey = 'com_auth_browser_unsupported';
   }
   const start = async () => {
+    if (!defaultMode.current || !canStart) return;
     if (!window.isSecureContext || !navigator.locks) {
       onState('BROWSER_SESSION_UNSUPPORTED');
       return;
     }
     onState('busy');
     try {
-      await navigator.locks.request('librechat.browser.enrollment', async () => {
+      const enrolled = await navigator.locks.request('librechat.browser.enrollment', async () => {
+        if (!defaultMode.current) return false;
         await request.resetBrowser();
+        if (!defaultMode.current) return false;
         localStorage.setItem(BROWSER_SESSION_MARKER, 'paused');
         await clearStates();
+        if (!defaultMode.current) return false;
         await request.enrollBrowser();
+        if (!defaultMode.current) return false;
         localStorage.setItem(BROWSER_SESSION_MARKER, 'active');
+        return true;
       });
-      window.location.assign(`${apiBaseUrl()}/c/new`);
+      if (enrolled && defaultMode.current) window.location.assign(`${apiBaseUrl()}/c/new`);
     } catch {
       onState('BROWSER_SESSION_UNAVAILABLE');
     }
   };
-  if (authMode.data && authMode.data.authMode !== 'default')
+  if (authMode.data && (confirmedMode === 'email_code' || confirmedMode === 'transition'))
     return (
       <main className="bg-surface-primary flex min-h-screen items-center justify-center p-6">
         <div className="text-text-primary w-full max-w-md">
@@ -61,7 +80,7 @@ export default function BrowserSession({
     <main className="bg-surface-primary flex min-h-screen items-center justify-center p-6">
       <section className="text-text-primary w-full max-w-md space-y-4" aria-live="polite">
         <h1 className="text-xl font-semibold">{localize('com_auth_browser_title')}</h1>
-        {busy ? (
+        {authMode.isLoading || (busy && confirmedMode === 'default') ? (
           <Spinner />
         ) : (
           <>

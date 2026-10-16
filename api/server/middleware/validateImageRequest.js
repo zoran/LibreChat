@@ -3,10 +3,12 @@ const {
   createImageAuthorizationMiddleware,
   getAppConfigOptionsFromUser,
   getBasePath,
+  getAuthMode,
   isEnabled,
 } = require('@librechat/api');
 const {
   findSession,
+  readEmailCodeIdentity,
   getAgent,
   getAssistant,
   getUserById,
@@ -43,6 +45,8 @@ function createValidateImageRequest(config = {}) {
         };
 
   const deps = {
+    getAuthMode,
+    readEmailCodeIdentity,
     parseCookies: cookie.parse,
     isOpenIdReuseEnabled: () => isEnabled(process.env.OPENID_REUSE_TOKENS),
     getBasePath,

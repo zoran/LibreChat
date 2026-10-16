@@ -107,6 +107,41 @@ export async function validateEmailCodeBearer(
   return identity && eligible(identity) && matches(payload, identity.grant) ? identity : null;
 }
 
+/** Only logout may ignore expiry; signed claims there authorize exact-session revocation only. */
+function parseSignedRefresh(token: unknown, ignoreExpiration = false): GrantClaims | null {
+  if (typeof token !== 'string' || !process.env.JWT_REFRESH_SECRET) return null;
+  let payload: unknown;
+  try {
+    payload = jwt.verify(token, process.env.JWT_REFRESH_SECRET, {
+      algorithms: ['HS256'],
+      ignoreExpiration,
+    });
+  } catch {
+    return null;
+  }
+  return claims(payload, 'refresh') &&
+    Number.isFinite(payload.exp) &&
+    payload.generation >= 0 &&
+    payload.tenantId === getEmailCodeSettings().tenantId
+    ? payload
+    : null;
+}
+
+/** Read current durable refresh authority without rotation, cookie writes or idle renewal. */
+export async function validateEmailCodeRefresh(
+  token: unknown,
+  repository: Pick<EmailCodeRepository, 'readEmailCodeIdentity'>,
+): Promise<EmailCodeIdentity | null> {
+  if (getAuthMode() === 'default' || !getEmailCodeSettings().configured) return null;
+  const payload = parseSignedRefresh(token);
+  if (!payload) return null;
+  const identity = await repository.readEmailCodeIdentity(payload.sessionId, payload.tenantId, {
+    refreshTokenHash: hash(payload.jti!),
+    refreshGeneration: payload.generation,
+  });
+  return identity && eligible(identity) && matches(payload, identity.grant) ? identity : null;
+}
+
 function issueTokens(identity: EmailCodeIdentity, refreshNonce: string) {
   const { grant } = identity;
   const now = Date.now();
@@ -316,19 +351,8 @@ export function createEmailCodeAuth(deps: EmailCodeDependencies): {
   });
 
   function signedRefresh(req: Request, ignoreExpiration = false): GrantClaims {
-    const token = req.cookies?.refreshToken;
-    if (typeof token !== 'string' || !process.env.JWT_REFRESH_SECRET) fail('AUTH_SESSION_REQUIRED');
-    let payload: unknown;
-    try {
-      payload = jwt.verify(token, process.env.JWT_REFRESH_SECRET, {
-        algorithms: ['HS256'],
-        ignoreExpiration,
-      });
-    } catch {
-      fail('AUTH_SESSION_REQUIRED');
-    }
-    if (!claims(payload, 'refresh') || payload.tenantId !== getEmailCodeSettings().tenantId)
-      fail('AUTH_SESSION_REQUIRED');
+    const payload = parseSignedRefresh(req.cookies?.refreshToken, ignoreExpiration);
+    if (!payload) fail('AUTH_SESSION_REQUIRED');
     return payload;
   }
 

@@ -153,6 +153,82 @@ describe('email-code native transactional authority', () => {
     ).rejects.toMatchObject({ code: 'REFRESH_REPLACED' });
   });
 
+  it('matches the current nonce hash and generation together without mutating the grant', async () => {
+    const value = await a.redeemEmailCode(redeem(await accepted()));
+    const read = (refreshTokenHash = '3'.repeat(64), refreshGeneration = 0) =>
+      b.readEmailCodeIdentity(value.grant.sessionId, 'cortex-bwi', {
+        refreshTokenHash,
+        refreshGeneration,
+      });
+    const before = await runAsSystem(() =>
+      mongoose.models.Session.findById(value.grant.sessionId).lean(),
+    );
+    expect(await read()).toEqual(value);
+    expect(await read('4'.repeat(64))).toBeNull();
+    expect(await read('3'.repeat(64), 1)).toBeNull();
+    expect(await read('', 0)).toBeNull();
+    expect(await read('3'.repeat(64), -1)).toBeNull();
+    expect(
+      await runAsSystem(() => mongoose.models.Session.findById(value.grant.sessionId).lean()),
+    ).toEqual(before);
+    await a.rotateEmailCodeRefresh({
+      grant: value.grant,
+      oldHash: '3'.repeat(64),
+      newHash: '4'.repeat(64),
+      now: new Date(),
+    });
+    expect(await read()).toBeNull();
+    expect(await read('4'.repeat(64), 0)).toBeNull();
+    expect((await read('4'.repeat(64), 1))?.grant.refreshGeneration).toBe(1);
+    await a.revokeEmailCodeSession(value.grant.sessionId, value.user.id, 'cortex-bwi');
+    expect(await read('4'.repeat(64), 1)).toBeNull();
+  });
+
+  it.each([
+    ['User', 'authDisabled', true],
+    ['User', 'emailVerified', false],
+    ['User', 'provider', 'local'],
+    ['User', 'authVersion', 1],
+    ['User', 'credentialsChangedAt', new Date('2099-01-01')],
+    ['User', 'twoFactorEnrolledAt', new Date('2099-01-01')],
+    ['User', 'agentTriggerDeletionStartedAt', new Date('2099-01-01')],
+    ['Session', 'revokedAt', new Date(0)],
+    ['Session', 'expiration', new Date(0)],
+    ['Session', 'idleExpiresAt', new Date(0)],
+  ])(
+    'retains live identity checks with current-refresh proof: %s.%s',
+    async (model, field, changed) => {
+      const value = await a.redeemEmailCode(redeem(await accepted()));
+      const current = { refreshTokenHash: '3'.repeat(64), refreshGeneration: 0 };
+      expect(
+        await b.readEmailCodeIdentity(value.grant.sessionId, 'another-tenant', current),
+      ).toBeNull();
+      await runAsSystem(() =>
+        mongoose.models[model as string].updateOne(
+          {
+            _id: model === 'User' ? value.user.id : value.grant.sessionId,
+          },
+          { $set: { [field as string]: changed } },
+        ),
+      );
+      expect(
+        await b.readEmailCodeIdentity(value.grant.sessionId, 'cortex-bwi', current),
+      ).toBeNull();
+    },
+  );
+
+  it('propagates an operational current-refresh read failure', async () => {
+    jest.spyOn(mongoose.models.Session, 'findOne').mockImplementationOnce(() => {
+      throw new Error('database unavailable');
+    });
+    await expect(
+      b.readEmailCodeIdentity('1'.repeat(24), 'cortex-bwi', {
+        refreshTokenHash: '3'.repeat(64),
+        refreshGeneration: 0,
+      }),
+    ).rejects.toThrow('database unavailable');
+  });
+
   it('rejects exact idle and absolute boundaries without resurrection', async () => {
     const value = await a.redeemEmailCode(redeem(await accepted()));
     const clock = jest.spyOn(Date, 'now');

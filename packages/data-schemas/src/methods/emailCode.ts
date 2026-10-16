@@ -324,13 +324,30 @@ export function createEmailCodeMethods(mongoose: typeof import('mongoose')): Ema
     });
   }
 
-  async function readEmailCodeIdentity(sessionId: string, tenantId: string) {
+  async function readEmailCodeIdentity(
+    sessionId: string,
+    tenantId: string,
+    currentRefresh?: Parameters<EmailCodeRepository['readEmailCodeIdentity']>[2],
+  ) {
     if (!/^[a-f0-9]{24}$/.test(sessionId)) return null;
+    if (
+      currentRefresh !== undefined &&
+      (!currentRefresh ||
+        typeof currentRefresh.refreshTokenHash !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(currentRefresh.refreshTokenHash) ||
+        !Number.isSafeInteger(currentRefresh.refreshGeneration) ||
+        currentRefresh.refreshGeneration < 0)
+    )
+      return null;
     return scoped(tenantId, async () => {
       const session = await mongoose.models.Session.findOne({
         _id: sessionId,
         tenantId,
         authMethod: 'email_code',
+        ...(currentRefresh && {
+          refreshTokenHash: currentRefresh.refreshTokenHash,
+          refreshGeneration: currentRefresh.refreshGeneration,
+        }),
       })
         .read('primary')
         .readConcern('linearizable')

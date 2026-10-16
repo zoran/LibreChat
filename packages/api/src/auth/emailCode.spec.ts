@@ -22,7 +22,11 @@ import {
   mayRefreshGuest,
   setAuthSelection,
 } from './authMode';
-import { createEmailCodeAuth, validateEmailCodeBearer } from './emailCode';
+import {
+  createEmailCodeAuth,
+  validateEmailCodeBearer,
+  validateEmailCodeRefresh,
+} from './emailCode';
 
 const parseCookies: (value: string) => Record<string, string> = jest.requireActual('cookie').parse;
 const error = (code: string) => Object.assign(new Error(code), { code });
@@ -90,8 +94,12 @@ function fixture(sendFails = false) {
       };
       return copy(identity);
     }),
-    readEmailCodeIdentity: jest.fn(async (sid, tenant) =>
-      identity?.grant.sessionId === sid && identity.grant.tenantId === tenant
+    readEmailCodeIdentity: jest.fn(async (sid, tenant, currentRefresh) =>
+      identity?.grant.sessionId === sid &&
+      identity.grant.tenantId === tenant &&
+      (!currentRefresh ||
+        (currentRefresh.refreshTokenHash === refreshHash &&
+          currentRefresh.refreshGeneration === identity.grant.refreshGeneration))
         ? copy(identity)
         : null,
     ),
@@ -159,6 +167,105 @@ describe('email-code authentication composition', () => {
   });
   afterAll(() => {
     process.env = original;
+  });
+
+  describe('read-only current refresh authority', () => {
+    async function authenticated() {
+      const f = fixture();
+      const challenge = await request(f.app)
+        .post('/request')
+        .send({ email: 'person@employees.example.test' });
+      const response = await request(f.app)
+        .post('/verify')
+        .set('Cookie', cookies(challenge))
+        .send({ attemptId: challenge.body.attemptId, code: f.code() });
+      expect(response.status).toBe(200);
+      return { ...f, response, token: parseCookies(cookies(response)).refreshToken };
+    }
+
+    it('reads the current nonce and generation without rotation or idle extension', async () => {
+      const f = await authenticated();
+      const before = await validateEmailCodeRefresh(f.token, f.repository);
+      expect(before?.user.provider).toBe('email_code');
+      expect(await validateEmailCodeRefresh(f.token, f.repository)).toEqual(before);
+      expect(f.repository.rotateEmailCodeRefresh).not.toHaveBeenCalled();
+      expect(f.repository.touchEmailCodeSession).not.toHaveBeenCalled();
+      expect(f.repository.revokeEmailCodeSession).not.toHaveBeenCalled();
+      const refreshed = await request(f.app).post('/refresh').set('Cookie', cookies(f.response));
+      expect(refreshed.status).toBe(200);
+      expect(await validateEmailCodeRefresh(f.token, f.repository)).toBeNull();
+      expect(
+        (
+          await validateEmailCodeRefresh(
+            parseCookies(cookies(refreshed)).refreshToken,
+            f.repository,
+          )
+        )?.grant,
+      ).toMatchObject({
+        refreshGeneration: 1,
+        idleExpiresAt: before!.grant.idleExpiresAt,
+        absoluteExpiresAt: before!.grant.absoluteExpiresAt,
+      });
+      // The replaced credential still has exact-session logout authority, never image authority.
+      expect((await request(f.app).post('/logout').set('Cookie', cookies(f.response))).status).toBe(
+        200,
+      );
+      expect(
+        await validateEmailCodeRefresh(parseCookies(cookies(refreshed)).refreshToken, f.repository),
+      ).toBeNull();
+    });
+
+    it('rejects signed but ineligible credentials and never treats database failure as absence', async () => {
+      const f = await authenticated();
+      const payload = jwt.decode(f.token) as jwt.JwtPayload;
+      const invalidClaims = [
+        { tokenUse: 'access' },
+        { authMethod: 'browser' },
+        { jti: 'malformed' },
+        { generation: -1 },
+        { tenantId: 'another-tenant' },
+        { policyVersion: 2 },
+        { authVersion: 2 },
+        { id: '2'.repeat(24) },
+        { sessionId: '2'.repeat(24) },
+        { exp: 1 },
+        { exp: undefined },
+      ];
+      for (const changes of invalidClaims) {
+        const changed = { ...payload, ...changes };
+        if (changed.exp === undefined) delete changed.exp;
+        const token = jwt.sign(changed, process.env.JWT_REFRESH_SECRET!, { algorithm: 'HS256' });
+        expect(await validateEmailCodeRefresh(token, f.repository)).toBeNull();
+      }
+      for (const token of [
+        undefined,
+        '',
+        {},
+        'openid-refresh',
+        f.response.body.token,
+        jwt.sign({ id: payload.id }, process.env.JWT_REFRESH_SECRET!, { expiresIn: '1h' }),
+        jwt.sign(payload, 'wrong-secret'),
+        jwt.sign(payload, process.env.JWT_REFRESH_SECRET!, { algorithm: 'HS384' }),
+      ]) {
+        expect(await validateEmailCodeRefresh(token, f.repository)).toBeNull();
+      }
+      process.env.EMAIL_CODE_ALLOWED_DOMAINS = 'other.example.test';
+      expect(await validateEmailCodeRefresh(f.token, f.repository)).toBeNull();
+      process.env.EMAIL_CODE_ALLOWED_DOMAINS = 'employees.example.test';
+      process.env.EMAIL_CODE_ENABLED = 'false';
+      expect(await validateEmailCodeRefresh(f.token, f.repository)).not.toBeNull();
+      process.env.AUTH_MODE = 'default';
+      expect(await validateEmailCodeRefresh(f.token, f.repository)).toBeNull();
+      process.env.AUTH_MODE = 'email_code';
+      (f.repository.readEmailCodeIdentity as jest.Mock).mockRejectedValueOnce(
+        new Error('database unavailable'),
+      );
+      await expect(validateEmailCodeRefresh(f.token, f.repository)).rejects.toThrow(
+        'database unavailable',
+      );
+      (f.repository.readEmailCodeIdentity as jest.Mock).mockResolvedValueOnce(null);
+      expect(await validateEmailCodeRefresh(f.token, f.repository)).toBeNull();
+    });
   });
 
   it('exports the shared90/270 policy while access/challenge stay short', () => {

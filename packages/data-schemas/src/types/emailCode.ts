@@ -77,7 +77,12 @@ export interface EmailCodeRepository {
   getEmailCodeChallenge(attemptId: string, tenantId: string): Promise<EmailCodeChallenge | null>;
   consumeEmailCodeNetwork(key: string, now: Date): Promise<void>;
   redeemEmailCode(input: EmailCodeRedeemInput): Promise<EmailCodeIdentity>;
-  readEmailCodeIdentity(sessionId: string, tenantId: string): Promise<EmailCodeIdentity | null>;
+  /** Optional exact current-refresh proof is matched in the same read; never rotates or touches. */
+  readEmailCodeIdentity(
+    sessionId: string,
+    tenantId: string,
+    currentRefresh?: { refreshTokenHash: string; refreshGeneration: number },
+  ): Promise<EmailCodeIdentity | null>;
   rotateEmailCodeRefresh(input: {
     grant: EmailCodeGrant;
     oldHash: string;

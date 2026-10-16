@@ -1,8 +1,10 @@
 import jwt from 'jsonwebtoken';
 import { createHash } from 'node:crypto';
+import { logger } from '@librechat/data-schemas';
 import type { NextFunction, Request, Response } from 'express';
 import type { ImageAuthorizationDeps } from './authorization';
 import { createImageAuthorizationMiddleware } from './authorization';
+import { getAuthMode } from '~/auth/authMode';
 
 const VIEWER_ID = '65cfb246f7ecadb8b1e8036b';
 const OWNER_ID = '65cfb246f7ecadb8b1e8036c';
@@ -21,6 +23,8 @@ function createResponse(): Response {
 
 function createDeps(): ImageAuthorizationDeps {
   return {
+    getAuthMode,
+    readEmailCodeIdentity: jest.fn().mockResolvedValue(null),
     parseCookies: (header: string) =>
       Object.fromEntries(
         header.split(';').map((part: string) => {
@@ -82,11 +86,203 @@ describe('createImageAuthorizationMiddleware', () => {
   let next: jest.MockedFunction<NextFunction>;
 
   beforeEach(() => {
+    process.env.AUTH_MODE = 'default';
     process.env.ENFORCE_TWO_FACTOR_AUTHENTICATION = 'false';
     process.env.JWT_REFRESH_SECRET = 'image-authorization-secret';
     deps = createDeps();
     response = createResponse();
     next = jest.fn();
+  });
+
+  describe('mandatory current email identity', () => {
+    const original = { ...process.env };
+    const nonce = 'n'.repeat(43);
+    const sessionId = '1'.repeat(24);
+    let token: string;
+    beforeEach(() => {
+      process.env.AUTH_MODE = 'email_code';
+      process.env.EMAIL_CODE_TENANT_ID = 'tenant-a';
+      process.env.EMAIL_CODE_ALLOWED_DOMAINS = 'employees.example.test';
+      process.env.EMAIL_CODE_HMAC_KEY = 'test-only-image-key-'.repeat(3);
+      process.env.EMAIL_CODE_POLICY_VERSION = '1';
+      const createdAt = Date.now();
+      const identity = {
+        user: {
+          id: VIEWER_ID,
+          _id: VIEWER_ID,
+          email: 'person@employees.example.test',
+          emailVerified: true,
+          provider: 'email_code',
+          tenantId: 'tenant-a',
+          role: 'USER',
+          name: 'Person',
+          username: 'person',
+        },
+        grant: {
+          userId: VIEWER_ID,
+          sessionId,
+          tenantId: 'tenant-a',
+          authVersion: 0,
+          policyVersion: 1,
+          refreshGeneration: 2,
+          createdAt,
+          absoluteExpiresAt: createdAt + 86400000,
+          idleExpiresAt: createdAt + 3600000,
+        },
+      };
+      token = jwt.sign(
+        {
+          id: VIEWER_ID,
+          sessionId,
+          tenantId: 'tenant-a',
+          authMethod: 'email_code',
+          authVersion: 0,
+          policyVersion: 1,
+          generation: 2,
+          issuedAtMs: createdAt,
+          tokenUse: 'refresh',
+          jti: nonce,
+        },
+        process.env.JWT_REFRESH_SECRET!,
+        { algorithm: 'HS256', expiresIn: '1h' },
+      );
+      (deps.readEmailCodeIdentity as jest.Mock).mockImplementation(async (sid, tenant, current) =>
+        sid === sessionId &&
+        tenant === 'tenant-a' &&
+        current?.refreshGeneration === 2 &&
+        current?.refreshTokenHash === createHash('sha256').update(nonce).digest('hex')
+          ? identity
+          : null,
+      );
+      // Generic sessions hash the whole JWT; this is deliberately not an email-session match.
+      (deps.findSession as jest.Mock).mockResolvedValue(null);
+    });
+    afterAll(() => {
+      process.env = original;
+    });
+
+    it('accepts the real nonce-shaped email grant without rotating or generic-session fallback', async () => {
+      await createImageAuthorizationMiddleware({}, deps)(
+        createRequest(`/images/${VIEWER_ID}/private.png`, `refreshToken=${token}`),
+        response,
+        next,
+      );
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(response.locals.privateImageCache).toBe(true);
+      expect(deps.findSession).not.toHaveBeenCalled();
+    });
+
+    it.each([true, false])(
+      'rejects an active legacy refresh with secureImageLinks=%s',
+      async (secureImageLinks) => {
+        (deps.findSession as jest.Mock).mockResolvedValue({ _id: 'legacy-session' });
+        await createImageAuthorizationMiddleware({ secureImageLinks }, deps)(
+          createRequest(`/images/${VIEWER_ID}/private.png`, `refreshToken=${signUser(VIEWER_ID)}`),
+          response,
+          next,
+        );
+        expect(next).not.toHaveBeenCalled();
+        expect(response.status).toHaveBeenCalledWith(403);
+        expect(deps.findSession).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      'static',
+      'dynamic',
+      'malformed',
+      'missing-owner',
+      'public-agent',
+      'other-owner',
+      'other-tenant',
+    ])('does not bypass identity and resource policy: %s', async (scenario) => {
+      let path = `/images/${OWNER_ID}/private.png`;
+      let cookie: string | undefined;
+      if (scenario === 'dynamic')
+        deps.getImageConfig = jest.fn().mockResolvedValue({ secureImageLinks: false });
+      if (scenario === 'malformed') path = '/images/logo.png';
+      if (scenario === 'missing-owner') (deps.getUserById as jest.Mock).mockResolvedValue(null);
+      if (scenario === 'public-agent') {
+        path = AGENT_PATH;
+        (deps.getAgent as jest.Mock).mockResolvedValue({ _id: AGENT_DB_ID });
+        (deps.hasPermission as jest.Mock).mockResolvedValue(true);
+      }
+      if (scenario === 'other-owner' || scenario === 'other-tenant')
+        cookie = `refreshToken=${token}`;
+      if (scenario === 'other-tenant') {
+        path = AGENT_PATH;
+        (deps.getUserById as jest.Mock).mockImplementation(async (id) => ({
+          role: 'USER',
+          tenantId: id === OWNER_ID ? 'tenant-b' : 'tenant-a',
+        }));
+        (deps.getAgent as jest.Mock).mockResolvedValue({ _id: AGENT_DB_ID });
+        (deps.hasPermission as jest.Mock).mockResolvedValue(true);
+      }
+      await createImageAuthorizationMiddleware({ secureImageLinks: false }, deps)(
+        createRequest(path, cookie),
+        response,
+        next,
+      );
+      expect(next).not.toHaveBeenCalled();
+      expect(response.status).toHaveBeenCalledWith(cookie ? 403 : 401);
+    });
+
+    it('retains same-tenant stored avatar permissions for a current email user', async () => {
+      (deps.getUserById as jest.Mock).mockResolvedValue({
+        role: 'USER',
+        tenantId: 'tenant-a',
+        avatar: USER_AVATAR_PATH,
+      });
+      await createImageAuthorizationMiddleware({ secureImageLinks: false }, deps)(
+        createRequest(USER_AVATAR_PATH, `refreshToken=${token}`),
+        response,
+        next,
+      );
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(response.locals.privateImageCache).toBe(true);
+    });
+
+    it('rejects OpenID session reuse and guest markers without consulting legacy sessions', async () => {
+      (deps.isOpenIdReuseEnabled as jest.Mock).mockReturnValue(true);
+      (deps.findSession as jest.Mock).mockResolvedValue({ _id: 'legacy-session' });
+      const refresh = 'provider-refresh';
+      const req = Object.assign(
+        createRequest(
+          `/images/${VIEWER_ID}/private.png`,
+          `refreshToken=${refresh}; token_provider=openid; openid_user_id=${signOpenIdUser(VIEWER_ID, refresh)}`,
+        ),
+        { session: { openidTokens: { refreshToken: refresh } } },
+      );
+      const middleware = createImageAuthorizationMiddleware({ secureImageLinks: false }, deps);
+      await middleware(req, response, next);
+      expect(response.status).toHaveBeenCalledWith(403);
+      await middleware(
+        createRequest(req.originalUrl, 'browserId=guest; librechat_auth_selection=guest'),
+        response,
+        next,
+      );
+      expect(response.status).toHaveBeenCalledWith(401);
+      expect(next).not.toHaveBeenCalled();
+      expect(deps.findSession).not.toHaveBeenCalled();
+    });
+
+    it('fails closed without exposing current-identity database error contents', async () => {
+      const secret = 'synthetic-private-refresh-value';
+      (deps.readEmailCodeIdentity as jest.Mock).mockRejectedValue(new Error(secret));
+      const log = jest.spyOn(logger, 'error').mockReturnValue(logger);
+      await createImageAuthorizationMiddleware({ secureImageLinks: false }, deps)(
+        createRequest(`/images/${VIEWER_ID}/private.png`, `refreshToken=${token}`),
+        response,
+        next,
+      );
+      expect(next).not.toHaveBeenCalled();
+      expect(response.status).toHaveBeenCalledWith(500);
+      expect(response.send).toHaveBeenCalledWith('Internal Server Error');
+      expect(log).toHaveBeenCalledWith('[imageAuthorization] Error authorizing image request', {
+        type: 'Error',
+      });
+      expect(JSON.stringify(log.mock.calls)).not.toContain(secret);
+    });
   });
 
   it('authenticates an active session and allows the owner path', async () => {

@@ -8,6 +8,7 @@ jest.mock('@librechat/api', () => ({
   isEnabled: jest.fn(),
 }));
 jest.mock('~/models', () => ({
+  readEmailCodeIdentity: jest.fn(),
   findSession: jest.fn(),
   getAgent: jest.fn(),
   getAssistant: jest.fn(),
@@ -22,6 +23,7 @@ jest.mock('~/server/services/Config', () => ({
 
 const { isEnabled } = require('@librechat/api');
 const {
+  readEmailCodeIdentity,
   findSession,
   getAgent,
   getAssistant,
@@ -38,6 +40,7 @@ describe('validateImageRequest middleware', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    process.env.AUTH_MODE = 'default';
     req = {
       headers: {},
       originalUrl: '',
@@ -66,6 +69,101 @@ describe('validateImageRequest middleware', () => {
 
   afterEach(() => {
     jest.clearAllMocks();
+  });
+
+  describe('email-only composition through the built TS owner', () => {
+    const original = { ...process.env };
+    beforeEach(() => {
+      process.env.AUTH_MODE = 'email_code';
+      process.env.EMAIL_CODE_TENANT_ID = 'tenant-a';
+      process.env.EMAIL_CODE_ALLOWED_DOMAINS = 'employees.example.test';
+      process.env.EMAIL_CODE_HMAC_KEY = 'test-only-email-image-key-'.repeat(3);
+      process.env.EMAIL_CODE_POLICY_VERSION = '1';
+    });
+    afterAll(() => {
+      process.env = original;
+    });
+
+    test.each([false, { secureImageLinks: false }])(
+      'closes false-option legacy access: %j',
+      async (options) => {
+        getAppConfig.mockResolvedValue({ secureImageLinks: false, endpoints: {} });
+        req.originalUrl = `/images/${validObjectId}/private.png`;
+        req.headers.cookie = `refreshToken=${jwt.sign({ id: validObjectId }, process.env.JWT_REFRESH_SECRET, { expiresIn: '1h' })}`;
+        await createValidateImageRequest(options)(req, res, next);
+        expect(next).not.toHaveBeenCalled();
+        expect(res.status).toHaveBeenCalledWith(403);
+        expect(findSession).not.toHaveBeenCalled();
+      },
+    );
+
+    test('admits a current nonce-shaped identity but still denies another private owner', async () => {
+      const nonce = 'n'.repeat(43);
+      const sessionId = '1'.repeat(24);
+      const now = Date.now();
+      const token = jwt.sign(
+        {
+          id: validObjectId,
+          sessionId,
+          tenantId: 'tenant-a',
+          authMethod: 'email_code',
+          tokenUse: 'refresh',
+          authVersion: 0,
+          policyVersion: 1,
+          generation: 0,
+          issuedAtMs: now,
+          jti: nonce,
+        },
+        process.env.JWT_REFRESH_SECRET,
+        { algorithm: 'HS256', expiresIn: '1h' },
+      );
+      readEmailCodeIdentity.mockImplementation(async (sid, tenant, current) => {
+        if (
+          sid !== sessionId ||
+          tenant !== 'tenant-a' ||
+          current?.refreshGeneration !== 0 ||
+          current?.refreshTokenHash !== createHash('sha256').update(nonce).digest('hex')
+        )
+          return null;
+        return {
+          user: {
+            id: validObjectId,
+            _id: validObjectId,
+            email: 'person@employees.example.test',
+            emailVerified: true,
+            provider: 'email_code',
+            tenantId: 'tenant-a',
+            role: 'USER',
+            name: 'Person',
+            username: 'person',
+          },
+          grant: {
+            userId: validObjectId,
+            sessionId,
+            tenantId: 'tenant-a',
+            authVersion: 0,
+            policyVersion: 1,
+            refreshGeneration: 0,
+            createdAt: now,
+            absoluteExpiresAt: now + 86400000,
+            idleExpiresAt: now + 3600000,
+          },
+        };
+      });
+      findSession.mockResolvedValue(null);
+      req.headers.cookie = `refreshToken=${token}`;
+      req.originalUrl = `/images/${validObjectId}/private.png`;
+      const middleware = createValidateImageRequest(false);
+      await middleware(req, res, next);
+      expect(next).toHaveBeenCalledTimes(1);
+      expect(res.locals.privateImageCache).toBe(true);
+      next.mockClear();
+      req.originalUrl = '/images/65cfb246f7ecadb8b1e8036c/private.png';
+      await middleware(req, res, next);
+      expect(next).not.toHaveBeenCalled();
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(findSession).not.toHaveBeenCalled();
+    });
   });
 
   describe('Factory function', () => {

@@ -9,9 +9,13 @@ import {
   tenantStorage,
 } from '@librechat/data-schemas';
 import type { IAgent, IAssistant, AssistantQuery, SystemCapability } from '@librechat/data-schemas';
+import type { EmailCodeRepository } from '@librechat/data-schemas';
+import type { AuthMode } from 'librechat-data-provider';
 import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import type { FilterQuery, ProjectionType, Types } from 'mongoose';
 import type { TokenIssuance, TwoFactorAccount, TwoFactorTokenCredential } from '~/auth/twoFactor';
+import { validateEmailCodeRefresh } from '~/auth/emailCode';
+import { getSafeErrorMetadata } from '~/utils/errors';
 import {
   isTokenRetired,
   isTwoFactorEnrollmentRequired,
@@ -64,7 +68,7 @@ type ResolvedImageConfig = {
 type CookieAuthResult =
   | { status: 'missing' }
   | { status: 'invalid' }
-  | ({ status: 'authenticated' } & TwoFactorTokenCredential);
+  | ({ status: 'authenticated'; tenantId?: string } & TwoFactorTokenCredential);
 
 type OpenIdCookieAuthResult =
   | { status: 'invalid' }
@@ -72,6 +76,8 @@ type OpenIdCookieAuthResult =
   | ({ status: 'authenticated'; userId: string } & TokenIssuance);
 
 export interface ImageAuthorizationDeps {
+  getAuthMode: () => AuthMode;
+  readEmailCodeIdentity: EmailCodeRepository['readEmailCodeIdentity'];
   parseCookies: (cookieHeader: string) => Record<string, string | undefined>;
   isOpenIdReuseEnabled: () => boolean;
   getBasePath: () => string;
@@ -228,6 +234,7 @@ function getStoredPathCandidates(canonicalPath: string): string[] {
 async function authenticateRequest(
   req: ImageRequest,
   deps: ImageAuthorizationDeps,
+  requiredEmail = false,
 ): Promise<CookieAuthResult> {
   const cookieHeader = req.headers.cookie;
   if (!cookieHeader) {
@@ -244,6 +251,18 @@ async function authenticateRequest(
   const refreshToken = parsed.refreshToken;
   if (!refreshToken) {
     return { status: 'missing' };
+  }
+
+  if (requiredEmail) {
+    const identity = await validateEmailCodeRefresh(refreshToken, deps);
+    return identity
+      ? {
+          status: 'authenticated',
+          userId: identity.grant.userId,
+          tenantId: identity.grant.tenantId,
+          issuedAtMs: identity.grant.createdAt,
+        }
+      : { status: 'invalid' };
   }
 
   if (parsed.token_provider === 'openid' && deps.isOpenIdReuseEnabled()) {
@@ -437,23 +456,29 @@ export function createImageAuthorizationMiddleware(
   options: ImageAuthorizationOptions,
   deps: ImageAuthorizationDeps,
 ): RequestHandler {
-  if (!deps.getImageConfig && options.secureImageLinks === false) {
-    return (_req: Request, _res: Response, next: NextFunction): void => next();
-  }
-
   return async function authorizeImageRequest(
     req: ImageRequest,
     res: Response,
     next: NextFunction,
   ): Promise<void> {
     try {
+      const requiredEmail = deps.getAuthMode() === 'email_code';
+      const emailAuth = requiredEmail ? await authenticateRequest(req, deps, true) : undefined;
+      if (emailAuth && emailAuth.status !== 'authenticated') {
+        denyRequest(res, emailAuth);
+        return;
+      }
+      if (!requiredEmail && !deps.getImageConfig && options.secureImageLinks === false) {
+        next();
+        return;
+      }
       const imagePath = parseImagePath(req.originalUrl, deps.getBasePath());
       if (!imagePath) {
-        if (options.secureImageLinks === false) {
+        if (!requiredEmail && options.secureImageLinks === false) {
           next();
           return;
         }
-        const auth = await authenticateRequest(req, deps);
+        const auth = emailAuth ?? (await authenticateRequest(req, deps));
         denyRequest(res, auth);
         return;
       }
@@ -462,16 +487,16 @@ export function createImageAuthorizationMiddleware(
         deps.getUserById(imagePath.ownerId, IMAGE_USER_PROJECTION),
       );
       if (!owner) {
-        if (options.secureImageLinks === false) {
+        if (!requiredEmail && options.secureImageLinks === false) {
           next();
           return;
         }
-        const auth = await authenticateRequest(req, deps);
+        const auth = emailAuth ?? (await authenticateRequest(req, deps));
         denyRequest(res, auth);
         return;
       }
 
-      const authPromise = authenticateRequest(req, deps);
+      const authPromise = emailAuth ? Promise.resolve(emailAuth) : authenticateRequest(req, deps);
       void authPromise.catch(() => undefined);
       const loadImageConfig = (): Promise<ResolvedImageConfig> =>
         resolveImageConfig(imagePath.ownerId, owner, options, deps);
@@ -481,7 +506,7 @@ export function createImageAuthorizationMiddleware(
             loadImageConfig,
           )
         : await runAsSystem(loadImageConfig);
-      if (!imageConfig.secureImageLinks) {
+      if (!requiredEmail && !imageConfig.secureImageLinks) {
         next();
         return;
       }
@@ -501,6 +526,16 @@ export function createImageAuthorizationMiddleware(
         }
       }
       const viewerId = auth.status === 'authenticated' ? auth.userId : undefined;
+      if (
+        requiredEmail &&
+        (auth.status !== 'authenticated' ||
+          !viewer ||
+          auth.tenantId !== owner.tenantId ||
+          viewer.tenantId !== owner.tenantId)
+      ) {
+        denyRequest(res, auth);
+        return;
+      }
       if (viewerId === imagePath.ownerId) {
         next();
         return;
@@ -541,7 +576,10 @@ export function createImageAuthorizationMiddleware(
 
       denyRequest(res, auth);
     } catch (error) {
-      logger.error('[imageAuthorization] Error authorizing image request', error);
+      logger.error(
+        '[imageAuthorization] Error authorizing image request',
+        getSafeErrorMetadata(error),
+      );
       res.status(500).send('Internal Server Error');
     }
   };
