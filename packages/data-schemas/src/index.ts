@@ -15,6 +15,7 @@ export {
   createMethods,
   createGenerationAdmissionMethods,
   GenerationAdmissionStorageError,
+  snapshotGenerationCheckpointAdmission,
   AGENT_OWNER_CONTACT_RESOLVED_FIELD,
   AgentSortCursorError,
   CLIENT_MESSAGE_SELECT,

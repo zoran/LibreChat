@@ -101,10 +101,12 @@ export type { GenerationSettlementState } from './interfaces/IJobStore';
 export {
   generationRequestBinding,
   GenerationAdmissionHeldError,
+  GenerationAdmissionCoordinator,
   awaitGenerationAuxiliaryWork,
 } from './generationAdmission';
 export type {
   GenerationAdmissionConfiguration,
   GenerationAdmissionCensus,
   GenerationRequestBinding,
+  GenerationCheckpointRecoveryPorts,
 } from './generationAdmission';

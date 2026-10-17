@@ -24,6 +24,7 @@ import {
   checkpointOwnerNamespacePrefix,
   createCheckpointNamespace,
 } from '../../stream/checkpoints';
+import { checkpointTestEnvironment } from './__tests__/helpers/mongo';
 import { resolveCheckpointerConfig } from './config';
 import { openCheckpointDeletion } from './deletion';
 import { DurableMongoSaver } from './durable';
@@ -59,12 +60,12 @@ async function collect(rows: AsyncIterable<CheckpointTuple>): Promise<Checkpoint
 let mongo: MongoMemoryServer | undefined;
 let scratch: string | undefined;
 beforeAll(async () => {
-  if (!process.env.UPLOAD_TEST_TMPDIR) throw new Error('Explicit owned test scratch is required');
-  scratch = await mkdtemp(join(process.env.UPLOAD_TEST_TMPDIR, 'durable-checkpoints-'));
+  const environment = checkpointTestEnvironment();
+  scratch = await mkdtemp(join(environment.scratchRoot, 'durable-checkpoints-'));
   const dbPath = join(scratch, 'mongo');
   await mkdir(dbPath, { mode: 0o700 });
   mongo = await MongoMemoryServer.create({
-    binary: { version: '7.0.43' },
+    binary: environment.binary,
     instance: { dbPath, args: ['--nounixsocket'], storageEngine: 'wiredTiger' },
   });
   await mongoose.connect(mongo.getUri('driver_default'), { dbName: 'durable_test' });
@@ -340,7 +341,9 @@ it('enforces the serialized checkpoint and pending-write size boundary before Mo
   const target = scope();
   await getDurableAgentCheckpointer(target, cfg);
   const saver = new DurableMongoSaver({
-    client: mongoose.connection.getClient(),
+    client: mongoose.connection.getClient() as unknown as ConstructorParameters<
+      typeof DurableMongoSaver
+    >[0]['client'],
     dbName: mongoose.connection.db!.databaseName,
     checkpointCollectionName: cfg.checkpointCollectionName,
     checkpointWritesCollectionName: cfg.checkpointWritesCollectionName,

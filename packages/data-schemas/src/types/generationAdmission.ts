@@ -1,3 +1,16 @@
+import type { ClientSession } from 'mongoose';
+
+/** Immutable native checkpoint identity, acquired before the first provider dispatch. */
+export interface GenerationCheckpointBinding {
+  readonly version: 1;
+  readonly runId: string;
+  readonly threadId: string;
+  readonly checkpointNamespace: string;
+  readonly graphFingerprint: string;
+  readonly policyFingerprint: string;
+  readonly mode: 'checkpoint-only-v1';
+}
+
 /** Trusted server identity. Callers must never populate scope from unverified request-body fields. */
 export interface GenerationAdmissionKey {
   tenantId: string;
@@ -14,6 +27,7 @@ export interface GenerationAdmissionInput extends GenerationAdmissionKey {
   processBootId: string;
   generationEpoch: number;
   segmentId: string;
+  continuation?: GenerationCheckpointBinding;
 }
 
 export interface GenerationAdmissionTerminal {
@@ -37,6 +51,20 @@ export interface GenerationAdmissionSuccessor {
   segmentId: string;
 }
 
+/** Server-owned proof references; neither timestamps nor an expired lease authorize recovery. */
+export interface GenerationCheckpointRecoveryEvidence {
+  checkpointWriteRevision: number;
+  terminationEvidenceSha256: string;
+  effectsEvidenceSha256: string;
+}
+
+/** Interrupted ownership is retained separately from genuinely settled HITL predecessors. */
+export interface GenerationAdmissionRecovery extends GenerationAdmissionSuccessor {
+  dispatchedAt: string;
+  recoveredAt: string;
+  evidence: GenerationCheckpointRecoveryEvidence;
+}
+
 /** Plain durable receipt, without database documents or provider/stream contents. */
 export interface GenerationAdmissionRecord extends GenerationAdmissionInput {
   state: 'admitted' | 'dispatching' | 'settled';
@@ -46,6 +74,8 @@ export interface GenerationAdmissionRecord extends GenerationAdmissionInput {
   settledAt?: string;
   terminal?: GenerationAdmissionTerminal;
   predecessors?: GenerationAdmissionPredecessor[];
+  checkpointWriteRevision: number;
+  recoveries?: GenerationAdmissionRecovery[];
 }
 
 export type GenerationAdmissionFailureCode =
@@ -83,6 +113,17 @@ export interface GenerationAdmissionMethods {
   dispatchGenerationAdmission(
     input: GenerationAdmissionInput,
   ): Promise<GenerationAdmissionResult<GenerationAdmissionRecord>>;
+  /** Only the acknowledged CAS winner may subsequently authorize the successor's dispatch. */
+  recoverGenerationAdmission(
+    predecessor: GenerationAdmissionInput,
+    evidence: GenerationCheckpointRecoveryEvidence,
+    successor: GenerationAdmissionSuccessor,
+  ): Promise<GenerationAdmissionResult<GenerationAdmissionRecord>>;
+  /** Database-only callback, using this exact session/client; external effects are forbidden. */
+  writeGenerationCheckpoint<T>(
+    input: GenerationAdmissionInput,
+    write: (session: ClientSession) => Promise<T>,
+  ): Promise<GenerationAdmissionResult<T>>;
   /** Explicit HITL continuation only; exact settled predecessor evidence is mandatory. */
   acquireGenerationAdmissionSuccessor(
     predecessor: GenerationAdmissionInput,

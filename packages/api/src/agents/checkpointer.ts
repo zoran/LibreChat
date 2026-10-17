@@ -1,7 +1,13 @@
 import mongoose from 'mongoose';
 import { INTERRUPT } from '@langchain/langgraph-checkpoint';
 import { MongoDBSaver } from '@langchain/langgraph-checkpoint-mongodb';
-import { buildIndexWithRetry, isIndexBuildInProgress, logger } from '@librechat/data-schemas';
+import {
+  buildIndexWithRetry,
+  isIndexBuildInProgress,
+  logger,
+  createGenerationAdmissionMethods,
+  snapshotGenerationCheckpointAdmission,
+} from '@librechat/data-schemas';
 import type {
   Checkpoint,
   CheckpointListOptions,
@@ -9,9 +15,9 @@ import type {
   CheckpointTuple,
   PendingWrite,
 } from '@langchain/langgraph-checkpoint';
+import type { IndexBuildOptions, GenerationAdmissionInput } from '@librechat/data-schemas';
 import type { BaseMessage } from '@librechat/agents/langchain/messages';
 import type { TCheckpointerConfig } from 'librechat-data-provider';
-import type { IndexBuildOptions } from '@librechat/data-schemas';
 import type { RunnableConfig } from '@langchain/core/runnables';
 import type { DurableAgentCheckpointScope } from './checkpoints/durable';
 import type { ResolvedCheckpointerConfig } from './checkpoints/config';
@@ -568,11 +574,18 @@ export async function getAgentCheckpointer(
   return saverPromise;
 }
 
-/** Scope-bound native persistence; missing Mongo or required indexes is fatal. */
+/**
+ * Scope-bound native persistence; missing Mongo or indexes is fatal. A supplied
+ * admission additionally binds writes to the actual active native segment. Raw
+ * storage callers without admission acquire no recovery or dispatch authority.
+ */
 export async function getDurableAgentCheckpointer(
   scope: DurableAgentCheckpointScope,
   cfg?: TCheckpointerConfig,
+  admission?: GenerationAdmissionInput,
 ): Promise<DurableMongoSaver> {
+  const boundAdmission =
+    admission === undefined ? undefined : snapshotGenerationCheckpointAdmission(admission);
   const resolved = resolveCheckpointerConfig(cfg);
   const names = [resolved.checkpointCollectionName, resolved.checkpointWritesCollectionName];
   if (
@@ -594,6 +607,7 @@ export async function getDurableAgentCheckpointer(
   // Construction snapshots the scope synchronously, before setup can yield.
   const saver = new DurableMongoSaver({
     scope,
+    ...(boundAdmission === undefined ? {} : { admission: boundAdmission }),
     client: mongoose.connection.getClient() as unknown as ConstructorParameters<
       typeof MongoDBSaver
     >[0]['client'],
@@ -613,6 +627,20 @@ export async function getDurableAgentCheckpointer(
       () => db.collection(name).createIndex({ lc_owner: 1, thread_id: 1 }),
       `${name}.lc_owner`,
     );
+  }
+  if (boundAdmission) {
+    const result =
+      await createGenerationAdmissionMethods(mongoose).getGenerationAdmission(boundAdmission);
+    if (
+      !result.ok ||
+      !result.value ||
+      result.value.state !== 'dispatching' ||
+      result.value.active !== true ||
+      JSON.stringify(snapshotGenerationCheckpointAdmission(result.value)) !==
+        JSON.stringify(boundAdmission)
+    ) {
+      throw new Error('Durable checkpoint run requires confirmed active dispatch admission');
+    }
   }
   return saver;
 }

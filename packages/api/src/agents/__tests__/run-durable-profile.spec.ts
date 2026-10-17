@@ -1,4 +1,5 @@
 import * as agentsSdk from '@librechat/agents';
+import type { GenerationAdmissionInput } from '@librechat/data-schemas';
 import type { DurableAgentCheckpointScope } from '~/agents/checkpointer';
 import { getAgentCheckpointer, getDurableAgentCheckpointer } from '~/agents/checkpointer';
 import { createCheckpointNamespace } from '~/stream/checkpoints';
@@ -24,13 +25,38 @@ jest.mock('~/agents/checkpointer', () => ({
 }));
 
 type Options = Parameters<typeof createRun>[0];
+const checkpointNamespace = createCheckpointNamespace('owner', 'tenant');
 
 function scope(): DurableAgentCheckpointScope {
   return {
     userId: 'owner',
     tenantId: 'tenant',
     threadId: 'conversation',
-    checkpointNamespace: createCheckpointNamespace('owner', 'tenant'),
+    checkpointNamespace,
+  };
+}
+
+function admission(): GenerationAdmissionInput {
+  return {
+    tenantId: 'tenant',
+    principalId: 'owner',
+    clientRequestId: 'request',
+    conversationId: 'conversation',
+    requestFingerprint: 'a'.repeat(64),
+    protocol: '2',
+    ownerInstanceId: 'pod',
+    processBootId: 'boot',
+    generationEpoch: 7,
+    segmentId: 'segment',
+    continuation: {
+      version: 1,
+      mode: 'checkpoint-only-v1',
+      runId: 'response-message',
+      threadId: 'conversation',
+      checkpointNamespace: scope().checkpointNamespace,
+      graphFingerprint: 'b'.repeat(64),
+      policyFingerprint: 'c'.repeat(64),
+    },
   };
 }
 
@@ -65,6 +91,9 @@ function options(extra: Partial<Options> = {}): Options {
         toolContextMap: {},
       },
     ],
+    ...(extra.durableCheckpointScope === undefined
+      ? {}
+      : { durableCheckpointAdmission: admission() }),
     ...extra,
   };
 }
@@ -106,7 +135,7 @@ it('binds the native durable saver and SDK sync policy without replacing Run', a
   await expect(
     createRun(options({ durableCheckpointScope: binding, eventActorCheckpointing: true })),
   ).resolves.toBe(nativeRun);
-  expect(getDurableAgentCheckpointer).toHaveBeenCalledWith(binding, undefined);
+  expect(getDurableAgentCheckpointer).toHaveBeenCalledWith(binding, undefined, admission());
   expect(getAgentCheckpointer).not.toHaveBeenCalled();
   expect(agentsSdk.Run.create).toHaveBeenCalledWith(
     expect.objectContaining({
@@ -134,6 +163,60 @@ it.each([
   expect(getDurableAgentCheckpointer).not.toHaveBeenCalled();
   expect(getAgentCheckpointer).not.toHaveBeenCalled();
   expect(agentsSdk.Run.create).not.toHaveBeenCalled();
+});
+
+it.each([
+  ['loaded tools', { tools: [{ name: 'remote-write' }] }],
+  ['deferred registry', { toolRegistry: new Map([['remote-write', {}]]) }],
+  ['serialized tools', { toolDefinitions: [{ name: 'remote-write' }] }],
+  ['deferred discovery', { hasDeferredTools: true }],
+  ['subagent spawn', { subagents: { enabled: true } }],
+  ['lazy delegate', { lazySubagentConfigs: [{ id: 'child' }] }],
+  ['background tools', { backgroundToolNames: ['remote-write'] }],
+  ['handoff edge', { edges: [{ from: 'agent', to: 'other', edgeType: 'handoff' }] }],
+] as const)('rejects checkpoint-only %s before persistence', async (_name, changes) => {
+  const input = options({ durableCheckpointScope: scope() });
+  input.agents = [{ ...input.agents[0], ...changes } as Options['agents'][number]];
+  await expect(createRun(input)).rejects.toThrow('Checkpoint-only');
+  expect(getDurableAgentCheckpointer).not.toHaveBeenCalled();
+  expect(agentsSdk.Run.create).not.toHaveBeenCalled();
+});
+
+it.each([
+  ['run files', { runFiles: { activate: jest.fn() } }],
+  ['detached task owner', { subagentTasks: {} }],
+  ['client tools', { clientToolNames: new Set(['client-write']) }],
+  ['forced discovered tools', { discoveredToolNames: ['deferred-write'] }],
+] as const)('rejects checkpoint-only %s before persistence', async (_name, changes) => {
+  await expect(
+    createRun(options({ durableCheckpointScope: scope(), ...(changes as Partial<Options>) })),
+  ).rejects.toThrow('Checkpoint-only');
+  expect(getDurableAgentCheckpointer).not.toHaveBeenCalled();
+  expect(agentsSdk.Run.create).not.toHaveBeenCalled();
+});
+
+it('checks the assembled tools again after async setup without executing them', async () => {
+  const input = options({ durableCheckpointScope: scope() });
+  const invoke = jest.fn();
+  jest.mocked(getDurableAgentCheckpointer).mockImplementationOnce(async () => {
+    input.agents[0].tools = [{ name: 'late-write', invoke } as never];
+    return durableSaver as never;
+  });
+  await expect(createRun(input)).rejects.toThrow('resolved an unsupported tool surface');
+  expect(invoke).not.toHaveBeenCalled();
+  expect(agentsSdk.Run.create).not.toHaveBeenCalled();
+});
+
+it('preserves the checkpoint-only native direct agent chain', async () => {
+  const input = options({ durableCheckpointScope: scope() });
+  input.agents[0].edges = [{ from: 'agent', to: 'second', edgeType: 'direct' }];
+  input.agents.push({ ...input.agents[0], id: 'second', edges: [] });
+  await expect(createRun(input)).resolves.toBe(nativeRun);
+  expect(agentsSdk.Run.create).toHaveBeenCalledWith(
+    expect.objectContaining({
+      graphConfig: expect.objectContaining({ type: 'multi-agent' }),
+    }),
+  );
 });
 
 it('does not activate a profile or derive its thread from request data', async () => {
@@ -181,17 +264,91 @@ it('refuses an unexpectedly absent saver instead of enabling SDK memory storage'
 it('snapshots the owner binding before the durable factory yields', async () => {
   const binding = scope();
   const original = { ...binding };
-  jest.mocked(getDurableAgentCheckpointer).mockImplementationOnce(async (received) => {
-    expect(received).not.toBe(binding);
-    expect(Object.isFrozen(received)).toBe(true);
-    binding.threadId = 'changed-after-admission';
-    binding.userId = 'other';
-    await Promise.resolve();
-    expect(received).toEqual(original);
-    return durableSaver as never;
-  });
-  await createRun(options({ durableCheckpointScope: binding }));
+  const admitted = admission();
+  const originalAdmission = admission();
+  jest
+    .mocked(getDurableAgentCheckpointer)
+    .mockImplementationOnce(async (received, _cfg, savedAdmission) => {
+      expect(received).not.toBe(binding);
+      expect(Object.isFrozen(received)).toBe(true);
+      expect(savedAdmission).not.toBe(admitted);
+      expect(Object.isFrozen(savedAdmission)).toBe(true);
+      expect(Object.isFrozen(savedAdmission?.continuation)).toBe(true);
+      binding.threadId = 'changed-after-admission';
+      binding.userId = 'other';
+      admitted.segmentId = 'other-segment';
+      admitted.continuation = { ...admitted.continuation!, runId: 'other-run' };
+      await Promise.resolve();
+      expect(received).toEqual(original);
+      expect(savedAdmission).toEqual(originalAdmission);
+      return durableSaver as never;
+    });
+  await createRun(
+    options({ durableCheckpointScope: binding, durableCheckpointAdmission: admitted }),
+  );
   expect(agentsSdk.Run.create).toHaveBeenLastCalledWith(
     expect.objectContaining({ checkpointPolicy: { threadId: 'conversation', durability: 'sync' } }),
   );
+});
+
+it.each([
+  ['missing admission', { durableCheckpointAdmission: undefined }],
+  [
+    'admission without scope',
+    { durableCheckpointScope: undefined, durableCheckpointAdmission: admission() },
+  ],
+  ['missing explicit run ID', { runId: undefined }],
+  ['different run ID', { runId: 'other-run' }],
+  ['foreign principal', { durableCheckpointAdmission: { ...admission(), principalId: 'other' } }],
+  ['foreign tenant', { durableCheckpointAdmission: { ...admission(), tenantId: 'other' } }],
+  [
+    'foreign conversation',
+    { durableCheckpointAdmission: { ...admission(), conversationId: 'other' } },
+  ],
+  [
+    'missing continuation',
+    { durableCheckpointAdmission: { ...admission(), continuation: undefined } },
+  ],
+  [
+    'foreign continuation thread',
+    {
+      durableCheckpointAdmission: {
+        ...admission(),
+        continuation: { ...admission().continuation!, threadId: 'other' },
+      },
+    },
+  ],
+  [
+    'foreign continuation namespace',
+    {
+      durableCheckpointAdmission: {
+        ...admission(),
+        continuation: { ...admission().continuation!, checkpointNamespace: 'other' },
+      },
+    },
+  ],
+  [
+    'malformed graph identity',
+    {
+      durableCheckpointAdmission: {
+        ...admission(),
+        continuation: { ...admission().continuation!, graphFingerprint: 'invalid' },
+      },
+    },
+  ],
+] as const)('rejects %s before run-file activation and the first await', async (_name, extra) => {
+  const activate = jest.fn();
+  await expect(
+    createRun(
+      options({
+        durableCheckpointScope: scope(),
+        runFiles: { activate } as unknown as Options['runFiles'],
+        ...extra,
+      }),
+    ),
+  ).rejects.toThrow();
+  expect(activate).not.toHaveBeenCalled();
+  expect(getDurableAgentCheckpointer).not.toHaveBeenCalled();
+  expect(getAgentCheckpointer).not.toHaveBeenCalled();
+  expect(agentsSdk.Run.create).not.toHaveBeenCalled();
 });

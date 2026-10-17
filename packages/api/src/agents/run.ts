@@ -1,8 +1,12 @@
 import { randomUUID } from 'crypto';
 import * as agentsSdk from '@librechat/agents';
-import { logger } from '@librechat/data-schemas';
 import { ensureHandler } from '@langchain/core/callbacks/manager';
 import { Run, Providers, Constants, GraphEvents, HookRegistry } from '@librechat/agents';
+import {
+  logger,
+  SYSTEM_TENANT_ID,
+  snapshotGenerationCheckpointAdmission,
+} from '@librechat/data-schemas';
 import {
   KnownEndpoints,
   EModelEndpoint,
@@ -49,7 +53,12 @@ import type {
   SummarizationConfig,
   TurnFileConsumers,
 } from 'librechat-data-provider';
-import type { AppConfig, IAgentFadingTier, IUser } from '@librechat/data-schemas';
+import type {
+  AppConfig,
+  IAgentFadingTier,
+  IUser,
+  GenerationAdmissionInput,
+} from '@librechat/data-schemas';
 import type { CallbackHandlerMethods } from '@langchain/core/callbacks/base';
 import type { ToolApprovalGrantStorage } from 'librechat-data-provider';
 import type { BaseMessage } from '@librechat/agents/langchain/messages';
@@ -2205,6 +2214,7 @@ export async function createRun({
   activityPhase,
   eventActorCheckpointing = false,
   durableCheckpointScope,
+  durableCheckpointAdmission,
   hitlCapable = false,
   resolvedToolApprovalHooks,
   toolApprovalStorage,
@@ -2351,6 +2361,8 @@ export async function createRun({
    * this profile only binds persistence and synchronous SDK checkpointing.
    */
   durableCheckpointScope?: DurableAgentCheckpointScope;
+  /** Exact active native segment acquired and dispatched by the trusted host coordinator. */
+  durableCheckpointAdmission?: GenerationAdmissionInput;
   /**
    * Whether the caller implements the HITL pause/resume lifecycle (inspects
    * `run.getInterrupt()`, persists a pending action, exposes a resume route). Gates the
@@ -2379,10 +2391,27 @@ export async function createRun({
   const completeAssistantHistory = assertCompleteAssistantHistorySingleton(agents);
   const durableScope =
     durableCheckpointScope === undefined ? undefined : Object.freeze({ ...durableCheckpointScope });
+  if (durableCheckpointAdmission !== undefined && durableScope === undefined) {
+    throw new Error('Durable checkpoint admission requires an explicit durable scope');
+  }
+  const durableAdmission =
+    durableScope === undefined
+      ? undefined
+      : snapshotGenerationCheckpointAdmission(durableCheckpointAdmission!);
   if (durableScope !== undefined) {
+    const resolvedTenant = tenantId ?? user?.tenantId;
+    const admissionTenant =
+      resolvedTenant && resolvedTenant !== SYSTEM_TENANT_ID ? resolvedTenant : '__single_tenant__';
     if (
       !user?.id ||
       !conversationId ||
+      !runId ||
+      durableAdmission!.principalId !== user.id ||
+      durableAdmission!.tenantId !== admissionTenant ||
+      durableAdmission!.conversationId !== conversationId ||
+      durableAdmission!.continuation!.runId !== runId ||
+      durableAdmission!.continuation!.threadId !== conversationId ||
+      durableAdmission!.continuation!.checkpointNamespace !== durableScope.checkpointNamespace ||
       durableScope.userId !== user.id ||
       durableScope.tenantId !== (tenantId ?? user.tenantId) ||
       durableScope.threadId !== conversationId ||
@@ -2393,6 +2422,30 @@ export async function createRun({
       )
     ) {
       throw new Error('Durable checkpoint scope does not match the native run owner and thread');
+    }
+    if (
+      runFiles != null ||
+      subagentTasks != null ||
+      (clientToolNames?.size ?? 0) > 0 ||
+      (discoveredToolNames?.length ?? 0) > 0 ||
+      agents.some(
+        (agent) =>
+          (agent.tools?.length ?? 0) > 0 ||
+          (agent.toolRegistry?.size ?? 0) > 0 ||
+          (agent.toolDefinitions?.length ?? 0) > 0 ||
+          agent.hasDeferredTools === true ||
+          agent.codeEnvAvailable === true ||
+          (agent.backgroundToolNames?.length ?? 0) > 0 ||
+          agent.subagents?.enabled === true ||
+          (agent.subagents?.agent_ids?.length ?? 0) > 0 ||
+          (agent.subagents?.graphs?.length ?? 0) > 0 ||
+          (agent.subagentAgentConfigs?.length ?? 0) > 0 ||
+          (agent.lazySubagentConfigs?.length ?? 0) > 0 ||
+          (agent.subagentGraphConfigs?.length ?? 0) > 0 ||
+          (agent.edges ?? []).some((edge) => edge.edgeType !== 'direct' || edge.condition != null),
+      )
+    ) {
+      throw new Error('Checkpoint-only execution does not support tools, delegation or run files');
     }
     if (
       (agentsSdk as { CHECKPOINT_CONTINUATION_VERSION?: number })
@@ -2407,6 +2460,7 @@ export async function createRun({
       : await getDurableAgentCheckpointer(
           durableScope,
           appConfig?.endpoints?.[EModelEndpoint.agents]?.checkpointer,
+          durableAdmission,
         );
   if (durableScope !== undefined && durableCheckpointer == null) {
     throw new Error('Durable execution requires a persistent checkpointer');
@@ -2827,7 +2881,6 @@ export async function createRun({
     }
     agentInputs.push(agentInput);
   }
-
   const graphConfig: RunConfig['graphConfig'] = {
     signal,
     agents: agentInputs,
@@ -3241,6 +3294,22 @@ export async function createRun({
     // older versions ignore the field.
     ...(streamLimits && { streamLimits }),
   };
+  if (
+    durableScope !== undefined &&
+    (agentInputs.some(
+      (agent) =>
+        (agent.tools?.length ?? 0) > 0 ||
+        (agent.toolRegistry?.size ?? 0) > 0 ||
+        (agent.toolDefinitions?.length ?? 0) > 0 ||
+        (agent.subagentConfigs?.length ?? 0) > 0 ||
+        ((agent as AgentInputs & { graphTools?: GenericTool[] }).graphTools?.length ?? 0) > 0,
+    ) ||
+      ((graphConfig as MultiAgentGraphConfig).edges ?? []).some(
+        (edge) => edge.edgeType !== 'direct' || edge.condition != null,
+      ))
+  ) {
+    throw new Error('Checkpoint-only execution resolved an unsupported tool surface');
+  }
   const run = await Run.create(runConfig);
   if (approvalWiring != null) bindRunToolApprovalSession(run, agentApprovalSession);
   runMCPToolAliases.set(run, mcpToolAliases);

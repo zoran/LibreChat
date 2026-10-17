@@ -7,6 +7,7 @@ import { createGenerationAdmissionMethods } from './generationAdmission';
 export {
   createGenerationAdmissionMethods,
   GenerationAdmissionStorageError,
+  snapshotGenerationCheckpointAdmission,
 } from './generationAdmission';
 import type { ToolApprovalGrantStorage } from 'librechat-data-provider';
 import type { ScheduleMCPConsentStorage } from './scheduleConsent';

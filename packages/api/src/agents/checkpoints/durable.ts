@@ -1,6 +1,11 @@
 import mongoose from 'mongoose';
-import { logger } from '@librechat/data-schemas';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import {
+  logger,
+  SYSTEM_TENANT_ID,
+  createGenerationAdmissionMethods,
+  snapshotGenerationCheckpointAdmission,
+} from '@librechat/data-schemas';
 import type {
   Checkpoint,
   CheckpointListOptions,
@@ -8,8 +13,10 @@ import type {
   CheckpointTuple,
   PendingWrite,
 } from '@langchain/langgraph-checkpoint';
+import type { GenerationAdmissionInput, GenerationAdmissionMethods } from '@librechat/data-schemas';
 import type { MongoDBSaverParams } from '@langchain/langgraph-checkpoint-mongodb';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { CheckpointWriteSession } from './saver';
 import {
   LIBRECHAT_CHECKPOINT_NAMESPACE_KEY,
   toStorageCheckpointConfig,
@@ -88,6 +95,7 @@ export interface DurableAgentCheckpointScope {
 
 export type DurableMongoSaverOptions = MongoDBSaverParams & {
   scope: DurableAgentCheckpointScope;
+  admission?: GenerationAdmissionInput;
   warnBytes?: number;
   hardLimitBytes?: number;
 };
@@ -155,11 +163,38 @@ export class DurableMongoSaver extends OwnedMongoSaver {
   private readonly owner: string;
   private readonly hardLimitBytes: number;
   private readonly warnBytes: number;
+  private readonly admission?: Readonly<GenerationAdmissionInput>;
+  private readonly admissionMethods?: GenerationAdmissionMethods;
+  private writeTail: Promise<void> = Promise.resolve();
+  private writesHeld = false;
   private readonly serializationBudget = new AsyncLocalStorage<{ bytes: number } | undefined>();
 
   constructor(options: DurableMongoSaverOptions) {
     // Capture the caller's scope before any async setup or database work.
     const scope = snapshotScope(options.scope);
+    const admission =
+      options.admission === undefined
+        ? undefined
+        : snapshotGenerationCheckpointAdmission(options.admission);
+    if (admission) {
+      const tenant =
+        scope.tenantId && scope.tenantId !== SYSTEM_TENANT_ID
+          ? scope.tenantId
+          : '__single_tenant__';
+      if (
+        admission.principalId !== scope.userId ||
+        admission.tenantId !== tenant ||
+        admission.conversationId !== scope.threadId ||
+        admission.continuation!.threadId !== scope.threadId ||
+        admission.continuation!.checkpointNamespace !== scope.checkpointNamespace ||
+        options.client !== (mongoose.connection.getClient() as unknown) ||
+        options.dbName !== mongoose.connection.db?.databaseName
+      ) {
+        throw new Error(
+          'Durable checkpoint admission does not match its owner or Mongo connection',
+        );
+      }
+    }
     const hardLimitBytes = options.hardLimitBytes ?? CHECKPOINT_HARD_LIMIT_BYTES;
     const warnBytes = options.warnBytes ?? Math.min(CHECKPOINT_WARN_BYTES, hardLimitBytes);
     if (
@@ -174,6 +209,8 @@ export class DurableMongoSaver extends OwnedMongoSaver {
     }
     super(options);
     this.scope = scope;
+    this.admission = admission;
+    this.admissionMethods = admission ? createGenerationAdmissionMethods(mongoose) : undefined;
     this.owner = checkpointOwnerNamespacePrefix(scope.userId, scope.tenantId);
     this.hardLimitBytes = hardLimitBytes;
     this.warnBytes = warnBytes;
@@ -190,6 +227,37 @@ export class DurableMongoSaver extends OwnedMongoSaver {
         return serialized;
       },
     };
+  }
+
+  protected override async withWriteSession<T>(
+    config: RunnableConfig,
+    write: (session?: CheckpointWriteSession) => Promise<T>,
+  ): Promise<T> {
+    if (!this.admission || !this.admissionMethods) return super.withWriteSession(config, write);
+    const admission = this.admission;
+    const methods = this.admissionMethods;
+    // LangGraph submits pending writes concurrently. Serialize only their database
+    // transactions; the native admission remains the cross-process authority.
+    const operation = this.writeTail.then(async () => {
+      if (this.writesHeld) throw new Error('Durable checkpoint writes are held after failure');
+      try {
+        // Construction verifies the same client/db despite separate driver minor types.
+        const result = await methods.writeGenerationCheckpoint(admission, (session) =>
+          write(session as unknown as CheckpointWriteSession),
+        );
+        if (!result.ok)
+          throw new Error('Durable checkpoint writer no longer holds confirmed admission');
+        return result.value;
+      } catch (error) {
+        this.writesHeld = true;
+        throw error;
+      }
+    });
+    this.writeTail = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    return operation;
   }
 
   private assertFits(bytes: number): void {

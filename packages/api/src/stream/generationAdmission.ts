@@ -1,6 +1,10 @@
 import { createHash } from 'node:crypto';
-import { SYSTEM_TENANT_ID } from '@librechat/data-schemas';
-import type { GenerationAdmissionInput, GenerationAdmissionMethods } from '@librechat/data-schemas';
+import { SYSTEM_TENANT_ID, snapshotGenerationCheckpointAdmission } from '@librechat/data-schemas';
+import type {
+  GenerationAdmissionInput,
+  GenerationAdmissionMethods,
+  GenerationCheckpointBinding,
+} from '@librechat/data-schemas';
 import type { ExternalApplicationWorkCensus } from '~/app';
 
 export interface GenerationRequestBinding {
@@ -13,6 +17,19 @@ export interface GenerationAdmissionConfiguration {
   ownerInstanceId: string;
   processBootId: string;
   externalCensus?: () => Promise<ExternalApplicationWorkCensus>;
+}
+/** Server-owned proof ports. Process termination alone never proves remote effects settled. */
+export interface GenerationCheckpointRecoveryPorts {
+  authorize(predecessor: Readonly<GenerationAdmissionInput>): Promise<boolean>;
+  confirmTerminatedOwner(predecessor: Readonly<GenerationAdmissionInput>): Promise<{
+    predecessor: GenerationAdmissionInput;
+    terminationEvidenceSha256: string;
+  } | null>;
+  reconcileEffects(predecessor: Readonly<GenerationAdmissionInput>): Promise<{
+    predecessor: GenerationAdmissionInput;
+    checkpointWriteRevision: number;
+    effectsEvidenceSha256: string;
+  } | null>;
 }
 export interface GenerationAdmissionCensus {
   admissionClosed: boolean;
@@ -157,10 +174,11 @@ export class GenerationAdmissionCoordinator {
     conversationId: string,
     protocol: number,
     binding?: GenerationRequestBinding,
+    continuation?: GenerationCheckpointBinding,
   ): Promise<void> {
     if (!this.required) return;
     if (!binding || !this.config?.methods) throw new GenerationAdmissionHeldError();
-    const input: GenerationAdmissionInput = {
+    let input: GenerationAdmissionInput = {
       ...binding,
       tenantId: tenant(tenantId),
       principalId,
@@ -170,7 +188,13 @@ export class GenerationAdmissionCoordinator {
       processBootId: this.config.processBootId,
       generationEpoch: epoch,
       segmentId: segment,
+      ...(continuation === undefined ? {} : { continuation }),
     };
+    if (continuation !== undefined) {
+      input = snapshotGenerationCheckpointAdmission(input);
+      if (input.continuation!.threadId !== conversationId || stream !== conversationId)
+        throw new GenerationAdmissionHeldError();
+    }
     const key = localKey(stream, epoch, segment);
     this.local.set(key, { input, phase: 'held' });
     const result = await this.config.methods.acquireGenerationAdmission(input);
@@ -179,6 +203,107 @@ export class GenerationAdmissionCoordinator {
       throw new GenerationAdmissionHeldError();
     }
     this.local.set(key, { input, phase: 'admitted' });
+  }
+
+  /**
+   * Recover only a proven interrupted checkpoint owner. The acknowledged CAS winner
+   * is admitted locally; the existing authorize path still owns provider dispatch.
+   */
+  async recoverCheckpoint(
+    stream: string,
+    predecessor: GenerationAdmissionInput,
+    successorSegment: string,
+    ports: GenerationCheckpointRecoveryPorts,
+  ): Promise<GenerationAdmissionInput | undefined> {
+    const config = this.config;
+    if (!config?.required || !config.methods || this.closedBy) return undefined;
+    let prior: Readonly<GenerationAdmissionInput>;
+    let next: Readonly<GenerationAdmissionInput>;
+    let callbacks: GenerationCheckpointRecoveryPorts;
+    try {
+      prior = snapshotGenerationCheckpointAdmission(predecessor);
+      next = snapshotGenerationCheckpointAdmission({
+        ...prior,
+        ownerInstanceId: config.ownerInstanceId,
+        processBootId: config.processBootId,
+        segmentId: successorSegment,
+      });
+      callbacks = Object.freeze({
+        authorize: ports.authorize,
+        confirmTerminatedOwner: ports.confirmTerminatedOwner,
+        reconcileEffects: ports.reconcileEffects,
+      });
+      if (
+        stream !== prior.conversationId ||
+        prior.continuation!.threadId !== stream ||
+        successorSegment === prior.segmentId ||
+        (prior.ownerInstanceId === next.ownerInstanceId &&
+          prior.processBootId === next.processBootId) ||
+        Object.values(callbacks).some((callback) => typeof callback !== 'function')
+      )
+        return undefined;
+    } catch {
+      return undefined;
+    }
+    const key = localKey(stream, next.generationEpoch, next.segmentId);
+    if (this.local.has(key)) return undefined;
+    const entry: LocalAdmission = { input: next, phase: 'held' };
+    this.local.set(key, entry);
+    this.initializing++;
+    let retain = false;
+    try {
+      const terminated = await callbacks.confirmTerminatedOwner(prior);
+      if (!terminated || this.closedBy) return undefined;
+      const terminationEvidenceSha256 = terminated.terminationEvidenceSha256;
+      if (
+        JSON.stringify(snapshotGenerationCheckpointAdmission(terminated.predecessor)) !==
+          JSON.stringify(prior) ||
+        typeof terminationEvidenceSha256 !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(terminationEvidenceSha256)
+      )
+        return undefined;
+      const effects = await callbacks.reconcileEffects(prior);
+      if (!effects || this.closedBy) return undefined;
+      const evidence = Object.freeze({
+        checkpointWriteRevision: effects.checkpointWriteRevision,
+        terminationEvidenceSha256,
+        effectsEvidenceSha256: effects.effectsEvidenceSha256,
+      });
+      if (
+        JSON.stringify(snapshotGenerationCheckpointAdmission(effects.predecessor)) !==
+          JSON.stringify(prior) ||
+        !Number.isSafeInteger(evidence.checkpointWriteRevision) ||
+        evidence.checkpointWriteRevision < 0 ||
+        typeof evidence.effectsEvidenceSha256 !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(evidence.effectsEvidenceSha256)
+      )
+        return undefined;
+      // Revalidate access after potentially slow termination/effects reconciliation.
+      if ((await callbacks.authorize(prior)) !== true || this.closedBy) return undefined;
+      retain = true; // A thrown or unacknowledged CAS must remain an unresolved obligation.
+      const result = await config.methods.recoverGenerationAdmission(prior, evidence, {
+        ownerInstanceId: next.ownerInstanceId,
+        processBootId: next.processBootId,
+        segmentId: next.segmentId,
+      });
+      if (!result.ok) {
+        retain = result.error.code === 'OUTCOME_UNKNOWN';
+        return undefined;
+      }
+      if (
+        result.value.state !== 'admitted' ||
+        result.value.active !== true ||
+        JSON.stringify(snapshotGenerationCheckpointAdmission(result.value)) !== JSON.stringify(next)
+      )
+        return undefined;
+      entry.phase = 'admitted';
+      return this.closedBy ? undefined : next;
+    } catch {
+      return undefined;
+    } finally {
+      this.initializing--;
+      if (!retain && this.local.get(key) === entry) this.local.delete(key);
+    }
   }
 
   async authorize(
