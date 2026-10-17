@@ -20,6 +20,8 @@ jobs:
       contents: read
       pull-requests: write
     uses: ./.github/workflows/lighthouse.yml
+    with:
+      upload_frontend_build: true
 
   publish:
     needs: lighthouse
@@ -31,6 +33,7 @@ jobs:
       images: '[{"target":"node","file":"Dockerfile","image_name":"librechat"}]'
       arches: '["amd64"]'
       checkout_ref: ${{ github.sha }}
+      frontend_build_artifact: frontend-build-${{ github.sha }}
       build_branch: ${{ github.ref_name }}
       tag_suffixes: ${{ github.sha }}
       publish_dockerhub: false

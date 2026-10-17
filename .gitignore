@@ -207,3 +207,6 @@ scripts/activity-labels/results/
 # Ephemeral local presentation fixture connection data.
 /e2e/presentation/.runtime/
 /e2e/presentation/.test-results/
+
+# Verified CI build artifact, regenerated for one exact source revision.
+/ci-build/

@@ -33,6 +33,10 @@ on:
         description: Ref to build. Defaults to the ref that triggered the caller.
         type: string
         default: ''
+      frontend_build_artifact:
+        description: Optional frontend-build-<checkout SHA> artifact from this workflow run.
+        type: string
+        default: ''
       build_branch:
         description: Value for the BUILD_BRANCH build-arg and runtime env.
         type: string
@@ -116,6 +120,26 @@ jobs:
           printf 'BUILD_BRANCH=%s\n' "$BUILD_BRANCH_INPUT" >> "$GITHUB_ENV"
           printf 'BUILD_DATE=%s\n' "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_ENV"
 
+      - name: Bind frontend artifact to the checkout
+        if: ${{ inputs.frontend_build_artifact != '' }}
+        env:
+          FRONTEND_BUILD_ARTIFACT: ${{ inputs.frontend_build_artifact }}
+        run: |
+          set -euo pipefail
+          if [ "$FRONTEND_BUILD_ARTIFACT" != "frontend-build-$BUILD_COMMIT" ]; then
+            echo 'Frontend artifact must match the exact checkout commit.' >&2
+            exit 1
+          fi
+
+      # Omitting a token and run-id restricts this to the current workflow run.
+      # A missing named artifact fails the job before any image is published.
+      - name: Download verified frontend build
+        if: ${{ inputs.frontend_build_artifact != '' }}
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ inputs.frontend_build_artifact }}
+          path: ci-build
+
       # The layer cache lives in GHCR beside the image: no 10GB Actions-cache cap,
       # and readable from every branch and workflow, unlike type=gha which is
       # branch-scoped. The ref is per-architecture so the platform jobs cannot
@@ -135,6 +159,7 @@ jobs:
             BUILD_COMMIT=${{ env.BUILD_COMMIT }}
             BUILD_BRANCH=${{ env.BUILD_BRANCH }}
             BUILD_DATE=${{ env.BUILD_DATE }}
+            ${{ inputs.frontend_build_artifact != '' && format('PREBUILT_FRONTEND_COMMIT={0}', env.BUILD_COMMIT) || '' }}
 
       - name: Export digest
         env:

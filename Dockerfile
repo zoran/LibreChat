@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.19
+
 # v0.8.8
 
 # Base node image
@@ -54,12 +56,19 @@ RUN \
         sleep 10 ; \
     done
 
-COPY --chown=node:node . .
+# Keep the CI artifact out of image layers; the build step reads it from the context.
+COPY --chown=node:node --exclude=ci-build . .
 
 ARG VITE_MCP_SANDBOX_URL=
-RUN \
-    # React client build with configurable memory
-    NODE_OPTIONS="--max-old-space-size=${NODE_MAX_OLD_SPACE_SIZE}" npm run frontend && \
+ARG PREBUILT_FRONTEND_COMMIT=
+RUN --mount=type=bind,target=/build-context \
+    if [ -n "$PREBUILT_FRONTEND_COMMIT" ]; then \
+        node scripts/ci/frontend-build.mjs install \
+            --revision "$PREBUILT_FRONTEND_COMMIT" --directory /build-context/ci-build ; \
+    else \
+        # React client build with configurable memory
+        NODE_OPTIONS="--max-old-space-size=${NODE_MAX_OLD_SPACE_SIZE}" npm run frontend ; \
+    fi && \
     npm prune --production && \
     npm cache clean --force
 

@@ -2,6 +2,11 @@ name: Lighthouse CI
 
 on:
   workflow_call:
+    inputs:
+      upload_frontend_build:
+        description: Upload the verified frontend build for image publishing in this run.
+        type: boolean
+        default: false
   pull_request:
     paths:
       - 'api/**'
@@ -11,6 +16,7 @@ on:
       - 'e2e/**'
       - 'package.json'
       - 'package-lock.json'
+      - 'scripts/ci/frontend-build*.mjs'
       - '.github/workflows/lighthouse.yml'
       - '!**.md'
   workflow_dispatch:
@@ -35,6 +41,8 @@ jobs:
         with:
           node-version: '24.16.0'
           cache: npm
+      - name: Verify frontend build artifact integrity
+        run: node --test scripts/ci/frontend-build.test.mjs
       - run: npm ci
       - run: npm run e2e:prepare
       - name: Verify managed documents reach model-neutral chat context
@@ -77,3 +85,17 @@ jobs:
             e2e/presentation/.test-results/
           include-hidden-files: true
           retention-days: 7
+          overwrite: true
+      - name: Package verified frontend build
+        if: ${{ inputs.upload_frontend_build }}
+        run: node scripts/ci/frontend-build.mjs pack --revision "$GITHUB_SHA" --directory ci-build
+      - name: Upload verified frontend build
+        if: ${{ inputs.upload_frontend_build }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: frontend-build-${{ github.sha }}
+          path: ci-build
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
