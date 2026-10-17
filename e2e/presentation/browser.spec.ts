@@ -1,12 +1,169 @@
 import { randomUUID } from 'node:crypto';
 import { expect, test } from '@playwright/test';
-import type { BrowserContext, Page } from '@playwright/test';
+import type { BrowserContext, Locator, Page } from '@playwright/test';
+import { emailCodeMessage } from '../../packages/api/src/auth/emailCodeMessage';
+import { emailCodeLink } from '../../packages/api/src/auth/emailCodeLink';
 import { seedConversations, seedMessages } from '../specs/mock/db';
 import { getAccessToken } from '../specs/mock/helpers';
 
 const appTitle = 'Example Workplace';
 const version = 'v1.2.3+example.1';
 const userText = 'Meine Notiz über LibreChat bleibt unverändert.';
+const mailAttemptId = 'a'.repeat(43);
+const mailCode = '01234567';
+
+type PresentationFixture = { theme: 'light' | 'dark'; customWelcome?: string };
+
+async function configureBranding(page: Page, fixture: PresentationFixture) {
+  await page.addInitScript((theme) => localStorage.setItem('color-theme', theme), fixture.theme);
+  await page.route('**/api/config', async (route) => {
+    const response = await route.fetch();
+    const startup = await response.json();
+    await route.fulfill({
+      response,
+      json: {
+        ...startup,
+        interface: {
+          ...startup.interface,
+          appLogo: {
+            light: 'assets/presentation-logo-light.svg',
+            dark: 'assets/presentation-logo-dark.svg',
+          },
+          ...(fixture.customWelcome ? { customWelcome: fixture.customWelcome } : {}),
+        },
+      },
+    });
+  });
+  await page.route(/\/assets\/presentation-logo-(?:light|dark)\.svg$/, async (route) => {
+    const fill = route.request().url().includes('-dark.svg') ? '#ffffff' : '#202124';
+    await route.fulfill({
+      contentType: 'image/svg+xml',
+      body: `<svg xmlns="http://www.w3.org/2000/svg" width="400" height="80" viewBox="0 0 400 80"><text x="4" y="56" font-size="40" fill="${fill}">${appTitle}</text></svg>`,
+    });
+  });
+}
+
+async function expectThemedLogo(logo: Locator, theme: PresentationFixture['theme']) {
+  await expect(logo).toBeVisible();
+  await expect(logo).toHaveAttribute('src', `assets/presentation-logo-${theme}.svg`);
+  await expect
+    .poll(() =>
+      logo.evaluate(
+        (image) => image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0,
+      ),
+    )
+    .toBe(true);
+}
+
+async function signInFixture(page: Page) {
+  const email = `presentation-${randomUUID()}@example.invalid`;
+  const password = 'Local-fixture-only-42!';
+  const registered = await page.request.post('/api/auth/register', {
+    data: { name: 'Presentation User', email, password, confirm_password: password },
+  });
+  expect(registered.ok()).toBeTruthy();
+  const signedIn = await page.request.post('/api/auth/login', { data: { email, password } });
+  expect(signedIn.ok()).toBeTruthy();
+}
+
+function responseGate() {
+  let release!: () => void;
+  const ready = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { ready, release };
+}
+
+async function clickRenderedMailLink(page: Page, baseURL: string) {
+  const trustedClient = new URL(baseURL);
+  trustedClient.protocol = 'https:';
+  const link = emailCodeLink(trustedClient.href, mailAttemptId, mailCode);
+  const message = emailCodeMessage({ appTitle, code: mailCode, locale: 'de', link });
+  if (!message.html) throw new Error('The production mail renderer must supply its link');
+  await page.route('**/__presentation-mail', (route) =>
+    route.fulfill({ contentType: 'text/html', body: message.html }),
+  );
+  await page.goto('/__presentation-mail');
+  const anchor = page.getByRole('link', { name: `Mit dem Code ${mailCode} anmelden`, exact: true });
+  const href = await anchor.getAttribute('href');
+  expect(href).toBe(link);
+  if (!href) throw new Error('Rendered mail has no link');
+  const localLink = new URL(href);
+  // Production requires HTTPS; only the scheme changes for this enforced HTTP loopback harness.
+  localLink.protocol = new URL(baseURL).protocol;
+  await anchor.evaluate((element, value) => element.setAttribute('href', value), localLink.href);
+  await anchor.click();
+  await expect(page).toHaveURL(new URL('login/email-code', baseURL).href);
+}
+
+async function expectSettledLanding(page: Page, greetingText: string) {
+  const landing = page.getByTestId('landing');
+  const logo = landing.getByRole('img', { name: appTitle, exact: true });
+  const greeting = landing.getByTestId('landing-greeting').locator('.split-parent');
+  const composer = page.getByTestId('composer-surface');
+  await expect(greeting).toBeVisible();
+  await expect(greeting.locator('.sr-only')).toHaveText(greetingText);
+  await expect(composer).toBeVisible();
+  // A visible paragraph box alone can still contain transparent or translated spring letters.
+  await expect
+    .poll(() =>
+      greeting.locator('[aria-hidden="true"] > span').evaluateAll(
+        (letters) =>
+          letters.length > 0 &&
+          letters.every((letter) => {
+            const style = getComputedStyle(letter);
+            const settledTransform =
+              style.transform === 'none' ||
+              Math.abs(new DOMMatrixReadOnly(style.transform).m42) < 0.5;
+            return Number(style.opacity) >= 0.99 && settledTransform;
+          }),
+      ),
+    )
+    .toBe(true);
+  let previous = '';
+  let stableSamples = 0;
+  await expect
+    .poll(
+      async () => {
+        const boxes = await Promise.all([
+          logo.boundingBox(),
+          greeting.boundingBox(),
+          composer.boundingBox(),
+        ]);
+        if (boxes.some((box) => box === null)) return false;
+        const sample = JSON.stringify(boxes, (_key, value) =>
+          typeof value === 'number' ? Math.round(value * 10) / 10 : value,
+        );
+        stableSamples = sample === previous ? stableSamples + 1 : 0;
+        previous = sample;
+        return stableSamples >= 2;
+      },
+      { intervals: [100, 150, 200] },
+    )
+    .toBe(true);
+  const logoBox = await logo.boundingBox();
+  const greetingBox = await greeting.boundingBox();
+  const composerBox = await composer.boundingBox();
+  const viewport = page.viewportSize();
+  if (!logoBox || !greetingBox || !composerBox || !viewport) {
+    throw new Error('Landing layout must have measurable logo, greeting, composer and viewport');
+  }
+  expect(
+    greetingBox.y - (logoBox.y + logoBox.height),
+    'Logo must clear the visible greeting',
+  ).toBeGreaterThan(0);
+  expect(
+    composerBox.y - (greetingBox.y + greetingBox.height),
+    'Greeting must clear the composer',
+  ).toBeGreaterThan(0);
+  for (const box of [logoBox, greetingBox, composerBox]) {
+    expect(box.x).toBeGreaterThanOrEqual(-1);
+    expect(box.y).toBeGreaterThanOrEqual(-1);
+    expect(box.x + box.width).toBeLessThanOrEqual(viewport.width + 1);
+    expect(box.y + box.height).toBeLessThanOrEqual(viewport.height + 1);
+  }
+  await expectNoOverflow(page);
+}
 
 async function prepareEnglish(context: BrowserContext, baseURL: string, json: boolean) {
   await context.addCookies([{ name: 'lang', value: 'en', url: baseURL }]);
@@ -212,3 +369,154 @@ test('German presentation survives old English preferences, login, settings, rel
     await publicContext.close();
   }
 });
+
+for (const theme of ['light', 'dark'] as const) {
+  test(`mail route resolves authentication and retains ${theme} branding through rejection and recovery (controlled auth boundary)`, async ({
+    page,
+    context,
+    baseURL,
+    isMobile,
+  }, testInfo) => {
+    if (!baseURL) throw new Error('Presentation requires its isolated baseURL');
+    await prepareEnglish(context, baseURL, isMobile);
+    await configureBranding(page, { theme });
+    const refresh = responseGate();
+    const verification = responseGate();
+    const requests: Array<{ attemptId: string; code: string }> = [];
+    await page.route('**/api/auth/refresh', async (route) => {
+      await refresh.ready;
+      await route.fulfill({ status: 200, json: {} });
+    });
+    // The harness disables email-code auth: only this endpoint boundary is simulated.
+    await page.route('**/api/auth/email-code/verify', async (route) => {
+      requests.push(route.request().postDataJSON());
+      await verification.ready;
+      await route.fulfill({ status: 400, json: { code: 'EMAIL_CODE_INVALID' } });
+    });
+    try {
+      await clickRenderedMailLink(page, baseURL);
+      await expectGerman(page);
+      await expect(page).toHaveTitle(appTitle);
+      await expect(page.getByRole('main')).toHaveCount(1);
+      const status = page.getByRole('main').getByRole('status');
+      await expect(status).toHaveText('Anmeldung wird geprüft …');
+      expect(requests).toHaveLength(0);
+      // The shared API client waits for auth resolution before loading startup branding.
+      refresh.release();
+      await expect(
+        page.getByRole('heading', { name: 'Anmelden mit E-Mail-Code', exact: true }),
+      ).toBeVisible();
+      const logo = page.getByRole('img', { name: appTitle, exact: true });
+      await expectThemedLogo(logo, theme);
+      await expect(status).toHaveText('Anmeldung wird geprüft …');
+      await expectNoOverflow(page);
+
+      await expect.poll(() => requests.length).toBe(1);
+      expect(requests[0]).toEqual({ attemptId: mailAttemptId, code: mailCode });
+      await expect(status).toHaveText('Anmeldung wird geprüft …');
+      await expectThemedLogo(logo, theme);
+      // The real HTML bootstrap consumes the fragment before application resources load.
+      expect(new URL(page.url()).hash).toBe('');
+      expect(new URL(page.url()).search).toBe('');
+
+      verification.release();
+      await expect(page.getByRole('main').getByRole('alert')).toHaveText(
+        'Dieser Link ist nicht mehr gültig. Fordere einen neuen Code an.',
+      );
+      await expect(status).toHaveCount(0);
+      await expectThemedLogo(logo, theme);
+      const recovery = page.getByRole('link', { name: 'Neuen Code anfordern', exact: true });
+      await expect(recovery).toHaveAttribute('href', '/login');
+      await expectNoOverflow(page);
+      await page.screenshot({
+        path: testInfo.outputPath(`presentation-mail-${theme}-recovery.png`),
+      });
+      await recovery.click();
+      await expect(page).toHaveURL(/\/login$/);
+      await expect(page.getByRole('form', { name: 'Anmeldeformular' })).toBeVisible();
+      await expectThemedLogo(logo, theme);
+      expect(requests).toHaveLength(1);
+    } finally {
+      refresh.release();
+      verification.release();
+    }
+  });
+}
+
+test('branded mail route preserves signed-in account confirmation (controlled verification boundary)', async ({
+  page,
+  context,
+  baseURL,
+  isMobile,
+}, testInfo) => {
+  if (!baseURL) throw new Error('Presentation requires its isolated baseURL');
+  await prepareEnglish(context, baseURL, isMobile);
+  await configureBranding(page, { theme: 'dark' });
+  await signInFixture(page);
+  const requests: Array<{ attemptId: string; code: string }> = [];
+  await page.route('**/api/auth/email-code/verify', async (route) => {
+    requests.push(route.request().postDataJSON());
+    await route.fulfill({ status: 400, json: { code: 'EMAIL_CODE_INVALID' } });
+  });
+  await clickRenderedMailLink(page, baseURL);
+  await expect(
+    page.getByText(
+      'Du bist bereits angemeldet. Möchtest du die Anmeldung aus dieser E-Mail verwenden?',
+      {
+        exact: true,
+      },
+    ),
+  ).toBeVisible();
+  await expectThemedLogo(page.getByRole('img', { name: appTitle, exact: true }), 'dark');
+  const confirm = page.getByRole('main').getByRole('button', { name: 'Anmelden', exact: true });
+  await expect(confirm).toBeEnabled();
+  expect(requests).toHaveLength(0);
+  await expectNoOverflow(page);
+  await page.screenshot({ path: testInfo.outputPath('presentation-mail-confirmation.png') });
+  await confirm.click();
+  await expect(page.getByRole('main').getByRole('alert')).toHaveText(
+    'Dieser Link ist nicht mehr gültig. Fordere einen neuen Code an.',
+  );
+  expect(requests).toEqual([{ attemptId: mailAttemptId, code: mailCode }]);
+});
+
+for (const centered of [true, false]) {
+  test(`chat logo, settled greeting and ${centered ? 'centered' : 'bottom'} composer remain separated`, async ({
+    page,
+    context,
+    baseURL,
+    isMobile,
+  }, testInfo) => {
+    if (!baseURL) throw new Error('Presentation requires its isolated baseURL');
+    await prepareEnglish(context, baseURL, isMobile);
+    await page.addInitScript(
+      (value) => localStorage.setItem('centerFormOnLanding', JSON.stringify(value)),
+      centered,
+    );
+    const fixture: PresentationFixture = { theme: centered ? 'dark' : 'light' };
+    await configureBranding(page, fixture);
+    await signInFixture(page);
+    const greetings = [
+      'Willkommen, Presentation User.',
+      'Willkommen, alexander.von-der-linden-mustermann-mit-langer-mailadresse.',
+      'Guten Morgen, Presentation User. Schön, dass du da bist. Hier ist Platz für deine Fragen, Gedanken und die gemeinsame Arbeit an deinem nächsten Projekt.',
+    ];
+    for (const [index, greeting] of greetings.entries()) {
+      fixture.customWelcome = greeting;
+      await page.goto('/c/new');
+      await expect(
+        page.getByRole('textbox', { name: 'Nachrichteneingabe', exact: true }),
+      ).toBeVisible();
+      await expectThemedLogo(
+        page.getByTestId('landing').getByRole('img', { name: appTitle, exact: true }),
+        fixture.theme,
+      );
+      await expectSettledLanding(page, greeting);
+      await page.screenshot({
+        path: testInfo.outputPath(
+          `presentation-chat-${centered ? 'centered' : 'bottom'}-${index}.png`,
+        ),
+      });
+    }
+  });
+}

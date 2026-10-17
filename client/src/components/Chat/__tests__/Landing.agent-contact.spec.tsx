@@ -27,6 +27,7 @@ jest.mock('@librechat/client', () => ({
   TooltipAnchor: ({ children }: { children: React.ReactNode }) => <span>{children}</span>,
   SplitText: ({ text }: { text: string }) => <span>{text}</span>,
   useRemScale: () => 1,
+  useTheme: () => ({ resolvedMode: 'light' }),
 }));
 
 jest.mock('~/Providers', () => ({

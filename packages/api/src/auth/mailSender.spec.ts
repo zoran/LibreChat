@@ -179,7 +179,7 @@ describe('bounded approved SMTP submission', () => {
     expect(f.messages[0]).toMatchObject({
       from: { name: 'Example Portal', address: 'no-reply@example.test' },
       envelope: { from: 'no-reply@example.test', to: [input.email] },
-      subject: 'Ihr Anmeldecode für Example Portal',
+      subject: 'Dein Anmeldecode für Example Portal',
       text: expect.stringContaining('01234567'),
     });
   });
@@ -187,14 +187,12 @@ describe('bounded approved SMTP submission', () => {
   it('tries the second relay after TCP non-acceptance, without extending the overall deadline', async () => {
     const f = fixture();
     const pending = f.sender.sendCode(input);
-    const rejected = expect(pending).rejects.toMatchObject({
-      code: 'EMAIL_CODE_UNAVAILABLE',
-    });
+    const rejected = pending.catch((error: unknown) => error);
     jest.advanceTimersByTime(5_000);
     expect(f.options.map((o) => o.host)).toEqual(['192.0.2.10', 'smtp-backup.example.test']);
     f.sockets[1].emit('connect');
     jest.advanceTimersByTime(15_000);
-    await rejected;
+    expect(await rejected).toMatchObject({ code: 'EMAIL_CODE_UNAVAILABLE' });
     expect(f.sockets.every((s) => s.destroyed)).toBe(true);
     // A callback after cancellation cannot convert an unknown submission into a login code.
     f.callbacks[1](null, { accepted: [input.email], response: '250 accepted too late' });
@@ -265,6 +263,86 @@ describe('bounded approved SMTP submission', () => {
     expect(
       getEmailCodeMailConfig(environment({ EMAIL_CODE_SMTP_HOSTS: '["2001:db8::1"]' }), domains),
     ).toMatchObject({ hosts: ['2001:db8::1'] });
+  });
+
+  it('normalizes optional public help without inventing a default contact', () => {
+    const supportText = 'Bei Fragen hilft dir das Portal-Team weiter.';
+    expect(
+      getEmailCodeMailConfig(
+        environment({ EMAIL_CODE_SUPPORT_TEXT: `  ${supportText}  ` }),
+        config.allowedDomains,
+      ),
+    ).toMatchObject({ supportText });
+    for (const value of [undefined, '', '   ']) {
+      expect(
+        getEmailCodeMailConfig(
+          environment({ EMAIL_CODE_SUPPORT_TEXT: value }),
+          config.allowedDomains,
+        ),
+      ).not.toHaveProperty('supportText');
+    }
+    expect(
+      getEmailCodeMailConfig(
+        environment({ EMAIL_CODE_SUPPORT_TEXT: 'x'.repeat(240) }),
+        config.allowedDomains,
+      ),
+    ).toMatchObject({ supportText: 'x'.repeat(240) });
+  });
+
+  it.each([
+    'x'.repeat(241),
+    'Help\nMore',
+    'Help\rMore',
+    'Help\tMore',
+    'Help\u0000',
+    'Help\u007f',
+    'Help\u0085More',
+    'Help\u2028More',
+    'Help\u2029More',
+  ])('rejects oversized or non-paragraph help before opening transport: %p', (supportText) => {
+    expect(() =>
+      getEmailCodeMailConfig(
+        environment({ EMAIL_CODE_SUPPORT_TEXT: supportText }),
+        config.allowedDomains,
+      ),
+    ).toThrow('Invalid email-code SMTP configuration');
+    const createTransport = jest.fn();
+    expect(() =>
+      createBoundedEmailCodeSender({ ...config, supportText }, { createTransport }),
+    ).toThrow('Invalid email-code SMTP configuration');
+    expect(createTransport).not.toHaveBeenCalled();
+  });
+
+  it.each([null, 123, ['Help'], { text: 'Help' }])(
+    'rejects non-text public help: %p',
+    (supportText) => {
+      expect(() => fixture({ ...config, supportText } as EmailCodeMailConfig)).toThrow(
+        'Invalid email-code SMTP configuration',
+      );
+    },
+  );
+
+  it('passes the snapshotted deployment help through to both mail alternatives', async () => {
+    const supportText = 'Bei Fragen hilft dir das Portal-Team weiter.';
+    const settings = getEmailCodeMailConfig(
+      environment({
+        EMAIL_CODE_SUPPORT_TEXT: ` ${supportText} `,
+        DOMAIN_CLIENT: 'https://portal.example.test',
+      }),
+      config.allowedDomains,
+    )!;
+    const mutable = { ...settings };
+    const f = fixture(mutable);
+    mutable.supportText = 'Changed after construction';
+    const pending = f.sender.sendCode({ ...input, attemptId: 'a'.repeat(43) });
+    f.sockets[0].emit('connect');
+    f.callbacks[0](null, { accepted: [input.email], response: '250 queued' });
+    await pending;
+    const message = f.messages[0] as EmailCodeMailMessage;
+    expect(message.text.split(supportText)).toHaveLength(2);
+    expect(message.html!.split(supportText)).toHaveLength(2);
+    expect(message.text).not.toContain(mutable.supportText);
+    expect(message.html).not.toContain(mutable.supportText);
   });
 
   it('rejects malformed endpoints and partial explicit SMTP configuration', () => {
@@ -362,11 +440,9 @@ describe('bounded approved SMTP submission', () => {
   it('uses the configured title in English and does not invent a second relay', async () => {
     const f = fixture({ ...config, hosts: ['smtp.example.test'], appTitle: 'Another Portal' });
     const pending = f.sender.sendCode({ ...input, locale: 'en' });
-    const rejected = expect(pending).rejects.toMatchObject({
-      code: 'EMAIL_CODE_UNAVAILABLE',
-    });
+    const rejected = pending.catch((error: unknown) => error);
     jest.advanceTimersByTime(20_000);
-    await rejected;
+    expect(await rejected).toMatchObject({ code: 'EMAIL_CODE_UNAVAILABLE' });
     expect(f.options).toHaveLength(1);
     expect(f.options[0].host).toBe('smtp.example.test');
     expect(f.messages[0]).toMatchObject({

@@ -5,36 +5,33 @@ export function emailCodeMessage(input: {
   locale?: string;
   link?: string;
   embeddedLogo?: boolean;
+  supportText?: string;
 }): { subject: string; text: string; html?: string } {
-  const { appTitle, code, link } = input;
+  const { appTitle, code, link, supportText } = input;
   const german = input.locale === 'de';
-  const subject = german ? `Ihr Anmeldecode für ${appTitle}` : `Your ${appTitle} sign-in code`;
-  const heading = german ? 'Ihr Anmeldecode' : 'Your sign-in code';
+  const subject = german ? `Dein Anmeldecode für ${appTitle}` : `Your ${appTitle} sign-in code`;
+  const heading = german ? 'Dein Anmeldecode' : 'Your sign-in code';
   const instruction = german
-    ? 'Geben Sie diesen Code auf der Anmeldeseite ein:'
+    ? 'Gib diesen Code auf der Anmeldeseite ein:'
     : 'Enter this code on the sign-in page:';
   const validity = german
     ? 'Der Code ist zehn Minuten gültig.'
     : 'The code is valid for ten minutes.';
   const alternative = german
-    ? 'Alternativ können Sie den Code anklicken. Verwenden Sie dafür denselben Browser, in dem Sie die Anmeldung begonnen haben.'
-    : 'You can also click the code. Use the same browser where you started signing in.';
+    ? 'Alternativ kannst du den Code anklicken.'
+    : 'You can also click the code.';
   const ignore = german
-    ? 'Wenn Sie diese Anmeldung nicht angefordert haben, ignorieren Sie diese E-Mail.'
+    ? 'Wenn du diese Anmeldung nicht angefordert hast, ignoriere diese E-Mail.'
     : 'If you did not request this sign-in, you can ignore this email.';
   const text = [
     subject,
     `${instruction}\n\n${code}`,
     validity,
     ...(link
-      ? [
-          german
-            ? 'Alternativ können Sie diesen Link im selben Browser öffnen, in dem Sie die Anmeldung begonnen haben:'
-            : 'You can also open this link in the same browser where you started signing in:',
-          link,
-        ]
+      ? [german ? 'Alternativ kannst du diesen Link öffnen:' : 'You can also open this link:', link]
       : []),
     ignore,
+    ...(supportText ? [supportText] : []),
   ].join('\n\n');
   if (!link) return { subject, text };
   const escape = (value: string) =>
@@ -60,7 +57,7 @@ export function emailCodeMessage(input: {
 <a aria-label="${escape(accessibleCode)}" style="display:inline-block;max-width:100%;box-sizing:border-box;padding:12px 16px;border:1px solid #D9DDE2;border-radius:8px;background:${codeBackground};color:#202124;font-family:Consolas,monospace;font-size:28px;font-weight:bold;line-height:1.5;letter-spacing:2px;text-decoration:none;overflow-wrap:anywhere;word-break:break-all;" href="${escape(link)}">${escape(code)}</a>
 <p style="margin:12px 0 24px;font-size:16px;color:#4A4F57;">${validity}</p>
 <p style="margin:0;font-size:14px;color:#4A4F57;">${alternative}</p>
-</td></tr><tr><td style="padding:20px 24px;border-top:1px solid #D9DDE2;color:#4A4F57;font-size:14px;overflow-wrap:anywhere;">${ignore}</td></tr>
+</td></tr><tr><td style="padding:20px 24px;border-top:1px solid #D9DDE2;color:#4A4F57;font-size:14px;overflow-wrap:anywhere;">${ignore}${supportText ? `<p style="margin:12px 0 0;">${escape(supportText)}</p>` : ''}</td></tr>
 </table></td></tr></table></body></html>`;
   return { subject, text, html };
 }

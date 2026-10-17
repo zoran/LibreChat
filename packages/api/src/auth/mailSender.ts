@@ -1,9 +1,9 @@
 import { URL } from 'node:url';
 import { Socket, isIP } from 'node:net';
 import { X509Certificate } from 'node:crypto';
+import type { EmailCodeSender } from './emailCode.types';
 import { emailCodeLink, mailClientUrl } from './emailCodeLink';
 import { emailCodeMessage } from './emailCodeMessage';
-import type { EmailCodeSender } from './emailCode.types';
 
 const DEADLINE_MS = 20_000;
 const CONNECT_MS = 5_000;
@@ -18,6 +18,8 @@ export interface EmailCodeMailConfig {
   appTitle: string;
   allowedDomains: readonly string[];
   clientUrl?: string;
+  /** Optional deployment help: one trimmed paragraph of at most 240 characters, rendered as text. */
+  supportText?: string;
   /** Trusted deployment artwork, copied once; never a URL or a mail-client file path. */
   logoPng?: Buffer;
 }
@@ -183,6 +185,17 @@ function snapshotMailConfig(value: unknown): EmailCodeMailConfig {
   if (!Array.isArray(input.allowedDomains) || input.allowedDomains.length === 0)
     return invalidMailConfig();
   const allowedDomains = input.allowedDomains.map(dnsName);
+  let supportText: string | undefined;
+  if (input.supportText !== undefined) {
+    if (
+      typeof input.supportText !== 'string' ||
+      // eslint-disable-next-line no-control-regex -- Public mail help must remain one paragraph without control characters.
+      /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(input.supportText)
+    )
+      return invalidMailConfig();
+    supportText = input.supportText.trim() || undefined;
+    if (supportText && supportText.length > 240) return invalidMailConfig();
+  }
   const logo = input.logoPng;
   if (
     logo !== undefined &&
@@ -212,6 +225,7 @@ function snapshotMailConfig(value: unknown): EmailCodeMailConfig {
     from,
     appTitle: title.trim(),
     allowedDomains: Object.freeze(allowedDomains),
+    ...(supportText === undefined ? {} : { supportText }),
     ...(logo === undefined ? {} : { logoPng: Buffer.from(logo as Buffer) }),
     ...(input.clientUrl === undefined ? {} : { clientUrl: mailClientUrl(input.clientUrl) }),
   });
@@ -251,6 +265,7 @@ export function getEmailCodeMailConfig(
     from: env.EMAIL_CODE_SMTP_FROM,
     appTitle: env.APP_TITLE == null || env.APP_TITLE === '' ? 'LibreChat' : env.APP_TITLE,
     allowedDomains,
+    supportText: env.EMAIL_CODE_SUPPORT_TEXT,
     ...(env.DOMAIN_CLIENT ? { clientUrl: env.DOMAIN_CLIENT } : {}),
   });
 }
@@ -286,6 +301,7 @@ export function createBoundedEmailCodeSender(
           locale: input.locale,
           link,
           embeddedLogo: Boolean(config.logoPng && link),
+          supportText: config.supportText,
         }),
         ...(config.logoPng && link
           ? {

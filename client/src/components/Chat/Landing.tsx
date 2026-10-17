@@ -1,8 +1,8 @@
-import { useMemo, useCallback, useState, useEffect, useRef } from 'react';
+import { useMemo, useCallback, useState } from 'react';
 import { HatGlasses } from 'lucide-react';
 import { easings } from '@react-spring/web';
 import { EModelEndpoint } from 'librechat-data-provider';
-import { BirthdayIcon, TooltipAnchor, SplitText, useRemScale } from '@librechat/client';
+import { BirthdayIcon, TooltipAnchor, SplitText } from '@librechat/client';
 import { useChatContext, useAgentsMapContext, useAssistantsMapContext } from '~/Providers';
 import Description, { isHtmlDescription } from '~/components/ui/Description';
 import { useGetEndpointsQuery, useGetStartupConfig } from '~/data-provider';
@@ -46,13 +46,9 @@ export default function Landing({ centerFormOnLanding }: { centerFormOnLanding: 
   const { data: endpointsConfig } = useGetEndpointsQuery();
   const { user } = useAuthContext();
   const localize = useLocalize();
-  const remScale = useRemScale();
   const { isTemporary } = useChatSettings();
 
   const [textHasMultipleLines, setTextHasMultipleLines] = useState(false);
-  const [lineCount, setLineCount] = useState(1);
-  const [contentHeight, setContentHeight] = useState(0);
-  const contentRef = useRef<HTMLDivElement>(null);
 
   const endpointType = useMemo(() => {
     let ep = conversation?.endpoint ?? '';
@@ -98,34 +94,7 @@ export default function Landing({ centerFormOnLanding }: { centerFormOnLanding: 
 
   const handleLineCountChange = useCallback((count: number) => {
     setTextHasMultipleLines(count > 1);
-    setLineCount(count);
   }, []);
-
-  useEffect(() => {
-    if (contentRef.current) {
-      setContentHeight(contentRef.current.offsetHeight);
-    }
-  }, [lineCount, description, selectedAgent, remScale]);
-
-  const getDynamicMargin = useMemo(() => {
-    let margin = 'mb-0';
-
-    if (lineCount > 2 || (description && description.length > 100)) {
-      margin = 'mb-10';
-    } else if (lineCount > 1 || (description && description.length > 0)) {
-      margin = 'mb-6';
-    } else if (textHasMultipleLines) {
-      margin = 'mb-4';
-    }
-
-    if (contentHeight > 200) {
-      margin = 'mb-16';
-    } else if (contentHeight > 150) {
-      margin = 'mb-12';
-    }
-
-    return margin;
-  }, [lineCount, description, textHasMultipleLines, contentHeight]);
 
   const resolvedWelcome =
     customWelcome != null && user?.name
@@ -136,16 +105,23 @@ export default function Landing({ centerFormOnLanding }: { centerFormOnLanding: 
     ? localize('com_ui_temporary')
     : (resolvedWelcome ?? scheduledGreeting);
 
+  // Reserve the full logo/text height so the composer cannot cover the greeting.
+  // ChatView centers this block with the composer on desktop; other modes fill
+  // the available space without collapsing or estimating the welcome content.
   return (
     <div
-      className={`flex h-full transform-gpu flex-col items-center justify-center pb-16 transition-all duration-200 ${centerFormOnLanding ? 'max-h-full sm:max-h-0' : 'max-h-full'} ${getDynamicMargin}`}
+      data-testid="landing"
+      className={`flex w-full shrink-0 grow transform-gpu flex-col items-center justify-center gap-4 pb-16 transition-all duration-200 ${centerFormOnLanding ? 'sm:grow-0' : ''}`}
     >
-      <AppLogo startupConfig={startupConfig} className="mb-4" />
-      <div ref={contentRef} className="flex flex-col items-center gap-0 p-2">
+      <AppLogo startupConfig={startupConfig} />
+      <div className="flex w-full min-w-0 shrink-0 flex-col items-center gap-0 p-2">
         <div
-          className={`flex ${textHasMultipleLines ? 'flex-col' : 'flex-col md:flex-row'} items-center justify-center gap-2`}
+          data-testid="landing-greeting"
+          className={`flex max-w-full ${textHasMultipleLines ? 'flex-col' : 'flex-col md:flex-row'} items-center justify-center gap-2`}
         >
-          <div className={`relative size-10 justify-center ${textHasMultipleLines ? 'mb-2' : ''}`}>
+          <div
+            className={`relative size-10 shrink-0 justify-center ${textHasMultipleLines ? 'mb-2' : ''}`}
+          >
             {isTemporary ? (
               <div className={containerClassName}>
                 <HatGlasses className="text-text-primary h-2/3 w-2/3" aria-hidden="true" />
@@ -173,11 +149,11 @@ export default function Landing({ centerFormOnLanding }: { centerFormOnLanding: 
             )}
           </div>
           {((isAgent || isAssistant) && name) || name ? (
-            <div className="flex flex-col items-center gap-0 p-2">
+            <div className="flex max-w-full min-w-0 flex-col items-center gap-0 p-2">
               <SplitText
                 key={`split-text-${name}`}
                 text={name}
-                className={`${getTextSizeClass(name)} text-text-primary font-medium`}
+                className={`${getTextSizeClass(name)} text-text-primary max-w-full font-medium`}
                 delay={50}
                 textAlign="center"
                 animationFrom={greetingAnimationFrom}
@@ -192,7 +168,7 @@ export default function Landing({ centerFormOnLanding }: { centerFormOnLanding: 
             <SplitText
               key={`split-text-${greetingText}${user?.name ? '-user' : ''}`}
               text={greetingText}
-              className={`${getTextSizeClass(greetingText)} text-text-primary font-medium`}
+              className={`${getTextSizeClass(greetingText)} text-text-primary max-w-full font-medium`}
               delay={50}
               textAlign="center"
               animationFrom={greetingAnimationFrom}

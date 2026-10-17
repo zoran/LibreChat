@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import {
   Button,
   Input,
@@ -29,6 +29,32 @@ const errorKeys: Record<string, TranslationKeys> = {
   BROWSER_SESSION_EXPIRED: 'com_auth_browser_expired',
 };
 
+const cooldownStorageKey = 'librechat-email-code-cooldowns';
+const sendCooldownMs = 60_000;
+const maxCooldownMs = 3_600_000;
+const requestActions = ['send', 'verify', 'guest'] as const;
+type RequestAction = (typeof requestActions)[number];
+type Cooldowns = Record<RequestAction, number>;
+
+/** Only bounded deadlines survive reloads; email addresses, codes and challenges stay in memory. */
+function readCooldowns(): Cooldowns {
+  const cooldowns: Cooldowns = { send: 0, verify: 0, guest: 0 };
+  const now = Date.now();
+  try {
+    const saved = JSON.parse(localStorage.getItem(cooldownStorageKey) ?? 'null');
+    for (const action of requestActions) {
+      const until = saved?.[action];
+      if (Number.isSafeInteger(until) && until > now && until <= now + maxCooldownMs) {
+        cooldowns[action] = until;
+      }
+    }
+  } catch {
+    // A blocked or corrupt store must not break sign-in; the mounted handler still has its guard.
+  }
+  return cooldowns;
+}
+
+/** Own request admission and visible cooldowns for every action in the email-code login flow. */
 export default function EmailCodeLogin({
   config,
   emailOnly = false,
@@ -49,45 +75,88 @@ export default function EmailCodeLogin({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<TranslationKeys>();
   const [guestExpired, setGuestExpired] = useState(false);
-  const [seconds, setSeconds] = useState(0);
-  const [minutesLeft, setMinutesLeft] = useState(10);
+  const [cooldowns, setCooldowns] = useState<Cooldowns>(readCooldowns);
+  const [now, setNow] = useState(Date.now);
+  const cooldownsRef = useRef(cooldowns);
+  const inFlight = useRef(false);
+  const mounted = useRef(true);
   const generation = useRef(0);
   const controller = useRef<AbortController>();
   const codeInput = useRef<HTMLInputElement>(null);
   const id = useId();
 
-  useEffect(
-    () => () => {
-      generation.current++;
-      controller.current?.abort();
-    },
-    [],
-  );
-  useEffect(() => {
-    if (!challenge) return;
-    codeInput.current?.focus();
-    const update = () => {
-      setSeconds(Math.max(0, Math.ceil((Date.parse(challenge.resendAt) - Date.now()) / 1000)));
-      setMinutesLeft(
-        Math.max(0, Math.ceil((Date.parse(challenge.expiresAt) - Date.now()) / 60000)),
-      );
-    };
-    update();
-    const timer = window.setInterval(update, 1000);
-    return () => window.clearInterval(timer);
-  }, [challenge]);
+  const syncCooldowns = useCallback((action?: RequestAction, until = 0) => {
+    const saved = readCooldowns();
+    const next = { ...cooldownsRef.current };
+    const timestamp = Date.now();
+    for (const kind of requestActions) {
+      next[kind] = Math.max(next[kind], saved[kind]);
+    }
+    if (action && Number.isFinite(until) && until > timestamp) {
+      next[action] = Math.max(next[action], Math.min(Math.ceil(until), timestamp + maxCooldownMs));
+      try {
+        localStorage.setItem(cooldownStorageKey, JSON.stringify(next));
+      } catch {
+        // Keep enforcing the in-memory deadline when browser storage is unavailable.
+      }
+    }
+    cooldownsRef.current = next;
+    setCooldowns(next);
+    setNow(timestamp);
+    return next;
+  }, []);
 
-  const run = async (action: (signal: AbortSignal) => Promise<void>) => {
-    if (busy) return;
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      generation.current += 1;
+      controller.current?.abort();
+      controller.current = undefined;
+      inFlight.current = false;
+    };
+  }, []);
+  useEffect(() => {
+    const onStorage = (event: StorageEvent) => {
+      if (event.key === cooldownStorageKey || event.key === null) syncCooldowns();
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, [syncCooldowns]);
+  useEffect(() => {
+    if (challenge) codeInput.current?.focus();
+  }, [challenge]);
+  const hasCountdown = !!challenge || requestActions.some((action) => cooldowns[action] > now);
+  useEffect(() => {
+    if (!hasCountdown) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [hasCountdown]);
+  const secondsLeft = (action: RequestAction) =>
+    Math.max(0, Math.ceil((cooldowns[action] - now) / 1000));
+  const sendSeconds = secondsLeft('send');
+  const verifySeconds = secondsLeft('verify');
+  const guestSeconds = secondsLeft('guest');
+  const minutesLeft = challenge
+    ? Math.max(0, Math.ceil((Date.parse(challenge.expiresAt) - now) / 60_000))
+    : 10;
+
+  const run = async (kind: RequestAction, action: (signal: AbortSignal) => Promise<void>) => {
+    if (!mounted.current || inFlight.current || syncCooldowns()[kind] > Date.now()) return;
+    inFlight.current = true;
     const current = ++generation.current;
-    controller.current?.abort();
-    controller.current = new AbortController();
+    const requestController = new AbortController();
+    controller.current = requestController;
+    if (kind === 'send') syncCooldowns('send', Date.now() + sendCooldownMs);
     setBusy(true);
     setError(undefined);
     try {
-      await action(controller.current.signal);
+      await action(requestController.signal);
     } catch (cause) {
-      if (current !== generation.current || controller.current.signal.aborted) return;
+      if (current !== generation.current || requestController.signal.aborted) return;
+      if (cause instanceof EmailCodeRequestError && cause.retryAfter > 0) {
+        syncCooldowns(kind, Date.now() + cause.retryAfter * 1000);
+      }
       const key =
         cause instanceof EmailCodeRequestError &&
         Object.prototype.hasOwnProperty.call(errorKeys, cause.code)
@@ -97,7 +166,11 @@ export default function EmailCodeLogin({
         setGuestExpired(true);
       setError(key ?? 'com_auth_email_code_unavailable');
     } finally {
-      if (current === generation.current) setBusy(false);
+      if (current === generation.current) {
+        inFlight.current = false;
+        controller.current = undefined;
+        setBusy(false);
+      }
     }
   };
   const finish = async (data: TLoginResponse, signal: AbortSignal) => {
@@ -106,7 +179,7 @@ export default function EmailCodeLogin({
     if (!signal.aborted) onComplete?.();
   };
   const requestCode = () =>
-    run(async (signal) => {
+    run('send', async (signal) => {
       const next = await emailCodeRequest<EmailCodeChallengeResponse>(
         'email-code/request',
         {
@@ -116,32 +189,64 @@ export default function EmailCodeLogin({
         signal,
       );
       if (!signal.aborted) {
+        syncCooldowns('send', Date.parse(next.resendAt));
         setChallenge(next);
         setCode('');
       }
     });
 
+  const blockedSeconds = challenge ? verifySeconds : sendSeconds;
+  let submitLabel = localize(challenge ? 'com_auth_email_code_verify' : 'com_auth_email_code_send');
+  if (busy) {
+    submitLabel = localize('com_auth_email_code_working');
+  } else if (blockedSeconds > 0) {
+    submitLabel = challenge
+      ? `${submitLabel} (${localize('com_ui_duration_seconds', { 0: String(blockedSeconds) })})`
+      : localize('com_auth_email_code_resend_wait', { 0: String(blockedSeconds) });
+  }
+  let guestLabel = localize(
+    guestExpired ? 'com_auth_browser_new' : 'com_auth_email_code_choice_guest',
+  );
+  if (busy) {
+    guestLabel = localize('com_auth_email_code_working');
+  } else if (guestSeconds > 0) {
+    guestLabel += ` (${localize('com_ui_duration_seconds', { 0: String(guestSeconds) })})`;
+  }
+  const pendingStatus = busy && (
+    <p role="status" className="text-text-secondary flex items-center justify-center gap-2 text-sm">
+      <Spinner className="shrink-0" />
+      <span>{localize('com_auth_email_code_working')}</span>
+    </p>
+  );
+
   if (step === 'choice') {
     return (
       <section className="space-y-4" aria-label={localize('com_auth_email_code_choice')}>
-        <Button className="w-full" disabled={busy} onClick={() => setStep('email')}>
+        <Button
+          className="w-full"
+          disabled={busy}
+          onClick={() => {
+            if (!inFlight.current) setStep('email');
+          }}
+        >
           {localize('com_auth_email_code_choice_email')}
         </Button>
         <Button
           className="w-full"
           variant="outline"
-          disabled={busy}
+          disabled={busy || guestSeconds > 0}
           onClick={() =>
-            run(async (signal) => {
+            run('guest', async (signal) => {
               if (guestExpired) await emailCodeRequest('browser/reset', {}, signal);
+              if (signal.aborted) return;
               await finish(await emailCodeRequest<TLoginResponse>('guest', {}, signal), signal);
             })
           }
         >
-          {localize(guestExpired ? 'com_auth_browser_new' : 'com_auth_email_code_choice_guest')}
+          {guestLabel}
         </Button>
         <p className="text-text-secondary text-sm">{localize('com_auth_email_code_guest_help')}</p>
-        {busy && <Spinner />}
+        {pendingStatus}
         {error && (
           <p role="alert" className="text-status-error-strong">
             {localize(error)}
@@ -158,11 +263,12 @@ export default function EmailCodeLogin({
       ) : (
         <form
           className="space-y-4"
+          aria-busy={busy}
           onSubmit={(event) => {
             event.preventDefault();
             if (!challenge) void requestCode();
             else
-              void run(async (signal) =>
+              void run('verify', async (signal) =>
                 finish(
                   await emailCodeRequest<TLoginResponse>(
                     'email-code/verify',
@@ -221,21 +327,19 @@ export default function EmailCodeLogin({
               />
             </div>
           )}
-          <Button className="w-full" type="submit" disabled={busy}>
-            {busy
-              ? localize('com_auth_email_code_working')
-              : localize(challenge ? 'com_auth_email_code_verify' : 'com_auth_email_code_send')}
+          <Button className="w-full" type="submit" disabled={busy || blockedSeconds > 0}>
+            {submitLabel}
           </Button>
           {challenge && (
             <div className="flex flex-wrap gap-3">
               <Button
                 type="button"
                 variant="outline"
-                disabled={busy || seconds > 0}
+                disabled={busy || sendSeconds > 0}
                 onClick={() => void requestCode()}
               >
-                {seconds > 0
-                  ? localize('com_auth_email_code_resend_wait', { 0: String(seconds) })
+                {sendSeconds > 0
+                  ? localize('com_auth_email_code_resend_wait', { 0: String(sendSeconds) })
                   : localize('com_auth_email_code_resend')}
               </Button>
               <Button
@@ -243,6 +347,7 @@ export default function EmailCodeLogin({
                 variant="outline"
                 disabled={busy}
                 onClick={() => {
+                  if (inFlight.current) return;
                   setChallenge(undefined);
                   setCode('');
                   setError(undefined);
@@ -254,13 +359,20 @@ export default function EmailCodeLogin({
           )}
         </form>
       )}
+      {pendingStatus}
       {error && (
         <p role="alert" className="text-status-error-strong">
           {localize(error)}
         </p>
       )}
       {config.authMode === 'transition' && !emailOnly && (
-        <Button variant="outline" disabled={busy} onClick={() => setStep('choice')}>
+        <Button
+          variant="outline"
+          disabled={busy}
+          onClick={() => {
+            if (!inFlight.current) setStep('choice');
+          }}
+        >
           {localize('com_auth_email_code_back')}
         </Button>
       )}

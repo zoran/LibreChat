@@ -163,7 +163,7 @@ const SplitText: React.FC<SplitTextProps> = ({
             key={wordIndex}
             dir="auto"
             aria-hidden="true"
-            style={{ display: 'inline-block', whiteSpace: 'nowrap' }}
+            style={{ display: 'inline-block', maxWidth: '100%', whiteSpace: 'normal' }}
           >
             {word.map((letter, letterIndex) => {
               const index = offsets[wordIndex] + letterIndex;

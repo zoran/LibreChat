@@ -1,13 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { Button, Spinner } from '@librechat/client';
 import type { TLoginResponse } from 'librechat-data-provider';
-import { useAuthContext } from '~/hooks/AuthContext';
+import type { ReactNode } from 'react';
 import { emailCodeRequest } from '~/hooks/Auth/useAuthMode';
 import { emailCodeLink } from '~/common/emailCodeLink';
+import AuthLayout from '~/components/Auth/AuthLayout';
+import { useGetStartupConfig } from '~/data-provider';
+import { useAuthContext } from '~/hooks/AuthContext';
 import useLocalize from '~/hooks/useLocalize';
 
+/** Share the branded auth shell while retaining this link's explicit account-switch confirmation. */
 export default function EmailCodeLanding() {
   const localize = useLocalize();
+  const { data: startupConfig, isFetching, error: startupConfigError } = useGetStartupConfig();
   const auth = useAuthContext();
   const current = useRef(auth);
   current.current = auth;
@@ -48,33 +54,59 @@ export default function EmailCodeLanding() {
   }, [auth.authResolution, needsConfirmation, redeem]);
   const unavailable = auth.authResolution.status === 'unavailable';
   const invalid = !emailCodeLink || state === 'invalid';
+  let content: ReactNode;
+  if (invalid || unavailable) {
+    content = (
+      <p role="alert" className="text-status-error-strong text-sm leading-6">
+        {localize(invalid ? 'com_auth_email_link_invalid' : 'com_auth_email_link_unavailable')}
+      </p>
+    );
+  } else if (auth.authResolution.status === 'pending' || state === 'working') {
+    content = (
+      <div
+        role="status"
+        className="text-text-secondary flex items-center justify-center gap-3 text-sm leading-6"
+      >
+        <Spinner className="shrink-0" />
+        <p>{localize('com_auth_email_link_working')}</p>
+      </div>
+    );
+  } else {
+    content = (
+      <>
+        <p className="text-text-secondary text-sm leading-6">
+          {localize(
+            needsConfirmation ? 'com_auth_email_link_switch' : 'com_auth_email_link_confirm',
+          )}
+        </p>
+        <Button className="w-full" onClick={() => void redeem()}>
+          {localize('com_auth_email_link_continue')}
+        </Button>
+      </>
+    );
+  }
   return (
-    <main className="mx-auto max-w-md space-y-4 p-6" aria-labelledby="email-link-title">
-      <h1 id="email-link-title">{localize('com_auth_email_link_title')}</h1>
-      {invalid ? (
-        <p role="alert">{localize('com_auth_email_link_invalid')}</p>
-      ) : unavailable ? (
-        <p role="alert">{localize('com_auth_email_link_unavailable')}</p>
-      ) : auth.authResolution.status === 'pending' || state === 'working' ? (
-        <p role="status">{localize('com_auth_email_link_working')}</p>
-      ) : (
-        <>
-          <p>
-            {localize(
-              needsConfirmation ? 'com_auth_email_link_switch' : 'com_auth_email_link_confirm',
-            )}
-          </p>
-          <button className="btn btn-primary" onClick={() => void redeem()}>
-            {localize('com_auth_email_link_continue')}
-          </button>
-        </>
-      )}
-      {(invalid || unavailable) && (
-        <>
-          <p>{localize('com_auth_email_link_browser')}</p>
-          <Link to="/login">{localize('com_auth_email_link_new')}</Link>
-        </>
-      )}
-    </main>
+    <AuthLayout
+      header={localize('com_auth_email_link_title')}
+      isFetching={isFetching}
+      startupConfig={startupConfig}
+      startupConfigError={startupConfigError}
+      pathname="/login/email-code"
+      error={null}
+    >
+      <div className="text-text-primary space-y-4 text-center">
+        {content}
+        {(invalid || unavailable) && (
+          <div className="space-y-4">
+            <p className="text-text-secondary text-sm leading-6">
+              {localize('com_auth_email_link_browser')}
+            </p>
+            <Button asChild variant="outline" className="w-full">
+              <Link to="/login">{localize('com_auth_email_link_new')}</Link>
+            </Button>
+          </div>
+        )}
+      </div>
+    </AuthLayout>
   );
 }
