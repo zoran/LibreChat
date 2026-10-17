@@ -22,12 +22,8 @@ export default function AppLogo({
   const logo = startupConfig?.interface?.appLogo;
   const dark = resolvedMode === 'dark';
   const wordmark = dark ? (logo?.dark ?? logo?.light) : logo?.light;
-  const src =
-    (variant === 'mark'
-      ? dark
-        ? (logo?.markDark ?? logo?.mark ?? wordmark)
-        : (logo?.mark ?? wordmark)
-      : wordmark) ?? fallbackSrc;
+  const mark = dark ? (logo?.markDark ?? logo?.mark) : logo?.mark;
+  const src = (variant === 'mark' ? (mark ?? wordmark) : wordmark) ?? fallbackSrc;
 
   return src ? (
     <img
