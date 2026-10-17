@@ -5,6 +5,12 @@ on:
     branches:
       - fix/complete-assistant-history
   workflow_dispatch:
+    inputs:
+      publish_image:
+        description: Publish the qualified image after all checks succeed.
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
@@ -21,9 +27,10 @@ jobs:
       pull-requests: write
     uses: ./.github/workflows/lighthouse.yml
     with:
-      upload_frontend_build: true
+      upload_frontend_build: ${{ github.event_name != 'workflow_dispatch' || inputs.publish_image }}
 
   publish:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish_image }}
     needs: lighthouse
     permissions:
       contents: read
