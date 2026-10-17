@@ -1,4 +1,4 @@
-/** Real worker lifecycle and real TXT/receipt validators; fixtures only simulate hostile timing. */
+/** Real worker lifecycle and real TXT/CSV validators; fixtures only simulate hostile timing. */
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -59,6 +59,84 @@ afterAll(async () => {
 });
 
 describe('bounded security worker', () => {
+  it('approves original CSV bytes/MIME with the new scanner version only after real thread exit', async () => {
+    const source = '\ufeffName,Wert\r\nNotiz,-1.25\r\n';
+    const input = { ...subject(source), mediaType: 'text/csv' };
+    const instance = worker();
+    const execution = await instance.prepare({
+      attemptId: 'upload.1',
+      subject: input,
+      signal: signal(),
+    });
+    const result = await instance.inspect({
+      execution,
+      subject: input,
+      body: body(source),
+      signal: signal(),
+    });
+    expect(matchesUploadSecurityApproval(result.decision, input, policySha256, Date.now())).toBe(
+      true,
+    );
+    expect(result.decision).toMatchObject({ scannerVersion: 'txt-csv-worker-v2', subject: input });
+    expect(
+      matchesUploadSecurityApproval(
+        result.decision,
+        { ...input, mediaType: 'text/plain' },
+        policySha256,
+        Date.now(),
+      ),
+    ).toBe(false);
+    expect(result.cleanup).toEqual({ writerStopped: true, transientDataRemoved: true });
+  });
+
+  it.each([
+    ['Name,Wert\nEinstufung,GEHEIM', 'rejected', 'classification_marking'],
+    ['Begriff,GEHEIM', 'uninspectable', 'ambiguous_marking'],
+    ['Name,Wert\nNotiz,"=1+1"', 'uninspectable', 'invalid_content'],
+    ['a,b\nc', 'uninspectable', 'invalid_content'],
+    ['a'.repeat(65_537), 'uninspectable', 'resource_limit'],
+  ])(
+    'retains negative CSV decisions through the actual thread %#',
+    async (source, decision, reason) => {
+      const instance = worker();
+      const input = { ...subject(source), mediaType: 'text/csv' };
+      const execution = await instance.prepare({
+        attemptId: 'upload.1',
+        subject: input,
+        signal: signal(),
+      });
+      const result = await instance.inspect({
+        execution,
+        subject: input,
+        body: body(source),
+        signal: signal(),
+      });
+      expect(result.decision).toEqual({ version: 1, decision, reason });
+      expect(result.cleanup).toEqual({ writerStopped: true, transientDataRemoved: true });
+    },
+  );
+
+  it('rejects changed CSV bytes before returning a valid approval', async () => {
+    const instance = worker();
+    const input = { ...subject('a,b'), mediaType: 'text/csv' };
+    const execution = await instance.prepare({
+      attemptId: 'upload.1',
+      subject: input,
+      signal: signal(),
+    });
+    const result = await instance.inspect({
+      execution,
+      subject: input,
+      body: body('a,c'),
+      signal: signal(),
+    });
+    expect(result.decision).toEqual({
+      version: 1,
+      decision: 'uninspectable',
+      reason: 'invalid_content',
+    });
+  });
+
   it('binds maintenance to its requester while prepared inspections and cancellations remain usable', async () => {
     const instance = worker();
     const execution = await instance.prepare({

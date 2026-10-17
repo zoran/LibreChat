@@ -1,6 +1,7 @@
 import { renderHook, act, waitFor } from '@testing-library/react';
 import {
   megabyte,
+  request,
   Constants,
   mergeFileConfig,
   EModelEndpoint,
@@ -62,6 +63,7 @@ let mockManagedEligible = true;
 let mockManagedSessionKey = 'tenant/user';
 let mockAdmissionsPaused: boolean | null = false;
 const mockManagedSelection = jest.fn();
+const mockManagedReady = jest.fn();
 jest.mock('~/features/uploads/useManagedUploads', () => ({
   useManagedUploads: () => ({
     enabled: mockManagedEnabled,
@@ -69,8 +71,8 @@ jest.mock('~/features/uploads/useManagedUploads', () => ({
     sessionKey: mockManagedSessionKey,
     admissionsPaused: mockAdmissionsPaused,
     getAdmissionsPaused: () => mockAdmissionsPaused,
-    refresh: jest.fn(),
-    waitForReady: jest.fn(),
+    refresh: jest.fn().mockResolvedValue(undefined),
+    waitForReady: mockManagedReady,
   }),
 }));
 jest.mock('~/features/uploads/transfer', () => ({
@@ -242,11 +244,178 @@ describe('useFileHandling', () => {
     mockManagedSessionKey = 'tenant/user';
     mockAdmissionsPaused = false;
     mockManagedSelection.mockReset().mockResolvedValue(undefined);
+    mockManagedReady.mockReset();
   });
 
   const loadHook = async () => (await import('../useFileHandling')).default;
 
   describe('managed admission selection', () => {
+    it.each([
+      { browserMime: 'text/csv', uninspectable: false },
+      { browserMime: '', uninspectable: false },
+      { browserMime: 'text/csv', uninspectable: true },
+    ])(
+      'keeps original CSV bytes on the real managed grant/gateway path ($browserMime, rejected=$uninspectable)',
+      async ({ browserMime, uninspectable }) => {
+        mockManagedEnabled = true;
+        mockManagedSelection.mockImplementation(
+          jest.requireActual('~/features/uploads/transfer').runManagedSelection,
+        );
+        // The scanner's smaller inspection limit is not a second browser upload limit.
+        const file = new File(
+          [uninspectable ? 'x'.repeat(64 * 1024 + 1) : 'name,value\r\nalpha,12.50\r\n'],
+          'Tabelle.CSV',
+          { type: browserMime },
+        );
+        const operation = { id: 'csv-operation', state: 'queued_processing' };
+        mockManagedReady.mockResolvedValue({
+          ...operation,
+          state: 'ready',
+          attachment: {
+            file_id: operation.id,
+            bytes: file.size,
+            filename: file.name,
+            type: 'text/csv',
+          },
+        });
+        const respond = (body: object) =>
+          ({
+            ok: true,
+            status: 200,
+            body: {
+              getReader: () => ({
+                read: jest
+                  .fn()
+                  .mockResolvedValueOnce({
+                    done: false,
+                    value: new TextEncoder().encode(JSON.stringify(body)),
+                  })
+                  .mockResolvedValueOnce({ done: true }),
+                cancel: jest.fn().mockResolvedValue(undefined),
+              }),
+            },
+          }) as unknown as Response;
+        const fetch = jest
+          .spyOn(request, 'authenticatedFetch')
+          .mockResolvedValueOnce(respond({ ...operation, state: 'waiting' }))
+          .mockResolvedValueOnce(
+            respond({
+              version: 1,
+              operationId: operation.id,
+              capability: 'A'.repeat(43),
+              expiresAt: new Date(Date.now() + 60_000).toISOString(),
+            }),
+          );
+        const open = jest.fn();
+        const headers = jest.fn();
+        const send = jest.fn();
+        const originalXHR = global.XMLHttpRequest;
+        class GatewayTransfer {
+          upload = {};
+          onload?: () => void;
+          onabort?: () => void;
+          status = uninspectable ? 422 : 200;
+          responseText = JSON.stringify(
+            uninspectable ? { code: 'security_uninspectable' } : operation,
+          );
+
+          open = open;
+          setRequestHeader = headers;
+
+          send(body: File) {
+            send(body);
+            queueMicrotask(() => this.onload?.());
+          }
+
+          abort() {
+            this.onabort?.();
+          }
+        }
+        global.XMLHttpRequest = GatewayTransfer as unknown as typeof XMLHttpRequest;
+        const onSuccess = jest.fn();
+        try {
+          const useFileHandling = await loadHook();
+          const { result } = renderHook(() => useFileHandling());
+          await act(async () => {
+            expect(await result.current.handleFiles([file], undefined, { onSuccess })).toBe(true);
+          });
+          const reservation = JSON.parse(fetch.mock.calls[0][1]!.body as string);
+          expect(reservation).toEqual({
+            mediaType: 'text/csv',
+            declaredBytes: file.size,
+            idempotencyKey: expect.any(String),
+            scope: { kind: 'personal' },
+          });
+          expect(fetch.mock.calls[1][0]).toBe('/api/uploads/operations/csv-operation/intake');
+          expect(open).toHaveBeenCalledWith('PUT', '/api/uploads/operations/csv-operation/body');
+          expect(headers).toHaveBeenCalledWith('X-Upload-Capability', 'A'.repeat(43));
+          expect(headers).toHaveBeenCalledWith('Content-Type', 'application/octet-stream');
+          expect(headers).toHaveBeenCalledWith('X-Upload-Filename', encodeURIComponent(file.name));
+          expect(send).toHaveBeenCalledTimes(1);
+          expect(send).toHaveBeenCalledWith(file);
+          expect(file.type).toBe(browserMime);
+          if (uninspectable) {
+            expect(onSuccess).not.toHaveBeenCalled();
+            expect(mockManagedReady).not.toHaveBeenCalled();
+            expect(mockUpdateFileById).toHaveBeenLastCalledWith(
+              expect.any(String),
+              expect.objectContaining({
+                managedUpload: expect.objectContaining({
+                  phase: 'failed',
+                  error: 'security_uninspectable',
+                }),
+              }),
+            );
+          } else {
+            expect(onSuccess).toHaveBeenCalledTimes(1);
+          }
+          expect(mockMutate).not.toHaveBeenCalled();
+          expect(mockResizeImageIfNeeded).not.toHaveBeenCalled();
+        } finally {
+          global.XMLHttpRequest = originalXHR;
+          fetch.mockRestore();
+        }
+      },
+    );
+
+    it.each(['notes.md', 'sheet.xlsx', 'unknown.bin'])(
+      'does not infer CSV admission from MIME for %s',
+      async (name) => {
+        mockManagedEnabled = true;
+        const useFileHandling = await loadHook();
+        const { result } = renderHook(() => useFileHandling());
+        await act(async () => {
+          expect(
+            await result.current.handleFiles([new File(['a,b'], name, { type: 'text/csv' })]),
+          ).toBe(false);
+        });
+        expect(mockManagedSelection).not.toHaveBeenCalled();
+        expect(mockMutate).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      { eligible: false, paused: false, message: 'com_upload_login_needed' },
+      { eligible: true, paused: true, message: 'com_upload_admission_paused' },
+      { eligible: true, paused: null, message: 'com_upload_status_unavailable' },
+    ])('keeps CSV behind native admission ($message)', async ({ eligible, paused, message }) => {
+      mockManagedEnabled = true;
+      mockManagedEligible = eligible;
+      mockAdmissionsPaused = paused;
+      const useFileHandling = await loadHook();
+      const { result } = renderHook(() => useFileHandling());
+      await act(async () => {
+        expect(
+          await result.current.handleFiles([new File(['a,b'], 'table.csv', { type: 'text/csv' })]),
+        ).toBe(false);
+      });
+      expect(mockManagedSelection).not.toHaveBeenCalled();
+      expect(mockMutate).not.toHaveBeenCalled();
+      expect(mockAddFile).not.toHaveBeenCalled();
+      await waitFor(() =>
+        expect(mockShowToast).toHaveBeenCalledWith(expect.objectContaining({ message })),
+      );
+    });
     it('does not route an ineligible guest selection through managed or legacy uploads', async () => {
       mockManagedEnabled = true;
       mockManagedEligible = false;

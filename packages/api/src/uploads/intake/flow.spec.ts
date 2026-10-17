@@ -113,6 +113,8 @@ describe('isolated Intake through native authority, scanner and App promotion', 
   let lostReplies: number;
   let ordinaryBytes: number;
   let receivedBytes: number;
+  let requestSettled: Promise<void>;
+  let settleRequest: () => void;
   let renewals: UploadLease[];
   let onRenew: (() => void) | undefined;
   let expectedCompleteDrain: boolean;
@@ -245,6 +247,9 @@ describe('isolated Intake through native authority, scanner and App promotion', 
   }
 
   beforeEach(async () => {
+    requestSettled = new Promise<void>((resolve) => {
+      settleRequest = resolve;
+    });
     for (const name of ['File', 'Message', 'UploadOperation', 'UploadCounter', 'Session', 'User'])
       if (db.models[name]) await db.models[name].deleteMany({});
     for (const name of await readdir(ordinaryRoot)) await rm(path.join(ordinaryRoot, name));
@@ -452,6 +457,7 @@ describe('isolated Intake through native authority, scanner and App promotion', 
       deadlineMs: 15_000,
       observe: (event) => {
         if (event.kind === 'received') receivedBytes += event.bytes;
+        if (event.kind === 'stage' && event.stage === 'request') settleRequest();
       },
     });
   }, 20_000);
@@ -486,10 +492,10 @@ describe('isolated Intake through native authority, scanner and App promotion', 
     }
   }, 30_000);
 
-  async function ticket(bytes: Buffer, owner = grant) {
+  async function ticket(bytes: Buffer, owner = grant, mediaType = 'text/plain') {
     const operation = await management.reserve(owner.principal, {
       idempotencyKey: randomUUID(),
-      mediaType: 'text/plain',
+      mediaType,
       declaredBytes: bytes.length,
     });
     const capability = randomBytes(32).toString('base64url');
@@ -507,6 +513,7 @@ describe('isolated Intake through native authority, scanner and App promotion', 
     input: { operationId: string; capability: string },
     bytes: Buffer,
     finishAfter?: Promise<void>,
+    filename = 'Freigegebener Testtext.txt',
   ): Promise<{ status: number; body: Record<string, unknown> }> {
     return new Promise((resolve, reject) => {
       const req = request(
@@ -521,7 +528,7 @@ describe('isolated Intake through native authority, scanner and App promotion', 
             'Content-Type': 'application/octet-stream',
             'Content-Length': bytes.length,
             'X-Upload-Capability': input.capability,
-            'X-Upload-Filename': encodeURIComponent('Freigegebener Testtext.txt'),
+            'X-Upload-Filename': encodeURIComponent(filename),
           },
         },
         (res) => {
@@ -586,6 +593,60 @@ describe('isolated Intake through native authority, scanner and App promotion', 
         channel.control({ ...input, command, signal: AbortSignal.timeout(5_000) }),
       ).rejects.toMatchObject({ code: 'unauthorized' });
   }
+
+  it.each([
+    [
+      'allowed',
+      'Synthetischer Test,Wert\r\n"Änderung, A",-1.25\r\n"Zeile\nzwei",001.50\r\n',
+      undefined,
+    ],
+    ['marked final cell', 'Synthetischer Test,Wert\nA,1\nEinstufung,"VS-NfD"', 'security_rejected'],
+    ['active formula', 'Synthetischer Test,Wert\nA,"=1+1"', 'security_uninspectable'],
+    ['incomplete quotes', 'Synthetischer Test,Wert\nA,"unfinished', 'security_uninspectable'],
+  ] as const)(
+    'keeps CSV %s bytes inside the existing security boundary',
+    async (_, text, error) => {
+      const bytes = Buffer.from(text);
+      const issued = await ticket(bytes, grant, 'text/csv');
+      const filename = 'Cortex-TEST-Tabelle.csv';
+      const response = await submit(issued, bytes, undefined, filename);
+      // HTTP completion precedes the existing finally/cleanup acknowledgement.
+      await requestSettled;
+      const row = await stored(issued.operationId);
+      expect(await readdir(stagingRoot)).toEqual([]);
+      if (error) {
+        expect(response.status).toBeGreaterThanOrEqual(400);
+        expect(response.body).toEqual({ code: error });
+        await noOrdinaryContent();
+        expect(row).not.toHaveProperty('securityApproval');
+        expect(row).not.toHaveProperty('filename');
+        expect(JSON.stringify(row)).not.toContain(text);
+        expect(await management.claimProcessing(appWorker)).toBeNull();
+        return;
+      }
+      expect(response).toMatchObject({
+        status: 202,
+        body: { id: issued.operationId, state: 'queued_processing' },
+      });
+      expect(ordinaryPut).toHaveBeenCalledTimes(1);
+      expect(await readFile(path.join(ordinaryRoot, issued.operationId))).toEqual(bytes);
+      expect(row).toMatchObject({
+        promotion: { state: 'settled', writerStopped: true },
+        securityApproval: {
+          decision: 'approved',
+          scannerVersion: 'txt-csv-worker-v2',
+          subject: { mediaType: 'text/csv', bytes: bytes.length, sha256: digest(bytes) },
+        },
+      });
+      expect(
+        await observer.models.File.findOne({ file_id: issued.operationId }).lean(),
+      ).toMatchObject({
+        filename,
+        type: 'text/csv',
+        status: 'pending',
+      });
+    },
+  );
 
   it('keeps separate Intake and App worker reservations valid through an actual five-second heartbeat', async () => {
     const bytes = Buffer.from('Freigegebener Text nach einem echten Intake-Heartbeat.');
@@ -663,7 +724,7 @@ describe('isolated Intake through native authority, scanner and App promotion', 
     const row = await stored(issued.operationId);
     expect(row).toMatchObject({
       promotion: { state: 'settled', writerStopped: true, worker: appWorker },
-      securityApproval: { scannerVersion: 'txt-worker-v1' },
+      securityApproval: { scannerVersion: 'txt-csv-worker-v2' },
     });
     expect(
       await observer.models.File.findOne({ file_id: issued.operationId })

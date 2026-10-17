@@ -123,6 +123,57 @@ describe('built managed document flow', () => {
     },
   );
 
+  it('preserves real CSV cells through the built parser, result frame and Unix client', async () => {
+    const bytes = Buffer.from(
+      'Synthetischer Test,Wert\r\n"Änderung, A",-1.25\r\n"Zeile\nzwei",001.50\r\n',
+    );
+    const staged = await stage('csv.1', bytes);
+    const signal = new AbortController().signal;
+    const execution = await documents.prepare({
+      attemptId: 'csv.1',
+      mediaType: 'text/csv',
+      signal,
+    });
+    const result = await documents.extract({ execution, signal });
+    expect(result.writerStopped).toBe(true);
+    expect(result.structure.source).toEqual({
+      sha256: createHash('sha256').update(bytes).digest('hex'),
+      bytes: bytes.length,
+      mediaType: 'text/csv',
+    });
+    expect(result.structure.pages).toEqual([]);
+    expect(result.structure.quality).toEqual({ status: 'complete', warnings: [] });
+    const cells = result.structure.elements.filter((element) => element.kind === 'cell');
+    expect(
+      cells.map((cell) => [
+        cell.cell!.row,
+        cell.cell!.column,
+        result.text.slice(cell.start, cell.end),
+      ]),
+    ).toEqual([
+      [0, 0, 'Synthetischer Test'],
+      [0, 1, 'Wert'],
+      [1, 0, 'Änderung, A'],
+      [1, 1, '-1.25'],
+      [2, 0, 'Zeile\nzwei'],
+      [2, 1, '001.50'],
+    ]);
+    expect(await readFile(staged.original)).toEqual(bytes);
+    expect(await readdir(scratchRoot)).toEqual([]);
+    await expect(documents.cancel({ execution, signal })).resolves.toEqual({ writerStopped: true });
+    await rm(staged.directory, { recursive: true });
+  });
+
+  it('rejects CSV beyond the qualified byte profile without a partial result', async () => {
+    const staged = await stage('csv-oversized.1', Buffer.alloc(65_537, 'a'));
+    await expect(extract('csv-oversized.1', 'text/csv')).rejects.toMatchObject({
+      code: 'resource_limit',
+      writerStopped: true,
+    });
+    expect(await readdir(scratchRoot)).toEqual([]);
+    await rm(staged.directory, { recursive: true });
+  });
+
   it('accepts exactly 30 MiB once and rejects one additional input byte', async () => {
     const fixture = fixtures.fixtures.find((item) => item.slot === 'C')!;
     const zip = await JSZip.loadAsync(await readFile(path.join(fixtureRoot, fixture.filename)));

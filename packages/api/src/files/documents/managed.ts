@@ -13,6 +13,7 @@ import {
   wordNS,
 } from './managedStructure';
 import { readSafeZipEntries, ZipBombError } from './zipSafety';
+import { MANAGED_CSV_LIMITS, parseManagedCsv } from './csv';
 
 type Limits = {
   inputBytes: number;
@@ -38,11 +39,13 @@ export const MANAGED_DOCUMENT_TYPES: readonly [
   'application/pdf',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'text/csv',
 ] = Object.freeze([
   'text/plain',
   'application/pdf',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  'text/csv',
 ] as const);
 
 export type DocumentFailureCode =
@@ -139,11 +142,15 @@ export async function extractManagedDocument(input: {
     fail('unsupported_format');
   }
   const info = await stat(input.filePath);
-  if (!info.isFile() || info.size < 1 || info.size > limits.inputBytes) {
+  const inputLimit =
+    input.mediaType === 'text/csv'
+      ? Math.min(limits.inputBytes, MANAGED_CSV_LIMITS.bytes)
+      : limits.inputBytes;
+  if (!info.isFile() || info.size < 1 || info.size > inputLimit) {
     fail('resource_limit');
   }
   const data = await readFile(input.filePath);
-  if (data.length !== info.size || data.length > limits.inputBytes) {
+  if (data.length !== info.size || data.length > inputLimit) {
     fail('resource_limit');
   }
   const output = textCollector(limits.outputBytes);
@@ -158,6 +165,29 @@ export async function extractManagedDocument(input: {
   if (input.mediaType === 'text/plain') {
     output.add(decode(data));
     plainParagraphs(output.finish().text, structure);
+    return finish();
+  }
+  if (input.mediaType === 'text/csv') {
+    const parsed = parseManagedCsv(decode(data));
+    if (!parsed.ok) {
+      fail(parsed.reason === 'resource_limit' ? 'resource_limit' : 'invalid_document');
+    }
+    const table = structure.add('table', 0, 0);
+    parsed.rows.forEach((row, rowIndex) => {
+      if (rowIndex > 0) output.add('\n');
+      row.forEach((value, column) => {
+        if (column > 0) output.add('\t');
+        const start = output.length;
+        output.add(value);
+        structure.add('cell', start, output.length, null, table.id, {
+          row: rowIndex,
+          column,
+          rowSpan: 1,
+          columnSpan: 1,
+        });
+      });
+    });
+    table.end = output.length;
     return finish();
   }
   if (input.mediaType === 'application/pdf') {

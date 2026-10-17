@@ -2286,7 +2286,7 @@
   "com_upload_loading": "Kontingent wird geladen …",
   "com_upload_status_unavailable": "Der Uploadstatus ist derzeit nicht verfügbar. Neue Dateien können nicht hinzugefügt werden. Bitte wähle sie erneut aus, sobald der Status wieder verfügbar ist.",
   "com_upload_throttled": "Wegen hoher Auslastung werden neue Uploads begrenzt. Laufende Übertragungen können länger dauern.",
-  "com_upload_unsupported": "Unterstützt werden TXT, PDF mit Text, DOCX und PPTX mit höchstens 30 MiB je Datei.",
+  "com_upload_unsupported": "Für die Dateiannahme sind TXT und CSV in UTF-8 bis 64 KiB prüfbar. CSV verwendet Kommas, bis zu 1.024 Zeilen, 128 Spalten und 2.048 Zellen; Formeln werden nicht unterstützt. PDF, DOCX und PPTX bleiben bis zur Sicherheitsfreigabe gesperrt.",
   "com_auth_email_code_choice": "Zugang wählen",
   "com_auth_email_code_choice_email": "Mit E-Mail-Code anmelden",
   "com_auth_email_code_choice_guest": "Ohne Anmeldung fortfahren",

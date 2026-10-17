@@ -1,10 +1,10 @@
-/** Trusted thread entry: no I/O, parser or model. Process/network isolation is the deployment owner. */
+/** Trusted text/CSV thread: no I/O/model. Process/network isolation is the deployment owner. */
 import { parentPort, workerData } from 'node:worker_threads';
-import { inspectPlainTextSecurity } from './text';
+import { inspectTextSecurity } from './text';
 
 if (parentPort) {
   try {
-    const result = inspectPlainTextSecurity(workerData);
+    const result = inspectTextSecurity(workerData);
     if (workerData.bytes instanceof Uint8Array) workerData.bytes.fill(0);
     workerData.bytes = undefined;
     parentPort.postMessage(JSON.stringify(result));

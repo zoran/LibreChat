@@ -119,6 +119,7 @@ export function readManagedDocumentResult(value: unknown): ManagedDocumentResult
     const mediaType = document.source.mediaType;
     const pageless =
       mediaType === 'text/plain' ||
+      mediaType === 'text/csv' ||
       mediaType === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
     let pageKind: 'page' | 'slide' | undefined;
     if (mediaType === 'application/pdf') pageKind = 'page';

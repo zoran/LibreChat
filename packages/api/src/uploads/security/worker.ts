@@ -285,7 +285,7 @@ export function createSecurityWorker(options: Options): SecurityWorker {
           decision: 'approved',
           subject: { ...record.subject },
           policySha256,
-          scannerVersion: 'txt-worker-v1',
+          scannerVersion: 'txt-csv-worker-v2',
           checkedAt: new Date(now()).toISOString(),
           coverage: { complete: true, pages: 1, parts: 1 },
         };

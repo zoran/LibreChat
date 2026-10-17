@@ -354,7 +354,7 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         expect(approved).toMatchObject({
           decision: 'approved',
           policySha256,
-          scannerVersion: 'txt-worker-v1',
+          scannerVersion: 'txt-csv-worker-v2',
           subject: {
             tenantId: principal.tenantId,
             userId: principal.userId,

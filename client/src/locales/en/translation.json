@@ -3460,7 +3460,7 @@
   "com_upload_loading": "Loading quota…",
   "com_upload_status_unavailable": "Upload status is currently unavailable. New files cannot be added. Please select them again once the status is available.",
   "com_upload_throttled": "New uploads are limited due to high load. Current transfers may take longer.",
-  "com_upload_unsupported": "Supported formats are TXT, text-bearing PDF, DOCX and PPTX, up to 30 MiB per file.",
+  "com_upload_unsupported": "Intake can inspect UTF-8 TXT and CSV up to 64 KiB. CSV uses commas, up to 1,024 rows, 128 columns and 2,048 cells; formulas are unsupported. PDF, DOCX and PPTX remain blocked until security qualification.",
   "com_auth_email_code_choice": "Choose how to continue",
   "com_auth_email_code_choice_email": "Sign in with an email code",
   "com_auth_email_code_choice_guest": "Continue without signing in",

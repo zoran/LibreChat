@@ -34,6 +34,7 @@ export type UploadManagementDependencies = {
 
 const MEDIA_TYPES = new Set([
   'text/plain',
+  'text/csv',
   'application/pdf',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   'application/vnd.openxmlformats-officedocument.presentationml.presentation',

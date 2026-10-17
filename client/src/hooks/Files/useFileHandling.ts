@@ -546,6 +546,7 @@ const useFileHandlingCore = (params: UseFileHandling | undefined, fileState: Fil
       }
       const formats: Record<string, string> = {
         txt: 'text/plain',
+        csv: 'text/csv',
         pdf: 'application/pdf',
         docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
         pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',

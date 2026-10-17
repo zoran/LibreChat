@@ -111,9 +111,10 @@ describe('versioned native document structure', () => {
     expect(readManagedDocumentResult(input)).toBeNull();
   });
 
-  it('rejects fabricated pagination for native TXT/DOCX or wrong PDF/PPTX page kinds', () => {
+  it('rejects fabricated pagination for native TXT/CSV/DOCX or wrong PDF/PPTX page kinds', () => {
     for (const mediaType of [
       'text/plain',
+      'text/csv',
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
     ]) {
       const input = result();
@@ -135,6 +136,54 @@ describe('versioned native document structure', () => {
       expect(readManagedDocumentResult(input)).toBeNull();
     }
   });
+
+  it('retains native CSV cells and UTF-16 ranges without inventing pagination', () => {
+    const input = result();
+    input.structure.source.mediaType = 'text/csv';
+    input.text = '🧭\t\n\tB';
+    input.structure.elements = [
+      { id: 'e1', kind: 'table', start: 0, end: 6, page: null, parentId: null },
+      ...[
+        [0, 2, 0, 0],
+        [3, 3, 0, 1],
+        [4, 4, 1, 0],
+        [5, 6, 1, 1],
+      ].map(([start, end, row, column], index) => ({
+        id: `e${index + 2}`,
+        kind: 'cell',
+        start,
+        end,
+        page: null,
+        parentId: 'e1',
+        cell: { row, column, rowSpan: 1, columnSpan: 1 },
+      })),
+    ];
+    const before = JSON.stringify(input);
+    expect(readManagedDocumentResult(input)).toEqual(input);
+    expect(JSON.stringify(input)).toBe(before);
+  });
+
+  it.each(['', ' \t\n'])(
+    'keeps entirely empty CSV documents outside normal processing %#',
+    (text) => {
+      const input = result();
+      input.structure.source.mediaType = 'text/csv';
+      input.text = text;
+      input.structure.elements = [
+        { id: 'e1', kind: 'table', start: 0, end: text.length, page: null, parentId: null },
+        {
+          id: 'e2',
+          kind: 'cell',
+          start: 0,
+          end: text.length,
+          page: null,
+          parentId: 'e1',
+          cell: { row: 0, column: 0, rowSpan: 1, columnSpan: 1 },
+        },
+      ];
+      expect(readManagedDocumentResult(input)).toBeNull();
+    },
+  );
 
   it('uses UTF-16 ranges without splitting a Unicode character', () => {
     const input = result();

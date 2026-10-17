@@ -87,6 +87,63 @@ function fixture(telemetry?: TelemetryPort) {
 }
 
 describe('managed upload public boundary', () => {
+  it('reserves canonical CSV without changing its MIME fingerprint or admission guards', async () => {
+    const f = fixture();
+    const csv = { ...request, mediaType: 'text/csv' };
+    f.reserve.mockResolvedValue({ ...operation, mediaType: csv.mediaType });
+    await expect(f.management.reserve(principal, csv)).resolves.toMatchObject({
+      mediaType: 'text/csv',
+      state: 'waiting',
+      canUseInComposer: false,
+    });
+    expect(f.authorize).toHaveBeenCalledWith(principal, { kind: 'personal' });
+    expect(f.assertSafe).toHaveBeenCalledWith({ phase: 'admission' });
+    const fingerprint = JSON.stringify([{ kind: 'personal' }, 'text/csv', csv.declaredBytes]);
+    expect(f.findReservation).toHaveBeenCalledWith(
+      principal,
+      csv.idempotencyKey,
+      fingerprint,
+      1000,
+    );
+    expect(f.reserve).toHaveBeenCalledWith(
+      principal,
+      {
+        ...csv,
+        scope: { kind: 'personal' },
+        operationId: 'operation',
+        fingerprint,
+      },
+      1000,
+    );
+    expect(f.accept).not.toHaveBeenCalled();
+    expect(f.publish).not.toHaveBeenCalled();
+  });
+  it.each([
+    'text/csv; charset=utf-8',
+    'text/markdown',
+    'text/x-csv',
+    'application/octet-stream',
+    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ])('does not admit the CSV alias or unrelated MIME %s', async (mediaType) => {
+    const f = fixture();
+    await expect(f.management.reserve(principal, { ...request, mediaType })).rejects.toMatchObject({
+      code: 'unsupported_type',
+    });
+    expect(f.findReservation).not.toHaveBeenCalled();
+    expect(f.reserve).not.toHaveBeenCalled();
+  });
+  it('does not let CSV bypass ownership or paused admission', async () => {
+    const f = fixture();
+    const csv = { ...request, mediaType: 'text/csv' };
+    f.authorize.mockResolvedValueOnce(false);
+    await expect(f.management.reserve(principal, csv)).rejects.toMatchObject({ code: 'forbidden' });
+    expect(f.assertSafe).not.toHaveBeenCalled();
+    f.assertSafe.mockRejectedValue(new UploadManagementError('admission_paused'));
+    await expect(f.management.reserve(principal, csv)).rejects.toMatchObject({
+      code: 'admission_paused',
+    });
+    expect(f.reserve).not.toHaveBeenCalled();
+  });
   it('admits the explicit null guest namespace only through the existing identity policy', async () => {
     const f = fixture();
     const guest = { tenantId: null, userId: 'guest-a', authentication: 'guest' } as const;

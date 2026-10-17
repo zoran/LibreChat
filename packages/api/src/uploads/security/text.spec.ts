@@ -1,6 +1,6 @@
 /** Exercise real byte decoding and complete-context classification, never a mocked scanner. */
 import type { SecurityMarkingPolicy } from './markings';
-import { inspectPlainTextSecurity } from './text';
+import { inspectPlainTextSecurity, inspectTextSecurity } from './text';
 
 const policy: SecurityMarkingPolicy = {
   version: 1,
@@ -150,5 +150,138 @@ describe('plain text security core', () => {
     expect(inspect('Private-87246 erwähnt GEHEIM.')).toEqual(ambiguous);
     expect(inspect('Private-87246\u0000')).toEqual(invalid);
     expect(inspect(`Private-87246${'x'.repeat(65_536)}`)).toEqual(limited);
+  });
+});
+
+describe('CSV security core with the real shared codec', () => {
+  function csv(text: string) {
+    return inspectTextSecurity({ bytes: Buffer.from(text), mediaType: 'text/csv', policy });
+  }
+
+  it('inspects complete fixed-dialect CSV without type inference or input mutation', () => {
+    const source = Buffer.from('Name,Notiz\r\nKöln,"intern, vertraulich"\r\n');
+    const before = Buffer.from(source);
+    const beforePolicy = JSON.stringify(policy);
+    expect(inspectTextSecurity({ bytes: source, mediaType: 'text/csv', policy })).toEqual(clear);
+    expect(source).toEqual(before);
+    expect(JSON.stringify(policy)).toBe(beforePolicy);
+    expect(csv('')).toEqual(clear);
+    expect(csv('"Zitat ""Hallo""",Text')).toEqual(clear);
+  });
+
+  it.each(['VS-NfD', 'VS-VERTRAULICH', 'GEHEIM', 'STRENG GEHEIM', 'vs\u2011nfd', 'ＶＳ－ＮｆＤ'])(
+    'rejects a complete classification in the last cell: %s',
+    (marking) => {
+      expect(csv(`Spalte,Inhalt\nEinstufung,${marking}`)).toEqual(rejected);
+    },
+  );
+
+  it('distinguishes a configured classification row from an ambiguous glossary cell', () => {
+    expect(csv('Einstufung,VS-NfD')).toEqual(rejected);
+    expect(csv('Begriff,VS-NfD')).toEqual(ambiguous);
+    expect(csv('VS-NfD')).toEqual(ambiguous);
+  });
+
+  it('decodes escaped quotes and line breaks before inspecting actual field boundaries', () => {
+    expect(csv('Titel,Wert\nEinstufung,"""GEHEIM"""')).toEqual(rejected);
+    expect(csv('Titel,Wert\nEinstufung,"VS-\r\nNfD"')).toEqual(rejected);
+    expect(csv('Titel,Wert\nEinstufung,"Einstufung: GEHEIM"')).toEqual(rejected);
+  });
+
+  it.each(['VS-,NfD', 'V,S,N,f,D', 'STRENG,GEHEIM', 'VS-\nNfD'])(
+    'never clears a marking distributed across cells or rows: %s',
+    (source) => {
+      expect(csv(source).decision).not.toBe('clear');
+    },
+  );
+
+  it('allows only complete policy prose and never lets it exempt other cells or rows', () => {
+    const prose = 'Die Kennzeichnung GEHEIM wird hier als Beispiel erläutert.';
+    expect(csv(`"${prose}"`)).toEqual(clear);
+    expect(csv(`"${prose}"\nGEHEIM`)).toEqual(ambiguous);
+    expect(csv('Die Kennzeichnung,GEHEIM,wird hier als Beispiel erläutert.')).toEqual(ambiguous);
+    expect(csv(`"${prose}"\n"Eine Erwähnung von GEHEIM."`)).toEqual(ambiguous);
+  });
+
+  it.each([
+    '=1+1',
+    ' =SUM(A1)',
+    '\t+cmd|run',
+    '-cmd|run',
+    '@SUM(A1)',
+    '\r\n=1',
+    '+NaN',
+    '-Infinity',
+    '+1e',
+    '-0x10',
+  ])('refuses active or non-literal signed field content %#', (cell) => {
+    expect(csv(`Name,Wert\nNotiz,"${cell}"`)).toEqual(invalid);
+  });
+
+  it.each(['-1', '+1', '-.5', '+0.25', '-1e-3', '+2E+5', '  -12.5', '\t+2', '0001', '-1 ', '-1\n'])(
+    'keeps exact numeric literals as inert text: %s',
+    (cell) => {
+      expect(csv(`Name,Wert\nNotiz,${cell}`)).toEqual(clear);
+    },
+  );
+
+  it.each(['"unterminated', 'a,b\nc', 'a"b,c', '"a"extra,b', 'a,b\rc,d'])(
+    'rejects malformed syntax through the shared codec %#',
+    (source) => expect(csv(source)).toEqual(invalid),
+  );
+
+  it('uses fatal UTF-8 and consumes exactly one initial BOM', () => {
+    expect(
+      inspectTextSecurity({ bytes: Uint8Array.from([0xc3]), mediaType: 'text/csv', policy }),
+    ).toEqual(invalid);
+    expect(csv('\ufeffName,Wert\nNotiz,1')).toEqual(clear);
+    expect(csv('\ufeffEinstufung,GEHEIM')).toEqual(rejected);
+    expect(csv('\ufeff\ufeffName,Wert')).toEqual(invalid);
+    expect(csv('Name,\ufeffWert')).toEqual(invalid);
+    expect(
+      inspectTextSecurity({
+        bytes: new Uint8Array(new SharedArrayBuffer(4)),
+        mediaType: 'text/csv',
+        policy,
+      }),
+    ).toEqual(invalid);
+  });
+
+  it.each(['\u0000', '\u001b', '\u007f', '\u0085', '\ufffd'])(
+    'rejects controls without content leakage %#',
+    (control) => expect(csv(`Private-87246,"${control}"`)).toEqual(invalid),
+  );
+
+  it('retains byte, row, column and cell limits without truncating later content', () => {
+    expect(csv('a'.repeat(65_536))).toEqual(clear);
+    expect(csv('a'.repeat(65_537))).toEqual(limited);
+    expect(csv(`\ufeff${'a'.repeat(65_534)}`)).toEqual(limited);
+    expect(csv(Array.from({ length: 1025 }, () => 'a').join('\n'))).toEqual(limited);
+    expect(csv(Array.from({ length: 129 }, () => 'a').join(','))).toEqual(limited);
+    expect(
+      csv(Array.from({ length: 17 }, () => Array(128).fill('a').join(',')).join('\n')),
+    ).toEqual(limited);
+    expect(csv(`${'a,b\n'.repeat(1023)}Einstufung,GEHEIM`)).toEqual(rejected);
+  });
+
+  it.each([
+    'text/markdown',
+    'text/html',
+    'application/pdf',
+    'text/csv; charset=utf-8',
+    'application/octet-stream',
+  ])('does not widen supported canonical media types: %s', (mediaType) =>
+    expect(inspectTextSecurity({ bytes: Buffer.from('a,b'), mediaType, policy })).toEqual(invalid),
+  );
+
+  it('preserves plain-text semantics and refuses recognizable foreign formats', () => {
+    expect(
+      inspectTextSecurity({ bytes: Buffer.from('GEHEIM'), mediaType: 'text/plain', policy }),
+    ).toEqual(ambiguous);
+    expect(
+      inspectPlainTextSecurity({ bytes: Buffer.from('a,b'), mediaType: 'text/csv', policy }),
+    ).toEqual(invalid);
+    expect(csv('<html>Private-87246</html>')).toEqual(invalid);
+    expect(csv('%PDF-1.7')).toEqual(invalid);
   });
 });

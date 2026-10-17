@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto';
 import { readManagedDocumentResult } from 'librechat-data-provider';
 import { mkdir, mkdtemp, writeFile, rm, readFile } from 'node:fs/promises';
 import { extractManagedDocument, MANAGED_DOCUMENT_TYPES } from './managed';
+import { MANAGED_CSV_LIMITS } from './csv';
 
 // Jest's CommonJS transform cannot parse PDF.js import.meta. Load the actual installed ESM module
 // through native Node (including its real worker); this replaces no PDF behavior with a fake.
@@ -38,6 +39,167 @@ describe('managed useful extraction and hard limits', () => {
     await writeFile(filePath, data);
     return extractManagedDocument({ filePath, mediaType: 'text/plain', limits });
   }
+
+  async function csv(data: Buffer | string, limits = {}) {
+    const filePath = path.join(root, 'original.csv');
+    await writeFile(filePath, data);
+    return extractManagedDocument({ filePath, mediaType: 'text/csv', limits });
+  }
+
+  describe('CSV structured extraction', () => {
+    it('preserves every decoded cell with stable coordinates and exact UTF-16 ranges', async () => {
+      const source =
+        '\uFEFFName,Value,Note,Empty\r\n"Grüße 😀",-001.20,"line 1\r\nline ""2"", α",\r\n,-0.50,"  spaced\tvalue  ",""\r\n';
+      const rows = [
+        ['Name', 'Value', 'Note', 'Empty'],
+        ['Grüße 😀', '-001.20', 'line 1\r\nline "2", α', ''],
+        ['', '-0.50', '  spaced\tvalue  ', ''],
+      ];
+      const result = await csv(source);
+      const expectedText = rows.map((row) => row.join('\t')).join('\n');
+      expect(result.text).toBe(expectedText);
+      expect(result.bytes).toBe(Buffer.byteLength(expectedText, 'utf8'));
+      expect(result.structure.source).toEqual({
+        bytes: Buffer.byteLength(source, 'utf8'),
+        sha256: createHash('sha256').update(source).digest('hex'),
+        mediaType: 'text/csv',
+      });
+      expect(result.structure.pages).toEqual([]);
+      expect(result.structure.quality).toEqual({ status: 'complete', warnings: [] });
+      const [table, ...cells] = result.structure.elements;
+      expect(table).toEqual({
+        id: 'e1',
+        kind: 'table',
+        start: 0,
+        end: expectedText.length,
+        page: null,
+        parentId: null,
+      });
+      expect(cells).toHaveLength(12);
+      expect(cells.map((cell) => [cell.start, cell.end])).toEqual([
+        [0, 4],
+        [5, 10],
+        [11, 15],
+        [16, 21],
+        [22, 30],
+        [31, 38],
+        [39, 58],
+        [59, 59],
+        [60, 60],
+        [61, 66],
+        [67, 83],
+        [84, 84],
+      ]);
+      expect(cells.map((cell) => result.text.slice(cell.start, cell.end))).toEqual(rows.flat());
+      expect(cells.map((cell) => cell.cell)).toEqual(
+        rows.flatMap((row, rowIndex) =>
+          row.map((_, column) => ({ row: rowIndex, column, rowSpan: 1, columnSpan: 1 })),
+        ),
+      );
+      expect(
+        cells.every(
+          (cell) => cell.kind === 'cell' && cell.page === null && cell.parentId === table.id,
+        ),
+      ).toBe(true);
+      expect(cells.map((cell) => cell.id)).toEqual(
+        Array.from({ length: 12 }, (_, i) => `e${i + 2}`),
+      );
+      expect(
+        readManagedDocumentResult({ text: result.text, structure: result.structure }),
+      ).not.toBeNull();
+      expect(await csv(source)).toEqual(result);
+    });
+
+    it('does not infer a header, coerce numeric strings, or evaluate formula-looking text', async () => {
+      const result = await csv('-000.50,001,+1.20,1e03,"=SUM(A1:A2)"\n,0,-0,,');
+      const cells = result.structure.elements.filter((element) => element.kind === 'cell');
+      expect(cells.map((cell) => result.text.slice(cell.start, cell.end))).toEqual([
+        '-000.50',
+        '001',
+        '+1.20',
+        '1e03',
+        '=SUM(A1:A2)',
+        '',
+        '0',
+        '-0',
+        '',
+        '',
+      ]);
+      expect(
+        result.structure.elements.every(
+          (element) => element.kind === 'table' || element.kind === 'cell',
+        ),
+      ).toBe(true);
+    });
+
+    it.each([',,', '""', '  ,"\t"\r\n ," "', '\uFEFF'])(
+      'keeps wholly blank CSV as no_text: %j',
+      async (value) => {
+        await expect(csv(value)).rejects.toMatchObject({ code: 'no_text' });
+      },
+    );
+
+    it.each(['a,b\n1', 'a,b\n1,2,3', '"unterminated', 'a"b,c', '"a"x,b', 'a,b\rc,d', 'a,\u0000'])(
+      'fails malformed CSV without returning a partial table: %j',
+      async (value) => {
+        await expect(csv(value)).rejects.toMatchObject({ code: 'invalid_document' });
+      },
+    );
+
+    it('rejects invalid UTF-8 and enforces raw-byte limits including an initial BOM', async () => {
+      await expect(csv(Buffer.from([0xc3, 0x28]))).rejects.toMatchObject({
+        code: 'invalid_document',
+      });
+      await expect(csv('x'.repeat(MANAGED_CSV_LIMITS.bytes))).resolves.toMatchObject({
+        bytes: MANAGED_CSV_LIMITS.bytes,
+      });
+      await expect(csv('x'.repeat(MANAGED_CSV_LIMITS.bytes + 1))).rejects.toMatchObject({
+        code: 'resource_limit',
+      });
+      await expect(csv('\uFEFF' + 'x'.repeat(MANAGED_CSV_LIMITS.bytes))).rejects.toMatchObject({
+        code: 'resource_limit',
+      });
+      await expect(csv('éé', { inputBytes: 3 })).rejects.toMatchObject({ code: 'resource_limit' });
+    });
+
+    it.each([
+      [
+        'rows',
+        Array.from({ length: MANAGED_CSV_LIMITS.rows }, () => 'x').join('\n'),
+        Array.from({ length: MANAGED_CSV_LIMITS.rows + 1 }, () => 'x').join('\n'),
+        MANAGED_CSV_LIMITS.rows,
+      ],
+      [
+        'columns',
+        Array.from({ length: MANAGED_CSV_LIMITS.columns }, () => 'x').join(','),
+        Array.from({ length: MANAGED_CSV_LIMITS.columns + 1 }, () => 'x').join(','),
+        MANAGED_CSV_LIMITS.columns,
+      ],
+      [
+        'cells',
+        Array.from({ length: 16 }, () => 'x,'.repeat(127) + 'x').join('\n'),
+        Array.from({ length: 17 }, () => 'x,'.repeat(127) + 'x').join('\n'),
+        MANAGED_CSV_LIMITS.cells,
+      ],
+    ])(
+      'accepts exact %s ceiling and rejects excess without truncation',
+      async (_name, allowed, excess, count) => {
+        const result = await csv(allowed as string);
+        expect(result.structure.elements).toHaveLength(Number(count) + 1);
+        await expect(csv(excess as string)).rejects.toMatchObject({ code: 'resource_limit' });
+      },
+    );
+
+    it('counts canonical separators and UTF-8 bytes against the native output limit', async () => {
+      await expect(csv('"α",b', { outputBytes: 4 })).resolves.toMatchObject({
+        text: 'α\tb',
+        bytes: 4,
+      });
+      await expect(csv('"α",b', { outputBytes: 3 })).rejects.toMatchObject({
+        code: 'resource_limit',
+      });
+    });
+  });
 
   it('extracts real UTF-8 text and counts bytes rather than characters', async () => {
     await expect(text('Grüße\nαβ')).resolves.toMatchObject({ text: 'Grüße\nαβ', bytes: 12 });
