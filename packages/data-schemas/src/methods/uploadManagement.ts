@@ -986,6 +986,7 @@ export function createUploadManagementRepository(
           row.expiresAt! <= now
         )
           reject('not_ready');
+        const securityApproval = requireUploadSecurityApproval(row, securityPolicySha256, now);
         await lifecycle.assertManagedUploadProcessing(
           principalOf(row),
           row._id,
@@ -1000,7 +1001,7 @@ export function createUploadManagementRepository(
           mediaType: row.mediaType,
           bytes: row.actualBytes!,
           original: row.original,
-          securityApproval: requireUploadSecurityApproval(row, securityPolicySha256, now),
+          securityApproval,
         };
       });
     },

@@ -82,14 +82,7 @@ describe('private derived upload reservations', () => {
     coverage: { complete: true, pages: 1, parts: 1 },
   });
   beforeAll(async () => {
-    mongo = await MongoMemoryReplSet.create({
-      replSet: { count: 1 },
-      binary: {
-        version: '7.0.43',
-        systemBinary:
-          '/home/nodex/.local/share/nodex/tools/mongodb/7.0.43-ubuntu2204-linux-amd64/mongod',
-      },
-    });
+    mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
     await db.connect(mongo.getUri('upload-derived'));
     createModels(db);
     await db.models.File.init();

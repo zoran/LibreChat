@@ -106,14 +106,7 @@ describe('bound technical Intake recovery using actual Mongo transactions', () =
   const accept = (lease: UploadLease, time = now) =>
     first.accept(user, lease, receipt(lease), approval(lease), input(lease).metadata, time);
   beforeAll(async () => {
-    mongo = await MongoMemoryReplSet.create({
-      binary: {
-        version: '7.0.43',
-        systemBinary:
-          '/home/nodex/.local/share/nodex/tools/mongodb/7.0.43-ubuntu2204-linux-amd64/mongod',
-      },
-      replSet: { count: 1 },
-    });
+    mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
     await Promise.all([
       a.connect(mongo.getUri('intake')),
       b.connect(mongo.getUri('intake')),
