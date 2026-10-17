@@ -1,6 +1,7 @@
 export { EMAIL_CODE_IDLE_MS, EMAIL_CODE_ABSOLUTE_MS } from './emailCodePolicy';
 export { FileSourceUnavailableError } from './methods/fileRetention';
 export { createUploadManagementRepository } from './methods/uploadManagement';
+export type { UploadManagementRepository } from './methods/uploadManagement';
 export { createEmailCodeMethods } from './methods/emailCode';
 export type * from './types/emailCode';
 export * from './app';

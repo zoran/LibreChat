@@ -4,6 +4,7 @@ import type {
   UploadSecurityExecution,
   UploadSecuritySettlement,
 } from './upload-security';
+import type { UploadPromotionRecord } from './upload-intake';
 
 export const UPLOAD_CONTRACT_VERSION = 1;
 export const UPLOAD_MAX_FILE_BYTES = 31_457_280;
@@ -312,6 +313,8 @@ export type UploadCleanupTask = {
   parserExecution?: UploadParserExecution;
   securityExecution?: UploadSecurityExecution;
   securitySettlement?: UploadSecuritySettlement;
+  /** Private actual application-writer obligation, independent of intake/scanner cleanup. */
+  promotion?: UploadPromotionRecord;
   /** Explicit durable facts; missing historical journal values remain false/unknown. */
   writerStopped: boolean;
   localCopiesAbsent: boolean;
@@ -332,6 +335,8 @@ export type UploadClaimInput = {
   worker: UploadWorker;
   principal?: UploadPrincipal;
   operationId?: string;
+  /** Must match the still-current stored capability and grant in the claim transaction. */
+  intake?: { capabilitySha256: string };
   now: number;
 };
 export type UploadControllerLease = { ownerId: string; generation: number; expiresAt: string };

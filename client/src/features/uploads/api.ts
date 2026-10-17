@@ -1,4 +1,4 @@
-import { apiBaseUrl, getTokenHeader, request } from 'librechat-data-provider';
+import { apiBaseUrl, readUploadIntakeTicket, request } from 'librechat-data-provider';
 import type {
   ManagedUploadSnapshot,
   UploadOperation,
@@ -77,12 +77,23 @@ export const changeUpload = (id: string, action: 'cancel' | 'retry' | 'delete') 
   );
 
 /** One raw transfer, no implicit body retry/resume. Byte progress is measured by the browser. */
-export function sendUploadBody(
+export async function sendUploadBody(
   id: string,
   file: File,
   signal: AbortSignal,
   onProgress: (progress: TransferProgress) => void,
 ): Promise<UploadOperation> {
+  signal.throwIfAborted();
+  const ticket = readUploadIntakeTicket(
+    await uploadRequest<unknown>(`/operations/${encodeURIComponent(id)}/intake`, {
+      method: 'POST',
+      body: '{}',
+      signal,
+    }),
+  );
+  signal.throwIfAborted();
+  if (!ticket || ticket.operationId !== id || Date.parse(ticket.expiresAt) <= Date.now())
+    throw new UploadRequestError('unavailable');
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     const sample = createTransferProgress(file.size);
@@ -98,8 +109,7 @@ export function sendUploadBody(
     xhr.open('PUT', `${uploadsUrl}/operations/${encodeURIComponent(id)}/body`);
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
     xhr.setRequestHeader('X-Upload-Filename', encodeURIComponent(file.name));
-    const token = getTokenHeader();
-    if (token) xhr.setRequestHeader('Authorization', token);
+    xhr.setRequestHeader('X-Upload-Capability', ticket.capability);
     xhr.timeout = 135_000;
     xhr.upload.onprogress = (event) => {
       const now = performance.now();

@@ -347,6 +347,23 @@ describe('sole File owner managed cleanup adapter', () => {
     );
   });
 
+  it('never lets an old aggregate stop flag bypass an invalid App promotion obligation', async () => {
+    const task = {
+      ...base,
+      state: 'failed' as const,
+      writerStopped: true,
+      localCopiesAbsent: true,
+      promotion: {} as never,
+    };
+    const test = fixture(task);
+    await expect(test.cleanup.sweep({ deleteAcceptedFile: jest.fn() })).resolves.toMatchObject({
+      pending: 1,
+      cleaned: 0,
+    });
+    expect(test.storage.remove).not.toHaveBeenCalled();
+    expect(test.repository.confirmCleanup).not.toHaveBeenCalled();
+  });
+
   it('routes accepted deletion back through File composition and never stops a live task', async () => {
     const test = fixture();
     const deleteAcceptedFile = jest.fn().mockResolvedValue(false);

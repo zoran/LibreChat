@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import jwt from 'jsonwebtoken';
+import { readUploadIntakeGrant } from 'librechat-data-provider';
 import { createHash, createHmac, randomBytes, randomInt } from 'node:crypto';
 import type {
   EmailCodeIdentity,
@@ -7,6 +8,7 @@ import type {
   EmailCodeRepository,
   EmailCodeGrant,
 } from '@librechat/data-schemas';
+import type { UploadIntakeGrant } from 'librechat-data-provider';
 import type { Request, Response, RequestHandler } from 'express';
 import type { EmailCodeDependencies } from './emailCode.types';
 import {
@@ -77,7 +79,12 @@ function claims(value: unknown, use: 'access' | 'refresh'): value is GrantClaims
   );
 }
 
-function matches(c: GrantClaims, grant: EmailCodeGrant): boolean {
+type IdentityReference = Pick<
+  GrantClaims,
+  'id' | 'sessionId' | 'tenantId' | 'authVersion' | 'policyVersion'
+>;
+
+function matches(c: IdentityReference, grant: EmailCodeGrant): boolean {
   const settings = getEmailCodeSettings();
   return (
     settings.configured &&
@@ -95,16 +102,99 @@ const eligible = (identity: EmailCodeIdentity) =>
     identity.user.email.slice(identity.user.email.lastIndexOf('@') + 1).toLowerCase(),
   );
 
+async function readCurrentIdentity(
+  reference: IdentityReference,
+  repository: Pick<EmailCodeRepository, 'readEmailCodeIdentity'>,
+): Promise<EmailCodeIdentity | null> {
+  const configuredTenant = getEmailCodeSettings().tenantId;
+  if (reference.tenantId !== configuredTenant) return null;
+  const identity = await repository.readEmailCodeIdentity(reference.sessionId, configuredTenant);
+  return identity && eligible(identity) && matches(reference, identity.grant) ? identity : null;
+}
+
 /** Passport already verified the signature; this adds current durable grant/account authority. */
 export async function validateEmailCodeBearer(
   payload: unknown,
   repository: EmailCodeRepository,
 ): Promise<EmailCodeIdentity | null> {
   if (getAuthMode() === 'default' || !claims(payload, 'access')) return null;
-  const configuredTenant = getEmailCodeSettings().tenantId;
-  if (payload.tenantId !== configuredTenant) return null;
-  const identity = await repository.readEmailCodeIdentity(payload.sessionId, configuredTenant);
-  return identity && eligible(identity) && matches(payload, identity.grant) ? identity : null;
+  return readCurrentIdentity(payload, repository);
+}
+
+const UPLOAD_GRANT_MAX_MS = 12 * 60_000;
+const validGrantTime = (now: number) =>
+  Number.isSafeInteger(now) && now >= 0 && Number.isFinite(new Date(now).getTime());
+
+/** App-only issuance after JWT signature verification; never returns a transferable credential. */
+export async function createEmailCodeUploadGrant(
+  payload: unknown,
+  repository: Pick<EmailCodeRepository, 'readEmailCodeIdentity'>,
+  now: number = Date.now(),
+): Promise<UploadIntakeGrant | null> {
+  if (
+    getAuthMode() === 'default' ||
+    !validGrantTime(now) ||
+    !claims(payload, 'access') ||
+    typeof payload.exp !== 'number'
+  )
+    return null;
+  const accessExpiresAt = payload.exp * 1000;
+  if (!validGrantTime(accessExpiresAt) || accessExpiresAt <= now) return null;
+  // Snapshot only native identity fields before the database await; refresh rotation is unrelated.
+  const reference: IdentityReference = {
+    id: payload.id,
+    sessionId: payload.sessionId,
+    tenantId: payload.tenantId,
+    authVersion: payload.authVersion,
+    policyVersion: payload.policyVersion,
+  };
+  const identity = await readCurrentIdentity(reference, repository);
+  if (!identity) return null;
+  const expiresAt = Math.min(
+    accessExpiresAt,
+    now + UPLOAD_GRANT_MAX_MS,
+    identity.grant.idleExpiresAt,
+    identity.grant.absoluteExpiresAt,
+  );
+  if (!validGrantTime(expiresAt) || expiresAt <= now) return null;
+  return readUploadIntakeGrant({
+    version: 1,
+    principal: {
+      tenantId: reference.tenantId,
+      userId: reference.id,
+      authentication: 'verified-email',
+    },
+    sessionId: reference.sessionId,
+    authVersion: reference.authVersion,
+    policyVersion: reference.policyVersion,
+    expiresAt: new Date(expiresAt).toISOString(),
+  });
+}
+
+/** Revalidate the private stored reference against the same live native identity owner. */
+export async function validateEmailCodeUploadGrant(
+  reference: unknown,
+  repository: Pick<EmailCodeRepository, 'readEmailCodeIdentity'>,
+  now: number = Date.now(),
+): Promise<EmailCodeIdentity | null> {
+  if (getAuthMode() === 'default' || !validGrantTime(now)) return null;
+  const grant = readUploadIntakeGrant(reference);
+  if (!grant) return null;
+  const expiresAt = Date.parse(grant.expiresAt);
+  if (expiresAt <= now || expiresAt > now + UPLOAD_GRANT_MAX_MS) return null;
+  const identity = await readCurrentIdentity(
+    {
+      id: grant.principal.userId,
+      tenantId: grant.principal.tenantId!,
+      sessionId: grant.sessionId,
+      authVersion: grant.authVersion,
+      policyVersion: grant.policyVersion,
+    },
+    repository,
+  );
+  return identity && Math.min(identity.grant.idleExpiresAt, identity.grant.absoluteExpiresAt) > now
+    ? identity
+    : null;
 }
 
 /** Only logout may ignore expiry; signed claims there authorize exact-session revocation only. */

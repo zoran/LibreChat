@@ -112,6 +112,27 @@ describe('managed upload work ownership', () => {
     await expect(workers.close()).resolves.toEqual({ complete: false });
   });
 
+  it('does not replace an unsettled remote writer with a new binding for the same attempt', async () => {
+    const workers = fixture();
+    const first = workers.attempts.begin(jest.fn());
+    first.bind(lease);
+    first.settle({ ...stopped, storageOutcome: 'unknown' });
+    const second = workers.attempts.begin(jest.fn());
+    expect(() => second.bind(lease)).toThrow('lease_lost');
+    second.settle(stopped);
+    await expect(workers.close()).resolves.toEqual({ complete: false });
+  });
+
+  it('keeps an unknown PUT incomplete after a cleanup report without a storage fence', async () => {
+    const workers = fixture();
+    const ticket = workers.attempts.begin(jest.fn());
+    ticket.bind(lease);
+    ticket.settle({ ...stopped, storageOutcome: 'unknown' });
+    workers.attempts.recordCleanup(task, { writerStopped: true, localCopiesAbsent: true });
+    expect((await workers.maintenance.getMaintenanceCensus(null)).complete).toBe(false);
+    await expect(workers.close()).resolves.toEqual({ complete: false });
+  });
+
   it('keeps a missing or previous worker incarnation unknown', async () => {
     const workers = fixture();
     const abort = jest.fn();
@@ -172,5 +193,49 @@ describe('managed upload work ownership', () => {
     await jest.advanceTimersByTimeAsync(100);
     expect(processOne).toHaveBeenCalledTimes(1);
     await workers.close();
+  });
+
+  it('keeps processing failures incomplete while using the same journal port', async () => {
+    const onError = jest.fn(() => {
+      throw new Error('diagnostic failed');
+    });
+    processOne.mockRejectedValueOnce(new Error('processing failed'));
+    const workers = createUploadWorkers({
+      processing: { worker } as never,
+      runAsSystem: (run) => run(),
+      idleMs: 100,
+      onError,
+    });
+    workers.start();
+    await jest.advanceTimersByTimeAsync(100);
+    expect(processOne.mock.calls[0][0].attempts).toBe(workers.attempts);
+    expect(onError).toHaveBeenCalledTimes(1);
+    expect(workers.maintenance.pauseAdmissions('pause')).toBe(true);
+    expect(workers.maintenance.resumeAdmissions('pause')).toBe(false);
+    expect((await workers.maintenance.getMaintenanceCensus('pause')).complete).toBe(false);
+    await expect(workers.close()).resolves.toEqual({ complete: false });
+  });
+
+  it('drains the processing invocation separately from an empty journal', async () => {
+    let finish!: (result: { claimed: false }) => void;
+    processOne.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const workers = fixture();
+    workers.start();
+    await jest.advanceTimersByTimeAsync(100);
+    const timeout = new AbortController();
+    const closing = workers.close(timeout.signal);
+    expect(processOne.mock.calls[0][1]?.aborted).toBe(true);
+    timeout.abort();
+    await expect(closing).resolves.toEqual({ complete: false });
+    expect((await workers.maintenance.getMaintenanceCensus(null)).queuedContinuations).toBe(1);
+    finish({ claimed: false });
+    await expect(workers.close()).resolves.toEqual({ complete: true });
+    await jest.advanceTimersByTimeAsync(1_000);
+    expect(processOne).toHaveBeenCalledTimes(1);
   });
 });

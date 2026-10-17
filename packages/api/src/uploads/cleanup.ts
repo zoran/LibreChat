@@ -5,6 +5,7 @@ import {
   isCompleteUploadSecuritySettlement,
 } from 'librechat-data-provider';
 import type { UploadCleanupTask, UploadCleanupProof, UploadWorker } from 'librechat-data-provider';
+import type { UploadManagementRepository } from '@librechat/data-schemas';
 import type {
   UploadRepository,
   DocumentPort,
@@ -13,13 +14,15 @@ import type {
   UploadSecurityPort,
 } from './contract';
 import { attemptOriginalPath, uploadAttemptId } from './processing/paths';
+import { settleUploadPromotionCleanup } from './intake/promotion-cleanup';
 import { cancelSecurityExecution } from './security/cancellation';
 
 type FileOwner = { tenantId?: string | null; userId?: string };
 type CleanupRepository = Pick<
   UploadRepository,
   'cleanupForFile' | 'delete' | 'reconcile' | 'cleanupTasks' | 'confirmCleanup'
->;
+> &
+  Partial<Pick<UploadManagementRepository, 'settlePromotion'>>;
 export interface ManagedUploadCleanup {
   beginFileDeletion(owner: FileOwner, fileId: string): Promise<UploadCleanupTask | null>;
   removeFileOriginal(task: UploadCleanupTask): Promise<UploadCleanupProof>;
@@ -80,6 +83,17 @@ export function createManagedUploadCleanup(options: {
       textAndHistoryRemoved: false,
     };
     let securityPending = false;
+    const appStopped =
+      !task.promotion ||
+      (typeof options.repository.settlePromotion === 'function' &&
+        (await settleUploadPromotionCleanup({
+          task,
+          attempts: options.attempts,
+          worker: options.worker,
+          repository: { settlePromotion: options.repository.settlePromotion },
+          signal,
+          now,
+        })));
     if (local(task) && (!proof.writerStopped || !proof.localCopiesAbsent)) {
       const joined = await options.attempts.stopAndJoin(task, signal);
       proof.writerStopped ||= joined.writerStopped && joined.storageOutcome !== 'unknown';
@@ -112,7 +126,7 @@ export function createManagedUploadCleanup(options: {
     }
     // Preserve local stop evidence separately; a remote join cannot attest local or S3 writers.
     options.attempts.recordCleanup(task, { ...proof, securityPending });
-    proof.writerStopped &&= !securityPending;
+    proof.writerStopped &&= !securityPending && appStopped;
     return proof;
   }
 

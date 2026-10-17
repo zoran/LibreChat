@@ -1,13 +1,19 @@
 const jwt = require('jsonwebtoken');
 const { Registry } = require('prom-client');
 jest.mock('node:fs/promises', () => ({ mkdir: jest.fn(), lstat: jest.fn(), readFile: jest.fn() }));
+jest.mock('~/models', () => ({}));
+jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
+  createUploadManagementRepository: jest.fn(),
+}));
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
   initializeS3: jest.fn(),
   createHttpUploadSecurityPort: jest.fn(),
   validateEmailCodeBearer: jest.fn(),
-  createRawUploadBodyHandler: jest.fn(
-    jest.requireActual('@librechat/api').createRawUploadBodyHandler,
+  createRawUploadBodyHandler: jest.fn(),
+  createIntakeControlHandlers: jest.fn(
+    jest.requireActual('@librechat/api').createIntakeControlHandlers,
   ),
   createUploadWorkers: jest.fn(jest.requireActual('@librechat/api').createUploadWorkers),
   createUploadLiveHub: jest.fn(jest.requireActual('@librechat/api').createUploadLiveHub),
@@ -18,6 +24,7 @@ const {
   validateEmailCodeBearer,
   createRawUploadBodyHandler,
   createUploadWorkers,
+  createIntakeControlHandlers,
   createUploadLiveHub,
   createUploadRuntime,
   createHttpUploadSecurityPort,
@@ -198,6 +205,45 @@ describe('Cortex upload adapter trust boundaries', () => {
     expect(require('node:fs/promises').mkdir).not.toHaveBeenCalled();
   });
 
+  it('binds the native durable owner to the validated scanner policy', async () => {
+    Object.assign(process.env, {
+      CORTEX_UPLOAD_MANAGEMENT_ENABLED: 'true',
+      UPLOAD_SECURITY_ENDPOINT: 'https://scanner.example.test:8443',
+      UPLOAD_SECURITY_ALLOWED_HOSTS: 'scanner.example.test',
+      UPLOAD_SECURITY_POLICY_SHA256: 'a'.repeat(64),
+      AWS_REGION: 'us-east-1',
+      AWS_BUCKET_NAME: 'fixture-originals',
+      AWS_ENDPOINT_URL: 'https://storage.example.test:8333',
+      AWS_FORCE_PATH_STYLE: 'true',
+      AWS_ACCESS_KEY_ID: 'fixture-access',
+      AWS_SECRET_ACCESS_KEY: 'fixture-secret',
+    });
+    for (const prefix of ['UPLOAD_SECURITY_TLS', 'UPLOAD_INTAKE'])
+      for (const name of ['CA', 'CERT', 'KEY', ...(prefix === 'UPLOAD_INTAKE' ? ['PEERS'] : [])])
+        process.env[`${prefix}_${name}_FILE`] = `/fixture/${prefix}-${name}`;
+    const { readFile, lstat } = require('node:fs/promises');
+    readFile.mockImplementation(async (file) =>
+      Buffer.from(file.endsWith('PEERS') ? '[]' : 'fixture-tls'),
+    );
+    lstat.mockResolvedValue({
+      isDirectory: () => true,
+      isSymbolicLink: () => false,
+      uid: process.getuid(),
+      mode: 0o700,
+    });
+    initializeS3.mockReturnValue({ fixture: true });
+    const security = { policySha256: 'b'.repeat(64) };
+    createHttpUploadSecurityPort.mockReturnValue(security);
+    const { createUploadManagementRepository } = require('@librechat/data-schemas');
+    createUploadManagementRepository.mockImplementation(() => {
+      throw new Error('fixture-constructor-stop');
+    });
+    await expect(initializeUploads({})).rejects.toThrow('fixture-constructor-stop');
+    expect(createUploadManagementRepository).toHaveBeenCalledWith(require('mongoose'), {
+      securityPolicySha256: security.policySha256,
+    });
+  });
+
   it('binds source replay to the existing File quota with the exact trusted owner', async () => {
     const manager = { configureSourceReplay: jest.fn() };
     const models = {
@@ -254,7 +300,7 @@ describe('Cortex upload adapter trust boundaries', () => {
     }
   });
 
-  it('connects real management and transport/processing observations to the existing registry', async () => {
+  it('connects App promotion and processing while excluding the raw body handler', async () => {
     process.env.EMAIL_CODE_TENANT_ID = 'tenant-a';
     const owner = { tenantId: 'tenant-a', userId: 'user-a', authentication: 'verified-email' };
     const failed = { id: 'operation', revision: 2, scope: { kind: 'personal' }, state: 'failed' };
@@ -331,9 +377,15 @@ describe('Cortex upload adapter trust boundaries', () => {
         }),
       ).rejects.toMatchObject({ code: 'quota_exceeded' });
       await composition.management.retryProcessing(owner, failed.id);
-      const transport = createRawUploadBodyHandler.mock.calls.at(-1)[0];
-      transport.observe({ kind: 'accepted', bytes: 5 });
-      transport.observe({ kind: 'stage', stage: 'request', seconds: 1, outcome: 'success' });
+      expect(createRawUploadBodyHandler).not.toHaveBeenCalled();
+      expect(createIntakeControlHandlers).toHaveBeenCalledWith(
+        expect.objectContaining({
+          repository,
+          management: composition.management,
+          attempts: createUploadWorkers.mock.results.at(-1).value.attempts,
+          worker: { hostId: 'cpu-1', instanceId: 'fixture-app' },
+        }),
+      );
       const processing = createUploadWorkers.mock.calls.at(-1)[0].processing;
       processing.observe({ stage: 'processing', seconds: 2, outcome: 'success' });
       processing.observe({ stage: 'total', seconds: 9, outcome: 'success' });
@@ -343,10 +395,6 @@ describe('Cortex upload adapter trust boundaries', () => {
         'cortex_upload_quota_rejections_total{slot="cpu-1",reason="window"} 1',
       );
       expect(text).toContain('cortex_upload_retries_total{slot="cpu-1",reason="processing"} 1');
-      expect(text).toContain('cortex_upload_file_bytes_sum{slot="cpu-1"} 5');
-      expect(text).toContain(
-        'cortex_upload_duration_seconds_sum{slot="cpu-1",stage="request",outcome="success"} 1',
-      );
       expect(text).toContain(
         'cortex_upload_duration_seconds_sum{slot="cpu-1",stage="processing",outcome="success"} 2',
       );

@@ -44,9 +44,16 @@ describe('upload HTTP boundary', () => {
   let live: { open: jest.Mock };
   let body: jest.Mock;
   let admissionsPaused: boolean | null;
+  let issueIntake: jest.Mock;
 
   beforeEach(async () => {
     admissionsPaused = false;
+    issueIntake = jest.fn(async () => ({
+      version: 1,
+      operationId: 'operation',
+      capability: 'A'.repeat(43),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }));
     strongPrincipal = jest.fn(async (req: Request) => {
       if (req.headers.authorization !== 'Bearer verified')
         throw new UploadManagementError('unauthorized');
@@ -77,6 +84,7 @@ describe('upload HTTP boundary', () => {
       allowedOrigins: [origin],
       projectAttachments,
       live,
+      issueIntake,
       status: () => ({ throttled: false, waitingReason: null, admissionsPaused }),
     };
     const app = express();
@@ -99,6 +107,41 @@ describe('upload HTTP boundary', () => {
     await new Promise<void>((resolve, reject) =>
       server.close((error) => (error ? reject(error) : resolve())),
     );
+  });
+
+  it('issues an operation-scoped ticket only through the authenticated same-origin metadata path', async () => {
+    const response = await call('POST', '/api/uploads/operations/operation/intake', {});
+    expect(response.status).toBe(200);
+    expect(response.data).toMatchObject({ operationId: 'operation', capability: 'A'.repeat(43) });
+    expect(issueIntake).toHaveBeenCalledWith(expect.anything(), user, 'operation');
+  });
+
+  it('rejects document metadata and a forged ticket operation before exposing a capability', async () => {
+    expect(
+      (await call('POST', '/api/uploads/operations/operation/intake', { filename: 'secret.txt' }))
+        .status,
+    ).toBe(400);
+    expect(issueIntake).not.toHaveBeenCalled();
+    issueIntake.mockResolvedValueOnce({
+      version: 1,
+      operationId: 'foreign',
+      capability: 'A'.repeat(43),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    expect((await call('POST', '/api/uploads/operations/operation/intake', {})).status).toBe(503);
+  });
+
+  it('does not issue a ticket after session revocation while the issuer is awaiting storage', async () => {
+    issueIntake.mockImplementationOnce(async () => {
+      strongPrincipal.mockRejectedValueOnce(new UploadManagementError('unauthorized'));
+      return {
+        version: 1,
+        operationId: 'operation',
+        capability: 'A'.repeat(43),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      };
+    });
+    expect((await call('POST', '/api/uploads/operations/operation/intake', {})).status).toBe(401);
   });
 
   function call(

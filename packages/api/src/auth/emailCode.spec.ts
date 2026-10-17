@@ -2,6 +2,10 @@ jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
   ...jest.requireActual('../../../data-schemas/src/emailCodePolicy'),
 }));
+jest.mock('librechat-data-provider', () => ({
+  ...jest.requireActual('librechat-data-provider'),
+  ...jest.requireActual('../../../data-provider/src/upload-intake'),
+}));
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import request from 'supertest';
@@ -26,6 +30,8 @@ import {
   createEmailCodeAuth,
   validateEmailCodeBearer,
   validateEmailCodeRefresh,
+  createEmailCodeUploadGrant,
+  validateEmailCodeUploadGrant,
 } from './emailCode';
 
 const parseCookies: (value: string) => Record<string, string> = jest.requireActual('cookie').parse;
@@ -169,20 +175,180 @@ describe('email-code authentication composition', () => {
     process.env = original;
   });
 
-  describe('read-only current refresh authority', () => {
-    async function authenticated() {
-      const f = fixture();
-      const challenge = await request(f.app)
-        .post('/request')
-        .send({ email: 'person@employees.example.test' });
-      const response = await request(f.app)
-        .post('/verify')
-        .set('Cookie', cookies(challenge))
-        .send({ attemptId: challenge.body.attemptId, code: f.code() });
-      expect(response.status).toBe(200);
-      return { ...f, response, token: parseCookies(cookies(response)).refreshToken };
-    }
+  async function authenticated() {
+    const f = fixture();
+    const challenge = await request(f.app)
+      .post('/request')
+      .send({ email: 'person@employees.example.test' });
+    const response = await request(f.app)
+      .post('/verify')
+      .set('Cookie', cookies(challenge))
+      .send({ attemptId: challenge.body.attemptId, code: f.code() });
+    expect(response.status).toBe(200);
+    const payload = jwt.verify(response.body.token, process.env.JWT_SECRET!) as jwt.JwtPayload;
+    return { ...f, response, payload, token: parseCookies(cookies(response)).refreshToken };
+  }
 
+  describe('private native upload grants', () => {
+    it('keeps only private identity bounds, survives normal refresh and follows native logout', async () => {
+      const f = await authenticated();
+      const grant = await createEmailCodeUploadGrant(f.payload, f.repository);
+      expect(grant).toEqual({
+        version: 1,
+        principal: {
+          tenantId: 'cortex-bwi',
+          userId: '1'.repeat(24),
+          authentication: 'verified-email',
+        },
+        sessionId: f.payload.sessionId,
+        authVersion: 0,
+        policyVersion: 1,
+        expiresAt: new Date(f.payload.exp! * 1000).toISOString(),
+      });
+      expect(await validateEmailCodeUploadGrant(grant, f.repository)).not.toBeNull();
+      expect(f.repository.touchEmailCodeSession).not.toHaveBeenCalled();
+      expect(f.repository.rotateEmailCodeRefresh).not.toHaveBeenCalled();
+      expect(
+        (await request(f.app).post('/refresh').set('Cookie', cookies(f.response))).status,
+      ).toBe(200);
+      expect(await validateEmailCodeBearer(f.payload, f.repository)).not.toBeNull();
+      expect(await validateEmailCodeUploadGrant(grant, f.repository)).not.toBeNull();
+      expect((await request(f.app).post('/logout').set('Cookie', cookies(f.response))).status).toBe(
+        200,
+      );
+      expect(await validateEmailCodeUploadGrant(grant, f.repository)).toBeNull();
+      expect(await createEmailCodeUploadGrant(f.payload, f.repository)).toBeNull();
+    });
+
+    it('caps issuance at twelve minutes, original access expiry and both current session deadlines', async () => {
+      const f = await authenticated();
+      const now = Math.floor(Date.now() / 1000) * 1000;
+      const identity = (await validateEmailCodeBearer(f.payload, f.repository))!;
+      for (const [access, idle, absolute, expected] of [
+        [30, 30, 30, 12],
+        [3, 30, 30, 3],
+        [30, 2, 30, 2],
+        [30, 30, 1, 1],
+      ]) {
+        jest.mocked(f.repository.readEmailCodeIdentity).mockResolvedValueOnce({
+          ...identity,
+          grant: {
+            ...identity.grant,
+            idleExpiresAt: now + idle * 60000,
+            absoluteExpiresAt: now + absolute * 60000,
+          },
+        });
+        const grant = await createEmailCodeUploadGrant(
+          { ...f.payload, exp: now / 1000 + access * 60 },
+          f.repository,
+          now,
+        );
+        expect(grant?.expiresAt).toBe(new Date(now + expected * 60000).toISOString());
+      }
+      const grant = await createEmailCodeUploadGrant(f.payload, f.repository, now);
+      expect(
+        await validateEmailCodeUploadGrant(grant, f.repository, Date.parse(grant!.expiresAt)),
+      ).toBeNull();
+      for (const key of ['idleExpiresAt', 'absoluteExpiresAt'] as const) {
+        const expired = { ...identity, grant: { ...identity.grant, [key]: now } };
+        jest.mocked(f.repository.readEmailCodeIdentity).mockResolvedValueOnce(expired);
+        expect(await validateEmailCodeUploadGrant(grant, f.repository, now)).toBeNull();
+        jest.mocked(f.repository.readEmailCodeIdentity).mockResolvedValueOnce(expired);
+        expect(await createEmailCodeUploadGrant(f.payload, f.repository, now)).toBeNull();
+      }
+    });
+
+    it('rejects guests, refresh claims, invalid clocks and missing or expired access bounds', async () => {
+      const f = await authenticated();
+      for (const change of [
+        { authMethod: 'browser', provider: 'browser' },
+        { tokenUse: 'refresh' },
+        { exp: undefined },
+        { exp: NaN },
+        { exp: Infinity },
+        { exp: 1 },
+        { tenantId: 'other' },
+        { id: '2'.repeat(24) },
+        { sessionId: '2'.repeat(24) },
+      ])
+        expect(
+          await createEmailCodeUploadGrant({ ...f.payload, ...change }, f.repository),
+        ).toBeNull();
+      const grant = await createEmailCodeUploadGrant(f.payload, f.repository);
+      for (const now of [NaN, Infinity, -1]) {
+        expect(await createEmailCodeUploadGrant(f.payload, f.repository, now)).toBeNull();
+        expect(await validateEmailCodeUploadGrant(grant, f.repository, now)).toBeNull();
+      }
+      process.env.AUTH_MODE = 'default';
+      expect(await createEmailCodeUploadGrant(f.payload, f.repository)).toBeNull();
+      expect(await validateEmailCodeUploadGrant(grant, f.repository)).toBeNull();
+    });
+
+    it('reuses live policy, domain, auth-version and disabled-account decisions without masking DB errors', async () => {
+      const f = await authenticated();
+      const grant = await createEmailCodeUploadGrant(f.payload, f.repository);
+      const identity = (await validateEmailCodeBearer(f.payload, f.repository))!;
+      for (const key of ['authVersion', 'policyVersion'] as const) {
+        jest.mocked(f.repository.readEmailCodeIdentity).mockResolvedValueOnce({
+          ...identity,
+          grant: { ...identity.grant, [key]: identity.grant[key] + 1 },
+        });
+        expect(await validateEmailCodeUploadGrant(grant, f.repository)).toBeNull();
+      }
+      process.env.EMAIL_CODE_POLICY_VERSION = '2';
+      expect(await validateEmailCodeUploadGrant(grant, f.repository)).toBeNull();
+      process.env.EMAIL_CODE_POLICY_VERSION = '1';
+      process.env.EMAIL_CODE_ALLOWED_DOMAINS = 'other.example.test';
+      expect(await validateEmailCodeUploadGrant(grant, f.repository)).toBeNull();
+      process.env.EMAIL_CODE_ALLOWED_DOMAINS = 'employees.example.test';
+      // The native repository returns null for disabled accounts; do not duplicate that owner.
+      jest.mocked(f.repository.readEmailCodeIdentity).mockResolvedValueOnce(null);
+      expect(await validateEmailCodeUploadGrant(grant, f.repository)).toBeNull();
+      jest
+        .mocked(f.repository.readEmailCodeIdentity)
+        .mockRejectedValueOnce(new Error('DB unavailable'));
+      await expect(validateEmailCodeUploadGrant(grant, f.repository)).rejects.toThrow(
+        'DB unavailable',
+      );
+    });
+
+    it('rejects hostile references before DB access and snapshots identity before awaiting it', async () => {
+      const f = await authenticated();
+      const grant = (await createEmailCodeUploadGrant(f.payload, f.repository))!;
+      const identity = (await validateEmailCodeBearer(f.payload, f.repository))!;
+      const read = jest.mocked(f.repository.readEmailCodeIdentity);
+      read.mockClear();
+      const getter = jest.fn(() => grant.principal);
+      const hostile = Object.defineProperty({ ...grant }, 'principal', { get: getter });
+      expect(await validateEmailCodeUploadGrant(hostile, f.repository)).toBeNull();
+      expect(getter).not.toHaveBeenCalled();
+      expect(read).not.toHaveBeenCalled();
+      let finish!: (value: EmailCodeIdentity) => void;
+      read.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      );
+      const pending = validateEmailCodeUploadGrant(grant, f.repository);
+      grant.principal.userId = '2'.repeat(24);
+      grant.expiresAt = new Date(0).toISOString();
+      finish(identity);
+      expect(await pending).toEqual(identity);
+      read.mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      );
+      const issued = createEmailCodeUploadGrant(f.payload, f.repository);
+      f.payload.id = '2'.repeat(24);
+      finish(identity);
+      expect((await issued)?.principal.userId).toBe(identity.grant.userId);
+    });
+  });
+
+  describe('read-only current refresh authority', () => {
     it('reads the current nonce and generation without rotation or idle extension', async () => {
       const f = await authenticated();
       const before = await validateEmailCodeRefresh(f.token, f.repository);

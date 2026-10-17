@@ -59,6 +59,8 @@ export interface StoragePort {
     mediaType: string;
     bytes: number;
     integrity: UploadOriginalIntegrity;
+    /** Required and validated by isolated-intake promotion; direct storage callers remain compatible. */
+    securityApproval?: UploadSecurityApproval;
     body: AsyncIterable<Uint8Array>;
     signal: AbortSignal;
   }): Promise<UploadStorageReceipt>;
@@ -114,8 +116,10 @@ export type UploadAttemptSettlement = {
   /** Independent scanner obligation; local/S3 completion cannot settle it. */
   securityPending?: boolean;
 };
+/** Actual local writer identity, independent of whether its work owns the transfer lease. */
+export type UploadAttemptBinding = UploadWorker & { operationId: string; generation: number };
 export type UploadAttemptRegistration = {
-  bind(lease: UploadLease): void;
+  bind(binding: UploadAttemptBinding): void;
   settle(proof: UploadAttemptSettlement): void;
 };
 export type UploadAttemptPort = {

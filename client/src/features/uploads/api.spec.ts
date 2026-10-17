@@ -4,6 +4,7 @@ import { readUploadSnapshot, reserveUpload, sendUploadBody } from './api';
 jest.mock('librechat-data-provider', () => ({
   apiBaseUrl: () => '',
   getTokenHeader: () => 'Bearer verified',
+  readUploadIntakeTicket: jest.requireActual('librechat-data-provider').readUploadIntakeTicket,
   request: { authenticatedFetch: jest.fn() },
 }));
 
@@ -25,15 +26,54 @@ class BrowserTransfer {
     BrowserTransfer.last = this;
   }
 }
+const ticket = () => ({
+  version: 1,
+  operationId: 'one',
+  capability: 'A'.repeat(43),
+  expiresAt: new Date(Date.now() + 60_000).toISOString(),
+});
+const respond = (body: object, status = 200) => {
+  const read = jest
+    .fn()
+    .mockResolvedValueOnce({ done: false, value: new TextEncoder().encode(JSON.stringify(body)) })
+    .mockResolvedValueOnce({ done: true });
+  (request.authenticatedFetch as jest.Mock).mockResolvedValueOnce({
+    ok: status === 200,
+    status,
+    body: { getReader: () => ({ read, cancel: jest.fn().mockResolvedValue(undefined) }) },
+  });
+};
+const flushTicket = async () => {
+  for (let i = 0; i < 12; i++) await Promise.resolve();
+};
 describe('browser upload transport', () => {
   const OriginalXHR = global.XMLHttpRequest;
   beforeEach(() => {
     jest.useFakeTimers();
     global.XMLHttpRequest = BrowserTransfer as unknown as typeof XMLHttpRequest;
+    respond(ticket());
   });
   afterEach(() => {
     global.XMLHttpRequest = OriginalXHR;
     jest.useRealTimers();
+  });
+  it.each(['foreign', 'expired', 'denied'])('sends no bytes for a %s ticket', async (kind) => {
+    (request.authenticatedFetch as jest.Mock).mockReset();
+    const value = ticket();
+    if (kind === 'foreign') value.operationId = 'other';
+    if (kind === 'expired') value.expiresAt = new Date(Date.now() - 1000).toISOString();
+    respond(kind === 'denied' ? { code: 'unauthorized' } : value, kind === 'denied' ? 401 : 200);
+    const previous = BrowserTransfer.last;
+    await expect(
+      sendUploadBody(
+        'one',
+        new File(['private'], 'a.txt'),
+        new AbortController().signal,
+        jest.fn(),
+      ),
+    ).rejects.toBeDefined();
+    expect(BrowserTransfer.last).toBe(previous);
+    expect(jest.getTimerCount()).toBe(0);
   });
   it('removes stale throughput/ETA during a stalled transfer without new progress events', async () => {
     const progress = jest.fn();
@@ -43,6 +83,7 @@ describe('browser upload transport', () => {
       new AbortController().signal,
       progress,
     );
+    await flushTicket();
     const xhr = BrowserTransfer.last;
     for (const loaded of [1000, 2000, 3000]) {
       jest.advanceTimersByTime(600);
@@ -63,6 +104,7 @@ describe('browser upload transport', () => {
       new AbortController().signal,
       jest.fn(),
     );
+    await flushTicket();
     BrowserTransfer.last.onerror?.();
     await expect(operation).rejects.toMatchObject({ code: 'unavailable' });
     expect(BrowserTransfer.last.send).toHaveBeenCalledTimes(1);
@@ -76,8 +118,15 @@ describe('browser upload transport', () => {
       new AbortController().signal,
       jest.fn(),
     );
+    await flushTicket();
     const xhr = BrowserTransfer.last;
     expect(xhr.open).toHaveBeenCalledWith('PUT', '/api/uploads/operations/one/body');
+    expect(xhr.setRequestHeader).toHaveBeenCalledWith('X-Upload-Capability', 'A'.repeat(43));
+    expect(xhr.setRequestHeader.mock.calls.some(([name]) => name === 'Authorization')).toBe(false);
+    expect(request.authenticatedFetch).toHaveBeenCalledWith(
+      '/api/uploads/operations/one/intake',
+      expect.objectContaining({ method: 'POST', body: '{}' }),
+    );
     expect(xhr.setRequestHeader).toHaveBeenCalledWith(
       'X-Upload-Filename',
       encodeURIComponent(filename),
@@ -89,18 +138,6 @@ describe('browser upload transport', () => {
 });
 
 describe('managed snapshot admission boundary', () => {
-  const respond = (body: object, status = 200) => {
-    const read = jest
-      .fn()
-      .mockResolvedValueOnce({ done: false, value: new TextEncoder().encode(JSON.stringify(body)) })
-      .mockResolvedValueOnce({ done: true });
-    (request.authenticatedFetch as jest.Mock).mockResolvedValueOnce({
-      ok: status === 200,
-      status,
-      body: { getReader: () => ({ read, cancel: jest.fn().mockResolvedValue(undefined) }) },
-    });
-  };
-
   it.each([true, false, null])('preserves the explicit admission value %s', async (value) => {
     respond({ operations: [], admissionsPaused: value });
     expect((await readUploadSnapshot()).admissionsPaused).toBe(value);

@@ -3,6 +3,7 @@ import {
   UPLOAD_ERROR_CODES,
   isUploadPrincipal,
   readUploadAcceptedMetadata,
+  readUploadIntakeTicket,
 } from 'librechat-data-provider';
 import type {
   ManagedUploadSnapshot,
@@ -12,6 +13,7 @@ import type {
   UploadPrincipal,
   UploadRequest,
   UploadUsage,
+  UploadIntakeTicket,
 } from 'librechat-data-provider';
 import type { NextFunction, Request, RequestHandler, Response } from 'express';
 import type { UploadLiveHub, UploadRequestPrincipal } from './live';
@@ -32,6 +34,12 @@ export interface UploadHttpOptions extends AuthorityOptions {
   ): Promise<ReadonlyMap<string, Attachment>>;
   status(): Pick<ManagedUploadSnapshot, 'throttled' | 'waitingReason' | 'admissionsPaused'>;
   live: Pick<UploadLiveHub, 'open'>;
+  /** A private native grant is retained server-side; only this bounded capability is returned. */
+  issueIntake?(
+    request: Request,
+    principal: UploadPrincipal,
+    id: string,
+  ): Promise<UploadIntakeTicket>;
 }
 const safeStatuses: Partial<Record<UploadErrorCode, number>> = {
   unauthorized: 401,
@@ -300,6 +308,22 @@ export function createUploadHttpRouter(options: UploadHttpOptions): Router {
       }),
     );
   }
+  router.post(
+    '/operations/:id/intake',
+    metadata,
+    wrap(async (request, response) => {
+      exact(request.body, []);
+      if (!options.issueIntake) throw new UploadManagementError('unavailable');
+      const id = operationId(request);
+      const ticket = readUploadIntakeTicket(
+        await options.issueIntake(request, principal(request), id),
+      );
+      if (!ticket || ticket.operationId !== id || Date.parse(ticket.expiresAt) <= Date.now())
+        throw new UploadManagementError('unavailable');
+      await authenticate(request, principal(request));
+      response.json(ticket);
+    }),
+  );
   router.delete(
     '/operations/:id',
     wrap(async (request, response) => {

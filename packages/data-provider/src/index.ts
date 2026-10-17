@@ -10,6 +10,7 @@ export * from './langchain';
 export * from './filters';
 export * from './file-config';
 export * from './upload-management';
+export * from './upload-intake';
 export * from './upload-security';
 export * from './upload-view';
 export * from './email-code';

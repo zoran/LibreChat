@@ -32,6 +32,7 @@ import {
   reject,
 } from './uploadManagementStore';
 import { validateUploadMigrationSecurity } from './uploadManagement.security';
+import { validateUploadMigrationIntake } from './uploadManagementIntake';
 import { readUploadAdmission } from './uploadManagementAdmission';
 
 export type UploadMigrationMethods = {
@@ -189,6 +190,7 @@ export function createUploadMigrationMethods(
     )
       reject('migration_conflict');
     validateUploadMigrationSecurity(row, securityPolicySha256, Date.now());
+    validateUploadMigrationIntake(row);
     return row;
   }
   async function prepareExportRow(row: StoredUpload, session: ClientSession): Promise<void> {
@@ -211,6 +213,11 @@ export function createUploadMigrationMethods(
     row.fingerprint = fingerprint;
     if (row.acceptedAt == null) delete row.filename;
     if (!currentKey(row.idempotencyKey)) row.idempotencyKey = randomUUID();
+    // No body was claimed. Invalidate its credential on the frozen source and exported page.
+    if (row.intake && row.intake.generation === undefined) {
+      validateUploadMigrationIntake(row);
+      delete row.intake;
+    }
     validateRow(row);
     if (uploadDigest(row) !== previous) await store.save(row, session);
   }

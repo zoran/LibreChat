@@ -436,14 +436,14 @@ const startServer = async () => {
   app.use('/api/agents/chat', agentStartupIngressMiddleware);
   app.use(metricsMiddleware);
   app.use(noIndex);
-  // Authentication must precede the raw route; no body parser or proxy may pre-buffer it.
+  // This App accepts metadata only. The ingress sends document bodies to isolated Intake.
   app.use(cookieParser());
   app.use(authAdmissionMiddleware);
   app.use(passport.initialize());
   passport.use(jwtLogin());
   passport.use(passportLogin());
   if (uploads) {
-    app.use('/api/uploads', requireJwtAuth, uploads.bodyRouter, uploads.router);
+    app.use('/api/uploads', requireJwtAuth, uploads.router);
   } else {
     app.use('/api/uploads', (_req, res) => res.status(503).json({ code: 'unavailable' }));
   }

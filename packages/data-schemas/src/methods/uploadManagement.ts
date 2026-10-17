@@ -45,6 +45,7 @@ import type {
 import type { UploadMigrationMethods } from './uploadManagementMigration';
 import type { UploadAdmissionMethods } from './uploadManagementAdmission';
 import type { UploadControlMethods } from './uploadManagementControl';
+import type { UploadIntakeMethods } from './uploadManagementIntake';
 import {
   createUploadStore,
   principalFilter,
@@ -68,6 +69,13 @@ import {
   hasCompleteUploadSecurityExecution,
   recordUploadSecuritySettlement,
 } from './uploadManagement.security';
+import {
+  createUploadIntakeMethods,
+  bindUploadIntakeClaim,
+  requireUploadPromotionAcceptance,
+  hasStoppedUploadPromotion,
+  readStoredUploadPromotion,
+} from './uploadManagementIntake';
 import { createUploadAdmissionMethods, readUploadAdmission } from './uploadManagementAdmission';
 import { createUploadMigrationMethods } from './uploadManagementMigration';
 import { createUploadControlMethods } from './uploadManagementControl';
@@ -76,6 +84,7 @@ import { createFileRetentionMethods } from './fileRetention';
 export type UploadManagementRepository = UploadControlMethods &
   UploadMigrationMethods &
   UploadAdmissionMethods &
+  UploadIntakeMethods &
   UploadActivationMethods & {
     initialize(): Promise<void>;
     findReservation(
@@ -167,7 +176,8 @@ export function createUploadManagementRepository(
     parserExecution: row.parserExecution,
     securityExecution: row.securityExecution,
     securitySettlement: row.securitySettlement,
-    writerStopped: row.writerStopped === true,
+    promotion: readStoredUploadPromotion(row),
+    writerStopped: row.writerStopped === true && hasStoppedUploadPromotion(row),
     localCopiesAbsent: row.stagingHeld === false,
   });
   async function owned(
@@ -369,7 +379,14 @@ export function createUploadManagementRepository(
     });
   }
   async function claim(input: UploadClaimInput): Promise<UploadLease | null> {
+    input = {
+      ...input,
+      worker: { ...input.worker },
+      ...(input.principal ? { principal: { ...input.principal } } : {}),
+      ...(input.intake ? { intake: { capabilitySha256: input.intake.capabilitySha256 } } : {}),
+    };
     const { now, worker, kind } = input;
+    if (kind !== 'transfer' && input.intake !== undefined) reject('invalid_request');
     if (
       !worker.hostId ||
       !worker.instanceId ||
@@ -436,6 +453,7 @@ export function createUploadManagementRepository(
         global.textBytes + UPLOAD_MAX_TEXT_BYTES - row.textBytes > RESOURCE_MAX.textBytes
       )
         return null;
+      bindUploadIntakeClaim(row, input);
       row.generation++;
       row.workerGeneration = row.generation;
       row.workerKind = kind;
@@ -510,6 +528,7 @@ export function createUploadManagementRepository(
     ...createUploadMigrationMethods(store, securityPolicySha256),
     ...createUploadActivationMethods(store),
     ...createUploadAdmissionMethods(store),
+    ...createUploadIntakeMethods(store, securityPolicySha256),
     reserve,
     usage,
     async findReservation(principal, key, fingerprint, now) {
@@ -644,6 +663,7 @@ export function createUploadManagementRepository(
             lease.userId !== row.userId
           )
             reject('lease_lost');
+          requireUploadPromotionAcceptance(row, original, approval, acceptedMetadata);
           if (!original || !row.original || uploadDigest(original) !== uploadDigest(row.original))
             reject('idempotency_conflict');
           if (row.filename !== acceptedMetadata.filename) reject('idempotency_conflict');
@@ -655,6 +675,7 @@ export function createUploadManagementRepository(
         }
         assertLease(row, lease, now);
         if (row.slot !== 'transfer' || row.state !== 'transferring') reject('lease_lost');
+        requireUploadPromotionAcceptance(row, original, approval, acceptedMetadata);
         if (outcome !== 'durable') reject('storage_uncertain');
         if (
           bytes !== row.declaredBytes ||
@@ -817,6 +838,7 @@ export function createUploadManagementRepository(
           reject('lease_lost');
         if (settlement) recordUploadSecuritySettlement(row, settlement);
         if (row.securityExecution && !hasCompleteUploadSecurityExecution(row)) reject('not_ready');
+        if (!hasStoppedUploadPromotion(row)) reject('not_ready');
         if (!proof.writerStopped) reject('not_ready');
         row.writerStopped = true;
         if (row.slot && ['transferring', 'processing'].includes(row.state))

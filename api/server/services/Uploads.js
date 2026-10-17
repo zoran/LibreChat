@@ -6,8 +6,8 @@ const {
   createUploadRuntime,
   createUploadLiveHub,
   createUploadHttpRouter,
-  createUploadBodyRouter,
-  createRawUploadBodyHandler,
+  createIntakeControlHandlers,
+  startIntakeControlService,
   createUploadWorkers,
   createManagedUploadCleanup,
   createHttpUploadSecurityPort,
@@ -26,6 +26,8 @@ const {
   runAsSystem,
   logger,
 } = require('@librechat/data-schemas');
+
+const { createUploadTicketIssuer, managedIntakeControlConfig } = require('./UploadIntake');
 
 let current;
 const getUploadRuntime = () => current;
@@ -276,36 +278,23 @@ async function createUploadComposition({
     },
   });
   platform.bindMetrics?.(metrics);
-  const body = createRawUploadBodyHandler({
+  const intakeHandlers = createIntakeControlHandlers({
+    repository,
+    identityRepository: models,
     management,
-    principal,
+    resources: platform.resources,
     storage,
-    security,
-    worker,
-    stagingRoot,
     attempts: workers.attempts,
-    claimBytes: management.claimWorkBytes,
-    completeBytes: management.completeWorkBytes,
-    observe(event) {
-      if (event.kind === 'received') metrics.received(event.bytes);
-      else if (event.kind === 'accepted') metrics.fileSize(event.bytes);
-      // Storage service latency already has its own SDK observation.
-      else if (event.stage !== 'storage')
-        metrics.observeDuration({
-          stage: event.stage,
-          seconds: event.seconds,
-          outcome: event.outcome,
-        });
-    },
+    worker,
   });
   const authority = { principal, allowedOrigins };
-  const bodyRouter = createUploadBodyRouter({ ...authority, body });
   const router = createUploadHttpRouter({
     ...authority,
     management,
     live,
     status: controller.status,
     projectAttachments: attachmentProjection(models),
+    issueIntake: createUploadTicketIssuer({ repository, identityRepository: models, management }),
   });
   let started = false;
   return {
@@ -315,7 +304,7 @@ async function createUploadComposition({
     storage,
     principal,
     router,
-    bodyRouter,
+    intakeHandlers,
     allowedOrigins: Object.freeze([...allowedOrigins]),
     maintenance: workers.maintenance,
     configureSourceReplay(manager) {
@@ -341,6 +330,7 @@ async function createUploadComposition({
 async function initializeUploads({ registry }) {
   if (process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED !== 'true') return undefined;
   if (current) return current;
+  const intakeConfig = await managedIntakeControlConfig();
   const security = await managedSecurityClient();
   const client = managedStorageClient();
   const mongoose = require('mongoose');
@@ -358,7 +348,9 @@ async function initializeUploads({ registry }) {
   ) {
     throw new Error('Unsafe upload staging directory');
   }
-  const repository = createUploadManagementRepository(mongoose);
+  const repository = createUploadManagementRepository(mongoose, {
+    securityPolicySha256: security.policySha256,
+  });
   // Initialization never attests an empty store or enables an unreconciled authority.
   await runAsSystem(() => repository.initialize());
   const platform = await createUploadPlatform({ repository, worker, stagingRoot });
@@ -378,7 +370,7 @@ async function initializeUploads({ registry }) {
     socketPath: '/var/run/cortex-upload-parser/parser.sock',
   });
   const origin = new URL(process.env.DOMAIN_CLIENT).origin;
-  current = await createUploadComposition({
+  const composition = await createUploadComposition({
     repository,
     models,
     registry,
@@ -390,6 +382,24 @@ async function initializeUploads({ registry }) {
     stagingRoot,
     allowedOrigins: [origin],
   });
+  let intakeControl;
+  try {
+    intakeControl = await startIntakeControlService({
+      ...intakeConfig,
+      handlers: composition.intakeHandlers,
+    });
+  } catch (error) {
+    await composition.close(AbortSignal.timeout(30_000));
+    throw error;
+  }
+  current = {
+    ...composition,
+    async close(signal) {
+      const result = await intakeControl.close(signal);
+      await composition.close(signal);
+      if (!result.complete) throw new Error('Upload intake shutdown has unresolved work');
+    },
+  };
   return current;
 }
 

@@ -62,7 +62,7 @@ export type RawUploadBodyDependencies = {
     | 'settleSecurityExecution'
   >;
   principal(request: Request): Promise<UploadPrincipal>;
-  storage: StoragePort;
+  storage: Pick<StoragePort, 'put'>;
   security: UploadSecurityPort;
   worker: UploadWorker;
   stagingRoot: string;
@@ -466,6 +466,7 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
       let receipt;
       try {
         receipt = await deps.storage.put({
+          securityApproval,
           lease,
           filename: metadata.filename,
           mediaType: operation.mediaType,

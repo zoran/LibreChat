@@ -16,6 +16,7 @@ export default defineConfig({
     'src/uploads/processing/parser-child.ts',
     'src/uploads/security/worker-thread.ts',
     'src/uploads/security/security-entry.ts',
+    'src/uploads/intake/intake-entry.ts',
   ],
   format: ['cjs'],
   platform: 'node',

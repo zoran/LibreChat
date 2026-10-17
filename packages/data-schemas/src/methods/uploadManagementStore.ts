@@ -21,6 +21,8 @@ import type {
   UploadSecurityApproval,
   UploadSecurityExecution,
   UploadSecuritySettlement,
+  UploadIntakeGrant,
+  UploadPromotionRecord,
 } from 'librechat-data-provider';
 import type { ClientSession, Model } from 'mongoose';
 import { tenantStorage, SYSTEM_TENANT_ID, runAsSystem } from '~/config/tenantContext';
@@ -108,6 +110,15 @@ export type StoredUpload = {
   securityApproval?: UploadSecurityApproval;
   securityExecution?: UploadSecurityExecution;
   securitySettlement?: UploadSecuritySettlement;
+  /** Private capability hash and native identity reference; never projected to ordinary clients. */
+  intake?: {
+    capabilitySha256: string;
+    grant: UploadIntakeGrant;
+    worker?: UploadWorker;
+    generation?: number;
+  };
+  /** App writer is independent of the Intake transfer and scanner execution. */
+  promotion?: UploadPromotionRecord;
   originalBytes: number;
   textBytes: number;
   recordBytes: number;
@@ -386,6 +397,8 @@ export function createUploadStore(
       securityApproval: S.Types.Mixed,
       securityExecution: S.Types.Mixed,
       securitySettlement: S.Types.Mixed,
+      intake: S.Types.Mixed,
+      promotion: S.Types.Mixed,
       originalBytes: Number,
       textBytes: Number,
       recordBytes: Number,
