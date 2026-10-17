@@ -71,6 +71,26 @@ function identity(config: RunnableConfig): {
   return { thread_id, checkpoint_ns, ...(checkpoint_id == null ? {} : { checkpoint_id }) };
 }
 
+/** Mirrors the installed SDK's optional string-config contract for unowned reads. */
+function nativeStringConfig(name: string, value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string') throw new Error(`Invalid configurable.${name}: expected a string`);
+  return value;
+}
+
+/** No source-bearing row may reach Serde until the complete source authorization exists here. */
+function requireSourceFree(row: CheckpointRow | WriteRow): void {
+  for (const field of [
+    'lc_source_binding',
+    'lc_source_file_ids',
+    'lc_source_expires_at',
+    'lc_retained_allocations',
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(row, field))
+      throw new Error('Source-bound checkpoint reads require source authorization');
+  }
+}
+
 /** Isolate physical storage by owner while preserving logical SDK references. */
 export class OwnedMongoSaver extends MongoDBSaver {
   /** Ordinary/HITL saves remain unchanged; durable runs may fence the actual writes. */
@@ -105,40 +125,73 @@ export class OwnedMongoSaver extends MongoDBSaver {
       );
   }
 
-  private async tuple(doc: CheckpointRow, owner: string, legacy = false): Promise<CheckpointTuple> {
-    const namespace = doc.checkpoint_ns.startsWith(owner)
-      ? doc.checkpoint_ns.slice(owner.length)
-      : doc.checkpoint_ns;
+  private async tuple(
+    doc: CheckpointRow,
+    owner?: string,
+    legacy = false,
+    listed = false,
+  ): Promise<CheckpointTuple> {
+    const namespace =
+      owner != null && doc.checkpoint_ns.startsWith(owner)
+        ? doc.checkpoint_ns.slice(owner.length)
+        : doc.checkpoint_ns;
     const key = {
-      thread_id: doc.thread_id.startsWith(owner)
-        ? doc.thread_id.slice(owner.length)
-        : doc.thread_id,
+      thread_id:
+        owner != null && doc.thread_id.startsWith(owner)
+          ? doc.thread_id.slice(owner.length)
+          : doc.thread_id,
       checkpoint_ns: namespace,
       checkpoint_id: doc.checkpoint_id,
     };
     const rows = await this.db
       .collection<WriteRow>(this.checkpointWritesCollectionName)
-      .find({
-        checkpoint_id: key.checkpoint_id,
-        $or: [
-          {
-            thread_id: `${owner}${key.thread_id}`,
-            checkpoint_ns: `${owner}${namespace}`,
-            lc_owner: owner,
-          },
-          ...(legacy
-            ? [{ thread_id: key.thread_id, checkpoint_ns: namespace, lc_owner: { $exists: false } }]
-            : []),
-        ],
-      })
+      .find(
+        owner == null
+          ? key
+          : {
+              checkpoint_id: key.checkpoint_id,
+              $or: [
+                {
+                  thread_id: `${owner}${key.thread_id}`,
+                  checkpoint_ns: `${owner}${namespace}`,
+                  lc_owner: owner,
+                },
+                ...(legacy
+                  ? [
+                      {
+                        thread_id: key.thread_id,
+                        checkpoint_ns: namespace,
+                        lc_owner: { $exists: false },
+                      },
+                    ]
+                  : []),
+              ],
+            },
+      )
       .toArray();
-    const slots = new Map<string, WriteRow>();
-    for (const row of rows) {
-      const slot = JSON.stringify([row.task_id, row.idx]);
-      if (!slots.has(slot) || row.checkpoint_ns === `${owner}${namespace}`) slots.set(slot, row);
+    requireSourceFree(doc);
+    // Even a legacy duplicate that loses its slot must be checked before any decode starts.
+    for (const row of rows) requireSourceFree(row);
+    let pendingRows: WriteRow[] = rows;
+    if (owner != null) {
+      const slots = new Map<string, WriteRow>();
+      for (const row of rows) {
+        const slot = JSON.stringify([row.task_id, row.idx]);
+        if (!slots.has(slot) || row.checkpoint_ns === `${owner}${namespace}`) slots.set(slot, row);
+      }
+      pendingRows = [...slots.values()];
     }
+    // Preserve the installed SDK's decode order, after the shared raw-row guard.
+    const checkpoint =
+      owner == null
+        ? ((await this.serde.loadsTyped(doc.type, doc.checkpoint.value())) as Checkpoint)
+        : undefined;
+    const metadata =
+      owner == null && listed
+        ? ((await this.serde.loadsTyped(doc.type, doc.metadata.value())) as CheckpointMetadata)
+        : undefined;
     const pendingWrites: CheckpointPendingWrite[] = await Promise.all(
-      [...slots.values()].map(
+      pendingRows.map(
         async (row) =>
           [
             row.task_id,
@@ -147,35 +200,61 @@ export class OwnedMongoSaver extends MongoDBSaver {
           ] as CheckpointPendingWrite,
       ),
     );
+    const hasParent =
+      owner == null && listed
+        ? Boolean(doc.parent_checkpoint_id)
+        : doc.parent_checkpoint_id != null;
+    const parentConfig = hasParent
+      ? {
+          configurable: {
+            ...key,
+            checkpoint_id: doc.parent_checkpoint_id,
+            ...(owner == null
+              ? {}
+              : {
+                  [LIBRECHAT_CHECKPOINT_OWNER_KEY]: owner,
+                  [LIBRECHAT_LEGACY_CHECKPOINT_KEY]: doc.parent_checkpoint_id,
+                }),
+          },
+        }
+      : undefined;
     return {
       config: {
         configurable: {
           ...key,
-          [LIBRECHAT_CHECKPOINT_OWNER_KEY]: owner,
+          ...(owner == null ? {} : { [LIBRECHAT_CHECKPOINT_OWNER_KEY]: owner }),
           ...(legacy ? { [LIBRECHAT_LEGACY_CHECKPOINT_KEY]: doc.checkpoint_id } : {}),
         },
       },
-      checkpoint: (await this.serde.loadsTyped(doc.type, doc.checkpoint.value())) as Checkpoint,
-      metadata: (await this.serde.loadsTyped(doc.type, doc.metadata.value())) as CheckpointMetadata,
+      checkpoint:
+        owner == null
+          ? checkpoint!
+          : ((await this.serde.loadsTyped(doc.type, doc.checkpoint.value())) as Checkpoint),
+      metadata:
+        owner == null && listed
+          ? metadata!
+          : ((await this.serde.loadsTyped(doc.type, doc.metadata.value())) as CheckpointMetadata),
       pendingWrites,
-      ...(doc.parent_checkpoint_id == null
-        ? {}
-        : {
-            parentConfig: {
-              configurable: {
-                ...key,
-                checkpoint_id: doc.parent_checkpoint_id,
-                [LIBRECHAT_CHECKPOINT_OWNER_KEY]: owner,
-                [LIBRECHAT_LEGACY_CHECKPOINT_KEY]: doc.parent_checkpoint_id,
-              },
-            },
-          }),
+      ...(owner == null || hasParent ? { parentConfig } : {}),
     };
   }
 
   override async getTuple(config: RunnableConfig): Promise<CheckpointTuple | undefined> {
     const owner = ownerOf(config);
-    if (owner == null) return super.getTuple(config);
+    if (owner == null) {
+      const thread_id = nativeStringConfig('thread_id', config.configurable?.thread_id);
+      if (thread_id === undefined) return undefined;
+      const checkpoint_ns =
+        nativeStringConfig('checkpoint_ns', config.configurable?.checkpoint_ns) ?? '';
+      const checkpoint_id = nativeStringConfig('checkpoint_id', config.configurable?.checkpoint_id);
+      const doc = await this.db
+        .collection<CheckpointRow>(this.checkpointCollectionName)
+        .find({ thread_id, checkpoint_ns, ...(checkpoint_id ? { checkpoint_id } : {}) })
+        .sort({ checkpoint_id: -1 })
+        .limit(1)
+        .next();
+      return doc == null ? undefined : this.tuple(doc);
+    }
     const key = identity(config);
     const checkpoints = this.db.collection<CheckpointRow>(this.checkpointCollectionName);
     let doc = await checkpoints
@@ -210,32 +289,40 @@ export class OwnedMongoSaver extends MongoDBSaver {
     options?: CheckpointListOptions,
   ): AsyncGenerator<CheckpointTuple> {
     const owner = ownerOf(config);
+    let query: Filter<CheckpointRow>;
     if (owner == null) {
-      yield* super.list(config, options);
-      return;
+      const thread_id = nativeStringConfig('thread_id', config.configurable?.thread_id);
+      const checkpoint_ns = nativeStringConfig('checkpoint_ns', config.configurable?.checkpoint_ns);
+      query = {
+        ...(thread_id ? { thread_id } : {}),
+        ...(checkpoint_ns === undefined ? {} : { checkpoint_ns }),
+      };
+    } else {
+      const key = identity(config);
+      query = {
+        thread_id: `${owner}${key.thread_id}`,
+        checkpoint_ns: `${owner}${key.checkpoint_ns}`,
+        lc_owner: owner,
+      };
     }
-    const key = identity(config);
-    const query: Filter<CheckpointRow> = {
-      thread_id: `${owner}${key.thread_id}`,
-      checkpoint_ns: `${owner}${key.checkpoint_ns}`,
-      lc_owner: owner,
-    };
     for (const [name, value] of Object.entries(options?.filter ?? {})) {
       if (value !== null && typeof value === 'object')
         throw new Error('Checkpoint metadata filters must be primitive');
       query[`metadata_search.${name}`] = value;
     }
     const before = options?.before?.configurable?.checkpoint_id;
-    if (before != null) {
-      if (typeof before !== 'string') throw new Error('Invalid checkpoint list boundary');
-      query.checkpoint_id = { $lt: before };
+    if (owner == null ? before !== undefined : before != null) {
+      if (owner != null && typeof before !== 'string')
+        throw new Error('Invalid checkpoint list boundary');
+      query.checkpoint_id = { $lt: nativeStringConfig('checkpoint_id', before)! };
     }
     let cursor = this.db
       .collection<CheckpointRow>(this.checkpointCollectionName)
       .find(query)
       .sort({ checkpoint_id: -1 });
-    if (options?.limit != null) cursor = cursor.limit(options.limit);
-    for await (const doc of cursor) yield await this.tuple(doc, owner);
+    if (owner == null ? options?.limit !== undefined : options?.limit != null)
+      cursor = cursor.limit(options!.limit!);
+    for await (const doc of cursor) yield await this.tuple(doc, owner, false, true);
   }
 
   override async put(
