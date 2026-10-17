@@ -2,10 +2,12 @@ import { apiBaseUrl, request } from 'librechat-data-provider';
 import type {
   DocumentWorkspace,
   DocumentWorkspaceFormat,
+  DocumentWorkspaceVersion,
   UploadOperation,
 } from 'librechat-data-provider';
 import { sendUploadBody } from '../uploads/api';
 import type { WorkspaceEditorDocument } from './WorkspaceEditor';
+import type { WorkspaceEditorIdentity } from './model';
 
 const baseUrl = `${apiBaseUrl()}/api/workspaces`;
 const maxContentBytes = 65_536;
@@ -263,60 +265,156 @@ function wait(signal: AbortSignal) {
   });
 }
 
-/** One reservation, native raw intake, bounded status polling and one revision commit. */
-export const saveWorkspace = (
-  id: string,
+/** A receipt identifies one immutable revision, never the workspace's current head. */
+export type WorkspaceSavedRevision = { version: DocumentWorkspaceVersion; bytes: Uint8Array };
+export type WorkspaceSaveAttempt = Readonly<{
+  identity: WorkspaceEditorIdentity;
+  baseRevision: number;
+  idempotencyKey: string;
+  /** Every access returns a copy of the original submitted bytes. */
+  bytes: Uint8Array;
+  phase: 'reserve' | 'transfer' | 'poll' | 'commit' | 'read';
+  operationId?: string;
+  fileId?: string;
+  version?: DocumentWorkspaceVersion;
+}>;
+
+function checkpoint(value: WorkspaceSaveAttempt): WorkspaceSaveAttempt {
+  const bytes = new Uint8Array(value.bytes);
+  return Object.freeze({
+    ...value,
+    identity: Object.freeze({ ...value.identity }),
+    ...(value.version ? { version: Object.freeze({ ...value.version }) } : {}),
+    get bytes() {
+      return new Uint8Array(bytes);
+    },
+  });
+}
+
+/** The keyed editor owns this attempt; phase checkpoints keep its original identity and bytes. */
+export function createWorkspaceSaveAttempt(
+  identity: WorkspaceEditorIdentity,
   input: { baseRevision: number; bytes: Uint8Array },
+): WorkspaceSaveAttempt {
+  if (
+    !Number.isSafeInteger(input.baseRevision) ||
+    input.baseRevision < 0 ||
+    [identity.tenantId, identity.ownerId, identity.workspaceId].some(
+      (part) => typeof part !== 'string' || !part,
+    ) ||
+    !/^[A-Za-z0-9_.-]{1,128}$/.test(identity.workspaceId)
+  )
+    throw new WorkspaceRequestError('invalid_request');
+  return checkpoint({ ...input, identity, idempotencyKey: crypto.randomUUID(), phase: 'reserve' });
+}
+
+function receipt(value: unknown, attempt: WorkspaceSaveAttempt): DocumentWorkspaceVersion {
+  const item = value as DocumentWorkspaceVersion | null;
+  if (
+    !item ||
+    item.workspaceId !== attempt.identity.workspaceId ||
+    item.revision !== attempt.baseRevision + 1 ||
+    item.fileId !== attempt.fileId ||
+    typeof item.createdAt !== 'string' ||
+    typeof item.expiresAt !== 'string'
+  )
+    throw new WorkspaceRequestError('unavailable');
+  return {
+    workspaceId: item.workspaceId,
+    revision: item.revision,
+    fileId: item.fileId,
+    createdAt: item.createdAt,
+    expiresAt: item.expiresAt,
+  };
+}
+
+/** Resume the same native save. A possibly started body is only polled, never retransmitted. */
+export const saveWorkspace = (
+  attempt: WorkspaceSaveAttempt,
   signal: AbortSignal,
-) =>
+  onProgress: (next: WorkspaceSaveAttempt) => void,
+): Promise<WorkspaceSavedRevision> =>
   limited(signal, 180_000, async (bounded) => {
-    if (!input.bytes.length) throw new WorkspaceRequestError('empty_document');
-    if (input.bytes.length > maxContentBytes) throw new WorkspaceRequestError('document_too_large');
-    if (!Number.isSafeInteger(input.baseRevision) || input.baseRevision < 0)
-      throw new WorkspaceRequestError('invalid_request');
-    const bytes = new Uint8Array(input.bytes);
-    const prefix = `/${encodeURIComponent(id)}`;
-    const reserved = operation(
-      await json(`${prefix}/saves`, bounded, {
-        baseRevision: input.baseRevision,
-        declaredBytes: bytes.length,
-        idempotencyKey: crypto.randomUUID(),
-      }),
-    );
-    if (reserved.state !== 'waiting') throw new WorkspaceRequestError('unavailable');
-    const file = new File([bytes], 'cortex-entwurf.txt', { type: 'text/plain' });
-    operation(await sendUploadBody(reserved.id, file, bounded, () => undefined), reserved.id);
-    for (let attempt = 0; attempt < 120; attempt++) {
+    let current = attempt;
+    if (!current.bytes.length) throw new WorkspaceRequestError('empty_document');
+    if (current.bytes.length > maxContentBytes)
+      throw new WorkspaceRequestError('document_too_large');
+    const advance = (next: Partial<WorkspaceSaveAttempt>) => {
       bounded.throwIfAborted();
-      const status = operation(
-        await json(
-          `${prefix}/saves/${encodeURIComponent(reserved.id)}?baseRevision=${input.baseRevision}`,
-          bounded,
-        ),
-        reserved.id,
+      current = checkpoint({ ...current, ...next });
+      onProgress(current);
+    };
+    const prefix = `/${encodeURIComponent(current.identity.workspaceId)}`;
+    if (current.phase === 'reserve') {
+      const reserved = operation(
+        await json(`${prefix}/saves`, bounded, {
+          baseRevision: current.baseRevision,
+          declaredBytes: current.bytes.length,
+          idempotencyKey: current.idempotencyKey,
+        }),
       );
-      if (['failed', 'cancelled', 'deleted', 'expired'].includes(status.state)) {
-        throw new WorkspaceRequestError(status.error ?? status.state);
-      }
-      if (status.state === 'ready' && !status.cleanupPending) {
-        if (typeof status.fileId !== 'string' || !status.fileId)
-          throw new WorkspaceRequestError('unavailable');
-        const committed = workspace(
-          await json(`${prefix}/revisions`, bounded, {
-            baseRevision: input.baseRevision,
-            fileId: status.fileId,
-          }),
-          id,
-        );
-        if (
-          committed.revision !== input.baseRevision + 1 ||
-          committed.headFileId !== status.fileId
-        ) {
-          throw new WorkspaceRequestError('unavailable');
-        }
-        return content(committed, bounded);
-      }
-      await wait(bounded);
+      advance({
+        operationId: reserved.id,
+        phase: reserved.state === 'waiting' ? 'transfer' : 'poll',
+      });
     }
-    throw new WorkspaceRequestError('save_timeout');
+    if (current.phase === 'transfer') {
+      const file = new File([new Uint8Array(current.bytes)], 'cortex-entwurf.txt', {
+        type: 'text/plain',
+      });
+      // Persist this phase in the owning session BEFORE the external body effect starts.
+      advance({ phase: 'poll' });
+      operation(
+        await sendUploadBody(current.operationId!, file, bounded, () => undefined),
+        current.operationId,
+      );
+    }
+    if (current.phase === 'poll') {
+      for (let count = 0; count < 120; count++) {
+        bounded.throwIfAborted();
+        const status = operation(
+          await json(
+            `${prefix}/saves/${encodeURIComponent(current.operationId!)}?baseRevision=${current.baseRevision}`,
+            bounded,
+          ),
+          current.operationId,
+        );
+        if (['failed', 'cancelled', 'deleted', 'expired'].includes(status.state)) {
+          throw new WorkspaceRequestError(status.error ?? status.state);
+        }
+        if (status.state === 'ready' && !status.cleanupPending) {
+          if (typeof status.fileId !== 'string' || !status.fileId)
+            throw new WorkspaceRequestError('unavailable');
+          advance({ fileId: status.fileId, phase: 'commit' });
+          break;
+        }
+        await wait(bounded);
+      }
+      if (current.phase === 'poll') throw new WorkspaceRequestError('save_timeout');
+    }
+    if (current.phase === 'commit') {
+      const version = receipt(
+        await json(`${prefix}/revisions`, bounded, {
+          baseRevision: current.baseRevision,
+          fileId: current.fileId,
+        }),
+        current,
+      );
+      advance({ version, phase: 'read' });
+    }
+    if (current.phase !== 'read' || !current.version)
+      throw new WorkspaceRequestError('unavailable');
+    const result = await revisionContent(
+      current.identity.workspaceId,
+      current.version.revision,
+      bounded,
+    );
+    const submitted = current.bytes;
+    if (
+      result.bytes.length !== submitted.length ||
+      !result.bytes.every((byte, index) => byte === submitted[index])
+    ) {
+      throw new WorkspaceRequestError('unavailable');
+    }
+    return { version: { ...current.version }, bytes: result.bytes };
   });

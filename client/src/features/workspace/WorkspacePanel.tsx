@@ -369,13 +369,22 @@ function WorkspacePanelSession({ owner }: Pick<WorkspacePanelProps, 'owner'>) {
                 caller.removeEventListener('abort', abort);
               }
             }}
-            onSave={async (input) => {
+            onSave={async (attempt, onProgress) => {
               const signal = controller.current.signal;
               setEditorBusy(true);
               setFailure(null);
               try {
-                const saved = await saveWorkspace(document.workspace.workspaceId, input, signal);
-                if (active(signal)) update(saved);
+                if (
+                  attempt.identity.workspaceId !== document.workspace.workspaceId ||
+                  attempt.identity.ownerId !== owner.ownerId ||
+                  attempt.identity.tenantId !==
+                    (owner.tenantId === null ? 'personal' : `tenant:${owner.tenantId}`)
+                )
+                  throw new Error('Workspace save owner changed');
+                const saved = await saveWorkspace(attempt, signal, onProgress);
+                signal.throwIfAborted();
+                // Only a separate authorized metadata read can refresh the current-head list.
+                if (active(signal)) void refresh();
                 return saved;
               } catch (error) {
                 const code = codeOf(error);

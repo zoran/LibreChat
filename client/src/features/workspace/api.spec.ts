@@ -6,7 +6,8 @@ import {
   listWorkspaces,
   loadWorkspace,
   loadWorkspaceRevision,
-  saveWorkspace,
+  createWorkspaceSaveAttempt,
+  saveWorkspace as resumeSave,
 } from './api';
 
 jest.mock('librechat-data-provider', () => ({
@@ -16,6 +17,24 @@ jest.mock('librechat-data-provider', () => ({
 jest.mock('../uploads/api', () => ({ sendUploadBody: jest.fn() }));
 
 const bytes = (text: string) => new TextEncoder().encode(text);
+const identity = { ownerId: 'owner', tenantId: 'personal', workspaceId: 'draft' };
+const saveWorkspace = async (
+  id: string,
+  input: { baseRevision: number; bytes: Uint8Array },
+  signal: AbortSignal,
+) =>
+  resumeSave(
+    createWorkspaceSaveAttempt({ ...identity, workspaceId: id }, input),
+    signal,
+    () => undefined,
+  );
+const committed = (fileId = 'approved-file', revision = 1) => ({
+  workspaceId: 'draft',
+  revision,
+  fileId,
+  createdAt: '2026-10-17T00:00:00Z',
+  expiresAt: '2026-11-14T00:00:00Z',
+});
 const uuid = '471dc724-88d2-4b3a-88dc-1f67490bc4a4';
 const item: DocumentWorkspace = {
   workspaceId: 'draft',
@@ -174,11 +193,11 @@ describe('workspace API composition through native managed intake', () => {
 
   it('transfers once, waits for bound ready/cleanup status, commits once and reads the exact immutable revision', async () => {
     const data = bytes('\uFEFFPrivater Entwurf\r\n');
-    const committed = { ...item, revision: 1, headFileId: 'approved-file' };
+    const version = committed();
     respond(op());
     respond(op({ state: 'ready', fileId: 'approved-file', cleanupPending: true }));
     respond(op({ state: 'ready', fileId: 'approved-file', cleanupPending: false }));
-    respond(committed);
+    respond(version);
     respond(data);
     const promise = saveWorkspace(
       'draft',
@@ -187,7 +206,7 @@ describe('workspace API composition through native managed intake', () => {
     );
     await jest.advanceTimersByTimeAsync(1_000);
     const result = await promise;
-    expect(result.workspace).toEqual(committed);
+    expect(result.version).toEqual(version);
     expect(Array.from(result.bytes)).toEqual(Array.from(data));
     expect(sendUploadBody).toHaveBeenCalledTimes(1);
     const [id, file, signal] = (sendUploadBody as jest.Mock).mock.calls[0];
@@ -268,10 +287,10 @@ describe('workspace API composition through native managed intake', () => {
     }
   });
 
-  it('rejects a moved commit head without fetching another revision', async () => {
+  it('rejects another revision in place of the exact immutable receipt', async () => {
     respond(op());
     respond(op({ state: 'ready', fileId: 'approved-file' }));
-    respond({ ...item, revision: 2, headFileId: 'someone-elses-file' });
+    respond(committed('someone-elses-file', 2));
     await expect(
       saveWorkspace(
         'draft',
@@ -280,6 +299,104 @@ describe('workspace API composition through native managed intake', () => {
       ),
     ).rejects.toMatchObject({ code: 'unavailable' });
     expect(fetches()).toHaveLength(3);
+  });
+
+  it.each(['reserve', 'transfer', 'poll', 'commit', 'read'])(
+    'reconciles a %s failure with the same captured identity and no duplicate body',
+    async (phase) => {
+      const data = bytes('Original attempt');
+      let attempt = createWorkspaceSaveAttempt(identity, { baseRevision: 0, bytes: data });
+      const key = attempt.idempotencyKey;
+      data.fill(0);
+      attempt.bytes.fill(0);
+      const network = () =>
+        (request.authenticatedFetch as jest.Mock).mockRejectedValueOnce(
+          new TypeError('Lost response'),
+        );
+      if (phase === 'reserve') network();
+      else {
+        respond(op());
+        if (phase === 'transfer')
+          (sendUploadBody as jest.Mock).mockRejectedValueOnce(new TypeError('Lost body response'));
+        else if (phase === 'poll') network();
+        else {
+          respond(op({ state: 'ready', fileId: 'approved-file' }));
+          if (phase === 'commit') network();
+          else {
+            respond(committed());
+            network();
+          }
+        }
+      }
+      const progress = (next: typeof attempt) => {
+        attempt = next;
+      };
+      await expect(resumeSave(attempt, new AbortController().signal, progress)).rejects.toThrow();
+      expect(attempt.idempotencyKey).toBe(key);
+      expect(Object.isFrozen(attempt)).toBe(true);
+      expect(attempt.bytes).toEqual(bytes('Original attempt'));
+      if (phase === 'reserve') respond(op());
+      if (['reserve', 'transfer', 'poll'].includes(phase))
+        respond(op({ state: 'ready', fileId: 'approved-file' }));
+      if (phase !== 'read') respond(committed());
+      respond(bytes('Original attempt'));
+      await expect(resumeSave(attempt, new AbortController().signal, progress)).resolves.toEqual({
+        version: committed(),
+        bytes: bytes('Original attempt'),
+      });
+      expect(sendUploadBody).toHaveBeenCalledTimes(1);
+      const reservations = fetches().filter(([url]) => url.endsWith('/saves'));
+      for (const [, options] of reservations)
+        expect(JSON.parse(options.body).idempotencyKey).toBe(key);
+      expect(reservations).toHaveLength(phase === 'reserve' ? 2 : 1);
+      expect(jest.getTimerCount()).toBe(0);
+    },
+  );
+
+  it('holds an unknown body that is still waiting without retransmitting it', async () => {
+    let attempt = createWorkspaceSaveAttempt(identity, { baseRevision: 0, bytes: bytes('text') });
+    respond(op());
+    (sendUploadBody as jest.Mock).mockRejectedValueOnce(new TypeError('unknown body'));
+    const progress = (next: typeof attempt) => {
+      attempt = next;
+    };
+    await expect(resumeSave(attempt, new AbortController().signal, progress)).rejects.toThrow();
+    respond(op());
+    const owner = new AbortController();
+    const recovery = resumeSave(attempt, owner.signal, progress).catch((error: unknown) => error);
+    await jest.advanceTimersByTimeAsync(0);
+    owner.abort();
+    expect(await recovery).toMatchObject({ name: 'AbortError' });
+    expect(sendUploadBody).toHaveBeenCalledTimes(1);
+    expect(fetches().filter(([url]) => url.endsWith('/revisions'))).toHaveLength(0);
+  });
+
+  it('keeps a conflicting replay bound to the original File and refuses different confirmed bytes', async () => {
+    let attempt = createWorkspaceSaveAttempt(identity, { baseRevision: 0, bytes: bytes('mine') });
+    const progress = (next: typeof attempt) => {
+      attempt = next;
+    };
+    respond(op());
+    respond(op({ state: 'ready', fileId: 'approved-file' }));
+    respond({ code: 'revision_conflict' }, 409);
+    await expect(resumeSave(attempt, new AbortController().signal, progress)).rejects.toMatchObject(
+      { code: 'revision_conflict' },
+    );
+    respond(committed());
+    respond(bytes('other'));
+    await expect(resumeSave(attempt, new AbortController().signal, progress)).rejects.toMatchObject(
+      { code: 'unavailable' },
+    );
+    expect(sendUploadBody).toHaveBeenCalledTimes(1);
+    expect(attempt.bytes).toEqual(bytes('mine'));
+    expect(
+      fetches()
+        .filter(([url]) => url.endsWith('/revisions'))
+        .map(([, options]) => JSON.parse(options.body)),
+    ).toEqual([
+      { baseRevision: 0, fileId: 'approved-file' },
+      { baseRevision: 0, fileId: 'approved-file' },
+    ]);
   });
 
   it.each([401, 403])('clears authorization on HTTP %s without reading content', async (status) => {

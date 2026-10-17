@@ -48,10 +48,16 @@ jest.mock('./WorkspaceEditor', () => ({
         <button
           type="button"
           onClick={() =>
-            void onSave({
-              baseRevision: initial.workspace.revision,
-              bytes: new TextEncoder().encode(value),
-            }).catch(() => setError('Testfehler'))
+            void onSave(
+              {
+                identity,
+                phase: 'reserve',
+                idempotencyKey: '471dc724-88d2-4b3a-88dc-1f67490bc4a4',
+                baseRevision: initial.workspace.revision,
+                bytes: new TextEncoder().encode(value),
+              },
+              () => undefined,
+            ).catch(() => setError('Testfehler'))
           }
         >
           {'Testspeichern'}
@@ -96,9 +102,15 @@ describe('private workspace panel ownership and draft preservation', () => {
     });
     (loadWorkspace as jest.Mock).mockImplementation(async (id) => document(id));
     (createWorkspace as jest.Mock).mockResolvedValue(item('new'));
-    (saveWorkspace as jest.Mock).mockImplementation(async (_id, input) => ({
-      workspace: { ...item('a'), revision: input.baseRevision + 1, headFileId: 'file' },
-      bytes: input.bytes,
+    (saveWorkspace as jest.Mock).mockImplementation(async (attempt) => ({
+      version: {
+        workspaceId: 'a',
+        revision: attempt.baseRevision + 1,
+        fileId: 'file',
+        createdAt: item('a').createdAt,
+        expiresAt: '2026-11-14T00:00:00Z',
+      },
+      bytes: attempt.bytes,
     }));
   });
 
@@ -147,6 +159,27 @@ describe('private workspace panel ownership and draft preservation', () => {
     view.unmount();
   });
 
+  it('refreshes current metadata independently of a historical save receipt', async () => {
+    (listWorkspaces as jest.Mock)
+      .mockResolvedValueOnce({ workspaces: [item('a')], nextCursor: null })
+      .mockResolvedValueOnce({
+        workspaces: [{ ...item('a'), revision: 3, headFileId: 'newer-head' }],
+        nextCursor: null,
+      });
+    const view = render(<WorkspacePanel owner={owner} enabled />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Entwurf a' }));
+    const text = await screen.findByRole('textbox', { name: 'Testentwurf' });
+    fireEvent.change(text, { target: { value: 'My current local text' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Testspeichern' }));
+    await waitFor(() => expect(listWorkspaces).toHaveBeenCalledTimes(2));
+    fireEvent.click(screen.getByRole('button', { name: 'Zur Übersicht' }));
+    expect(await screen.findByText(/3 ·/)).toBeVisible();
+    expect(text).toHaveValue('My current local text');
+    expect(loadWorkspace).toHaveBeenCalledTimes(1);
+    expect(mockDisposed).toBe(0);
+    view.unmount();
+  });
+
   it('aborts and ignores an old list after ownership changes', async () => {
     const old = pending<{ workspaces: DocumentWorkspace[]; nextCursor: null }>();
     (listWorkspaces as jest.Mock)
@@ -169,7 +202,7 @@ describe('private workspace panel ownership and draft preservation', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Entwurf a' }));
     await screen.findByRole('textbox', { name: 'Testentwurf' });
     fireEvent.click(screen.getByRole('button', { name: 'Testspeichern' }));
-    const signal = (saveWorkspace as jest.Mock).mock.calls[0][2] as AbortSignal;
+    const signal = (saveWorkspace as jest.Mock).mock.calls[0][1] as AbortSignal;
     view.rerender(<WorkspacePanel owner={{ ownerId: 'other', tenantId: null }} enabled />);
     await act(async () => save.resolve(document('private-old')));
     expect(signal.aborted).toBe(true);

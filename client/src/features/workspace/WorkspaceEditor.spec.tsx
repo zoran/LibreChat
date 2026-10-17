@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type { DocumentWorkspace } from 'librechat-data-provider';
 import mockGerman from '~/locales/de/translation.json';
 import { WorkspaceEditor } from './WorkspaceEditor';
+import type { WorkspaceSavedRevision } from './api';
 import type { WorkspaceEditorDocument, WorkspaceEditorProps } from './WorkspaceEditor';
 
 let mockModelNumber = 0;
@@ -125,17 +126,23 @@ const document = (text: string, revision = 0): WorkspaceEditorDocument => ({
   workspace: { ...workspace, revision, headFileId: revision ? `file-${revision}` : null },
   bytes: bytes(text),
 });
+const saved = (text: string, revision = 1): WorkspaceSavedRevision => ({
+  version: {
+    workspaceId: workspace.workspaceId,
+    revision,
+    fileId: `file-${revision}`,
+    createdAt: workspace.createdAt,
+    expiresAt: '2026-11-14T00:00:00Z',
+  },
+  bytes: bytes(text),
+});
 function props(initial = document('Original\r\n')): WorkspaceEditorProps {
   return {
     identity: { tenantId: 'tenant', ownerId: 'owner', workspaceId: 'workspace' },
     initial,
-    onSave: jest.fn(async ({ baseRevision, bytes: saved }) => ({
-      workspace: {
-        ...workspace,
-        revision: baseRevision + 1,
-        headFileId: `file-${baseRevision + 1}`,
-      },
-      bytes: saved,
+    onSave: jest.fn(async ({ baseRevision, bytes: data }) => ({
+      ...saved('', baseRevision + 1),
+      bytes: data,
     })),
     onReload: jest.fn(async () => document('Server\n', 1)),
     onReadRevision: jest.fn(async (revision) => ({
@@ -158,8 +165,17 @@ const saveButton = () => screen.getByRole('button', { name: 'Speichern' });
 const editor = () => screen.findByRole('textbox', { name: 'Dokumenttext' });
 
 describe('workspace editor view with real codec and model adapter', () => {
-  beforeEach(() => mockInitialize.mockImplementation(() => Promise.resolve(mockMonaco)));
+  const originalUuid = Object.getOwnPropertyDescriptor(crypto, 'randomUUID');
+  beforeEach(() => {
+    mockInitialize.mockImplementation(() => Promise.resolve(mockMonaco));
+    Object.defineProperty(crypto, 'randomUUID', {
+      configurable: true,
+      value: () => '471dc724-88d2-4b3a-88dc-1f67490bc4a4',
+    });
+  });
   afterEach(() => {
+    if (originalUuid) Object.defineProperty(crypto, 'randomUUID', originalUuid);
+    else Reflect.deleteProperty(crypto, 'randomUUID');
     if (mockModels.size !== 0) throw new Error('The test left an editor model alive');
   });
 
@@ -174,10 +190,13 @@ describe('workspace editor view with real codec and model adapter', () => {
     fireEvent.change(text, { target: { value: 'Geändert\n' } });
     fireEvent.click(saveButton());
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Gespeichert'));
-    expect(input.onSave).toHaveBeenCalledWith({
-      baseRevision: 0,
-      bytes: bytes('\uFEFFGeändert\r\n'),
-    });
+    expect(input.onSave).toHaveBeenCalledWith(
+      expect.objectContaining({
+        baseRevision: 0,
+        bytes: bytes('\uFEFFGeändert\r\n'),
+      }),
+      expect.any(Function),
+    );
     expect(saveButton()).toBeDisabled();
     expect(store).not.toHaveBeenCalled();
     view.unmount();
@@ -186,7 +205,7 @@ describe('workspace editor view with real codec and model adapter', () => {
   it.each(['ctrlKey', 'metaKey'])(
     'saves with %s+S and guards duplicate requests while preserving newer edits',
     async (modifier) => {
-      const request = pending<WorkspaceEditorDocument>();
+      const request = pending<WorkspaceSavedRevision>();
       const input = props();
       input.onSave = jest.fn(() => request.promise);
       const view = render(<WorkspaceEditor {...input} />);
@@ -197,7 +216,7 @@ describe('workspace editor view with real codec and model adapter', () => {
       fireEvent.change(text, { target: { value: 'Neuere lokale Änderung\n' } });
       expect(input.onSave).toHaveBeenCalledTimes(1);
       expect(text).not.toHaveAttribute('readonly');
-      await act(async () => request.resolve(document('Zwischenstand\r\n', 1)));
+      await act(async () => request.resolve(saved('Zwischenstand\r\n', 1)));
       expect(text).toHaveValue('Neuere lokale Änderung\n');
       expect(screen.getByRole('status')).toHaveTextContent('Nicht gespeicherte Änderungen');
       expect(saveButton()).toBeEnabled();
@@ -218,7 +237,10 @@ describe('workspace editor view with real codec and model adapter', () => {
     expect(input.onSave).not.toHaveBeenCalled();
     fireEvent.click(saveButton());
     await waitFor(() =>
-      expect(input.onSave).toHaveBeenCalledWith({ baseRevision: 0, bytes: bytes('a\nb\nc!') }),
+      expect(input.onSave).toHaveBeenCalledWith(
+        expect.objectContaining({ baseRevision: 0, bytes: bytes('a\nb\nc!') }),
+        expect.any(Function),
+      ),
     );
     view.unmount();
   });
@@ -243,10 +265,13 @@ describe('workspace editor view with real codec and model adapter', () => {
         fireEvent.click(saveButton());
         await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Gespeichert'));
         expect(input.onSave).toHaveBeenCalledTimes(2);
-        expect(input.onSave).toHaveBeenLastCalledWith({
-          baseRevision: 0,
-          bytes: bytes('Korrigierter Entwurf\n'),
-        });
+        expect(input.onSave).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            baseRevision: 0,
+            bytes: bytes('Korrigierter Entwurf\n'),
+          }),
+          expect.any(Function),
+        );
         expect(text).toHaveValue('Korrigierter Entwurf\n');
         expect(input.onReload).not.toHaveBeenCalled();
         expect(saveButton()).toBeDisabled();
@@ -276,6 +301,116 @@ describe('workspace editor view with real codec and model adapter', () => {
       view.unmount();
     },
   );
+
+  it('reconciles the original save without replacing the model, newer edits or selection', async () => {
+    Object.defineProperty(crypto, 'randomUUID', {
+      configurable: true,
+      value: jest
+        .fn()
+        .mockReturnValueOnce('471dc724-88d2-4b3a-88dc-1f67490bc4a4')
+        .mockReturnValue('571dc724-88d2-4b3a-88dc-1f67490bc4a4'),
+    });
+    const input = props();
+    const recovery = pending<WorkspaceSavedRevision>();
+    input.onSave = jest
+      .fn()
+      .mockImplementationOnce(async (attempt, progress) => {
+        progress(
+          Object.freeze({
+            ...attempt,
+            phase: 'commit',
+            operationId: 'operation',
+            fileId: 'file-1',
+          }),
+        );
+        throw new Error('Lost acknowledgement');
+      })
+      .mockImplementationOnce(() => recovery.promise)
+      .mockResolvedValueOnce(saved('Newer B\r\n', 2));
+    const view = render(<WorkspaceEditor {...input} />);
+    const text = (await editor()) as HTMLTextAreaElement;
+    const model = [...mockModels.values()][0];
+    fireEvent.change(text, { target: { value: 'Submitted A\n' } });
+    fireEvent.click(saveButton());
+    await screen.findByRole('alert');
+    fireEvent.change(text, { target: { value: 'Newer B\n' } });
+    text.setSelectionRange(2, 5);
+    const reconcile = screen.getByRole('button', { name: 'Speichervorgang prüfen' });
+    fireEvent.click(reconcile);
+    fireEvent.click(reconcile);
+    expect(input.onSave).toHaveBeenCalledTimes(2);
+    const attempts = (input.onSave as jest.Mock).mock.calls.map(([attempt]) => attempt);
+    expect(attempts[1]).toMatchObject({
+      phase: 'commit',
+      baseRevision: 0,
+      bytes: bytes('Submitted A\r\n'),
+      idempotencyKey: attempts[0].idempotencyKey,
+    });
+    await act(async () => recovery.resolve(saved('Submitted A\r\n')));
+    expect([...mockModels.values()][0]).toBe(model);
+    expect(model.dispose).not.toHaveBeenCalled();
+    expect(text).toHaveValue('Newer B\n');
+    expect([text.selectionStart, text.selectionEnd]).toEqual([2, 5]);
+    expect(saveButton()).toBeEnabled();
+    expect(screen.getByRole('status')).toHaveTextContent('Nicht gespeicherte Änderungen');
+    expect(input.onReload).not.toHaveBeenCalled();
+    fireEvent.click(saveButton());
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('Gespeichert'));
+    const fresh = (input.onSave as jest.Mock).mock.calls[2][0];
+    expect(fresh).toMatchObject({ baseRevision: 1, bytes: bytes('Newer B\r\n'), phase: 'reserve' });
+    expect(fresh.idempotencyKey).not.toBe(attempts[0].idempotencyKey);
+    view.unmount();
+  });
+
+  it.each(['revision_conflict', 'source_unavailable'])(
+    'preserves conflict or clears revoked scope during reconciliation: %s',
+    async (code) => {
+      const input = props();
+      input.onSave = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('Lost response'))
+        .mockRejectedValueOnce({ code });
+      const view = render(<WorkspaceEditor {...input} />);
+      fireEvent.change(await editor(), { target: { value: 'My local draft' } });
+      fireEvent.click(saveButton());
+      await screen.findByRole('alert');
+      fireEvent.click(screen.getByRole('button', { name: 'Speichervorgang prüfen' }));
+      await waitFor(() => expect(input.onSave).toHaveBeenCalledTimes(2));
+      if (code === 'revision_conflict') {
+        expect(await editor()).toHaveValue('My local draft');
+        expect(saveButton()).toBeDisabled();
+      } else await waitFor(() => expect(screen.queryByRole('textbox')).not.toBeInTheDocument());
+      view.unmount();
+    },
+  );
+
+  it('ignores a reconciliation completion after the owner session ends', async () => {
+    const input = props();
+    const recovery = pending<WorkspaceSavedRevision>();
+    input.onSave = jest
+      .fn()
+      .mockRejectedValueOnce(new Error('Unknown commit'))
+      .mockReturnValueOnce(recovery.promise);
+    const view = render(<WorkspaceEditor {...input} />);
+    fireEvent.change(await editor(), { target: { value: 'Private old draft' } });
+    fireEvent.click(saveButton());
+    await screen.findByRole('alert');
+    const old = [...mockModels.values()][0];
+    fireEvent.click(screen.getByRole('button', { name: 'Speichervorgang prüfen' }));
+    view.rerender(
+      <WorkspaceEditor
+        {...input}
+        identity={{ ...input.identity, ownerId: 'next' }}
+        initial={document('Next owner')}
+      />,
+    );
+    await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue('Next owner'));
+    await act(async () => recovery.resolve(saved('Private old draft')));
+    expect(screen.getByRole('textbox')).toHaveValue('Next owner');
+    expect(old.dispose).toHaveBeenCalledTimes(1);
+    expect(saveButton()).toBeDisabled();
+    view.unmount();
+  });
 
   it('requires explicit discard before reloading and disposes the previous model', async () => {
     const input = props();
@@ -310,7 +445,7 @@ describe('workspace editor view with real codec and model adapter', () => {
   });
 
   it('disposes on ownership change and ignores the old save response', async () => {
-    const request = pending<WorkspaceEditorDocument>();
+    const request = pending<WorkspaceSavedRevision>();
     const input = props();
     input.onSave = jest.fn(() => request.promise);
     const view = render(<WorkspaceEditor {...input} />);
@@ -325,7 +460,7 @@ describe('workspace editor view with real codec and model adapter', () => {
       />,
     );
     await waitFor(() => expect(screen.getByRole('textbox')).toHaveValue('Neuer Nutzer\n'));
-    await act(async () => request.resolve(document('Alter Entwurf', 1)));
+    await act(async () => request.resolve(saved('Alter Entwurf', 1)));
     expect(screen.getByRole('textbox')).toHaveValue('Neuer Nutzer\n');
     expect(old.dispose).toHaveBeenCalledTimes(1);
     expect(saveButton()).toBeDisabled();
@@ -343,7 +478,7 @@ describe('workspace editor view with real codec and model adapter', () => {
 
   it('does not accept a save acknowledgment for different bytes', async () => {
     const input = props();
-    input.onSave = jest.fn(async () => document('Andere Bytes', 1));
+    input.onSave = jest.fn(async () => saved('Andere Bytes', 1));
     const view = render(<WorkspaceEditor {...input} />);
     fireEvent.change(await editor(), { target: { value: 'Mein Text' } });
     fireEvent.click(saveButton());
@@ -419,10 +554,13 @@ describe('workspace editor view with real codec and model adapter', () => {
     expect(input.onReload).not.toHaveBeenCalled();
     fireEvent.click(saveButton());
     await waitFor(() =>
-      expect(input.onSave).toHaveBeenCalledWith({
-        baseRevision: 2,
-        bytes: bytes('Lokaler Entwurf\r\n'),
-      }),
+      expect(input.onSave).toHaveBeenCalledWith(
+        expect.objectContaining({
+          baseRevision: 2,
+          bytes: bytes('Lokaler Entwurf\r\n'),
+        }),
+        expect.any(Function),
+      ),
     );
     await screen.findByText(label('stale'));
     view.unmount();

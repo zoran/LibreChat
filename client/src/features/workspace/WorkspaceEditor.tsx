@@ -9,7 +9,8 @@ import useLocalize from '~/hooks/useLocalize';
 import { decodeWorkspaceText } from './codec';
 import { createWorkspaceTextModel } from './model';
 import { WorkspaceRevisionComparison } from './WorkspaceRevisionComparison';
-import type { WorkspaceRevisionContent } from './api';
+import { createWorkspaceSaveAttempt } from './api';
+import type { WorkspaceRevisionContent, WorkspaceSaveAttempt, WorkspaceSavedRevision } from './api';
 import type { WorkspaceSaveEol, WorkspaceTextSnapshot } from './codec';
 import type { WorkspaceEditorIdentity, WorkspaceTextModel } from './model';
 
@@ -17,7 +18,10 @@ export type WorkspaceEditorDocument = { workspace: DocumentWorkspace; bytes: Uin
 export interface WorkspaceEditorProps {
   identity: WorkspaceEditorIdentity;
   initial: WorkspaceEditorDocument;
-  onSave(input: { baseRevision: number; bytes: Uint8Array }): Promise<WorkspaceEditorDocument>;
+  onSave(
+    attempt: WorkspaceSaveAttempt,
+    onProgress: (next: WorkspaceSaveAttempt) => void,
+  ): Promise<WorkspaceSavedRevision>;
   onReload(): Promise<WorkspaceEditorDocument>;
   onReadRevision(revision: number, signal: AbortSignal): Promise<WorkspaceRevisionContent>;
 }
@@ -94,8 +98,9 @@ function WorkspaceEditorSession({
   const [session, setSession] = useState<WorkspaceTextModel | null>(null);
   const current = useRef<WorkspaceTextModel | null>(null);
   const [dirty, setDirty] = useState(false);
-  const [pending, setPending] = useState<'save' | 'reload' | null>(null);
+  const [pending, setPending] = useState<'save' | 'reconcile' | 'reload' | null>(null);
   const busy = useRef(false);
+  const saveAttempt = useRef<WorkspaceSaveAttempt | null>(null);
   const [failure, setFailure] = useState<Failure>(seed ? null : 'load');
   const [saveHeld, setSaveHeld] = useState(false);
   const [needsEol, setNeedsEol] = useState(false);
@@ -118,6 +123,7 @@ function WorkspaceEditorSession({
         if (!active) return;
         owned = createWorkspaceTextModel(monaco, scope, seed.workspace.revision, seed.snapshot);
         current.current = owned;
+        saveAttempt.current = null;
         const model = owned;
         subscription = model.model.onDidChangeContent(() => {
           if (current.current !== model) return;
@@ -140,7 +146,10 @@ function WorkspaceEditorSession({
       });
     return () => {
       active = false;
-      if (current.current === owned) current.current = null;
+      if (current.current === owned) {
+        current.current = null;
+        saveAttempt.current = null;
+      }
       subscription?.dispose();
       owned?.dispose();
     };
@@ -151,6 +160,7 @@ function WorkspaceEditorSession({
   }, [confirmReload]);
 
   const unavailable = () => {
+    saveAttempt.current = null;
     current.current?.dispose();
     current.current = null;
     setSession(null);
@@ -163,40 +173,55 @@ function WorkspaceEditorSession({
     setFailure('unavailable');
   };
 
-  const save = async () => {
+  const save = async (reconcile = false) => {
     const model = current.current;
-    if (!model || busy.current || saveHeld || !model.isDirty()) return;
-    let candidate;
-    try {
-      candidate = model.encode(eol || undefined);
-    } catch {
-      setFailure('encoding');
-      return;
+    if (!model || busy.current || (!reconcile && (saveHeld || !model.isDirty()))) return;
+    let attempt = saveAttempt.current;
+    if (!reconcile) {
+      try {
+        const candidate = model.encode(eol || undefined);
+        if (candidate.status === 'unchanged') return;
+        if (candidate.status === 'normalization-required') {
+          setNeedsEol(true);
+          return;
+        }
+        attempt = createWorkspaceSaveAttempt(scope, {
+          baseRevision: model.revision,
+          bytes: candidate.bytes,
+        });
+        saveAttempt.current = attempt;
+      } catch {
+        setFailure('encoding');
+        return;
+      }
     }
-    if (candidate.status === 'unchanged') return;
-    if (candidate.status === 'normalization-required') {
-      setNeedsEol(true);
-      return;
-    }
-    const baseRevision = model.revision;
-    const submittedBytes = candidate.bytes;
+    if (!attempt) return;
+    const submitted = attempt;
     busy.current = true;
-    setPending('save');
+    setPending(reconcile ? 'reconcile' : 'save');
     setConfirmReload(false);
     setFailure(null);
     try {
-      const response = await onSave({ baseRevision, bytes: new Uint8Array(submittedBytes) });
+      const response = await onSave(submitted, (next) => {
+        if (
+          current.current === model &&
+          saveAttempt.current?.idempotencyKey === submitted.idempotencyKey
+        )
+          saveAttempt.current = next;
+      });
       if (current.current !== model) return;
-      const accepted = readSeed(response, scope);
-      const acceptedBytes = accepted.snapshot.originalBytes;
+      const accepted = decodeWorkspaceText(response.bytes);
+      const submittedBytes = submitted.bytes;
       if (
-        acceptedBytes.length !== submittedBytes.length ||
-        !acceptedBytes.every((byte, index) => byte === submittedBytes[index]) ||
-        !model.markSaved(baseRevision, accepted.workspace.revision, accepted.snapshot)
-      ) {
+        response.version.workspaceId !== scope.workspaceId ||
+        response.version.revision !== submitted.baseRevision + 1 ||
+        response.bytes.length !== submittedBytes.length ||
+        !response.bytes.every((byte, index) => byte === submittedBytes[index]) ||
+        !model.markSaved(submitted.baseRevision, response.version.revision, accepted)
+      )
         throw new Error('Workspace save was not confirmed');
-      }
-      setWorkspace(accepted.workspace);
+      saveAttempt.current = null;
+      setSaveHeld(false);
       setDirty(model.isDirty());
       setNeedsEol(false);
       setEol('');
@@ -206,7 +231,7 @@ function WorkspaceEditorSession({
       if (code === 'source_unavailable' || code === 'not_found') {
         unavailable();
       } else if (code === 'empty_document' || code === 'document_too_large') {
-        // The panel presents these local corrections; no write needs reconciliation.
+        saveAttempt.current = null;
         setFailure(null);
         setSaveHeld(false);
       } else {
@@ -262,6 +287,7 @@ function WorkspaceEditorSession({
   if (!session)
     status = failure ? 'com_workspace_editor_not_ready' : 'com_workspace_editor_loading';
   else if (pending === 'save') status = 'com_workspace_editor_saving';
+  else if (pending === 'reconcile') status = 'com_workspace_editor_reconciling';
   else if (pending === 'reload') status = 'com_workspace_editor_reloading';
   let theme = resolvedMode === 'dark' ? 'vs-dark' : 'light';
   if (highContrast) theme = resolvedMode === 'dark' ? 'hc-black' : 'hc-light';
@@ -295,6 +321,16 @@ function WorkspaceEditorSession({
           <p className="text-text-secondary text-xs">{localize('com_workspace_editor_reminder')}</p>
         </div>
         <div className="flex flex-wrap gap-2">
+          {saveHeld && saveAttempt.current && (
+            <button
+              type="button"
+              className={actionClass}
+              disabled={!session || !!pending}
+              onClick={() => void save(true)}
+            >
+              {localize('com_workspace_editor_reconcile')}
+            </button>
+          )}
           <button
             ref={compareButton}
             type="button"

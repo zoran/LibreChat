@@ -344,7 +344,7 @@ describe('Workspace HTTP saves through native security and File lifecycle', () =
       expect(JSON.stringify(status.body)).not.toMatch(/securityApproval|derivedOrigin|storageKey/);
       const committed = await post(`/${workspaceId}/revisions`, { baseRevision, fileId: id });
       expect(committed.status).toBe(200);
-      expect(committed.body).toMatchObject({ revision: baseRevision + 1, headFileId: id });
+      expect(committed.body).toMatchObject({ revision: baseRevision + 1, fileId: id });
     }
     const reloadedApp = application();
     expect((await get(`/${workspaceId}`, 'owner', reloadedApp)).body).toMatchObject({
@@ -369,6 +369,53 @@ describe('Workspace HTTP saves through native security and File lifecycle', () =
     expect(metadata).not.toContain('deutscher Testtext');
     expect(metadata).not.toContain('zweite Fassung');
     expect(await db.models.DocumentWorkspaceRevision.countDocuments({ workspaceId })).toBe(2);
+  });
+
+  it('replays an exact native receipt after a lost acknowledgement and an advanced head', async () => {
+    const workspaceId = await create();
+    const firstBytes = Buffer.from('Bestätigte erste Fassung.');
+    const secondBytes = Buffer.from('Neuere Fassung eines anderen Editors.');
+    const first = await reserve(workspaceId, 0, firstBytes);
+    await ready(first, firstBytes);
+    const nativeCommit = methods.commitDocumentWorkspaceVersion;
+    let loseAcknowledgement = true;
+    methods.commitDocumentWorkspaceVersion = async (...args) => {
+      const result = await nativeCommit(...args);
+      if (loseAcknowledgement) {
+        loseAcknowledgement = false;
+        // The Mongo commit is real; only its return channel fails after completion.
+        throw Object.assign(new Error('Lost committed acknowledgement'), { code: 'unavailable' });
+      }
+      return result;
+    };
+    expect(
+      (await post(`/${workspaceId}/revisions`, { baseRevision: 0, fileId: first })).status,
+    ).toBe(503);
+    expect((await get(`/${workspaceId}`)).body).toMatchObject({ revision: 1, headFileId: first });
+    const second = await reserve(workspaceId, 1, secondBytes);
+    await ready(second, secondBytes);
+    expect(
+      (await post(`/${workspaceId}/revisions`, { baseRevision: 1, fileId: second })).status,
+    ).toBe(200);
+    methods = createDocumentWorkspaceMethods(db, { securityPolicySha256: policySha256 });
+    app = application();
+    const replay = await post(`/${workspaceId}/revisions`, { baseRevision: 0, fileId: first });
+    expect(replay.status).toBe(200);
+    expect(replay.body).toEqual({
+      workspaceId,
+      revision: 1,
+      fileId: first,
+      createdAt: expect.any(String),
+      expiresAt: expect.any(String),
+    });
+    expect((await get(`/${workspaceId}`)).body).toMatchObject({ revision: 2, headFileId: second });
+    expect((await get(`/${workspaceId}/revisions/1/content`)).body).toEqual(firstBytes);
+    expect(
+      (await post(`/${workspaceId}/revisions`, { baseRevision: 0, fileId: second })).status,
+    ).toBe(409);
+    expect(await db.models.DocumentWorkspaceRevision.countDocuments({ workspaceId })).toBe(2);
+    expect(await db.models.File.countDocuments({})).toBe(2);
+    expect(objectWrites).toBe(2);
   });
 
   it.each([

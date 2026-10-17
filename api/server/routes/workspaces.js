@@ -253,12 +253,8 @@ function createWorkspaceRouter(options = {}) {
           fileId,
         ),
       );
-      const workspace = await system(() =>
-        methods.getDocumentWorkspace(owner(user), req.params.workspaceId),
-      );
-      if (workspace.revision !== result.revision || workspace.headFileId !== result.fileId)
-        throw failure('revision_conflict');
-      await json(req, res, workspace);
+      // A durable acknowledgement names exactly this commit, even if the head has moved.
+      await json(req, res, result);
     }),
   );
   return router;

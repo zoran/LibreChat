@@ -57,9 +57,13 @@ describe('Workspace metadata API on the native upload boundary', () => {
       getDocumentWorkspaceSaveIntent: jest
         .fn()
         .mockResolvedValue({ binding, directSourceFileIds: ['approved-source'] }),
-      commitDocumentWorkspaceVersion: jest
-        .fn()
-        .mockResolvedValue({ workspaceId: 'draft', revision: 1, fileId: 'operation' }),
+      commitDocumentWorkspaceVersion: jest.fn().mockResolvedValue({
+        workspaceId: 'draft',
+        revision: 1,
+        fileId: 'operation',
+        createdAt: workspace.createdAt,
+        expiresAt: '2026-11-14T00:00:00.000Z',
+      }),
     };
     runtime = {
       allowedOrigins: ['https://cortex.test'],
@@ -163,7 +167,7 @@ describe('Workspace metadata API on the native upload boundary', () => {
     expect((await get('/draft/saves/operation?baseRevision=-1')).status).toBe(400);
     expect((await get('/draft/saves/operation?baseRevision=0&tenantId=other')).status).toBe(400);
   });
-  it('rejects a stale source before reservation and a replaced head after commit', async () => {
+  it('rejects a stale source before reservation', async () => {
     methods.getDocumentWorkspaceSaveIntent.mockRejectedValueOnce(
       Object.assign(new Error('conflict'), { code: 'revision_conflict' }),
     );
@@ -177,21 +181,31 @@ describe('Workspace metadata API on the native upload boundary', () => {
       ).status,
     ).toBe(409);
     expect(runtime.management.reserveDerived).not.toHaveBeenCalled();
-    expect(
-      (await jsonPost('/draft/revisions', { baseRevision: 0, fileId: 'operation' })).status,
-    ).toBe(409);
   });
   it('acknowledges the committed immutable File and returns original bytes through the trusted reader', async () => {
     const saved = { ...workspace, revision: 1, headFileId: 'operation' };
     methods.getDocumentWorkspace.mockResolvedValue(saved);
     expect(
       (await jsonPost('/draft/revisions', { baseRevision: 0, fileId: 'operation' })).body,
-    ).toEqual(saved);
+    ).toEqual(await methods.commitDocumentWorkspaceVersion.mock.results[0].value);
+    expect(methods.getDocumentWorkspace).not.toHaveBeenCalled();
     const response = await get('/draft/revisions/1/content');
     expect(response.status).toBe(200);
     expect(response.body).toEqual(Buffer.from('approved'));
     expect(original.read).toHaveBeenCalledWith(expect.anything(), 'draft', 1);
     expect(response.headers['content-type']).toBe('application/octet-stream');
+  });
+  it('acknowledges an immutable receipt even after the head advances', async () => {
+    methods.getDocumentWorkspace.mockResolvedValue({
+      ...workspace,
+      revision: 2,
+      headFileId: 'newer',
+    });
+    const response = await jsonPost('/draft/revisions', { baseRevision: 0, fileId: 'operation' });
+    expect(response.status).toBe(200);
+    expect(response.body).toMatchObject({ workspaceId: 'draft', revision: 1, fileId: 'operation' });
+    expect(response.body).not.toHaveProperty('headFileId');
+    expect(methods.getDocumentWorkspace).not.toHaveBeenCalled();
   });
   it('rechecks identity after an asynchronous metadata read', async () => {
     methods.getDocumentWorkspace.mockImplementation(async () => {

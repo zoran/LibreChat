@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { expect, test } from '@playwright/test';
-import type { DocumentWorkspace, UploadOperation } from 'librechat-data-provider';
+import type {
+  DocumentWorkspace,
+  DocumentWorkspaceVersion,
+  UploadOperation,
+} from 'librechat-data-provider';
 
 // Native default authentication, compiled WorkspaceSurface/Panel, Monaco and raw XHR run here.
 // Workspace metadata, intake tickets, file bodies and approval results are explicit server
@@ -49,9 +53,24 @@ test('native workspace saves, restores and protects a local draft across hiding 
   const versions = new Map<number, Buffer>();
   const operations = new Map<
     string,
-    { operation: UploadOperation; bytes?: Buffer; polls: number }
+    {
+      operation: UploadOperation;
+      baseRevision: number;
+      bytes?: Buffer;
+      polls: number;
+      receipt?: Readonly<DocumentWorkspaceVersion>;
+    }
   >();
-  const counts = { reservations: 0, tickets: 0, bodies: 0, commits: 0, content: 0 };
+  const counts = {
+    reservations: 0,
+    tickets: 0,
+    bodies: 0,
+    commits: 0,
+    committedVersions: 0,
+    receiptReplays: 0,
+    content: 0,
+  };
+  const commitRequests: { baseRevision: number; fileId: string }[] = [];
   let conflict = false;
   const capability = 'A'.repeat(43);
   const stamp = () => new Date().toISOString();
@@ -119,14 +138,14 @@ test('native workspace saves, restores and protects a local draft across hiding 
         canUseInComposer: false,
         canRetryProcessing: false,
       };
-      operations.set(operationId, { operation, polls: 0 });
+      operations.set(operationId, { operation, baseRevision: input.baseRevision, polls: 0 });
       return route.fulfill({ json: operation });
     }
     const status = path.match(new RegExp(`^/api/workspaces/${id}/saves/([^/]+)$`));
     if (status && method === 'GET') {
       const entry = operations.get(status[1]);
       expect(entry?.bytes).toBeDefined();
-      expect(url.searchParams.get('baseRevision')).toBe(String(metadata?.revision));
+      expect(url.searchParams.get('baseRevision')).toBe(String(entry?.baseRevision));
       entry!.polls++;
       return route.fulfill({
         json: {
@@ -141,19 +160,38 @@ test('native workspace saves, restores and protects a local draft across hiding 
     if (path === `/api/workspaces/${id}/revisions` && method === 'POST') {
       counts.commits++;
       const input = request.postDataJSON();
+      commitRequests.push(input);
       const entry = operations.get(input.fileId);
       expect(Object.keys(input).sort()).toEqual(['baseRevision', 'fileId']);
-      expect(input.baseRevision).toBe(metadata?.revision);
+      expect(input.baseRevision).toBe(entry?.baseRevision);
       expect(entry?.polls).toBeGreaterThanOrEqual(2);
       expect(entry?.bytes).toBeDefined();
+      if (entry!.receipt) {
+        counts.receiptReplays++;
+        // An exact retry returns the original immutable version, independent of the head.
+        return route.fulfill({ json: entry!.receipt });
+      }
+      expect(input.baseRevision).toBe(metadata?.revision);
+      const receipt: Readonly<DocumentWorkspaceVersion> = Object.freeze({
+        workspaceId: id,
+        revision: input.baseRevision + 1,
+        fileId: input.fileId,
+        createdAt: stamp(),
+        expiresAt: new Date(Date.now() + 28 * 24 * 60 * 60 * 1000).toISOString(),
+      });
+      entry!.receipt = receipt;
       metadata = {
         ...metadata!,
-        revision: metadata!.revision + 1,
-        headFileId: input.fileId,
-        updatedAt: stamp(),
+        revision: receipt.revision,
+        headFileId: receipt.fileId,
+        updatedAt: receipt.createdAt,
+        expiresAt: receipt.expiresAt,
       };
-      versions.set(metadata.revision, entry!.bytes!);
-      return route.fulfill({ json: metadata });
+      versions.set(receipt.revision, entry!.bytes!);
+      counts.committedVersions++;
+      // Persistence succeeded, but the client cannot know that until it reconciles.
+      if (counts.committedVersions === 1) return route.abort('failed');
+      return route.fulfill({ json: receipt });
     }
     throw new Error(`Unexpected synthetic workspace request: ${method} ${path}`);
   });
@@ -231,9 +269,51 @@ test('native workspace saves, restores and protects a local draft across hiding 
     await page.keyboard.press('Control+Shift+z');
     await expect(editor).toContainText(original);
     await save.click();
-    await expect(surface.getByRole('status')).toHaveText('Gespeichert');
+    const reconcile = surface.getByRole('button', {
+      name: 'Speichervorgang prüfen',
+      exact: true,
+    });
+    await expect(reconcile).toBeVisible();
+    await expect(surface.getByRole('alert')).toContainText(
+      'Das Speichern konnte nicht bestätigt werden. Dein Text bleibt hier erhalten.',
+    );
+    await expect(save).toBeDisabled();
     expect(counts).toMatchObject({ reservations: 1, tickets: 1, bodies: 1, commits: 1 });
     expect(versions.get(1)?.toString('utf8')).toBe(original);
+    await editor.getByRole('textbox', { name: 'Dokumenttext', exact: true }).focus();
+    await page.keyboard.press('Control+End');
+    await page.keyboard.type(' SPAETERER-LOKALER-TEXT');
+    await expect(editor).toContainText('SPAETERER-LOKALER-TEXT');
+    await page.screenshot({ path: testInfo.outputPath('native-workspace-save-unconfirmed.png') });
+    await reconcile.click();
+    await expect(reconcile).toHaveCount(0);
+    await expect(editor).toContainText(original);
+    await expect(editor).toContainText('SPAETERER-LOKALER-TEXT');
+    await expect(surface.getByRole('status')).toHaveText('Nicht gespeicherte Änderungen');
+    await expect(save).toBeEnabled();
+    expect(counts).toMatchObject({
+      reservations: 1,
+      tickets: 1,
+      bodies: 1,
+      commits: 2,
+      committedVersions: 1,
+      receiptReplays: 1,
+    });
+    expect(commitRequests).toEqual([commitRequests[0], commitRequests[0]]);
+    expect(commitRequests[0]).toEqual({ baseRevision: 0, fileId: [...operations.keys()][0] });
+    expect(versions.get(1)?.toString('utf8')).toBe(original);
+    await page.screenshot({ path: testInfo.outputPath('native-workspace-recovered-save.png') });
+
+    // Only an explicit discard may replace the later local draft with the saved snapshot.
+    await surface.getByRole('button', { name: 'Neu laden', exact: true }).click();
+    await expect(
+      surface.getByRole('button', { name: 'Änderungen behalten', exact: true }),
+    ).toBeFocused();
+    await surface.getByRole('button', { name: 'Gespeicherte Version laden', exact: true }).click();
+    await expect(editor).toContainText(original);
+    await expect(editor).not.toContainText('SPAETERER-LOKALER-TEXT');
+    await expect(surface.getByRole('status')).toHaveText('Gespeichert');
+    await expect(save).toBeDisabled();
 
     await page.reload();
     await toggle.click();
@@ -329,7 +409,7 @@ test('native workspace saves, restores and protects a local draft across hiding 
     await expect(editor).toContainText(original);
     await page.keyboard.press('Control+Shift+z');
     await expect.poll(() => editor.locator('.view-lines').innerText()).toBe(beforeComparisonUndo);
-    expect(counts).toMatchObject({ reservations: 1, tickets: 1, bodies: 1, commits: 1 });
+    expect(counts).toMatchObject({ reservations: 1, tickets: 1, bodies: 1, commits: 2 });
 
     metadata = { ...metadata!, revision: 2, headFileId: randomUUID(), updatedAt: stamp() };
     versions.set(2, Buffer.from(serverUpdate));
@@ -374,7 +454,7 @@ test('native workspace saves, restores and protects a local draft across hiding 
     await expect(editor).toContainText(serverUpdate);
     await expect(save).toBeDisabled();
     await comparison.getByRole('button', { name: 'Vergleich schließen', exact: true }).click();
-    expect(counts).toMatchObject({ reservations: 2, tickets: 1, bodies: 1, commits: 1 });
+    expect(counts).toMatchObject({ reservations: 2, tickets: 1, bodies: 1, commits: 2 });
     await page.screenshot({ path: testInfo.outputPath('native-workspace-reconciled.png') });
   } finally {
     await testInfo.attach('workspace-server-boundary-fixtures', {
@@ -382,6 +462,7 @@ test('native workspace saves, restores and protects a local draft across hiding 
         {
           scope: 'synthetic workspace/intake server boundary; native auth, UI, Monaco and XHR',
           counts,
+          commitRequests,
           blocked,
         },
         null,
