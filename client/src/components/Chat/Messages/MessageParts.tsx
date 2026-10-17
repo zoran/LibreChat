@@ -18,6 +18,7 @@ import MessageRow from '~/components/Chat/Messages/ui/MessageRow';
 import MessageIcon from '~/components/Chat/Messages/MessageIcon';
 import { showThinkingAtom } from '~/store/showThinking';
 import Elapsed, { shouldShowElapsed } from './Elapsed';
+import SourceCoverage from './Content/SourceCoverage';
 import ContentParts from './Content/ContentParts';
 import SiblingSwitch from './SiblingSwitch';
 import { AuthorContext } from '~/Providers';
@@ -195,6 +196,7 @@ function MessageParts(props: TMessageProps) {
                 isLatestMessage={messageId === latestMessageId}
                 content={message.content as Array<TMessageContentParts | undefined>}
               />
+              {!edit && <SourceCoverage message={message} />}
             </ErrorSourceProvider>
           </AuthorContext.Provider>
         </MessageRow>

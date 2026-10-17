@@ -1,7 +1,7 @@
 import { logger } from '@librechat/data-schemas';
 import { formatMessage } from '@librechat/agents';
 import { ContentTypes } from 'librechat-data-provider';
-import type { TFile, TurnFileConsumers } from 'librechat-data-provider';
+import type { TFile, TurnFileConsumers, SourceCoverageOrigin } from 'librechat-data-provider';
 import type { QuoteSourceRef } from 'librechat-data-provider';
 import type { IMongoFile } from '@librechat/data-schemas';
 import type { SteerQueueItem } from '~/stream/interfaces/IJobStore';
@@ -21,6 +21,7 @@ export interface SteerMediaClient {
     message: Record<string, unknown>,
     files: IMongoFile[],
     consumers?: TurnFileConsumers,
+    origin?: SourceCoverageOrigin | null,
   ): Promise<void>;
   processAttachments(
     message: Record<string, unknown>,
@@ -89,13 +90,18 @@ async function encodeSteerContent({
   client: SteerMediaClient;
   text: string;
   quotes?: string[] | null;
-  steerId: string;
+  steerId?: string;
   fileDocs: IMongoFile[];
   fileConsumers?: TurnFileConsumers;
 }): Promise<SteerMediaResult> {
   const modelText = mergeSteerModelText(text, quotes);
-  const pseudo: PseudoMessage = { messageId: `steer:${steerId}` };
-  await client.addFileContextToMessage(pseudo, fileDocs, fileConsumers);
+  const pseudo: PseudoMessage = { messageId: `steer:${steerId ?? 'replay'}` };
+  await client.addFileContextToMessage(
+    pseudo,
+    fileDocs,
+    fileConsumers,
+    steerId ? { kind: 'steer', id: steerId } : null,
+  );
   const validated = await client.processAttachments(pseudo, fileDocs, fileConsumers);
   const formatted = formatMessage({
     message: {
@@ -312,7 +318,7 @@ export async function stampSteerPartMedia({
             client,
             text: steerText,
             quotes,
-            steerId: part.steerId ?? 'replay',
+            steerId: part.steerId,
             fileDocs: partDocs,
           });
           return stampPart(

@@ -420,6 +420,54 @@ describe('areMessageFieldsEqual', () => {
 
 const baseMessage = makeFieldsMsg();
 
+describe('source coverage row invalidation', () => {
+  const coverage = {
+    version: 1,
+    stage: 'prepared',
+    scope: 'retained_sources',
+    entries: [
+      {
+        file_id: 'file-one',
+        source: { kind: 'message', id: 'user-one' },
+        coverage: { unit: 'utf16', start: 0, end: 50, total: 100, complete: false },
+        extraction: 'not_assessed',
+      },
+    ],
+  };
+
+  it('invalidates receipt arrival, replacement and removal without a text change', () => {
+    const absent = makeFieldsMsg();
+    const present = makeFieldsMsg({ metadata: { sourceCoverage: coverage } });
+    const replaced = makeFieldsMsg({ metadata: { sourceCoverage: { ...coverage, entries: [] } } });
+    expect(areMessageFieldsEqual(absent, present)).toBe(false);
+    expect(areMessageFieldsEqual(present, replaced)).toBe(false);
+    expect(areMessageFieldsEqual(present, absent)).toBe(false);
+    expect(
+      areMessageRowPropsEqual(makeProps({ message: absent }), makeProps({ message: present })),
+    ).toBe(false);
+  });
+
+  it('keeps the same receipt stable when only unrelated metadata changes', () => {
+    const previous = makeFieldsMsg({ metadata: { sourceCoverage: coverage, unused: 1 } });
+    const next = makeFieldsMsg({ metadata: { sourceCoverage: coverage, unused: 2 } });
+    expect(areMessageFieldsEqual(previous, next)).toBe(true);
+  });
+
+  it('invalidates source removal and removal-marker withdrawal', () => {
+    const present = makeFieldsMsg({ metadata: { sourceCoverage: coverage } });
+    const removed = { ...present, sourceContentRemovedAt: '2026-10-17T08:00:00Z' };
+    expect(areMessageFieldsEqual(present, removed)).toBe(false);
+    expect(areMessageFieldsEqual(removed, present)).toBe(false);
+  });
+
+  it('invalidates edited provenance even when the answer text is unchanged', () => {
+    const present = makeFieldsMsg({ metadata: { sourceCoverage: coverage } });
+    const edited = { ...present, isEdited: true };
+    expect(areMessageFieldsEqual(present, edited)).toBe(false);
+    expect(areMessageFieldsEqual(edited, { ...edited, isEdited: false })).toBe(false);
+  });
+});
+
 const makeProps = (over: Partial<TMessageProps> = {}): TMessageProps =>
   ({
     currentEditId: null,

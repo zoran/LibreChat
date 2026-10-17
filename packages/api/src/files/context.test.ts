@@ -43,6 +43,57 @@ function readReceipt(result: string | undefined): Receipt {
 }
 
 describe('extractFileContext', () => {
+  it('emits only ID-bound coverage from the same prepared documents without another token count', async () => {
+    const onSourceCoverage = jest.fn();
+    const tokenCountFn = jest.fn(countTokens);
+    const result = readReceipt(
+      await extractFileContext({
+        attachments: [
+          file({ file_id: 'full', text: 'abc' }),
+          file({ text: 'legacy' }),
+          file({ file_id: 'partial', text: 'x'.repeat(40) }),
+        ],
+        req: makeReq(8),
+        tokenCountFn,
+        onSourceCoverage,
+      }),
+    );
+    expect(onSourceCoverage).toHaveBeenCalledTimes(1);
+    expect(onSourceCoverage.mock.calls[0][0]).toEqual(
+      result.documents
+        .filter((document) => document.file_id)
+        .map(({ file_id, coverage, extraction }) => ({ file_id, coverage, extraction })),
+    );
+    expect(tokenCountFn).toHaveBeenCalledTimes(4);
+    expect(JSON.stringify(onSourceCoverage.mock.calls)).not.toContain('source.txt');
+    expect(onSourceCoverage.mock.calls[0][0][0]).not.toHaveProperty('text');
+  });
+  it('keeps legacy source context without inventing IDs or a coverage callback', async () => {
+    const onSourceCoverage = jest.fn();
+    const result = await extractFileContext({
+      attachments: [file()],
+      req: makeReq(),
+      tokenCountFn: countTokens,
+      onSourceCoverage,
+    });
+    expect(result).toContain('Extracted text');
+    expect(onSourceCoverage).not.toHaveBeenCalled();
+  });
+  it('detaches callback coverage from the serialized document context', async () => {
+    const result = readReceipt(
+      await extractFileContext({
+        attachments: [file({ file_id: 'full', text: 'abc' })],
+        req: makeReq(),
+        tokenCountFn: countTokens,
+        onSourceCoverage(entries) {
+          entries[0].coverage.end = 99;
+          entries[0].file_id = 'changed';
+        },
+      }),
+    );
+    expect(result.documents[0].file_id).toBe('full');
+    expect(result.documents[0].coverage.end).toBe(3);
+  });
   it('omits missing, disabled or non-text delivery without calling the tokenizer', async () => {
     const tokenCountFn = jest.fn(countTokens);
     for (const attachments of [

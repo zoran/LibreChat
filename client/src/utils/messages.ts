@@ -883,8 +883,8 @@ export function areMessageFilesEqual(prevFiles?: TMessage['files'], nextFiles?: 
  * fields that drive rendering instead of the object reference.
  */
 export function areMessageFieldsEqual(
-  prevMsg?: TMessage | null,
-  nextMsg?: TMessage | null,
+  prevMsg?: (TMessage & { isEdited?: boolean }) | null,
+  nextMsg?: (TMessage & { isEdited?: boolean }) | null,
 ): boolean {
   if (prevMsg === nextMsg) {
     return true;
@@ -906,6 +906,9 @@ export function areMessageFieldsEqual(
     prevMsg.depth === nextMsg.depth &&
     prevMsg.isCreatedByUser === nextMsg.isCreatedByUser &&
     prevMsg.isUserSubmitted === nextMsg.isUserSubmitted &&
+    prevMsg.isEdited === nextMsg.isEdited &&
+    prevMsg.sourceContentRemovedAt === nextMsg.sourceContentRemovedAt &&
+    prevMsg.metadata?.sourceCoverage === nextMsg.metadata?.sourceCoverage &&
     (prevMsg.children?.length ?? 0) === (nextMsg.children?.length ?? 0) &&
     prevMsg.content === nextMsg.content &&
     prevMsg.model === nextMsg.model &&

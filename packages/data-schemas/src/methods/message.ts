@@ -2,10 +2,12 @@ import {
   backgroundResultMetadata,
   HITL_MESSAGE_FILTER_FIELDS,
   isForcedTemporaryRetention,
+  readSourceCoverage,
   RetentionMode,
 } from 'librechat-data-provider';
 import type { DeleteResult, FilterQuery, Model, Types, UpdateQuery } from 'mongoose';
 import type { UserSubmittedMessageFieldPath } from 'librechat-data-provider';
+import type { SourceCoverage } from 'librechat-data-provider';
 import type { QuoteSourceRef } from 'librechat-data-provider';
 import type { SearchParams } from 'meilisearch';
 import type { ClientSession } from 'mongoose';
@@ -295,11 +297,14 @@ function getSteerUserSubmittedPaths(content: unknown): string[] {
 function sanitizeMessageUpdate(
   update: Record<string, unknown>,
   trustedRetention = false,
+  sourceCoverage?: SourceCoverage,
 ): Record<string, unknown> {
-  return Object.fromEntries(
+  const sanitized = Object.fromEntries(
     Object.entries(update).filter(
       ([key, value]) =>
         value !== undefined &&
+        key !== 'metadata.sourceCoverage' &&
+        !key.startsWith('metadata.sourceCoverage.') &&
         ![
           '_id',
           'tenantId',
@@ -312,6 +317,28 @@ function sanitizeMessageUpdate(
         ].includes(key.split('.')[0]),
     ),
   );
+  if (sanitized.metadata != null && typeof sanitized.metadata === 'object') {
+    sanitized.metadata = Object.fromEntries(
+      Object.entries(sanitized.metadata).filter(([key]) => key.split('.')[0] !== 'sourceCoverage'),
+    );
+  }
+  // Only the separately validated server option may insert this namespace.
+  if (sourceCoverage) {
+    sanitized.metadata = {
+      ...(sanitized.metadata != null && typeof sanitized.metadata === 'object'
+        ? sanitized.metadata
+        : {}),
+      sourceCoverage,
+    };
+  }
+  return sanitized;
+}
+
+/** Whole metadata replacement already drops the receipt; avoid conflicting Mongo paths. */
+function sourceCoverageUnset(update: Record<string, unknown>, unset = false) {
+  return unset && !Object.prototype.hasOwnProperty.call(update, 'metadata')
+    ? { 'metadata.sourceCoverage': 1 as const }
+    : {};
 }
 
 /** Conservatively admit any server-bound resource to the slow path, including legacy MIME forms. */
@@ -333,6 +360,7 @@ function buildMessageSaveUpdate(
     stampModelOutputOnInsert: boolean;
     unsetContextMeta: boolean;
     unsetPrivateText?: boolean;
+    unsetSourceCoverage?: boolean;
     retentionOnInsert?: { expiredAt: Date; isTemporary: false };
   },
 ): UpdateQuery<IMessage> {
@@ -345,8 +373,9 @@ function buildMessageSaveUpdate(
         ...options.retentionOnInsert,
       },
     }),
-    ...((options.unsetContextMeta || options.unsetPrivateText) && {
+    ...((options.unsetContextMeta || options.unsetPrivateText || options.unsetSourceCoverage) && {
       $unset: {
+        ...sourceCoverageUnset(update, options.unsetSourceCoverage),
         ...(options.unsetContextMeta && { contextMeta: 1 }),
         ...(options.unsetPrivateText && {
           privateText: 1,
@@ -369,6 +398,8 @@ async function findOneAndMergeMessageProvenance(
     stampModelOutputOnInsert?: boolean;
     unsetContextMeta?: boolean;
     unsetPrivateText?: boolean;
+    unsetSourceCoverage?: boolean;
+    sourceCoverage?: SourceCoverage;
     retentionOnInsert?: { expiredAt: Date; isTemporary: false };
     prepareAppUpdate?: (
       current: Record<string, unknown> | null,
@@ -380,7 +411,7 @@ async function findOneAndMergeMessageProvenance(
     onWrite?: (inserted: boolean, id: unknown) => void;
   },
 ) {
-  const safeUpdate = sanitizeMessageUpdate(update, true);
+  const safeUpdate = sanitizeMessageUpdate(update, true, options.sourceCoverage);
   const preservesStoredIsUserSubmitted = !Object.prototype.hasOwnProperty.call(
     safeUpdate,
     'isUserSubmitted',
@@ -444,8 +475,11 @@ async function findOneAndMergeMessageProvenance(
           $inc: { __v: 1 },
           ...(current == null &&
             options.retentionOnInsert != null && { $setOnInsert: options.retentionOnInsert }),
-          ...((options.unsetContextMeta || options.unsetPrivateText) && {
+          ...((options.unsetContextMeta ||
+            options.unsetPrivateText ||
+            options.unsetSourceCoverage) && {
             $unset: {
+              ...sourceCoverageUnset(admittedUpdate, options.unsetSourceCoverage),
               ...(options.unsetContextMeta && { contextMeta: 1 }),
               ...(options.unsetPrivateText && {
                 privateText: 1,
@@ -824,6 +858,8 @@ export interface MessageMethods {
       privateText?: PrivateTextWrite;
       insertOnly?: boolean;
       sourceRetention?: SourceRetentionContext;
+      /** Server-produced preparation receipt; never read from message.metadata. */
+      sourceCoverage?: SourceCoverage;
       quoteRetention?: ResolvedQuoteRetention;
     },
   ): Promise<IMessage | null | undefined>;
@@ -1404,8 +1440,15 @@ export function createMessageMethods(
           const current = await Message.findOne({ ...identity, ...fileSourceScope(owner) })
             .session(session)
             .select(privateMessagePaths())
-            .lean<IMessage>();
+            .lean<IMessage & { isEdited?: boolean }>();
           if (current?.sourceContentRemovedAt) throw new FileSourceUnavailableError();
+          if (
+            options.sourceCoverage &&
+            (current?.isCreatedByUser === true ||
+              current?.isUserSubmitted === true ||
+              current?.isEdited === true)
+          )
+            throw new FileSourceUnavailableError();
           let prepared = options.quoteRetention;
           let sourceRetention = options.sourceRetention;
           if (options.nativeSource) {
@@ -1829,9 +1872,11 @@ export function createMessageMethods(
     current: Record<string, unknown> | null,
     unsetContextMeta = false,
     retentionOnInsert?: { expiredAt: Date; isTemporary: false },
+    sourceCoverage?: SourceCoverage,
+    unsetSourceCoverage = false,
   ): Promise<Record<string, unknown>> {
     const Message = mongoose.models.Message as Model<IMessage>;
-    const safeUpdate = sanitizeMessageUpdate(update, true);
+    const safeUpdate = sanitizeMessageUpdate(update, true, sourceCoverage);
     // Omission retains the attachments of THIS fenced row; null/[] explicitly clears them.
     const attachments = Object.prototype.hasOwnProperty.call(safeUpdate, 'attachments')
       ? safeUpdate.attachments
@@ -1855,6 +1900,10 @@ export function createMessageMethods(
         // Keep unknown fields already stored by a newer producer, even if this schema drops them.
         const candidate = { ...current, ...next };
         if (unsetContextMeta) delete candidate.contextMeta;
+        if (unsetSourceCoverage && candidate.metadata != null) {
+          candidate.metadata = { ...candidate.metadata };
+          delete candidate.metadata.sourceCoverage;
+        }
         return mongoose.mongo.BSON.calculateObjectSize(candidate);
       },
       maxBytes,
@@ -1875,9 +1924,11 @@ export function createMessageMethods(
       unsetContextMeta?: boolean;
       retentionOnInsert?: { expiredAt: Date; isTemporary: false };
       unsetPrivateText?: boolean;
+      unsetSourceCoverage?: boolean;
       timestamps?: boolean;
       session?: ClientSession;
       sourceRetention?: SourceRetentionContext;
+      sourceCoverage?: SourceCoverage;
       quoteRetention?: ResolvedQuoteRetention;
       nativeSource?: { messageId: string; messageVersion: number | null };
       attachmentSourceFileIds?: readonly string[];
@@ -1886,7 +1937,17 @@ export function createMessageMethods(
     },
   ): Promise<IMessage | null> {
     const Message = mongoose.models.Message as Model<IMessage>;
-    const update = sanitizeMessageUpdate(input, options.session != null);
+    const update = sanitizeMessageUpdate(input, options.session != null, options.sourceCoverage);
+    options = {
+      ...options,
+      unsetSourceCoverage:
+        !options.sourceCoverage &&
+        (options.unsetSourceCoverage === true ||
+          Object.keys(update).some((key) => ['text', 'content'].includes(key.split('.')[0])) ||
+          update.isEdited === true ||
+          update.isUserSubmitted === true ||
+          update.isCreatedByUser === true),
+    };
     const paths = normalizeUserSubmittedPaths(update.userSubmittedPaths);
     const fields = normalizeUserSubmittedMessageFieldPaths(update.userSubmittedMessageFieldPaths);
     delete update.userSubmittedPaths;
@@ -1953,6 +2014,7 @@ export function createMessageMethods(
             unsetContextMeta: options.unsetContextMeta ?? false,
             retentionOnInsert: options.retentionOnInsert,
             unsetPrivateText: options.unsetPrivateText,
+            unsetSourceCoverage: options.unsetSourceCoverage,
           }),
           {
             upsert: options.upsert,
@@ -2003,7 +2065,14 @@ export function createMessageMethods(
         ...options,
         privateMessagePaths: privateMessagePaths(),
         prepareAppUpdate: (current, sanitized) =>
-          prepareAppUpdate(sanitized, current, options.unsetContextMeta, options.retentionOnInsert),
+          prepareAppUpdate(
+            sanitized,
+            current,
+            options.unsetContextMeta,
+            options.retentionOnInsert,
+            options.sourceCoverage,
+            options.unsetSourceCoverage,
+          ),
       },
     );
   }
@@ -2033,6 +2102,7 @@ export function createMessageMethods(
       privateText?: PrivateTextWrite;
       insertOnly?: boolean;
       sourceRetention?: SourceRetentionContext;
+      sourceCoverage?: SourceCoverage;
       quoteRetention?: ResolvedQuoteRetention;
     },
   ) {
@@ -2050,11 +2120,33 @@ export function createMessageMethods(
 
     try {
       const Message = mongoose.models.Message as Model<IMessage>;
-      const update: Record<string, unknown> = {
+      const update = sanitizeMessageUpdate({
         ...params,
         user: userId,
         messageId: params.newMessageId || params.messageId,
-      };
+      });
+      const sourceCoverage =
+        metadata?.sourceCoverage === undefined
+          ? undefined
+          : readSourceCoverage(metadata.sourceCoverage);
+      if (metadata?.sourceCoverage !== undefined) {
+        const retention = metadata.sourceRetention;
+        if (
+          !sourceCoverage ||
+          params.isCreatedByUser !== false ||
+          params.isUserSubmitted === true ||
+          update.isEdited === true ||
+          params.newMessageId != null ||
+          metadata.insertOnly === true ||
+          !(retention?.sourceExpiresAt instanceof Date) ||
+          !Number.isFinite(retention.sourceExpiresAt.getTime()) ||
+          retention.sourceExpiresAt <= new Date() ||
+          !Array.isArray(retention.sourceFileIds) ||
+          !retention.sourceFileIds.length ||
+          sourceCoverage.entries.some((entry) => !retention.sourceFileIds.includes(entry.file_id))
+        )
+          throw new FileSourceUnavailableError();
+      }
       delete update.sourceFileIds;
       delete update.sourceExpiresAt;
       delete update.sourceContentRemovedAt;
@@ -2216,6 +2308,7 @@ export function createMessageMethods(
         {
           upsert: true,
           sourceRetention: metadata?.sourceRetention,
+          sourceCoverage: sourceCoverage ?? undefined,
           quoteRetention: metadata?.quoteRetention,
           stampModelOutputOnInsert,
           unsetContextMeta,
@@ -2373,6 +2466,7 @@ export function createMessageMethods(
               $set: normalizedMessage,
               $inc: { __v: 1 },
               $unset: {
+                ...sourceCoverageUnset(normalizedMessage, true),
                 privateText: 1,
                 privacyRevision: 1,
                 ...(normalizedMessage.privateTextTokens == null && { privateTextTokens: 1 }),
@@ -2446,6 +2540,7 @@ export function createMessageMethods(
           upsert: true,
           nativeSource: provenance?.nativeSources?.get(String(op.updateOne.filter.messageId)),
           unsetPrivateText: true,
+          unsetSourceCoverage: true,
           timestamps: !overrideTimestamp,
           onWrite: (inserted, id) => {
             if (inserted) {

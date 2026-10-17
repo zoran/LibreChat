@@ -80,6 +80,12 @@ describe('buildSteerMedia', () => {
 
     expect(getFiles).toHaveBeenCalledWith({ file_id: { $in: ['f1'] }, user: 'user-1' }, {}, {});
     expect(result?.content).toEqual([{ type: 'text', text: 'look at this' }, imagePart]);
+    expect(client.addFileContextToMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      [imageDoc],
+      { executeCode: false, fileSearch: false },
+      { kind: 'steer', id: 's1' },
+    );
     expect(result?.files).toEqual([
       {
         file_id: 'f1',
@@ -159,10 +165,15 @@ describe('buildSteerMedia', () => {
       fileSearch: false,
     });
     expect(assertFilesAllowed).toHaveBeenCalledWith([turnCsv]);
-    expect(client.addFileContextToMessage).toHaveBeenCalledWith(expect.anything(), [turnCsv], {
-      executeCode: false,
-      fileSearch: false,
-    });
+    expect(client.addFileContextToMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      [turnCsv],
+      {
+        executeCode: false,
+        fileSearch: false,
+      },
+      { kind: 'steer', id: 's1' },
+    );
     expect(client.processAttachments).toHaveBeenCalledWith(expect.anything(), [turnCsv], {
       executeCode: false,
       fileSearch: false,
@@ -236,6 +247,26 @@ describe('buildSteerMedia', () => {
 });
 
 describe('stampSteerPartMedia', () => {
+  it('suppresses receipt origin for legacy replay without a real steer ID', async () => {
+    const client = createClient({ image_urls: [imagePart] });
+    const message = {
+      role: 'assistant',
+      content: [{ type: 'steer', steer: 'legacy', files: [{ file_id: 'f1' }] }],
+    };
+    await stampSteerPartMedia({
+      client,
+      user,
+      payload: [message],
+      getFiles: async () => [imageDoc],
+    });
+    expect(client.addFileContextToMessage).toHaveBeenCalledWith(
+      expect.objectContaining({ messageId: 'steer:replay' }),
+      [imageDoc],
+      undefined,
+      null,
+    );
+    expect(message.content[0]).toHaveProperty('media');
+  });
   it('stamps media onto steer parts immutably with one batched fetch', async () => {
     const getFiles: SteerFileFetcher = jest.fn(async () => [imageDoc]);
     const client = createClient({ image_urls: [imagePart] });
@@ -263,6 +294,12 @@ describe('stampSteerPartMedia', () => {
     expect(content[1]).not.toBe(steerPart);
     expect(content[1].media).toEqual([{ type: 'text', text: 'inline steer' }, imagePart]);
     expect(steerPart).not.toHaveProperty('media');
+    expect(client.addFileContextToMessage).toHaveBeenCalledWith(
+      expect.anything(),
+      [imageDoc],
+      undefined,
+      { kind: 'steer', id: 's1' },
+    );
     expect(stamped).toEqual([
       {
         index: 1,

@@ -5026,3 +5026,183 @@ it('fences response persistence without marking the independent user question', 
   );
   expect(saveMessage.mock.calls.at(-1)[2]).not.toHaveProperty('sourceRetention');
 });
+
+describe('native response source coverage', () => {
+  const retained = (ids) => ({ sourceFileIds: ids, sourceExpiresAt: new Date('2030-01-20') });
+  const attachment = (file_id) => ({
+    file_id,
+    filename: 'same-name.txt',
+    source: 'text',
+    llmDeliveryPath: 'text',
+    text: 'Private source text. '.repeat(30),
+  });
+  beforeAll(async () => {
+    await Tokenizer.initEncoding('o200k_base');
+  });
+  function clientFor(ids = ['file-a']) {
+    const req = {
+      user: { id: 'owner' },
+      body: { fileTokenLimit: 16 },
+      config: {},
+      ...(ids && { _fileSourceRetention: retained(ids) }),
+    };
+    const client = initializeFakeClient(
+      undefined,
+      { modelOptions: { model: 'gpt-4o-mini' }, endpoint: 'custom', req },
+      [],
+    );
+    client.skipSaveConvo = true;
+    client.skipSaveUserMessage = true;
+    // The database boundary is controlled; actual retention/DB validation belongs to its own suite.
+    saveMessage.mockImplementation(async (_ctx, row, trusted) => ({
+      ...row,
+      _id: 'db-id',
+      metadata: trusted?.sourceCoverage
+        ? { ...row.metadata, sourceCoverage: trusted.sourceCoverage }
+        : row.metadata,
+    }));
+    return client;
+  }
+  function prepareDuringBuild(client, files, origin) {
+    const build = client.buildMessages;
+    client.buildMessages = async (...args) => {
+      await client.addFileContextToMessage(args[0].at(-1), files, undefined, origin);
+      return build(...args);
+    };
+  }
+  async function openCollection(client) {
+    const stop = new Error('Controlled stop before build');
+    client.handleStartMethods = jest.fn(async () => {
+      throw stop;
+    });
+    await expect(client.sendReservedMessage('', {}, {})).rejects.toBe(stop);
+  }
+  test('completed response and DB option share only current retained IDs, never names or completion claims', async () => {
+    const client = clientFor(['file-b']);
+    prepareDuringBuild(client, [attachment('file-a'), attachment('file-b')]);
+    client.sendCompletion.mockResolvedValue({
+      completion: 'reply',
+      metadata: { sourceCoverage: { forged: true }, unrelated: 'kept' },
+    });
+    const result = await client.sendMessage('Compare', { user: 'owner' });
+    const receipt = result.metadata.sourceCoverage;
+    expect(receipt).toMatchObject({
+      version: 1,
+      stage: 'prepared',
+      scope: 'retained_sources',
+      entries: [
+        {
+          file_id: 'file-b',
+          source: { kind: 'message', id: result.parentMessageId },
+          extraction: 'not_assessed',
+        },
+      ],
+    });
+    expect(receipt.entries).toHaveLength(1);
+    expect(receipt.entries[0].coverage.complete).toBe(false);
+    expect(Object.keys(receipt.entries[0]).sort()).toEqual([
+      'coverage',
+      'extraction',
+      'file_id',
+      'source',
+    ]);
+    expect(JSON.stringify(receipt)).not.toMatch(/same-name|Private source|forged/);
+    expect(result.metadata.unrelated).toBe('kept');
+    const write = saveMessage.mock.calls.find((call) => call[1].isCreatedByUser === false);
+    expect(write[1].metadata).not.toHaveProperty('sourceCoverage');
+    expect(write[2].sourceCoverage).toEqual(receipt);
+    expect(write[2].sourceRetention).toEqual(retained(['file-b']));
+  });
+  test.each([null, []])(
+    'omits the receipt without an authoritative retained source (%s)',
+    async (ids) => {
+      const client = clientFor(ids?.length ? ids : null);
+      prepareDuringBuild(client, [attachment('file-a')]);
+      client.sendCompletion.mockResolvedValue({
+        completion: 'reply',
+        metadata: { sourceCoverage: { forged: true } },
+      });
+      const result = await client.sendMessage('Compare', { user: 'owner' });
+      await result.databasePromise;
+      expect(result.metadata?.sourceCoverage).toBeUndefined();
+      expect(saveMessage.mock.calls.at(-1)[2].sourceCoverage).toBeUndefined();
+    },
+  );
+  test('a new/regenerated turn cannot inherit prior prepared entries or completion metadata', async () => {
+    const client = clientFor();
+    const build = client.buildMessages;
+    prepareDuringBuild(client, [attachment('file-a')]);
+    const first = await client.sendMessage('First', { user: 'owner' });
+    expect(first.metadata.sourceCoverage.entries).toHaveLength(1);
+    client.buildMessages = build;
+    client.sendCompletion.mockResolvedValue({
+      completion: 'regenerated',
+      metadata: first.metadata,
+    });
+    const second = await client.sendMessage('Second', { user: 'owner', isRegenerate: true });
+    await second.databasePromise;
+    expect(second.metadata?.sourceCoverage).toBeUndefined();
+    expect(client.getSourceCoverage()).toBeUndefined();
+  });
+  test('captures a real steer origin while null and missing message IDs omit candidates', async () => {
+    const client = clientFor();
+    await openCollection(client);
+    await client.addFileContextToMessage({}, [attachment('file-a')]);
+    await client.addFileContextToMessage(
+      { messageId: 'synthetic-replay' },
+      [attachment('file-a')],
+      undefined,
+      null,
+    );
+    expect(client.getSourceCoverage()).toBeUndefined();
+    await client.addFileContextToMessage({}, [attachment('file-a')], undefined, {
+      kind: 'steer',
+      id: 'actual-steer',
+    });
+    expect(client.getSourceCoverage().entries[0].source).toEqual({
+      kind: 'steer',
+      id: 'actual-steer',
+    });
+  });
+  test('a callback already awaiting the real limiter cannot contaminate a later collection', async () => {
+    const client = clientFor();
+    await openCollection(client);
+    const old = client.addFileContextToMessage({ messageId: 'old-message' }, [
+      attachment('file-a'),
+    ]);
+    const newer = openCollection(client);
+    await Promise.all([old, newer]);
+    expect(client.getSourceCoverage()).toBeUndefined();
+  });
+  test('generic metadata does not authorize the trusted DB option', async () => {
+    const client = clientFor();
+    await openCollection(client);
+    await client.addFileContextToMessage({ messageId: 'actual-message' }, [attachment('file-a')]);
+    const forged = client.getSourceCoverage();
+    const message = {
+      messageId: 'foreign-response',
+      conversationId: 'chat',
+      isCreatedByUser: false,
+      text: 'reply',
+      metadata: { sourceCoverage: forged },
+    };
+    await client.saveMessageToDatabase(message, {}, 'owner');
+    expect(saveMessage.mock.calls.at(-1)[2].sourceCoverage).toBeUndefined();
+    expect(message.metadata?.sourceCoverage).toBeUndefined();
+  });
+  test('a DB outcome that omits the receipt cannot leave a tentative SSE claim', async () => {
+    const client = clientFor();
+    prepareDuringBuild(client, [attachment('file-a')]);
+    saveMessage.mockImplementation(async (_ctx, row) => ({ ...row, _id: 'db-id' }));
+    const result = await client.sendMessage('Compare', { user: 'owner' });
+    expect(result.metadata?.sourceCoverage).toBeUndefined();
+  });
+  test('the collection clears conservatively when its actual entry bound is exceeded', async () => {
+    const ids = Array.from({ length: 65 }, (_, i) => `file-${i}`);
+    const client = clientFor(ids);
+    await openCollection(client);
+    for (const id of ids)
+      await client.addFileContextToMessage({ messageId: 'actual-message' }, [attachment(id)]);
+    expect(client.getSourceCoverage()).toBeUndefined();
+  });
+});

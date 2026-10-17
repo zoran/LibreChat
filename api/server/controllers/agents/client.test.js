@@ -11058,3 +11058,17 @@ describe('seedContextMeta', () => {
     expect(client.contextMeta).toBeUndefined();
   });
 });
+
+describe('native response source coverage resume boundary', () => {
+  it('does not expose unpersisted prepared candidates through Agent metadata assembly', () => {
+    const client = Object.create(AgentClient.prototype);
+    client.getSourceCoverage = jest.fn(() => ({
+      version: 1,
+      stage: 'prepared',
+      scope: 'retained_sources',
+      entries: [],
+    }));
+    expect(client.buildResponseMetadata()?.sourceCoverage).toBeUndefined();
+    expect(client.getSourceCoverage).not.toHaveBeenCalled();
+  });
+});

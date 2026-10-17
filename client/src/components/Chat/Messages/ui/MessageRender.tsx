@@ -14,6 +14,7 @@ import { parseWakeupMessage } from '~/components/Chat/Messages/Content/Parts/wak
 import Elapsed, { shouldShowElapsed } from '~/components/Chat/Messages/Elapsed';
 import { getHeaderHoverLabel } from '~/components/Chat/Messages/ui/HeaderLabel';
 import MessageContent from '~/components/Chat/Messages/Content/MessageContent';
+import SourceCoverage from '~/components/Chat/Messages/Content/SourceCoverage';
 import { useLocalize, useMessageActions, useContentMetadata } from '~/hooks';
 import SiblingSwitch from '~/components/Chat/Messages/SiblingSwitch';
 import { PrivateText } from '~/components/Chat/Messages/PrivateText';
@@ -255,6 +256,7 @@ const MessageRender = memo(function MessageRender({
               setSiblingIdx={setSiblingIdx ?? (() => ({}))}
             />
           ))}
+        {!edit && <SourceCoverage message={msg} />}
       </MessageContext.Provider>
     </Row>
   );

@@ -57,11 +57,21 @@ const {
   stripReasoningLabelMetadata,
   resolveTurnLLMDeliveryPath,
   resolveUseResponsesApi,
+  readSourceCoverage,
 } = require('librechat-data-provider');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { logViolation } = require('~/cache');
 const TextStream = require('./TextStream');
 const db = require('~/models');
+
+// Private per-turn preparation state and response-object capabilities, never request metadata.
+const sourceCoverageTurns = new WeakMap();
+const sourceCoverageResponses = new WeakMap();
+const coverageMetadata = (metadata, sourceCoverage) => {
+  const { sourceCoverage: _untrusted, ...rest } = metadata ?? {};
+  if (sourceCoverage) rest.sourceCoverage = sourceCoverage;
+  return Object.keys(rest).length ? rest : undefined;
+};
 
 const omitUnreplayedHistoricalFiles = (messages) =>
   messages.map(({ files: _files, attachments: _attachments, ...message }) => ({
@@ -779,6 +789,9 @@ class BaseClient {
    * this message; released once its usage is recorded, and by `sendMessage` on any other exit.
    */
   async sendReservedMessage(message, opts, balanceReservations) {
+    const coverageTurn = { entries: new Map(), disabled: false };
+    sourceCoverageTurns.set(this, coverageTurn);
+    const coverageRequest = this.options.req;
     const appConfig = this.options.req?.config;
     /** @type {Promise<TMessage>} */
     let userMessagePromise;
@@ -1097,7 +1110,7 @@ class BaseClient {
       iconURL: this.options.iconURL,
       endpoint: this.options.endpoint,
       ...(this.metadata ?? {}),
-      metadata: Object.keys(metadata ?? {}).length > 0 ? metadata : undefined,
+      metadata: coverageMetadata(metadata),
     };
     let editedSourceMessage;
     let editedSourceContentLength = 0;
@@ -1272,11 +1285,18 @@ class BaseClient {
       }
     }
 
+    const sourceCoverage = responseMessage.isEdited
+      ? undefined
+      : this.getSourceCoverage(coverageTurn, coverageRequest);
+    if (sourceCoverage) sourceCoverageResponses.set(responseMessage, sourceCoverage);
+    responseMessage.metadata = coverageMetadata(responseMessage.metadata);
     responseMessage.databasePromise = this.saveMessageToDatabase(
       responseMessage,
       saveOptions,
       user,
     );
+    // Completed coverage must agree with the verified persisted row before SSE can expose it.
+    if (sourceCoverage) await responseMessage.databasePromise;
     this.savedMessageIds.add(responseMessage.messageId);
     return responseMessage;
   }
@@ -1375,6 +1395,16 @@ class BaseClient {
 
     const hasAddedConvo = options?.req?.body?.addedConvo != null;
     const req = options?.req;
+    const sourceRetention =
+      message.isCreatedByUser === false && req?._fileSourceRetention != null
+        ? readFileSourceRetention(req._fileSourceRetention)
+        : undefined;
+    const candidate = sourceCoverageResponses.get(message);
+    const sourceCoverage =
+      sourceRetention &&
+      candidate?.entries.every((entry) => sourceRetention.sourceFileIds.includes(entry.file_id))
+        ? candidate
+        : undefined;
     if (needsRetentionConversation(req)) {
       req.resolvedConversation = await db.getConvo(req.user.id, message.conversationId);
     }
@@ -1385,6 +1415,7 @@ class BaseClient {
       reqCtx,
       {
         ...message,
+        metadata: coverageMetadata(message.metadata),
         endpoint: options.endpoint,
         unfinished: false,
         user,
@@ -1396,12 +1427,21 @@ class BaseClient {
           req?._quoteRetention != null && {
             quoteRetention: req._quoteRetention,
           }),
-        ...(message.isCreatedByUser === false &&
-          req?._fileSourceRetention != null && {
-            sourceRetention: readFileSourceRetention(req?._fileSourceRetention),
-          }),
+        ...(sourceRetention && { sourceRetention }),
+        ...(sourceCoverage && { sourceCoverage }),
       },
     );
+
+    if (message.isCreatedByUser === false) {
+      const persisted =
+        sourceCoverage && readSourceCoverage(savedMessage?.metadata?.sourceCoverage);
+      message.metadata = coverageMetadata(
+        message.metadata,
+        persisted && JSON.stringify(persisted) === JSON.stringify(sourceCoverage)
+          ? persisted
+          : undefined,
+      );
+    }
 
     if (message.isCreatedByUser === true && savedMessage && Array.isArray(savedMessage.quotes)) {
       // Completion/edit carries the saved field snapshot, not a consumed origin version.
@@ -1815,17 +1855,69 @@ class BaseClient {
    * @param {MongoFile[]} attachments - Array of file attachments
    * @returns {Promise<void>}
    */
-  async addFileContextToMessage(message, attachments, fileConsumers) {
+  async addFileContextToMessage(message, attachments, fileConsumers, origin) {
+    const turn = sourceCoverageTurns.get(this);
+    const source = origin === undefined ? { kind: 'message', id: message.messageId } : origin;
+    const pinnedSource = source && { kind: source.kind, id: source.id };
     const textAttachments = this.getTextContextAttachments(attachments, fileConsumers);
     const fileContext = await extractFileContext({
       attachments: textAttachments,
       req: this.options?.req,
       tokenCountFn: (text) => countTokens(text),
+      onSourceCoverage: (entries) => {
+        if (!turn || turn.disabled || turn !== sourceCoverageTurns.get(this) || !pinnedSource)
+          return;
+        for (const entry of entries) {
+          const checked = readSourceCoverage({
+            version: 1,
+            stage: 'prepared',
+            scope: 'retained_sources',
+            entries: [{ ...entry, source: pinnedSource }],
+          });
+          if (!checked) continue;
+          const value = checked.entries[0];
+          turn.entries.set(
+            JSON.stringify([value.source.kind, value.source.id, value.file_id]),
+            value,
+          );
+          if (
+            !readSourceCoverage({
+              version: 1,
+              stage: 'prepared',
+              scope: 'retained_sources',
+              entries: [...turn.entries.values()],
+            })
+          ) {
+            turn.entries.clear();
+            turn.disabled = true;
+            return;
+          }
+        }
+      },
     });
 
     if (fileContext) {
       message.fileContext = fileContext;
     }
+  }
+
+  /** Only prepared candidates whose files remain in the authoritative native retention context. */
+  getSourceCoverage(turn = sourceCoverageTurns.get(this), req = this.options?.req) {
+    if (!turn || turn.disabled || turn !== sourceCoverageTurns.get(this)) return undefined;
+    const retained = readFileSourceRetention(req?._fileSourceRetention);
+    if (!retained) return undefined;
+    const entries = [...turn.entries.values()].filter((entry) =>
+      retained.sourceFileIds.includes(entry.file_id),
+    );
+    if (!entries.length) return undefined;
+    return (
+      readSourceCoverage({
+        version: 1,
+        stage: 'prepared',
+        scope: 'retained_sources',
+        entries,
+      }) ?? undefined
+    );
   }
 
   getTextContextAttachments(attachments, fileConsumers) {

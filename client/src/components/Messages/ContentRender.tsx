@@ -18,6 +18,7 @@ import ToolCallLimitNotice from '~/components/Chat/Messages/Content/ToolCallLimi
 import { ErrorSourceProvider } from '~/components/Messages/Content/Error/source';
 import Elapsed, { shouldShowElapsed } from '~/components/Chat/Messages/Elapsed';
 import { getHeaderHoverLabel } from '~/components/Chat/Messages/ui/HeaderLabel';
+import SourceCoverage from '~/components/Chat/Messages/Content/SourceCoverage';
 import ContentParts from '~/components/Chat/Messages/Content/ContentParts';
 import { PrivateText } from '~/components/Chat/Messages/PrivateText';
 import SiblingSwitch from '~/components/Chat/Messages/SiblingSwitch';
@@ -251,6 +252,7 @@ const ContentRender = memo(function ContentRender({
               content={msg.content as Array<TMessageContentParts | undefined>}
             />
           )}
+          {!edit && <SourceCoverage message={msg} />}
         </ErrorSourceProvider>
       </AuthorContext.Provider>
       {/** A turn that ran out of agent steps is incomplete, not broken. Rendered
