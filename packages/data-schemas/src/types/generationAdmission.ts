@@ -9,6 +9,8 @@ export interface GenerationCheckpointBinding {
   readonly graphFingerprint: string;
   readonly policyFingerprint: string;
   readonly mode: 'checkpoint-only-v1';
+  /** Identity binding only; does not authorize document access or enable source processing. */
+  readonly sourceBindingSha256?: string;
 }
 
 /** Trusted server identity. Callers must never populate scope from unverified request-body fields. */

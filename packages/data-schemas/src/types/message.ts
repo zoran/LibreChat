@@ -6,6 +6,7 @@ import type {
   UserSubmittedMessageFieldPath,
 } from 'librechat-data-provider';
 import type { Document } from 'mongoose';
+import type { RetainedTextAllocation } from './file';
 import type { IAgentEventActorContextMeta } from './convo';
 
 export type SubagentTaskControlAction =
@@ -66,8 +67,6 @@ export type ResolvedQuoteRetention = {
   /** Transient exact snapshots touched in the same transaction as first materialization. */
   sourceMessageConditions: Array<{ messageId: string; messageVersion: number | null }>;
 };
-
-export type RetainedTextAllocation = { fileId: string; bytes: number };
 
 /** An exact authorized native artifact snapshot; no caller-provided source lists or bytes. */
 export type MessageArtifactSourceInput = Readonly<{

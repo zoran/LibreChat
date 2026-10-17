@@ -118,6 +118,193 @@ describe('native checkpoint generation recovery', () => {
     jest.restoreAllMocks();
   });
 
+  const sourceInput = () => ({
+    ...input(),
+    continuation: { ...input().continuation, sourceBindingSha256: '1'.repeat(64) },
+  });
+
+  it('retains the source binding through immutable capture, real writes, reads and recovery', async () => {
+    const supplied = sourceInput();
+    const expected = sourceInput();
+    const snapshot = snapshotGenerationCheckpointAdmission(supplied);
+    expect(Object.isFrozen(snapshot.continuation)).toBe(true);
+    const acquisition = methods.acquireGenerationAdmission(supplied);
+    supplied.continuation.sourceBindingSha256 = '2'.repeat(64);
+    expect(snapshot.continuation).toEqual(expected.continuation);
+    expect(unwrap(await acquisition).record.continuation).toEqual(expected.continuation);
+    expect(unwrap(await methods.acquireGenerationAdmission(expected)).acquired).toBe(false);
+    expect(unwrap(await methods.dispatchGenerationAdmission(expected)).continuation).toEqual(
+      expected.continuation,
+    );
+    expect(
+      unwrap(
+        await methods.writeGenerationCheckpoint(expected, async (session) => {
+          await artifacts().insertOne(
+            { _id: 'source-checkpoint', owner: 'old-segment' },
+            { session },
+          );
+          return 'committed';
+        }),
+      ),
+    ).toBe('committed');
+    expect(await read()).toMatchObject({
+      continuation: expected.continuation,
+      checkpointWriteRevision: 1,
+    });
+    expect(
+      unwrap(
+        await methods.findGenerationAdmissionByEpoch({
+          tenantId: expected.tenantId,
+          principalId: expected.principalId,
+          conversationId: expected.conversationId,
+          generationEpoch: expected.generationEpoch,
+        }),
+      )?.continuation,
+    ).toEqual(expected.continuation);
+    const recovered = unwrap(
+      await methods.recoverGenerationAdmission(expected, evidence(1), successor),
+    );
+    expect(recovered.continuation).toEqual(expected.continuation);
+    expect(unwrap(await methods.dispatchGenerationAdmission(recovered)).state).toBe('dispatching');
+    expect(
+      unwrap(
+        await methods.writeGenerationCheckpoint(recovered, async (session) => {
+          await artifacts().insertOne(
+            { _id: 'recovered-source-checkpoint', owner: 'new-segment' },
+            { session },
+          );
+          return 'resumed';
+        }),
+      ),
+    ).toBe('resumed');
+    expect(await artifacts().countDocuments({})).toBe(2);
+    const stale = jest.fn(async () => 'never');
+    expect(await methods.writeGenerationCheckpoint(expected, stale)).toEqual({
+      ok: false,
+      error: { code: 'HELD' },
+    });
+    expect(stale).not.toHaveBeenCalled();
+    expect(await read()).toMatchObject({
+      continuation: expected.continuation,
+      checkpointWriteRevision: 2,
+    });
+  });
+
+  it.each(['changed', 'removed', 'added'] as const)(
+    'rejects a %s source binding at every admission and continuation CAS',
+    async (change) => {
+      const original: GenerationAdmissionInput = change === 'added' ? input() : sourceInput();
+      const altered =
+        change === 'removed'
+          ? input()
+          : {
+              ...input(),
+              continuation: { ...input().continuation, sourceBindingSha256: '2'.repeat(64) },
+            };
+      unwrap(await methods.acquireGenerationAdmission(original));
+      expect(await methods.acquireGenerationAdmission(altered)).toEqual({
+        ok: false,
+        error: { code: 'REQUEST_CONFLICT' },
+      });
+      expect(await methods.dispatchGenerationAdmission(altered)).toEqual({
+        ok: false,
+        error: { code: 'HELD' },
+      });
+      expect(await methods.cancelUndispatchedGenerationAdmission(altered)).toEqual({
+        ok: false,
+        error: { code: 'HELD' },
+      });
+      unwrap(await methods.dispatchGenerationAdmission(original));
+      const callback = jest.fn(async () => 'never');
+      expect(await methods.writeGenerationCheckpoint(altered, callback)).toEqual({
+        ok: false,
+        error: { code: 'HELD' },
+      });
+      expect(await methods.recoverGenerationAdmission(altered, evidence(), successor)).toEqual({
+        ok: false,
+        error: { code: 'HELD' },
+      });
+      expect(await methods.settleGenerationAdmission(altered, terminal)).toEqual({
+        ok: false,
+        error: { code: 'HELD' },
+      });
+      expect(callback).not.toHaveBeenCalled();
+      expect(await read()).toMatchObject({
+        continuation: original.continuation,
+        checkpointWriteRevision: 0,
+        state: 'dispatching',
+      });
+      unwrap(await methods.settleGenerationAdmission(original, terminal));
+      expect(
+        await methods.acquireGenerationAdmissionSuccessor(altered, terminal, successor),
+      ).toEqual({ ok: false, error: { code: 'HELD' } });
+      expect(
+        unwrap(await methods.acquireGenerationAdmissionSuccessor(original, terminal, successor))
+          .continuation,
+      ).toEqual(original.continuation);
+    },
+  );
+
+  it.each(['', 'A'.repeat(64), '1'.repeat(63), '1'.repeat(65), null, 42, {}, []])(
+    'rejects malformed source binding %p before any checkpoint callback',
+    async (invalid) => {
+      const supplied = sourceInput();
+      Object.defineProperty(supplied.continuation, 'sourceBindingSha256', { value: invalid });
+      const callback = jest.fn(async () => 'never');
+      expect(() => snapshotGenerationCheckpointAdmission(supplied)).toThrow(
+        'Invalid generation checkpoint admission',
+      );
+      for (const result of [
+        await methods.acquireGenerationAdmission(supplied),
+        await methods.dispatchGenerationAdmission(supplied),
+        await methods.cancelUndispatchedGenerationAdmission(supplied),
+        await methods.settleGenerationAdmission(supplied, terminal),
+        await methods.acquireGenerationAdmissionSuccessor(supplied, terminal, successor),
+        await methods.writeGenerationCheckpoint(supplied, callback),
+        await methods.recoverGenerationAdmission(supplied, evidence(), successor),
+      ])
+        expect(result).toEqual({ ok: false, error: { code: 'INVALID_INPUT' } });
+      expect(callback).not.toHaveBeenCalled();
+      expect(await mongoose.models.GenerationAdmission.countDocuments({})).toBe(0);
+    },
+  );
+
+  it('rejects a source binding accessor without invoking it at any admission entry', async () => {
+    const supplied = sourceInput();
+    const getter = jest.fn(() => '1'.repeat(64));
+    Object.defineProperty(supplied.continuation, 'sourceBindingSha256', { get: getter });
+    const callback = jest.fn(async () => 'never');
+    expect(() => snapshotGenerationCheckpointAdmission(supplied)).toThrow(
+      'Invalid generation checkpoint admission',
+    );
+    for (const result of [
+      await methods.acquireGenerationAdmission(supplied),
+      await methods.dispatchGenerationAdmission(supplied),
+      await methods.cancelUndispatchedGenerationAdmission(supplied),
+      await methods.settleGenerationAdmission(supplied, terminal),
+      await methods.acquireGenerationAdmissionSuccessor(supplied, terminal, successor),
+      await methods.writeGenerationCheckpoint(supplied, callback),
+      await methods.recoverGenerationAdmission(supplied, evidence(), successor),
+    ])
+      expect(result).toEqual({ ok: false, error: { code: 'INVALID_INPUT' } });
+    expect(getter).not.toHaveBeenCalled();
+    expect(callback).not.toHaveBeenCalled();
+  });
+
+  it('rejects malformed source binding in the native Mongo schema', async () => {
+    const supplied = sourceInput();
+    supplied.continuation.sourceBindingSha256 = 'A'.repeat(64);
+    await expect(
+      mongoose.models.GenerationAdmission.create({
+        ...supplied,
+        state: 'admitted',
+        active: true,
+        createdAt: new Date().toISOString(),
+      }),
+    ).rejects.toMatchObject({ name: 'ValidationError' });
+    expect(await mongoose.models.GenerationAdmission.countDocuments({})).toBe(0);
+  });
+
   it('persists the detached immutable binding before dispatch and rejects a changed binding', async () => {
     const supplied = input();
     const expected = { ...supplied.continuation };

@@ -1,3 +1,7 @@
+import { createCheckpointSourceMethods } from './checkpointSource';
+import type { CheckpointSourceMethods } from '~/types/checkpointSource';
+export { createCheckpointSourceMethods } from './checkpointSource';
+export { resizeRetainedDerivatives } from './fileRetention';
 export { FileSourceUnavailableError } from './fileRetention';
 export { MessageVersionConflictError } from './message';
 import type { GenerationAdmissionMethods } from '~/types/generationAdmission';
@@ -264,7 +268,8 @@ export {
   AgentQueuedTurnLaneRetiredError,
 };
 
-export type AllMethods = ToolApprovalGrantStorage &
+export type AllMethods = CheckpointSourceMethods &
+  ToolApprovalGrantStorage &
   DocumentWorkspaceMethods &
   UserMethods &
   BrowserMethods &
@@ -512,6 +517,7 @@ export function createMethods(
     ...createBrowserMethods(mongoose),
     ...createEmailCodeMethods(mongoose),
     ...createGenerationAdmissionMethods(mongoose),
+    ...createCheckpointSourceMethods(mongoose),
     ...createToolApprovalGrantMethods(mongoose),
     ...createSessionMethods(mongoose),
     ...createTokenMethods(mongoose),

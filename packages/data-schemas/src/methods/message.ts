@@ -15,20 +15,19 @@ import type {
   SourceRetentionContext,
   QuoteSourceRetention,
   ResolvedQuoteRetention,
-  RetainedTextAllocation,
   MessageArtifactSourceInput,
   CapturedMessageArtifactSource,
 } from '~/types/message';
 import type { SchemaWithMeiliMethods } from '~/models/plugins/mongoMeili';
 import type { AppConfig, IConversation, IMessage } from '~/types';
-import type { FileOwnerScope } from './file';
+import type { FileOwnerScope, RetainedTextAllocation } from '~/types/file';
 import {
   FileSourceUnavailableError,
   fileSourceScope,
   liveFileFilter,
   resolveFileSources,
   touchFileSources,
-  resizeMessageDerivatives,
+  resizeRetainedDerivatives,
   unreconciledDocumentStorage,
 } from './fileRetention';
 import { createChatExpirationDate, createTempChatExpirationDate } from '~/utils/tempChatRetention';
@@ -1254,7 +1253,7 @@ export function createMessageMethods(
       .lean<IMessage>();
     if (!next) throw new FileSourceUnavailableError();
     const allocations = retainedAllocations(next);
-    await resizeMessageDerivatives(
+    await resizeRetainedDerivatives(
       mongoose,
       owner,
       previous?.retainedTextAllocations ?? [],

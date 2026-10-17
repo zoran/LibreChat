@@ -25,6 +25,19 @@ const generationAdmissionSchema: Schema<GenerationAdmissionRecord> =
             graphFingerprint: { type: String, required: true },
             policyFingerprint: { type: String, required: true },
             mode: { type: String, enum: ['checkpoint-only-v1'], required: true },
+            sourceBindingSha256: {
+              type: String,
+              cast: false,
+              default: undefined,
+              validate: {
+                validator: (value: unknown) =>
+                  value === undefined ||
+                  (typeof value === 'string' &&
+                    value.length === 64 &&
+                    /^[a-f0-9]{64}$/.test(value)),
+                message: 'Invalid source binding digest',
+              },
+            },
           },
           { _id: false },
         ),

@@ -23,7 +23,7 @@ import type {
   ManagedUploadAcceptance,
 } from '~/types/file';
 import type { IMongoFile, SourceRetentionContext } from '~/types';
-import type { RetainedTextAllocation } from '~/types/message';
+import type { RetainedTextAllocation } from '~/types/file';
 import { adjustRetainedTextBytes, RESOURCE_MAX } from './uploadManagementStore';
 import { approvedFileFilter, captureManagedFileApproval } from './fileSecurity';
 import { tenantStorage, SYSTEM_TENANT_ID } from '~/config/tenantContext';
@@ -38,8 +38,8 @@ export function unreconciledDocumentStorage(): never {
   });
 }
 
-/** File owns copy liabilities; Message owns each allocation receipt. Both join the same commit. */
-export async function resizeMessageDerivatives(
+/** File owns copy liabilities; retained consumers own their allocation receipts. Both join the same commit. */
+export async function resizeRetainedDerivatives(
   mongoose: typeof import('mongoose'),
   owner: FileOwnerScope,
   previous: readonly RetainedTextAllocation[],

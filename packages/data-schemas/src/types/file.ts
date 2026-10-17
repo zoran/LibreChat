@@ -12,6 +12,9 @@ import type {
   UploadDerivedOrigin,
 } from 'librechat-data-provider';
 
+/** One retained consumer's exact liability, committed alongside the existing File counter. */
+export type RetainedTextAllocation = { fileId: string; bytes: number };
+
 export type RunArtifactRunScope = {
   userId: string;
   tenantId?: string | null;

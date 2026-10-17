@@ -18,7 +18,7 @@ import {
   createFileRetentionMethods,
   FileSourceUnavailableError,
   resolveFileSources,
-  resizeMessageDerivatives,
+  resizeRetainedDerivatives,
 } from './fileRetention';
 import { createUploadStore } from './uploadManagementStore';
 import { tenantStorage } from '~/config/tenantContext';
@@ -546,7 +546,7 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
     const origin = await derived('child', ['root']);
     // Synthetic retained-copy liability, charged through the actual shared accounting owner.
     await transaction((session) =>
-      resizeMessageDerivatives(db, owner, [], [{ fileId: 'child', bytes: 2048 }], session),
+      resizeRetainedDerivatives(db, owner, [], [{ fileId: 'child', bytes: 2048 }], session),
     );
     const total = async () =>
       (await db.models.UploadCounter.findById('global').lean<{ value: { textBytes: number } }>())!

@@ -23,6 +23,8 @@ export * from './utils';
 export { createModels } from './models';
 export {
   createMethods,
+  createCheckpointSourceMethods,
+  resizeRetainedDerivatives,
   createGenerationAdmissionMethods,
   GenerationAdmissionStorageError,
   snapshotGenerationCheckpointAdmission,

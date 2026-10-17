@@ -55,3 +55,5 @@ export * from './mcp';
 export * from './mcpAuthority';
 
 export * from './generationAdmission';
+
+export type * from './checkpointSource';

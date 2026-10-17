@@ -67,7 +67,11 @@ function validContinuation(value: GenerationCheckpointBinding): boolean {
     typeof value.graphFingerprint === 'string' &&
     sha256.test(value.graphFingerprint) &&
     typeof value.policyFingerprint === 'string' &&
-    sha256.test(value.policyFingerprint)
+    sha256.test(value.policyFingerprint) &&
+    (value.sourceBindingSha256 === undefined ||
+      (typeof value.sourceBindingSha256 === 'string' &&
+        value.sourceBindingSha256.length === 64 &&
+        sha256.test(value.sourceBindingSha256)))
   );
 }
 function continuation(value: GenerationCheckpointBinding): GenerationCheckpointBinding {
@@ -79,6 +83,9 @@ function continuation(value: GenerationCheckpointBinding): GenerationCheckpointB
     graphFingerprint: value.graphFingerprint,
     policyFingerprint: value.policyFingerprint,
     mode: value.mode,
+    ...(value.sourceBindingSha256 === undefined
+      ? {}
+      : { sourceBindingSha256: value.sourceBindingSha256 }),
   };
 }
 function fence(input: GenerationAdmissionInput): GenerationAdmissionInput {
@@ -144,7 +151,8 @@ function sameContinuation(
     left.checkpointNamespace === right.checkpointNamespace &&
     left.graphFingerprint === right.graphFingerprint &&
     left.policyFingerprint === right.policyFingerprint &&
-    left.mode === right.mode
+    left.mode === right.mode &&
+    left.sourceBindingSha256 === right.sourceBindingSha256
   );
 }
 function plain(row: GenerationAdmissionRecord): GenerationAdmissionRecord {
@@ -291,8 +299,11 @@ export function createGenerationAdmissionMethods(
     }
   }
   async function dispatchGenerationAdmission(input: GenerationAdmissionInput) {
-    if (!valid(input)) return failure('INVALID_INPUT');
-    input = fence(input);
+    try {
+      input = snapshotAdmission(input);
+    } catch {
+      return failure('INVALID_INPUT');
+    }
     await ensureGenerationAdmissionIndexes();
     try {
       const row = await Model.findOneAndUpdate(
@@ -309,8 +320,12 @@ export function createGenerationAdmissionMethods(
     input: GenerationAdmissionInput,
     terminal: GenerationAdmissionTerminal,
   ) {
+    try {
+      input = snapshotAdmission(input);
+    } catch {
+      return failure('INVALID_INPUT');
+    }
     if (
-      !valid(input) ||
       !terminal ||
       !['completed', 'failed', 'cancelled'].includes(terminal.outcome) ||
       typeof terminal.evidenceSha256 !== 'string' ||
@@ -318,7 +333,6 @@ export function createGenerationAdmissionMethods(
     ) {
       return failure('INVALID_INPUT');
     }
-    input = fence(input);
     terminal = { outcome: terminal.outcome, evidenceSha256: terminal.evidenceSha256 };
     await ensureGenerationAdmissionIndexes();
     try {
@@ -344,8 +358,12 @@ export function createGenerationAdmissionMethods(
     terminal: GenerationAdmissionTerminal,
     successor: GenerationAdmissionSuccessor,
   ) {
+    try {
+      predecessor = snapshotAdmission(predecessor);
+    } catch {
+      return failure('INVALID_INPUT');
+    }
     if (
-      !valid(predecessor) ||
       !terminal ||
       !['completed', 'failed', 'cancelled'].includes(terminal.outcome) ||
       typeof terminal.evidenceSha256 !== 'string' ||
@@ -355,7 +373,6 @@ export function createGenerationAdmissionMethods(
       successor.segmentId === predecessor.segmentId
     )
       return failure('INVALID_INPUT');
-    predecessor = fence(predecessor);
     terminal = { outcome: terminal.outcome, evidenceSha256: terminal.evidenceSha256 };
     successor = {
       ownerInstanceId: successor.ownerInstanceId,
@@ -412,8 +429,11 @@ export function createGenerationAdmissionMethods(
     }
   }
   async function cancelUndispatchedGenerationAdmission(input: GenerationAdmissionInput) {
-    if (!valid(input)) return failure('INVALID_INPUT');
-    input = fence(input);
+    try {
+      input = snapshotAdmission(input);
+    } catch {
+      return failure('INVALID_INPUT');
+    }
     await ensureGenerationAdmissionIndexes();
     try {
       const row = await Model.findOneAndUpdate(
