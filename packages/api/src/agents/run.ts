@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto';
+import * as agentsSdk from '@librechat/agents';
 import { logger } from '@librechat/data-schemas';
 import { ensureHandler } from '@langchain/core/callbacks/manager';
 import { Run, Providers, Constants, GraphEvents, HookRegistry } from '@librechat/agents';
@@ -58,6 +59,7 @@ import type { ModelBoundChatModelCallback } from '~/middleware/modelBoundContent
 import type { ScheduledMCPPolicyError } from '~/schedules/authorization/policy';
 import type { ScheduleMCPExecution } from '~/schedules/authorization/execution';
 import type { ModelErrorTrackerCallback } from '~/agents/failures/tracker';
+import type { DurableAgentCheckpointScope } from '~/agents/checkpointer';
 import type { ToolInputValidationError } from '~/agents/toolValidation';
 import type { ResolvedToolApprovalHook } from '~/agents/hitl/hooks';
 import type { LangfuseTraceContext } from '~/langfuse/identity';
@@ -116,12 +118,14 @@ import { applyCustomHandoffPromptKeyCompatibility } from '~/agents/handoffPrompt
 import { stripIntentFromToolRegistry, stripIntentFromToolDefinitions } from '~/agents/intent';
 import { createAgentToolApprovalSession, bindRunToolApprovalSession } from './hitl/modes';
 import { resolveConfigHeaders, resolveModelHeaders, mergeHeaders } from '~/utils/headers';
+import { getAgentCheckpointer, getDurableAgentCheckpointer } from '~/agents/checkpointer';
 import { interruptToolHandler, supportsRunInterruption } from '~/agents/steering/tools';
 import { extractDefaultParams, resolveReasoningParams } from '~/endpoints/openai/llm';
 import { getLLMConfig as getAnthropicLLMConfig } from '~/endpoints/anthropic/llm';
 import { createScheduledMCPRunPolicy } from '~/schedules/authorization/run';
 import { CREATE_FILE_TOOL_NAME, EDIT_FILE_TOOL_NAME } from '~/agents/tools';
 import { buildAgentInitialToolSessions } from '~/agents/codeFilesSession';
+import { checkpointNamespaceBelongsToOwner } from '~/stream/checkpoints';
 import { getDirectDispatcher, getProxyDispatcher } from '~/utils/proxy';
 import { getAzureCredentials, constructAzureURL } from '~/utils/azure';
 import { buildEffectiveToolApprovalPolicy } from '~/agents/hitl/allow';
@@ -129,7 +133,6 @@ import { prepareQueuedCodeFileContext } from '~/files/code/queued';
 import { getBuiltInBaseURL } from '~/endpoints/openai/initialize';
 import { getProviderConfig } from '~/endpoints/config/providers';
 import { buildToolApprovalHooks } from '~/agents/hitl/hooks';
-import { getAgentCheckpointer } from '~/agents/checkpointer';
 import { getPluginHookSource } from '~/agents/hooks/source';
 import { getOpenAIConfig } from '~/endpoints/openai/config';
 import { createStepBudgetHook } from '~/agents/stepBudget';
@@ -2201,6 +2204,7 @@ export async function createRun({
   activityLabel,
   activityPhase,
   eventActorCheckpointing = false,
+  durableCheckpointScope,
   hitlCapable = false,
   resolvedToolApprovalHooks,
   toolApprovalStorage,
@@ -2342,6 +2346,12 @@ export async function createRun({
   /** Persist clean terminal checkpoints for an isolated bound-event invocation. */
   eventActorCheckpointing?: boolean;
   /**
+   * Trusted host-owned durable execution binding, never request/config/UI data.
+   * Requires the host's existing ACL, admission and source-retention checks;
+   * this profile only binds persistence and synchronous SDK checkpointing.
+   */
+  durableCheckpointScope?: DurableAgentCheckpointScope;
+  /**
    * Whether the caller implements the HITL pause/resume lifecycle (inspects
    * `run.getInterrupt()`, persists a pending action, exposes a resume route). Gates the
    * approval pause and checkpointer: only AgentClient (chat + resume) sets this.
@@ -2367,6 +2377,40 @@ export async function createRun({
   'tokenCounter' | 'customHandlers' | 'indexTokenCountMap' | 'initialSessions'
 >): Promise<Run<IState>> {
   const completeAssistantHistory = assertCompleteAssistantHistorySingleton(agents);
+  const durableScope =
+    durableCheckpointScope === undefined ? undefined : Object.freeze({ ...durableCheckpointScope });
+  if (durableScope !== undefined) {
+    if (
+      !user?.id ||
+      !conversationId ||
+      durableScope.userId !== user.id ||
+      durableScope.tenantId !== (tenantId ?? user.tenantId) ||
+      durableScope.threadId !== conversationId ||
+      !checkpointNamespaceBelongsToOwner(
+        durableScope.checkpointNamespace,
+        user.id,
+        tenantId ?? user.tenantId,
+      )
+    ) {
+      throw new Error('Durable checkpoint scope does not match the native run owner and thread');
+    }
+    if (
+      (agentsSdk as { CHECKPOINT_CONTINUATION_VERSION?: number })
+        .CHECKPOINT_CONTINUATION_VERSION !== 1
+    ) {
+      throw new Error('Durable execution requires SDK checkpoint policy support');
+    }
+  }
+  const durableCheckpointer =
+    durableScope === undefined
+      ? undefined
+      : await getDurableAgentCheckpointer(
+          durableScope,
+          appConfig?.endpoints?.[EModelEndpoint.agents]?.checkpointer,
+        );
+  if (durableScope !== undefined && durableCheckpointer == null) {
+    throw new Error('Durable execution requires a persistent checkpointer');
+  }
   const resolvedRunId = runId ?? randomUUID();
   const runFilesActive =
     runFiles?.activate(
@@ -2961,7 +3005,12 @@ export async function createRun({
    */
   const asksUserQuestions =
     hitlCapable && !askToolAdminDisabled && agents.some(agentRequestsAskUserQuestion);
-  if (hitl || asksUserQuestions || eventActorCheckpointing) {
+  if (durableCheckpointer != null) {
+    graphConfig.compileOptions = {
+      ...graphConfig.compileOptions,
+      checkpointer: durableCheckpointer,
+    };
+  } else if (hitl || asksUserQuestions || eventActorCheckpointing) {
     const checkpointer = await getAgentCheckpointer(agentsEndpointConfig?.checkpointer);
     graphConfig.compileOptions = { ...graphConfig.compileOptions, checkpointer };
   }
@@ -3089,6 +3138,9 @@ export async function createRun({
 
   const runConfig = {
     runId: resolvedRunId,
+    ...(durableScope !== undefined && {
+      checkpointPolicy: { threadId: durableScope.threadId, durability: 'sync' as const },
+    }),
     graphConfig,
     tokenCounter,
     customHandlers: runHandlers,

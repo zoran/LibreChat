@@ -46,7 +46,7 @@
     "@azure/storage-blob": "^12.30.0",
     "@google/genai": "^2.8.0",
     "@keyv/redis": "5.1.6",
-    "@librechat/agents": "git+https://github.com/zoran/LibreChat-agents.git#e7bd4d93e81187b35dc76cb5d8a20451d0676a3b",
+    "@librechat/agents": "github:zoran/LibreChat-agents#311e1d2b0c0155dd020991afd30ddd6524c520ba",
     "@librechat/api": "*",
     "@librechat/data-schemas": "*",
     "@microsoft/microsoft-graph-client": "^3.0.7",
