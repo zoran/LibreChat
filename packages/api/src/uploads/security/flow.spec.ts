@@ -1,9 +1,9 @@
 /** Real raw/Mongo/mTLS/thread flow. Ordinary storage alone is a local-byte test double, not S3. */
 import path from 'node:path';
 import mongoose from 'mongoose';
-import { createHash } from 'node:crypto';
 import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
+import { createHash, randomUUID } from 'node:crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import { createModels, createUploadManagementRepository } from '@librechat/data-schemas';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
@@ -171,9 +171,9 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
   ] as const)(
     'runs %s bytes through the real scanner before ordinary storage',
     async (name, bytes, rejection) => {
+      const filename = `Cortex-TEST-Privat-Grüße-${name}.txt`;
       const operation = await management.reserve(principal, {
-        idempotencyKey: name,
-        filename: 'display.txt',
+        idempotencyKey: randomUUID(),
         mediaType: 'text/plain',
         declaredBytes: bytes.length,
       });
@@ -182,12 +182,17 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
       const bindings: { execution: UploadSecurityExecution; stored: unknown }[] = [];
       const storageStates: { stored: unknown; files: number }[] = [];
       const readOperation = () => observer.models.UploadOperation.findById(operation.id).lean();
+      expect(await readOperation()).not.toHaveProperty('filename');
+      expect(JSON.stringify(await readOperation())).not.toContain('Cortex-TEST-Privat');
+      expect(JSON.stringify(await management.list(principal))).not.toContain('Cortex-TEST-Privat');
       const security: UploadSecurityPort = {
         policySha256: port.policySha256,
         prepare: (input) => port.prepare(input),
         cancel: (input) => port.cancel(input),
         async inspect(input) {
           bindings.push({ execution: input.execution, stored: await readOperation() });
+          expect(bindings.at(-1)!.stored).not.toHaveProperty('filename');
+          expect(JSON.stringify(bindings.at(-1)!.stored)).not.toContain('Cortex-TEST-Privat');
           const result = await port.inspect(input);
           observedInspections.push(result);
           return result;
@@ -231,6 +236,7 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         headers: {
           'content-type': 'application/octet-stream',
           'content-length': String(bytes.length),
+          'x-upload-filename': encodeURIComponent(filename),
         },
       });
       const response = Object.assign(new EventEmitter(), {
@@ -306,6 +312,11 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         expect(await readdir(ordinaryRoot)).toEqual([]);
         expect(await observer.models.File.countDocuments({})).toBe(0);
         expect(stored).not.toHaveProperty('securityApproval');
+        expect(stored).not.toHaveProperty('filename');
+        expect(JSON.stringify(stored)).not.toContain('Cortex-TEST-Privat');
+        expect(JSON.stringify(await management.list(principal))).not.toContain(
+          'Cortex-TEST-Privat',
+        );
         expect(await management.claimProcessing(worker)).toBeNull();
         expect(await management.usage(principal)).toMatchObject({
           usedBytes: 0,
@@ -316,6 +327,8 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         expect(response.statusCode).toBe(202);
         expect(response.value).toMatchObject({ id: operation.id, state: 'queued_processing' });
         expect(put).toHaveBeenCalledTimes(1);
+        expect(put.mock.calls[0][0].filename).toBe(filename);
+        expect(storageStates[0].stored).not.toHaveProperty('filename');
         expect(storageStates[0]).toMatchObject({
           files: 0,
           stored: {
@@ -344,11 +357,15 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
             sha256: originalSha256,
           },
         });
-        expect(stored).toMatchObject({ state: 'queued_processing', securityApproval: approved });
+        expect(stored).toMatchObject({
+          state: 'queued_processing',
+          securityApproval: approved,
+          filename,
+        });
         const file = await observer.models.File.findOne({ file_id: operation.id })
           .select('+securityApproval')
           .lean();
-        expect(file).toMatchObject({ status: 'pending', securityApproval: approved });
+        expect(file).toMatchObject({ status: 'pending', securityApproval: approved, filename });
         expect(await management.usage(principal)).toMatchObject({
           usedBytes: bytes.length,
           retainedBytes: bytes.length,

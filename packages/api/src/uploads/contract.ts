@@ -30,6 +30,7 @@ import type {
   UploadSecuritySubject,
   UploadSecurityApproval,
   UploadSecurityInspection,
+  UploadAcceptedMetadata,
   UploadSecurityExecution,
   UploadSecuritySettlement,
 } from 'librechat-data-provider';
@@ -167,6 +168,7 @@ export interface UploadRepository {
     lease: UploadLease,
     receipt: UploadStorageReceipt,
     securityApproval: UploadSecurityApproval,
+    metadata: UploadAcceptedMetadata,
     now: number,
   ): Promise<UploadOperation>;
   publish(

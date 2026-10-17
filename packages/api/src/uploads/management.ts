@@ -1,5 +1,9 @@
 import { randomUUID } from 'crypto';
-import { UPLOAD_MAX_FILE_BYTES, isUploadPrincipal } from 'librechat-data-provider';
+import {
+  UPLOAD_MAX_FILE_BYTES,
+  isUploadPrincipal,
+  readUploadAcceptedMetadata,
+} from 'librechat-data-provider';
 import type {
   UploadPrincipal,
   UploadRequest,
@@ -13,6 +17,7 @@ import type {
   UploadSecurityApproval,
   UploadSecurityExecution,
   UploadSecuritySettlement,
+  UploadAcceptedMetadata,
 } from 'librechat-data-provider';
 import type { UploadRepository, IdentityPort, ResourcePort, TelemetryPort } from './contract';
 import { UploadManagementError, isUploadManagementError } from './errors';
@@ -33,6 +38,25 @@ const MEDIA_TYPES = new Set([
   'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 ]);
 
+/** Snapshot only technical own-data fields before authorization or other asynchronous work. */
+function reservationData(value: unknown, allowed: readonly string[]): Record<string, unknown> {
+  try {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error();
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) throw new Error();
+    const result: Record<string, unknown> = {};
+    for (const key of Reflect.ownKeys(value)) {
+      if (typeof key !== 'string' || !allowed.includes(key)) throw new Error();
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor?.enumerable || !('value' in descriptor)) throw new Error();
+      result[key] = descriptor.value;
+    }
+    return result;
+  } catch {
+    throw new UploadManagementError('invalid_request');
+  }
+}
+
 export interface UploadManagement {
   reserve(principal: UploadPrincipal, request: UploadRequest): Promise<UploadOperation>;
   get(principal: UploadPrincipal, id: string): Promise<UploadOperation>;
@@ -49,6 +73,7 @@ export interface UploadManagement {
     lease: UploadLease,
     receipt: UploadStorageReceipt,
     securityApproval: UploadSecurityApproval,
+    metadata: UploadAcceptedMetadata,
   ): Promise<UploadOperation>;
   cancel(principal: UploadPrincipal, id: string): Promise<UploadOperation>;
   delete(principal: UploadPrincipal, id: string): Promise<UploadOperation>;
@@ -121,30 +146,44 @@ export function createUploadManagement(deps: UploadManagementDependencies): Uplo
     return operation;
   }
   return {
-    async reserve(principal: UploadPrincipal, request: UploadRequest) {
-      const scope = request.scope ?? { kind: 'personal' };
-      await authorize(principal, scope);
-      if (scope.kind !== 'personal') throw new UploadManagementError('forbidden');
+    async reserve(principal: UploadPrincipal, input: UploadRequest) {
+      const data = reservationData(input, [
+        'mediaType',
+        'declaredBytes',
+        'idempotencyKey',
+        'scope',
+      ]);
+      const suppliedScope =
+        data.scope === undefined
+          ? { kind: 'personal' }
+          : reservationData(data.scope, ['kind', 'workspaceId']);
+      if (suppliedScope.kind === 'workspace') throw new UploadManagementError('forbidden');
+      if (suppliedScope.kind !== 'personal' || Object.keys(suppliedScope).length !== 1)
+        throw new UploadManagementError('invalid_request');
+      const scope = { kind: 'personal' } as const;
       if (
-        !Number.isSafeInteger(request.declaredBytes) ||
-        request.declaredBytes <= 0 ||
-        request.declaredBytes > UPLOAD_MAX_FILE_BYTES ||
-        !request.filename ||
-        request.filename.length > 255 ||
-        // eslint-disable-next-line no-control-regex -- Reject control characters in uploaded filenames.
-        /[\x00-\x1f]/.test(request.filename) ||
-        !request.idempotencyKey ||
-        request.idempotencyKey.length > 128
+        typeof data.declaredBytes !== 'number' ||
+        !Number.isSafeInteger(data.declaredBytes) ||
+        data.declaredBytes <= 0 ||
+        data.declaredBytes > UPLOAD_MAX_FILE_BYTES ||
+        typeof data.mediaType !== 'string' ||
+        typeof data.idempotencyKey !== 'string' ||
+        data.idempotencyKey.length !== 36 ||
+        !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+          data.idempotencyKey,
+        )
       ) {
         throw new UploadManagementError('invalid_request');
       }
-      if (!MEDIA_TYPES.has(request.mediaType)) throw new UploadManagementError('unsupported_type');
-      const fingerprint = JSON.stringify([
+      const request: UploadRequest = {
+        mediaType: data.mediaType,
+        declaredBytes: data.declaredBytes,
+        idempotencyKey: data.idempotencyKey,
         scope,
-        request.filename,
-        request.mediaType,
-        request.declaredBytes,
-      ]);
+      };
+      await authorize(principal, scope);
+      if (!MEDIA_TYPES.has(request.mediaType)) throw new UploadManagementError('unsupported_type');
+      const fingerprint = JSON.stringify([scope, request.mediaType, request.declaredBytes]);
       const previous = await repository.findReservation(
         principal,
         request.idempotencyKey,
@@ -184,10 +223,15 @@ export function createUploadManagement(deps: UploadManagementDependencies): Uplo
       lease: UploadLease,
       receipt: UploadStorageReceipt,
       securityApproval: UploadSecurityApproval,
+      metadata: UploadAcceptedMetadata,
     ) {
+      const acceptedMetadata = readUploadAcceptedMetadata(metadata);
+      if (!acceptedMetadata) throw new UploadManagementError('invalid_request');
       if (lease.operationId !== id) throw new UploadManagementError('lease_lost');
       await get(principal, id);
-      return emit(repository.accept(principal, lease, receipt, securityApproval, now()));
+      return emit(
+        repository.accept(principal, lease, receipt, securityApproval, acceptedMetadata, now()),
+      );
     },
     async cancel(principal: UploadPrincipal, id: string) {
       await get(principal, id);

@@ -325,10 +325,9 @@ describe('Cortex upload adapter trust boundaries', () => {
       expect(repository.metrics).toHaveBeenCalledTimes(1);
       await expect(
         composition.management.reserve(owner, {
-          filename: 'tiny.txt',
           mediaType: 'text/plain',
           declaredBytes: 5,
-          idempotencyKey: 'fixture',
+          idempotencyKey: '00000000-0000-4000-8000-000000000001',
         }),
       ).rejects.toMatchObject({ code: 'quota_exceeded' });
       await composition.management.retryProcessing(owner, failed.id);

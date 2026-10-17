@@ -1,7 +1,10 @@
 const { isUploadPrincipal } = require('librechat-data-provider');
 const { once } = require('node:events');
 const { performance } = require('node:perf_hooks');
-const { getAuthMode } = require('@librechat/api');
+const {
+  isCortexFileMode,
+  rejectUnmanagedFileWrites,
+} = require('~/server/middleware/requireManagedIntake');
 const { runAsSystem } = require('@librechat/data-schemas');
 const { getContentDisposition } = require('~/server/utils/files');
 
@@ -9,22 +12,8 @@ const MAX_BYTES = 30 * 1024 * 1024;
 const MAX_CHUNK = 64 * 1024;
 const FILE_FIELDS =
   'file_id uploadOperationId tenantId user filename type source bytes embedded llmDeliveryPath status expiredAt retentionAcceptedAt deletionRequestedAt deletionCompletedAt storageKey';
-const isCortexFileMode = () => getAuthMode() !== 'default';
 const unavailable = (code = 'not_found') => Object.assign(new Error(code), { code });
 const runtime = () => require('~/server/services/Uploads').getUploadRuntime();
-
-/** Before Multer and every speech handler: these writes have no managed reservation. */
-function rejectUnmanagedFileWrites(req, res, next) {
-  if (
-    !isCortexFileMode() ||
-    req.method !== 'POST' ||
-    req.path.replace(/\/+$/, '').toLowerCase() === '/usage'
-  )
-    return next();
-  res.setHeader('Cache-Control', 'no-store');
-  res.setHeader('Connection', 'close');
-  return res.status(403).json({ code: 'managed_upload_required' });
-}
 
 function publicFile(file) {
   return {

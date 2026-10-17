@@ -10,6 +10,7 @@ const mockUser = jest.fn((_req, _res, next) => next());
 const mockAuth = jest.fn((_req, _res, next) => next());
 let mockDeps;
 jest.mock('@librechat/api', () => ({
+  getAuthMode: () => 'default',
   createSkillManagementHandlers: (deps) => {
     mockDeps = deps;
     return {

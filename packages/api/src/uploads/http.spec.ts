@@ -17,7 +17,6 @@ const operation: UploadOperation = {
   id: 'operation',
   revision: 1,
   scope: { kind: 'personal' },
-  filename: 'note.txt',
   mediaType: 'text/plain',
   declaredBytes: 5,
   state: 'waiting',
@@ -187,12 +186,24 @@ describe('upload HTTP boundary', () => {
     management.reserve.mockRejectedValueOnce(new UploadManagementError('admission_paused'));
     expect(
       await call('POST', '/api/uploads/operations', {
-        filename: 'note.txt',
         mediaType: 'text/plain',
         declaredBytes: 5,
-        idempotencyKey: 'new',
+        idempotencyKey: '11111111-1111-4111-8111-111111111111',
       }),
     ).toEqual({ status: 503, data: { code: 'admission_paused' } });
+  });
+  it('discloses an exact filename only after acceptance, including when an adapter returns legacy metadata', async () => {
+    const filename = ' Grüße 📄.txt ';
+    management.list.mockResolvedValue([{ ...operation, filename }]);
+    expect((await call('GET')).data).not.toHaveProperty('operations.0.filename');
+    management.list.mockResolvedValue([
+      { ...operation, filename, acceptedAt: new Date(1000).toISOString() },
+    ]);
+    expect((await call('GET')).data).toHaveProperty('operations.0.filename', filename);
+    management.list.mockResolvedValue([
+      { ...operation, filename: '../private', acceptedAt: new Date(1000).toISOString() },
+    ]);
+    expect((await call('GET')).data).not.toHaveProperty('operations.0.filename');
   });
 
   it('rechecks the current grant after asynchronous projection and before disclosure', async () => {
@@ -227,10 +238,9 @@ describe('upload HTTP boundary', () => {
 
   it('rejects guests, forged authority fields, queries, unknown metadata and oversized JSON', async () => {
     const input = {
-      filename: 'note.txt',
       mediaType: 'text/plain',
       declaredBytes: 5,
-      idempotencyKey: 'key',
+      idempotencyKey: '11111111-1111-4111-8111-111111111111',
     };
     strongPrincipal.mockResolvedValueOnce({ ...user, authentication: 'guest' });
     expect((await call('GET')).status).toBe(401);
@@ -239,6 +249,10 @@ describe('upload HTTP boundary', () => {
       { userId: 'other' },
       { generation: 9 },
       { unknown: true },
+      { filename: 'private-title.txt' },
+      { idempotencyKey: 'private-title.txt' },
+      { idempotencyKey: 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA' },
+      { idempotencyKey: '11111111-1111-1111-8111-111111111111' },
       {
         integrity: {
           version: 1,
@@ -314,10 +328,9 @@ describe('upload HTTP boundary', () => {
       management.reserve.mockRejectedValueOnce(failure);
       expect(
         await call('POST', '/api/uploads/operations', {
-          filename: 'note.txt',
           mediaType: 'text/plain',
           declaredBytes: 5,
-          idempotencyKey: 'new',
+          idempotencyKey: '11111111-1111-4111-8111-111111111111',
         }),
       ).toEqual({ status: 422, data: { code } });
       management.retryProcessing.mockRejectedValueOnce(failure);

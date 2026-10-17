@@ -7,6 +7,12 @@ import type { StoredUpload } from './uploadManagementStore';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createModels } from '~/models';
 
+/** Deterministic UUIDv4-shaped test keys keep operation labels out of the public key contract. */
+const fixtureKey = (label: string): string => {
+  const hex = createHash('sha256').update(label).digest('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+};
+
 describe('durable scanner execution', () => {
   let mongo: MongoMemoryReplSet;
   const a = new mongoose.Mongoose();
@@ -110,11 +116,10 @@ describe('durable scanner execution', () => {
       user,
       {
         operationId: 'scan',
-        idempotencyKey: 'scan',
-        filename: 'note.txt',
+        idempotencyKey: fixtureKey('scan'),
         mediaType: 'text/plain',
         declaredBytes: 8,
-        fingerprint: JSON.stringify([{ kind: 'personal' }, 'note.txt', 'text/plain', 8]),
+        fingerprint: JSON.stringify([{ kind: 'personal' }, 'text/plain', 8]),
       },
       now,
     );
@@ -134,7 +139,7 @@ describe('durable scanner execution', () => {
     return { lease, bound };
   }
   const accept = (lease: UploadLease) =>
-    first.accept(user, lease, receipt(lease), approval(lease), now);
+    first.accept(user, lease, receipt(lease), approval(lease), { filename: 'note.txt' }, now);
 
   it('binds one immutable execution across racing replicas and replays only the winner', async () => {
     const lease = await transfer();

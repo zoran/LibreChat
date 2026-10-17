@@ -5,6 +5,7 @@ import type {
   UploadPrincipal,
   UploadRequest,
   UploadLease,
+  UploadSecurityApproval,
 } from 'librechat-data-provider';
 import type { UploadRepository, TelemetryPort } from './contract';
 import { isUploadManagementError, UploadManagementError } from './errors';
@@ -16,17 +17,15 @@ const principal: UploadPrincipal = {
   authentication: 'verified-email',
 };
 const request: UploadRequest = {
-  filename: 'example.txt',
   mediaType: 'text/plain',
   declaredBytes: 8,
-  idempotencyKey: 'key',
+  idempotencyKey: '11111111-1111-4111-8111-111111111111',
 };
 const operation: UploadOperation = {
   version: 1,
   id: 'operation',
   revision: 1,
   scope: { kind: 'personal' },
-  filename: request.filename,
   mediaType: request.mediaType,
   declaredBytes: 8,
   state: 'waiting',
@@ -41,6 +40,7 @@ function fixture(telemetry?: TelemetryPort) {
   const findReservation = jest.fn().mockResolvedValue(null);
   const get = jest.fn().mockResolvedValue(operation);
   const renew = jest.fn();
+  const accept = jest.fn().mockResolvedValue({ ...operation, state: 'queued_processing' });
   const retryProcessing = jest
     .fn()
     .mockResolvedValue({ ...operation, state: 'queued_processing', revision: 3 });
@@ -50,6 +50,7 @@ function fixture(telemetry?: TelemetryPort) {
     findReservation,
     get,
     renew,
+    accept,
     retryProcessing,
     publish,
   };
@@ -76,6 +77,7 @@ function fixture(telemetry?: TelemetryPort) {
     findReservation,
     get,
     renew,
+    accept,
     retryProcessing,
     publish,
     authorize,
@@ -136,13 +138,109 @@ describe('managed upload public boundary', () => {
         scope: { kind: 'personal' },
         fingerprint: JSON.stringify([
           { kind: 'personal' },
-          request.filename,
           request.mediaType,
           request.declaredBytes,
         ]),
       },
       1000,
     );
+  });
+  it.each([
+    { filename: 'private-title.txt' },
+    { filename: undefined },
+    { idempotencyKey: 'private-title.txt' },
+    { idempotencyKey: 'AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA' },
+    { idempotencyKey: '11111111-1111-1111-8111-111111111111' },
+    { idempotencyKey: '11111111-1111-4111-1111-111111111111' },
+  ])('refuses legacy metadata and noncanonical replay identities: %j', async (extra) => {
+    const f = fixture();
+    await expect(f.management.reserve(principal, { ...request, ...extra })).rejects.toMatchObject({
+      code: 'invalid_request',
+    });
+    expect(f.findReservation).not.toHaveBeenCalled();
+    expect(f.reserve).not.toHaveBeenCalled();
+  });
+  it('snapshots technical metadata before asynchronous authorization without invoking getters', async () => {
+    const f = fixture();
+    const input = { ...request };
+    f.authorize.mockImplementationOnce(async () => {
+      input.idempotencyKey = 'private-title.txt';
+      input.mediaType = 'application/pdf';
+      return true;
+    });
+    await f.management.reserve(principal, input);
+    expect(f.reserve).toHaveBeenCalledWith(
+      principal,
+      expect.objectContaining({
+        ...request,
+        fingerprint: JSON.stringify([{ kind: 'personal' }, 'text/plain', 8]),
+      }),
+      1000,
+    );
+    const getter = jest.fn(() => 'text/plain');
+    Object.defineProperty(input, 'mediaType', { enumerable: true, get: getter });
+    await expect(f.management.reserve(principal, input)).rejects.toMatchObject({
+      code: 'invalid_request',
+    });
+    expect(getter).not.toHaveBeenCalled();
+    expect(f.reserve).toHaveBeenCalledTimes(1);
+  });
+  it('snapshots accepted filename metadata before awaits and rejects invalid names before repository access', async () => {
+    const f = fixture();
+    const lease: UploadLease = {
+      ...principal,
+      operationId: operation.id,
+      generation: 1,
+      kind: 'transfer',
+      hostId: 'host',
+      instanceId: 'app',
+      expiresAt: new Date(46_000).toISOString(),
+    };
+    const receipt = {
+      outcome: 'durable' as const,
+      bytes: 8,
+      source: 's3',
+      filepath: 'private',
+      storageKey: 'private',
+    };
+    const securityApproval: UploadSecurityApproval = {
+      version: 1,
+      decision: 'approved',
+      policySha256: 'a'.repeat(64),
+      scannerVersion: 'test/1',
+      checkedAt: new Date(1000).toISOString(),
+      coverage: { complete: true, pages: 1, parts: 1 },
+      subject: {
+        tenantId: principal.tenantId,
+        userId: principal.userId,
+        operationId: operation.id,
+        transferGeneration: 1,
+        mediaType: 'text/plain',
+        bytes: 8,
+        sha256: 'b'.repeat(64),
+      },
+    };
+    const metadata = { filename: ' Grüße 📄.txt ' };
+    f.authorize.mockImplementationOnce(async () => {
+      metadata.filename = 'changed.txt';
+      return true;
+    });
+    await f.management.accept(principal, operation.id, lease, receipt, securityApproval, metadata);
+    expect(f.accept).toHaveBeenCalledWith(
+      principal,
+      lease,
+      receipt,
+      securityApproval,
+      { filename: ' Grüße 📄.txt ' },
+      1000,
+    );
+    await expect(
+      f.management.accept(principal, operation.id, lease, receipt, securityApproval, {
+        filename: '../private.txt',
+      }),
+    ).rejects.toMatchObject({ code: 'invalid_request' });
+    expect(f.accept).toHaveBeenCalledTimes(1);
+    expect(f.get).toHaveBeenCalledTimes(1);
   });
   it('returns an authorized durable replay during a resource outage without another reservation', async () => {
     const f = fixture();

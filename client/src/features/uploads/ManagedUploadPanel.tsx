@@ -159,6 +159,7 @@ export function ManagedUploadCard({
   const local = file.managedUpload!;
   const operation =
     uploads.data?.operations.find((row) => row.id === local.operation?.id) ?? local.operation;
+  const filename = file.filename ?? operation?.filename ?? localize('com_file_source');
   let error = operation?.error ?? local.error;
   // A stale generic snapshot must not replace a concrete local security failure with retry advice.
   if (isSecurityFailure(local.error) && !isSecurityFailure(error)) error = local.error;
@@ -204,8 +205,8 @@ export function ManagedUploadCard({
   };
   return (
     <div className="border-border-light bg-surface-hover-alt w-full max-w-sm rounded-xl border p-3 text-sm">
-      <p className="text-text-primary truncate font-medium" title={file.filename}>
-        {file.filename}
+      <p className="text-text-primary truncate font-medium" title={filename}>
+        {filename}
       </p>
       <p role="status" aria-live="polite" aria-atomic="true" className="text-text-secondary">
         {localize(

@@ -12,6 +12,7 @@ import {
   readUploadSecurityExecution,
   readUploadSecuritySettlement,
   matchesUploadSecurityExecution,
+  readUploadAcceptedMetadata,
 } from 'librechat-data-provider';
 import type {
   UploadPrincipal,
@@ -32,6 +33,7 @@ import type {
   UploadSecurityApproval,
   UploadSecurityExecution,
   UploadSecuritySettlement,
+  UploadAcceptedMetadata,
 } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
 import type {
@@ -107,6 +109,7 @@ export type UploadManagementRepository = UploadControlMethods &
       lease: UploadLease,
       receipt: UploadStorageReceipt,
       securityApproval: UploadSecurityApproval,
+      metadata: UploadAcceptedMetadata,
       now: number,
     ): Promise<UploadOperation>;
     publish(
@@ -254,28 +257,56 @@ export function createUploadManagementRepository(
     now: number,
   ): Promise<UploadOperation> {
     principalFilter(principal);
-    const scope = input.scope ?? { kind: 'personal' };
-    if (scope.kind !== 'personal') reject('forbidden');
+    const allowed = new Set([
+      'operationId',
+      'idempotencyKey',
+      'fingerprint',
+      'mediaType',
+      'declaredBytes',
+      'scope',
+    ]);
+    if (
+      !input ||
+      typeof input !== 'object' ||
+      ![Object.prototype, null].includes(Object.getPrototypeOf(input)) ||
+      Reflect.ownKeys(input).some(
+        (key) =>
+          typeof key !== 'string' ||
+          !allowed.has(key) ||
+          !('value' in (Object.getOwnPropertyDescriptor(input, key) ?? {})),
+      )
+    )
+      reject('invalid_request');
+    if (
+      input.scope !== undefined &&
+      (!input.scope ||
+        typeof input.scope !== 'object' ||
+        ![Object.prototype, null].includes(Object.getPrototypeOf(input.scope)) ||
+        !('value' in (Object.getOwnPropertyDescriptor(input.scope, 'kind') ?? {})))
+    )
+      reject('invalid_request');
+    if (input.scope !== undefined && input.scope.kind !== 'personal') reject('forbidden');
+    if (input.scope !== undefined && Reflect.ownKeys(input.scope).some((key) => key !== 'kind'))
+      reject('invalid_request');
+    const scope = { kind: 'personal' as const };
+    // Snapshot the technical reservation before any await; never retain caller metadata.
+    input = { ...input, scope: { kind: 'personal' } };
     if (
       !Number.isSafeInteger(input.declaredBytes) ||
       input.declaredBytes <= 0 ||
       input.declaredBytes > UPLOAD_MAX_FILE_BYTES ||
-      !input.operationId ||
+      typeof input.operationId !== 'string' ||
       !/^[a-zA-Z0-9-]{1,128}$/.test(input.operationId) ||
-      !input.idempotencyKey ||
-      input.idempotencyKey.length > 128 ||
-      !input.filename ||
-      input.filename.length > 255 ||
+      typeof input.idempotencyKey !== 'string' ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+        input.idempotencyKey,
+      ) ||
+      typeof input.mediaType !== 'string' ||
       !input.mediaType ||
       input.mediaType.length > 128
     )
       reject('invalid_request');
-    const fingerprint = JSON.stringify([
-      scope,
-      input.filename,
-      input.mediaType,
-      input.declaredBytes,
-    ]);
+    const fingerprint = JSON.stringify([scope, input.mediaType, input.declaredBytes]);
     if (fingerprint !== input.fingerprint) reject('invalid_request');
     return store.transaction(async (session, global) => {
       const owner = principalFilter(principal);
@@ -313,7 +344,6 @@ export function createUploadManagementRepository(
         scope,
         idempotencyKey: input.idempotencyKey,
         fingerprint,
-        filename: input.filename,
         mediaType: input.mediaType,
         declaredBytes: input.declaredBytes,
         state: 'waiting',
@@ -582,7 +612,9 @@ export function createUploadManagementRepository(
         await store.save(row, session);
       });
     },
-    async accept(principal, lease, receipt, securityApproval, now) {
+    async accept(principal, lease, receipt, securityApproval, metadata, now) {
+      const acceptedMetadata = readUploadAcceptedMetadata(metadata);
+      if (!acceptedMetadata) reject('invalid_request');
       const approval = captureUploadSecurityApproval(securityApproval);
       if (!approval) reject('security_uninspectable');
       // Capture the trusted acknowledgement before awaiting Mongo; callers retain no mutable
@@ -614,6 +646,7 @@ export function createUploadManagementRepository(
             reject('lease_lost');
           if (!original || !row.original || uploadDigest(original) !== uploadDigest(row.original))
             reject('idempotency_conflict');
+          if (row.filename !== acceptedMetadata.filename) reject('idempotency_conflict');
           requireUploadSecurityApproval(row, securityPolicySha256, now);
           requireUploadSecurityApproval(row, securityPolicySha256, now, approval, original);
           if (uploadDigest(approval) !== uploadDigest(row.securityApproval))
@@ -646,6 +679,7 @@ export function createUploadManagementRepository(
         );
         await store.touchPrincipal(principal, session);
         row.acceptedAt = now;
+        row.filename = acceptedMetadata.filename;
         row.expiresAt = now + UPLOAD_RETENTION_MS;
         row.fileId = row._id;
         row.actualBytes = original.bytes;
@@ -813,6 +847,7 @@ export function createUploadManagementRepository(
       assertLease(row, lease, now);
       if (
         row.slot !== 'processing' ||
+        !readUploadAcceptedMetadata({ filename: row.filename }) ||
         !isUploadStorageReceipt(row.original) ||
         row.original.outcome !== 'durable' ||
         row.original.bytes !== row.actualBytes ||
@@ -823,7 +858,7 @@ export function createUploadManagementRepository(
       return {
         operationId: row._id,
         attemptGeneration: row.attemptGeneration!,
-        filename: row.filename,
+        filename: row.filename!,
         mediaType: row.mediaType,
         bytes: row.actualBytes!,
         original: row.original,

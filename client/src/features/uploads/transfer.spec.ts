@@ -37,6 +37,32 @@ describe('managed selection lifecycle', () => {
     reserve.mockReset();
     send.mockReset();
   });
+  it('reserves technical metadata without sending the selected name', async () => {
+    const id = '00000000-0000-4000-8000-000000000001';
+    const selectedFile = file(id);
+    selectedFile.filename = 'privater-testname-2026.txt';
+    selectedFile.file = new File(['text'], selectedFile.filename);
+    reserve.mockResolvedValue({ id: 'op', state: 'waiting' });
+    send.mockResolvedValue({ id: 'op', state: 'queued_processing' });
+    const options = setup();
+    await runManagedSelection([selectedFile], options);
+    expect(reserve).toHaveBeenCalledWith(
+      {
+        mediaType: 'text/plain',
+        declaredBytes: 4,
+        idempotencyKey: id,
+        scope: { kind: 'personal' },
+      },
+      expect.any(AbortSignal),
+    );
+    expect(send).toHaveBeenCalledWith(
+      'op',
+      selectedFile.file,
+      expect.any(AbortSignal),
+      expect.any(Function),
+    );
+    expect(options.onSuccess).toHaveBeenCalledWith(id);
+  });
   it('fences a reservation response after an account or composer change', async () => {
     let finish!: (value: unknown) => void;
     reserve.mockImplementation(

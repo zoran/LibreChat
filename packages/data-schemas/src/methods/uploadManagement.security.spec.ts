@@ -1,10 +1,17 @@
 /** Real Mongo evidence for private approval, original identity and policy changes across clients. */
 import mongoose from 'mongoose';
+import { createHash } from 'crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import type { UploadLease, UploadPrincipal, UploadSecurityApproval } from 'librechat-data-provider';
 import type { StoredUpload } from './uploadManagementStore';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createModels } from '~/models';
+
+/** Deterministic UUIDv4-shaped test keys keep operation labels out of the public key contract. */
+const fixtureKey = (label: string): string => {
+  const hex = createHash('sha256').update(label).digest('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+};
 
 describe('durable upload security approval', () => {
   let mongo: MongoMemoryReplSet;
@@ -113,11 +120,10 @@ describe('durable upload security approval', () => {
       user,
       {
         operationId: id,
-        idempotencyKey: id,
-        filename: 'note.txt',
+        idempotencyKey: fixtureKey(id),
         mediaType: 'text/plain',
         declaredBytes: 8,
-        fingerprint: JSON.stringify([{ kind: 'personal' }, 'note.txt', 'text/plain', 8]),
+        fingerprint: JSON.stringify([{ kind: 'personal' }, 'text/plain', 8]),
       },
       now,
     );
@@ -134,7 +140,7 @@ describe('durable upload security approval', () => {
   async function accepted() {
     const lease = await transfer();
     const proof = approval(lease);
-    await first.accept(user, lease, receipt(lease), proof, now);
+    await first.accept(user, lease, receipt(lease), proof, { filename: 'note.txt' }, now);
     await first.confirmCleanup(localGone(lease), now);
     return { lease, proof };
   }
@@ -188,6 +194,7 @@ describe('durable upload security approval', () => {
           lease,
           receipt(lease),
           change(approval(lease)) as UploadSecurityApproval,
+          { filename: 'note.txt' },
           now,
         ),
       ).rejects.toMatchObject({
@@ -210,7 +217,7 @@ describe('durable upload security approval', () => {
       const changed = createUploadManagementRepository(b, { securityPolicySha256 });
       await changed.initialize();
       await expect(
-        changed.accept(user, lease, receipt(lease), approval(lease), now),
+        changed.accept(user, lease, receipt(lease), approval(lease), { filename: 'note.txt' }, now),
       ).rejects.toMatchObject({ code: 'security_uninspectable' });
       expect(await b.models.File.countDocuments({})).toBe(0);
       expect(await first.usage(user, now)).toMatchObject({ usedBytes: 0, reservedBytes: 8 });
@@ -221,7 +228,7 @@ describe('durable upload security approval', () => {
     const lease = await transfer();
     const proof = approval(lease);
     const expected = JSON.parse(JSON.stringify(proof));
-    const pending = first.accept(user, lease, receipt(lease), proof, now);
+    const pending = first.accept(user, lease, receipt(lease), proof, { filename: 'note.txt' }, now);
     proof.subject.sha256 = 'd'.repeat(64);
     proof.coverage.pages = 99;
     await pending;
@@ -238,7 +245,7 @@ describe('durable upload security approval', () => {
         .lean(),
     ).toMatchObject({ securityApproval: expected });
     await expect(
-      second.accept(user, lease, receipt(lease), expected, now + 1),
+      second.accept(user, lease, receipt(lease), expected, { filename: 'note.txt' }, now + 1),
     ).resolves.toMatchObject({ state: 'queued_processing' });
     await expect(
       second.accept(
@@ -246,6 +253,7 @@ describe('durable upload security approval', () => {
         lease,
         receipt(lease),
         { ...expected, scannerVersion: 'new-proof' },
+        { filename: 'note.txt' },
         now + 1,
       ),
     ).rejects.toMatchObject({ code: 'idempotency_conflict' });
@@ -255,6 +263,7 @@ describe('durable upload security approval', () => {
         lease,
         receipt(lease),
         undefined as unknown as UploadSecurityApproval,
+        { filename: 'note.txt' },
         now + 1,
       ),
     ).rejects.toMatchObject({ code: 'security_uninspectable' });
@@ -312,7 +321,7 @@ describe('durable upload security approval', () => {
         code: 'security_uninspectable',
       });
       await expect(
-        changed.accept(user, original, receipt(original), proof, now),
+        changed.accept(user, original, receipt(original), proof, { filename: 'note.txt' }, now),
       ).rejects.toMatchObject({ code: 'security_uninspectable' });
       await changed.delete(user, original.operationId, now);
       await changed.confirmCleanup(

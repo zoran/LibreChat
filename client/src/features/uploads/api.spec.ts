@@ -68,6 +68,24 @@ describe('browser upload transport', () => {
     expect(BrowserTransfer.last.send).toHaveBeenCalledTimes(1);
     expect(jest.getTimerCount()).toBe(0);
   });
+  it('carries the original Unicode name only in bounded transient body metadata', async () => {
+    const filename = 'Prüfung – Quellen 2026.txt';
+    const operation = sendUploadBody(
+      'one',
+      new File(['text'], filename),
+      new AbortController().signal,
+      jest.fn(),
+    );
+    const xhr = BrowserTransfer.last;
+    expect(xhr.open).toHaveBeenCalledWith('PUT', '/api/uploads/operations/one/body');
+    expect(xhr.setRequestHeader).toHaveBeenCalledWith(
+      'X-Upload-Filename',
+      encodeURIComponent(filename),
+    );
+    xhr.onload?.();
+    await operation;
+    expect(jest.getTimerCount()).toBe(0);
+  });
 });
 
 describe('managed snapshot admission boundary', () => {
@@ -103,7 +121,11 @@ describe('managed snapshot admission boundary', () => {
     respond({ code: 'admission_paused' }, 503);
     await expect(
       reserveUpload(
-        { filename: 'a.txt', mediaType: 'text/plain', declaredBytes: 4, idempotencyKey: 'one' },
+        {
+          mediaType: 'text/plain',
+          declaredBytes: 4,
+          idempotencyKey: '00000000-0000-4000-8000-000000000001',
+        },
         new AbortController().signal,
       ),
     ).rejects.toMatchObject({ code: 'admission_paused', status: 503 });

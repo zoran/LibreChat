@@ -1,5 +1,6 @@
 /** Real replica-set evidence for the one durable upload store, through two independent clients. */
 import mongoose from 'mongoose';
+import { createHash } from 'crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import {
   UPLOAD_MAX_FILE_BYTES,
@@ -8,11 +9,18 @@ import {
   UPLOAD_RETENTION_MS,
 } from 'librechat-data-provider';
 import type { UploadPrincipal, UploadLease, UploadMigrationPage } from 'librechat-data-provider';
+import type { StoredUpload, GlobalState } from './uploadManagementStore';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createFileRetentionMethods } from './fileRetention';
 import { tenantStorage } from '~/config/tenantContext';
 import { RESOURCE_MAX } from './uploadManagementStore';
 import { createModels } from '~/models';
+
+/** Deterministic UUIDv4-shaped test keys keep operation labels out of the public key contract. */
+const fixtureKey = (label: string): string => {
+  const hex = createHash('sha256').update(label).digest('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+};
 
 describe('durable upload management', () => {
   let mongo: MongoMemoryReplSet;
@@ -34,11 +42,10 @@ describe('durable upload management', () => {
   const securityPolicySha256 = 'c'.repeat(64);
   const request = (id: string, bytes = 8) => ({
     operationId: id,
-    idempotencyKey: id,
-    filename: 'note.txt',
+    idempotencyKey: fixtureKey(id),
     mediaType: 'text/plain',
     declaredBytes: bytes,
-    fingerprint: JSON.stringify([{ kind: 'personal' }, 'note.txt', 'text/plain', bytes]),
+    fingerprint: JSON.stringify([{ kind: 'personal' }, 'text/plain', bytes]),
   });
   const receipt = (lease: UploadLease, bytes = 8) => ({
     outcome: 'durable' as const,
@@ -143,6 +150,7 @@ describe('durable upload management', () => {
       lease!,
       receipt(lease!, bytes),
       approval(lease!, bytes, at),
+      { filename: 'note.txt' },
       at,
     );
     await first.confirmCleanup(localGone(lease!), at);
@@ -158,10 +166,9 @@ describe('durable upload management', () => {
     await expect(second.get(user, row.id, now)).rejects.toMatchObject({ code: 'not_found' });
     const stored = await a.models.UploadOperation.findById(row.id).lean();
     expect(stored).toHaveProperty('tenantId', null);
-    await a.models.UploadOperation.collection.updateOne(
-      { _id: row.id },
-      { $unset: { tenantId: '' } },
-    );
+    await a.connection
+      .db!.collection<StoredUpload>(a.models.UploadOperation.collection.name)
+      .updateOne({ _id: row.id }, { $unset: { tenantId: '' } });
     await expect(second.get(guest, row.id, now)).rejects.toMatchObject({ code: 'not_found' });
   });
   async function processing(id: string, at = now) {
@@ -205,6 +212,208 @@ describe('durable upload management', () => {
     };
   }
 
+  it.each([
+    ['legacy filename', { filename: 'SECRET-before-approval.txt' }],
+    ['unknown metadata', { title: 'SECRET-before-approval' }],
+    ['free text key', { idempotencyKey: 'SECRET-before-approval.txt' }],
+    ['uppercase UUID', { idempotencyKey: fixtureKey('case').toUpperCase() }],
+    ['other UUID version', { idempotencyKey: '11111111-1111-5111-8111-111111111111' }],
+  ])('rejects %s before creating a durable reservation', async (_label, extra) => {
+    await expect(
+      first.reserve(user, { ...request('invalid-metadata'), ...extra }, now),
+    ).rejects.toMatchObject({ code: 'invalid_request' });
+    expect(await b.models.UploadOperation.countDocuments()).toBe(0);
+    expect(await second.usage(user, now)).toMatchObject({
+      usedBytes: 0,
+      reservedBytes: 0,
+      retainedBytes: 0,
+    });
+  });
+
+  it('rejects hidden filename and accessor request fields without evaluating them', async () => {
+    for (const input of [
+      Object.defineProperty(request('hidden-name'), 'filename', { value: 'SECRET' }),
+      Object.defineProperty(request('accessor-name'), 'mediaType', {
+        get: () => {
+          throw new Error('must not execute');
+        },
+      }),
+    ]) {
+      await expect(first.reserve(user, input, now)).rejects.toMatchObject({
+        code: 'invalid_request',
+      });
+    }
+    expect(await b.models.UploadOperation.countDocuments()).toBe(0);
+  });
+
+  it('keeps technical reservations nameless and snapshots caller scope before Mongo waits', async () => {
+    const input = { ...request('technical'), scope: { kind: 'personal' as const } };
+    const reservation = first.reserve(user, input, now);
+    Object.assign(input.scope, { filename: 'SECRET-mutated.txt' });
+    input.idempotencyKey = 'SECRET-mutated.txt';
+    const operation = await reservation;
+    expect(operation).not.toHaveProperty('filename');
+    expect((await second.list(user, now))[0]).not.toHaveProperty('filename');
+    const row = await b.models.UploadOperation.findById('technical').lean();
+    expect(row).not.toHaveProperty('filename');
+    expect(row).toMatchObject({
+      fingerprint: JSON.stringify([{ kind: 'personal' }, 'text/plain', 8]),
+      idempotencyKey: fixtureKey('technical'),
+      scope: { kind: 'personal' },
+    });
+    expect(JSON.stringify(row)).not.toContain('SECRET');
+  });
+
+  it('captures Unicode metadata atomically with File and rejects a renamed acceptance replay', async () => {
+    await first.reserve(user, request('unicode'), now);
+    const lease = (await first.claim({
+      kind: 'transfer',
+      principal: user,
+      operationId: 'unicode',
+      worker,
+      now,
+    }))!;
+    await completeScanner(lease, now);
+    const metadata = { filename: 'Öffentliche Übersicht 🧪.txt' };
+    const filename = metadata.filename;
+    const pending = first.accept(user, lease, receipt(lease), approval(lease), metadata, now);
+    metadata.filename = 'late-mutated.txt';
+    const operation = await pending;
+    expect(operation.filename).toBe(filename);
+    const row = await b.models.UploadOperation.findById('unicode').lean();
+    const file = await b.models.File.findOne({ file_id: 'unicode' })
+      .select('+securityApproval')
+      .lean();
+    expect(row).toMatchObject({
+      filename,
+      securityApproval: approval(lease),
+      state: 'queued_processing',
+    });
+    expect(file).toMatchObject({ filename, securityApproval: approval(lease) });
+    const quota = await second.usage(user, now);
+    expect(quota).toMatchObject({ usedBytes: 8, reservedBytes: 0, retainedBytes: 8 });
+    expect(
+      await second.accept(user, lease, receipt(lease), approval(lease), { filename }, now + 1),
+    ).toEqual(operation);
+    await expect(
+      second.accept(user, lease, receipt(lease), approval(lease), metadata, now + 1),
+    ).rejects.toMatchObject({ code: 'idempotency_conflict' });
+    expect(await first.usage(user, now)).toEqual(quota);
+    expect(await b.models.File.countDocuments({ file_id: 'unicode' })).toBe(1);
+    expect(
+      (await b.models.UploadOperation.findById('unicode').lean<StoredUpload>())?.filename,
+    ).toBe(filename);
+  });
+
+  it.each([
+    undefined,
+    {},
+    { filename: '' },
+    { filename: '../secret' },
+    { filename: 'x', extra: true },
+  ])('does not persist malformed accepted metadata %j', async (metadata) => {
+    await first.reserve(user, request('bad-accepted-metadata'), now);
+    const lease = (await first.claim({
+      kind: 'transfer',
+      principal: user,
+      operationId: 'bad-accepted-metadata',
+      worker,
+      now,
+    }))!;
+    await completeScanner(lease, now);
+    await expect(
+      first.accept(
+        user,
+        lease,
+        receipt(lease),
+        approval(lease),
+        metadata as { filename: string },
+        now,
+      ),
+    ).rejects.toMatchObject({ code: 'invalid_request' });
+    const row = await b.models.UploadOperation.findById(lease.operationId).lean();
+    expect(row).not.toHaveProperty('filename');
+    expect(row).not.toHaveProperty('acceptedAt');
+    expect(await b.models.File.countDocuments()).toBe(0);
+    expect(await second.usage(user, now)).toMatchObject({ usedBytes: 0, reservedBytes: 8 });
+  });
+
+  it('redacts legacy metadata once at frozen export while retaining accepted names and cleanup fences', async () => {
+    await accepted('accepted-legacy');
+    await first.reserve(other, request('pending-legacy'), now);
+    const lease = (await first.claim({
+      kind: 'transfer',
+      principal: other,
+      operationId: 'pending-legacy',
+      worker,
+      now,
+    }))!;
+    await completeScanner(lease, now);
+    await first.fail(lease, 'security_rejected', now);
+    await first.confirmCleanup(localGone(lease), now);
+    await first.reserve(user, request('waiting-legacy'), now);
+    for (const id of ['accepted-legacy', 'pending-legacy', 'waiting-legacy']) {
+      const filename = id === 'accepted-legacy' ? 'note.txt' : 'SECRET-unaccepted.txt';
+      await a.models.UploadOperation.updateOne(
+        { _id: id },
+        {
+          $set: {
+            filename,
+            idempotencyKey: `SECRET-legacy-key-${id}`,
+            fingerprint: JSON.stringify([{ kind: 'personal' }, filename, 'text/plain', 8]),
+          },
+        },
+      );
+    }
+    const before = await b.models.UploadOperation.findById('pending-legacy').lean<StoredUpload>();
+    const quota = await second.usage(other, now);
+    const page = await first.exportSnapshot({ epoch: 'metadata-move' });
+    expect(await second.exportSnapshot({ epoch: 'metadata-move' })).toEqual(page);
+    expect(JSON.stringify(page)).not.toContain('SECRET');
+    const source = await b.models.UploadOperation.find().lean<StoredUpload[]>();
+    expect(JSON.stringify(source)).not.toContain('SECRET');
+    for (const row of source) {
+      expect(row.idempotencyKey).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+      );
+      expect(row.fingerprint).toBe(JSON.stringify([{ kind: 'personal' }, 'text/plain', 8]));
+      if (row._id === 'accepted-legacy') expect(row.filename).toBe('note.txt');
+      else expect(row).not.toHaveProperty('filename');
+    }
+    const after = source.find((row) => row._id === 'pending-legacy')!;
+    for (const field of [
+      'generation',
+      'attemptGeneration',
+      'workerGeneration',
+      'worker',
+      'writerStopped',
+      'stagingHeld',
+      'cleanupPending',
+      'originalBytes',
+      'pendingBytes',
+      'securityExecution',
+      'securitySettlement',
+    ] as const) {
+      expect(after[field]).toEqual(before?.[field]);
+    }
+    expect(after.cleanupPending).toBe(true);
+    expect(after).not.toHaveProperty('securityApproval');
+    await target.importSnapshot(page);
+    expect(await replacement.models.UploadOperation.findById('pending-legacy').lean()).toEqual(
+      after,
+    );
+    expect(await second.usage(other, now)).toEqual(quota);
+    const tampered = JSON.parse(JSON.stringify(page)) as UploadMigrationPage;
+    const record = tampered.records.find(
+      (item) =>
+        item.type === 'operation' && (item.value as { _id: string })._id === 'waiting-legacy',
+    )!;
+    (record.value as { filename?: string }).filename = 'SECRET-returned.txt';
+    await expect(target.importSnapshot(tampered)).rejects.toMatchObject({
+      code: 'migration_conflict',
+    });
+  });
+
   it('defaults to disabled and never enables an existing authority through initialization', async () => {
     await expect(target.reserve(user, request('disabled'), now)).rejects.toMatchObject({
       code: 'unavailable',
@@ -231,7 +440,10 @@ describe('durable upload management', () => {
       historyCopiesAccounted: true as const,
     };
     await expect(
-      target.activateReconciled({ ...proof, historyCopiesAccounted: false } as typeof proof, now),
+      target.activateReconciled(
+        { ...proof, historyCopiesAccounted: false } as unknown as typeof proof,
+        now,
+      ),
     ).rejects.toMatchObject({ code: 'not_ready' });
     await target.claimController({ ownerId: 'intervening-writer', now });
     await expect(target.activateReconciled(proof, now)).rejects.toMatchObject({
@@ -546,7 +758,8 @@ describe('durable upload management', () => {
       const proof = await initialProof();
       await target.activateReconciled(proof, now);
       expect(
-        (await replacement.models.UploadCounter.findById('global').lean())!.value,
+        (await replacement.models.UploadCounter.findById('global').lean<{ value: GlobalState }>())!
+          .value,
       ).toMatchObject({ baseline, enabled: true, reconciled: true });
       expect(await replacement.models.Message.countDocuments()).toBe(4);
     });
@@ -567,7 +780,8 @@ describe('durable upload management', () => {
       });
       expect(await replacement.models.File.countDocuments()).toBe(1);
       expect(
-        (await replacement.models.UploadCounter.findById('global').lean())!.value,
+        (await replacement.models.UploadCounter.findById('global').lean<{ value: GlobalState }>())!
+          .value,
       ).toMatchObject({ baseline, enabled: false });
     });
 
@@ -761,8 +975,8 @@ describe('durable upload management', () => {
         aggregate.mockRestore();
       }
       expect(
-        (await replacement.models.UploadCounter.findById('global').lean())!.value
-          .reconciliationFence,
+        (await replacement.models.UploadCounter.findById('global').lean<{ value: GlobalState }>())!
+          .value.reconciliationFence,
       ).toBeUndefined();
     });
   });
@@ -875,17 +1089,15 @@ describe('durable upload management', () => {
   it('does not classify missing or malformed tenant snapshots as guest migrations', async () => {
     const guest = { tenantId: null, userId: user.userId, authentication: 'guest' } as const;
     await first.reserve(guest, request('malformed-guest'), now);
-    await a.models.UploadOperation.collection.updateOne(
-      { _id: 'malformed-guest' },
-      { $unset: { tenantId: '' } },
-    );
+    await a.connection
+      .db!.collection<StoredUpload>(a.models.UploadOperation.collection.name)
+      .updateOne({ _id: 'malformed-guest' }, { $unset: { tenantId: '' } });
     await expect(
       first.exportSnapshot({ epoch: 'missing-guest', limit: 100 }),
     ).rejects.toMatchObject({ code: 'migration_conflict' });
-    await a.models.UploadOperation.collection.updateOne(
-      { _id: 'malformed-guest' },
-      { $set: { tenantId: 42 } },
-    );
+    await a.connection
+      .db!.collection<{ _id: string; tenantId: unknown }>(a.models.UploadOperation.collection.name)
+      .updateOne({ _id: 'malformed-guest' }, { $set: { tenantId: 42 } });
     await expect(
       first.exportSnapshot({ epoch: 'invalid-guest', limit: 100 }),
     ).rejects.toMatchObject({ code: 'migration_conflict' });
@@ -1010,7 +1222,7 @@ describe('durable upload management', () => {
       Array.from({ length: 127 }, (_, i) => ({
         ...seed,
         _id: `held-${i}`,
-        idempotencyKey: `held-${i}`,
+        idempotencyKey: fixtureKey(`held-${i}`),
         state: 'failed',
         queueCharged: false,
         pendingBytes: 0,
@@ -1020,7 +1232,7 @@ describe('durable upload management', () => {
     await a.models.UploadOperation.create({
       ...seed,
       _id: 'overflow-held',
-      idempotencyKey: 'overflow-held',
+      idempotencyKey: fixtureKey('overflow-held'),
       state: 'failed',
       queueCharged: false,
       pendingBytes: 0,
@@ -1102,7 +1314,16 @@ describe('durable upload management', () => {
   it('replays durable accept and publish without a second debit, and waits for local cleanup', async () => {
     const { lease } = await accepted('replay');
     expect(
-      (await second.accept(user, lease, receipt(lease), approval(lease), now + 1)).acceptedAt,
+      (
+        await second.accept(
+          user,
+          lease,
+          receipt(lease),
+          approval(lease),
+          { filename: 'note.txt' },
+          now + 1,
+        )
+      ).acceptedAt,
     ).toBe(new Date(now).toISOString());
     const parser = await processing('replay');
     const result = { text: 'document', writerStopped: true as const };
@@ -1149,7 +1370,14 @@ describe('durable upload management', () => {
       now,
     }))!;
     await completeScanner(transfer, now);
-    await second.accept(user, transfer, receipt(transfer), approval(transfer), now);
+    await second.accept(
+      user,
+      transfer,
+      receipt(transfer),
+      approval(transfer),
+      { filename: 'note.txt' },
+      now,
+    );
     expect(await first.cleanupForFile(other, 'cleanup-proof')).toBeNull();
     expect(
       await first.cleanupForFile({ ...user, tenantId: 'tenant-b' }, 'cleanup-proof'),
@@ -1247,7 +1475,11 @@ describe('durable upload management', () => {
       });
     }
     await expect(
-      first.reserve({ ...user, authentication: 'guest' }, request('guest'), now),
+      first.reserve(
+        { ...user, authentication: 'guest' } as unknown as UploadPrincipal,
+        request('guest'),
+        now,
+      ),
     ).rejects.toMatchObject({ code: 'unauthorized' });
     await expect(
       first.reserve(

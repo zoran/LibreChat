@@ -101,8 +101,57 @@ export function isUploadPrincipal(value: unknown): value is UploadPrincipal {
   );
 }
 export type UploadScope = { kind: 'personal' } | { kind: 'workspace'; workspaceId: string };
+/** Filename enters durable application state only with the accepted original and security proof. */
+export type UploadAcceptedMetadata = { filename: string };
+
+/** Exact own-data snapshot; no accessors, path interpretation, trimming or Unicode rewriting. */
+export function readUploadAcceptedMetadata(value: unknown): UploadAcceptedMetadata | null {
+  try {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return null;
+    const keys = Reflect.ownKeys(value);
+    if (keys.length !== 1 || keys[0] !== 'filename') return null;
+    const descriptor = Object.getOwnPropertyDescriptor(value, 'filename');
+    if (!descriptor?.enumerable || !('value' in descriptor)) return null;
+    const filename: unknown = descriptor.value;
+    if (
+      typeof filename !== 'string' ||
+      filename.length < 1 ||
+      filename.length > 255 ||
+      filename === '.' ||
+      filename === '..' ||
+      filename.includes('/') ||
+      filename.includes('\\') ||
+      Array.from(filename).some(
+        (character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127,
+      )
+    )
+      return null;
+    return { filename };
+  } catch {
+    return null;
+  }
+}
+
+/** Canonical encodeURIComponent wire form; raw names never belong in a URL or reservation. */
+export function readUploadFilenameHeader(value: unknown): UploadAcceptedMetadata | null {
+  try {
+    if (
+      typeof value !== 'string' ||
+      value.length > 3072 ||
+      Array.from(value).some((character) => character.charCodeAt(0) > 127)
+    )
+      return null;
+    const filename = decodeURIComponent(value);
+    if (encodeURIComponent(filename) !== value) return null;
+    return readUploadAcceptedMetadata({ filename });
+  } catch {
+    return null;
+  }
+}
+
 export type UploadRequest = {
-  filename: string;
   mediaType: string;
   declaredBytes: number;
   idempotencyKey: string;
@@ -147,7 +196,7 @@ export type UploadOperation = {
   id: string;
   revision: number;
   scope: UploadScope;
-  filename: string;
+  filename?: string;
   mediaType: string;
   declaredBytes: number;
   actualBytes?: number;

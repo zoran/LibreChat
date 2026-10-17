@@ -86,7 +86,11 @@ describe('raw upload body admission and streaming', () => {
     if (ordinaryRoot) await rm(ordinaryRoot, { recursive: true, force: true });
   });
 
-  const headers = { 'content-type': 'application/octet-stream', 'content-length': '5' };
+  const headers = {
+    'content-type': 'application/octet-stream',
+    'content-length': '5',
+    'x-upload-filename': 'display.txt',
+  };
   test.each([
     { 'content-type': 'application/json' },
     { 'content-encoding': 'gzip' },
@@ -149,7 +153,6 @@ describe('raw upload body admission and streaming', () => {
       get: jest.fn(async () => {
         if (options.authorized === false) throw new Error('private authorization detail');
         return {
-          filename: 'display.txt',
           mediaType: 'text/plain',
           declaredBytes: options.declared ?? 5,
         };
@@ -194,7 +197,7 @@ describe('raw upload body admission and streaming', () => {
     const security = {
       policySha256,
       prepare: jest.fn(async () => ({ ...execution })),
-      cancel: jest.fn(async () => ({
+      cancel: jest.fn(async (_input: Parameters<UploadSecurityPort['cancel']>[0]) => ({
         execution: { ...execution },
         writerStopped: false,
         transientDataRemoved: false,
@@ -247,6 +250,8 @@ describe('raw upload body admission and streaming', () => {
   }
   it('commits the scanner binding before bytes and settlement before ordinary storage', async () => {
     const test = fixture();
+    const filename = ' Unverändert 📄.txt ';
+    test.req.headers['x-upload-filename'] = encodeURIComponent(filename);
     const done = test.run();
     test.req.end('hello');
     await done;
@@ -264,7 +269,40 @@ describe('raw upload body admission and streaming', () => {
       test.storage.put.mock.invocationCallOrder[0],
     );
     expect(test.claimBytes).toHaveBeenCalledTimes(3);
+    expect(test.storage.put).toHaveBeenCalledWith(expect.objectContaining({ filename }));
+    expect(test.management.accept).toHaveBeenCalledWith(
+      principal,
+      'operation',
+      lease,
+      expect.objectContaining({ outcome: 'durable' }),
+      expect.objectContaining({ decision: 'approved' }),
+      { filename },
+    );
+    expect(test.security.inspect.mock.calls[0][0].subject).not.toHaveProperty('filename');
   });
+  it.each(['missing', 'malformed', 'noncanonical', 'duplicates', 'unsafe'])(
+    'rejects a %s filename header before claim, staging or scanner access',
+    async (kind) => {
+      const test = fixture();
+      if (kind === 'missing') Reflect.deleteProperty(test.req.headers, 'x-upload-filename');
+      if (kind === 'malformed') test.req.headers['x-upload-filename'] = '%C3';
+      if (kind === 'noncanonical') test.req.headers['x-upload-filename'] = '%64isplay.txt';
+      if (kind === 'unsafe')
+        test.req.headers['x-upload-filename'] = encodeURIComponent('../secret.txt');
+      if (kind === 'duplicates')
+        Object.assign(test.req, {
+          rawHeaders: ['X-Upload-Filename', 'display.txt', 'x-upload-filename', 'display.txt'],
+        });
+      const done = test.run();
+      test.req.end('hello');
+      await done;
+      expect(test.response.value).toEqual({ code: 'invalid_request' });
+      expect(test.management.get).not.toHaveBeenCalled();
+      expect(test.management.claimTransfer).not.toHaveBeenCalled();
+      expect(test.security.prepare).not.toHaveBeenCalled();
+      await expectNoOrdinaryStorage(test);
+    },
+  );
   it.each(['binding', 'settlement'])(
     'does not publish when the scanner %s commit fails',
     async (step) => {
@@ -661,6 +699,7 @@ describe('raw upload body admission and streaming', () => {
       lease,
       expect.objectContaining({ outcome: 'durable' }),
       approval(test.security.inspect.mock.calls[0][0].subject),
+      { filename: 'display.txt' },
     );
     expect(await readFile(test.ordinaryPath, 'utf8')).toBe('hello');
   });
@@ -825,6 +864,7 @@ describe('raw upload body admission and streaming', () => {
       lease,
       expect.objectContaining({ outcome: 'durable' }),
       approval(inspected.subject),
+      { filename: 'display.txt' },
     );
     expect(test.completeBytes).toHaveBeenCalledTimes(3);
     expect(test.management.confirmCleanup).toHaveBeenCalledWith(
@@ -889,6 +929,7 @@ describe('raw upload body admission and streaming', () => {
           decision: 'approved',
           subject: expect.objectContaining({ sha256: integrity.sha256 }),
         }),
+        { filename: 'display.txt' },
       );
       expect(await readdir(root)).toEqual([]);
     }
@@ -975,6 +1016,7 @@ describe('raw upload body admission and streaming', () => {
       expect.objectContaining({
         subject: expect.objectContaining({ tenantId: null, userId: 'guest' }),
       }),
+      { filename: 'display.txt' },
     );
     expect(test.storage.put).toHaveBeenCalledWith(expect.objectContaining({ lease: guestLease }));
     expect(await readdir(root)).toEqual([]);

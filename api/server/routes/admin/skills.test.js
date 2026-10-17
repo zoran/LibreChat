@@ -35,6 +35,7 @@ jest.mock('@librechat/data-schemas', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  getAuthMode: jest.requireActual('../../../../packages/api/src/auth/authMode').getAuthMode,
   createAdminSkillsSyncAccess: jest.fn(() => mockSyncAccess),
   createAdminSkillsSyncHandlers: jest.fn(() => mockHandlers),
 }));
@@ -64,18 +65,48 @@ jest.mock('~/server/services/Skills/sync', () => ({
 }));
 
 describe('admin skills sync routes', () => {
+  const originalAuthMode = process.env.AUTH_MODE;
+
   beforeEach(() => {
+    process.env.AUTH_MODE = 'default';
+    jest.resetModules();
     jest.clearAllMocks();
   });
 
+  afterEach(() => {
+    if (originalAuthMode === undefined) delete process.env.AUTH_MODE;
+    else process.env.AUTH_MODE = originalAuthMode;
+  });
+
   function createApp() {
-    delete require.cache[require.resolve('./skills')];
     const router = require('./skills');
     const app = express();
     app.use(express.json());
     app.use('/api/admin/skills', router);
     return app;
   }
+
+  // The real shared policy must reject before any mocked intake handler can run.
+  it.each(['email_code', 'transition'])('blocks admin sync intake in %s mode', async (mode) => {
+    process.env.AUTH_MODE = mode;
+    const app = createApp();
+    const response = await request(app).post('/api/admin/skills/sync/run').expect(403);
+
+    expect(response.body).toEqual({ code: 'managed_upload_required' });
+    expect(response.headers['cache-control']).toBe('no-store');
+    expect(mockHandlers.runSync).not.toHaveBeenCalled();
+    expect(mockGetGitHubSkillSyncRunnerForRequest).not.toHaveBeenCalled();
+
+    const status = await request(app).get('/api/admin/skills/sync/status').expect(403);
+    expect(status.body).toEqual({ code: 'managed_upload_required' });
+    expect(mockHandlers.getSyncStatus).not.toHaveBeenCalled();
+    expect(mockGetGitHubSkillSyncRunnerForRequest).not.toHaveBeenCalled();
+
+    await request(app).put('/api/admin/skills/sync/credentials/default').send({}).expect(200);
+    await request(app).delete('/api/admin/skills/sync/credentials/default').expect(200);
+    expect(mockHandlers.setCredential).toHaveBeenCalled();
+    expect(mockHandlers.deleteCredential).toHaveBeenCalled();
+  });
 
   it('delegates skill sync access policy to the API package', async () => {
     const app = createApp();

@@ -5,9 +5,83 @@ import {
   isUploadOriginalIntegrity,
   isUploadStorageReceipt,
   isUploadPrincipal,
+  readUploadAcceptedMetadata,
+  readUploadFilenameHeader,
 } from './upload-management';
 
 const hash = 'a'.repeat(64);
+
+describe('accepted filename metadata boundary', () => {
+  it('preserves exact Unicode spelling and returns an independent accepted snapshot', () => {
+    const value = { filename: ' Äußerung 研究 📄.txt ' };
+    const snapshot = readUploadAcceptedMetadata(value);
+    expect(snapshot).toEqual(value);
+    value.filename = 'changed';
+    expect(snapshot).toEqual({ filename: ' Äußerung 研究 📄.txt ' });
+    expect(readUploadFilenameHeader(encodeURIComponent(snapshot!.filename))).toEqual(snapshot);
+  });
+  it.each([
+    '',
+    '.',
+    '..',
+    'a/b',
+    'a\\b',
+    'a\u0000b',
+    'a\u001fb',
+    'a\u007fb',
+    'a'.repeat(256),
+    '📄'.repeat(128),
+  ])('refuses unsafe or oversized accepted names %#', (filename) => {
+    expect(readUploadAcceptedMetadata({ filename })).toBeNull();
+    expect(readUploadFilenameHeader(encodeURIComponent(filename))).toBeNull();
+  });
+  it('uses the same 255 UTF-16-unit bound and does not trim or normalize names', () => {
+    for (const filename of ['a'.repeat(255), '📄'.repeat(127) + 'a', ' ', 'e\u0301.txt']) {
+      expect(readUploadAcceptedMetadata({ filename })).toEqual({ filename });
+      expect(readUploadFilenameHeader(encodeURIComponent(filename))).toEqual({ filename });
+    }
+  });
+  it.each([
+    undefined,
+    null,
+    [],
+    {},
+    { filename: 1 },
+    { filename: 'x', extra: true },
+    Object.create({ filename: 'x' }),
+  ])('rejects nonclosed records %#', (value) =>
+    expect(readUploadAcceptedMetadata(value)).toBeNull(),
+  );
+  it('never invokes metadata getters or accepts hidden/symbol fields', () => {
+    let read = false;
+    const accessor = Object.defineProperty({}, 'filename', {
+      enumerable: true,
+      get() {
+        read = true;
+        return 'secret';
+      },
+    });
+    expect(readUploadAcceptedMetadata(accessor)).toBeNull();
+    expect(read).toBe(false);
+    expect(
+      readUploadAcceptedMetadata(Object.defineProperty({}, 'filename', { value: 'x' })),
+    ).toBeNull();
+    expect(readUploadAcceptedMetadata({ filename: 'x', [Symbol('private')]: 'secret' })).toBeNull();
+  });
+  it.each([
+    undefined,
+    ['a'],
+    'ä.txt',
+    '%',
+    '%C3',
+    '%61.txt',
+    'a b',
+    '%c3%a4.txt',
+    'a'.repeat(3073),
+  ])('accepts only bounded canonical ASCII header encoding %#', (value) =>
+    expect(readUploadFilenameHeader(value)).toBeNull(),
+  );
+});
 const integrity = (bytes = 8) => ({
   version: 1,
   algorithm: 'sha256',

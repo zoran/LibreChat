@@ -10,12 +10,23 @@ const db = require('~/models');
 const { getAppConfig } = require('~/server/services/Config');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { getFileStrategy } = require('~/server/utils/getFileStrategy');
+const { isCortexFileMode } = require('~/server/middleware/requireManagedIntake');
 
 const SYSTEM_USER_ID = '000000000000000000000000';
 
 let appConfigRef;
 let runner;
 let scheduler;
+
+/** GitHub content has no managed intake owner; block before creating any sync work. */
+function assertSkillSyncAllowed() {
+  if (isCortexFileMode()) {
+    throw Object.assign(new Error('managed_upload_required'), {
+      code: 'managed_upload_required',
+      status: 403,
+    });
+  }
+}
 
 async function loadCurrentAppConfig() {
   try {
@@ -79,6 +90,7 @@ function createRunner({
   allowServerCredentials = true,
   onUnconfirmedWork,
 } = {}) {
+  assertSkillSyncAllowed();
   const resolveAppConfig = loadAppConfig ?? loadCurrentAppConfig;
   const resolveConfig = getConfig ?? (() => getSyncConfig(resolveAppConfig));
   const createdRunner = createGitHubSkillSyncRunner({
@@ -168,7 +180,10 @@ function createRunner({
   });
   return {
     getStatus: createdRunner.getStatus,
-    runOnce: createdRunner.runOnce,
+    runOnce: async () => {
+      assertSkillSyncAllowed();
+      return createdRunner.runOnce();
+    },
   };
 }
 
@@ -178,10 +193,12 @@ const triggerOrchestrator = createSkillSyncTriggerOrchestrator({
 });
 
 function getGitHubSkillSyncRunnerForRequest(req) {
+  assertSkillSyncAllowed();
   return triggerOrchestrator.getRunnerForAdminRequest(withBaseSkillSyncConfig(req, appConfigRef));
 }
 
 async function maybeRunGitHubSkillSyncForRequest(req) {
+  if (isCortexFileMode()) return false;
   const baseConfig = await loadCurrentAppConfig();
   return triggerOrchestrator.maybeRunForRequest({
     ...withBaseSkillSyncConfig(req, baseConfig),
@@ -190,6 +207,7 @@ async function maybeRunGitHubSkillSyncForRequest(req) {
 }
 
 function initializeGitHubSkillSync(appConfig) {
+  if (isCortexFileMode()) return;
   appConfigRef = appConfig;
   runner ??= triggerOrchestrator.createRunner({
     getConfig: getSyncConfig,
@@ -204,6 +222,7 @@ function initializeGitHubSkillSync(appConfig) {
 }
 
 function getGitHubSkillSyncRunner() {
+  assertSkillSyncAllowed();
   if (!runner) {
     runner = triggerOrchestrator.createRunner({
       getConfig: getSyncConfig,

@@ -26,6 +26,10 @@ const {
   getRoleByName,
 } = require('~/models');
 const { requireJwtAuth, canAccessSkillResource } = require('~/server/middleware');
+const {
+  requireManagedIntake,
+  isCortexFileMode,
+} = require('~/server/middleware/requireManagedIntake');
 const { grantPermission } = require('~/server/services/PermissionService');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { createFileLimiters } = require('~/server/middleware/limiters/uploadLimiters');
@@ -160,6 +164,7 @@ const uploadFileHandler = createSkillUploadHandler({
 // Routes
 // ---------------------------------------------------------------------------
 async function maybeStartRequestSkillSync(req, _res, next) {
+  if (isCortexFileMode()) return next();
   try {
     await maybeRunGitHubSkillSyncForRequest(req);
   } catch (error) {
@@ -171,6 +176,7 @@ async function maybeStartRequestSkillSync(req, _res, next) {
 // Import: accepts .md / .zip / .skill via multipart
 router.post(
   '/import',
+  requireManagedIntake,
   checkSkillCreate,
   fileUploadIpLimiter,
   fileUploadUserLimiter,
@@ -180,7 +186,7 @@ router.post(
 );
 
 router.get('/', maybeStartRequestSkillSync, handlers.list);
-router.post('/', checkSkillCreate, handlers.create);
+router.post('/', requireManagedIntake, checkSkillCreate, handlers.create);
 
 router.get(
   '/:id',
@@ -190,6 +196,7 @@ router.get(
 
 router.patch(
   '/:id',
+  requireManagedIntake,
   checkSkillCreate,
   canAccessSkillResource({ requiredPermission: PermissionBits.EDIT }),
   handlers.patch,
@@ -211,6 +218,7 @@ router.get(
 // Legacy upload and revision-checked editing. Older servers have no POST wildcard route.
 router.post(
   ['/:id/files', '/:id/files/*relativePath'],
+  requireManagedIntake,
   canAccessSkillResource({ requiredPermission: PermissionBits.EDIT }),
   fileUploadIpLimiter,
   fileUploadUserLimiter,

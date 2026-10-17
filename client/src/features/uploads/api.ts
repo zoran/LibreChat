@@ -97,6 +97,7 @@ export function sendUploadBody(
     };
     xhr.open('PUT', `${uploadsUrl}/operations/${encodeURIComponent(id)}/body`);
     xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+    xhr.setRequestHeader('X-Upload-Filename', encodeURIComponent(file.name));
     const token = getTokenHeader();
     if (token) xhr.setRequestHeader('Authorization', token);
     xhr.timeout = 135_000;

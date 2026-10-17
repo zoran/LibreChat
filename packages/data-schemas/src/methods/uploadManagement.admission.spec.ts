@@ -12,6 +12,12 @@ import type { GlobalState } from './uploadManagementStore';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createModels } from '~/models';
 
+/** Deterministic UUIDv4-shaped test keys keep operation labels out of the public key contract. */
+const fixtureKey = (label: string): string => {
+  const hex = createHash('sha256').update(label).digest('hex');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-8${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+};
+
 describe('durable upload admission pause', () => {
   let mongo: MongoMemoryReplSet;
   const a = new mongoose.Mongoose();
@@ -32,11 +38,10 @@ describe('durable upload admission pause', () => {
   const worker = { hostId: 'host-a', instanceId: 'app-a' };
   const request = (id: string, bytes = 8) => ({
     operationId: id,
-    idempotencyKey: id,
-    filename: 'note.txt',
+    idempotencyKey: fixtureKey(id),
     mediaType: 'text/plain',
     declaredBytes: bytes,
-    fingerprint: JSON.stringify([{ kind: 'personal' }, 'note.txt', 'text/plain', bytes]),
+    fingerprint: JSON.stringify([{ kind: 'personal' }, 'text/plain', bytes]),
   });
   const receipt = (lease: UploadLease) => ({
     outcome: 'durable' as const,
@@ -421,7 +426,14 @@ describe('durable upload admission pause', () => {
     expect(grant?.bytes).toBe(8);
     await second.completeWorkBytes({ lease: transfer, generation: grant!.generation, now });
     await completeScanner(transfer, now);
-    await first.accept(user, transfer, receipt(transfer), approval(transfer, now), now);
+    await first.accept(
+      user,
+      transfer,
+      receipt(transfer),
+      approval(transfer, now),
+      { filename: 'note.txt' },
+      now,
+    );
     await second.confirmCleanup(localGone(transfer), now);
     const prior = (await first.claim({ kind: 'processing', worker, now }))!;
     await first.bindProcessingExecution(

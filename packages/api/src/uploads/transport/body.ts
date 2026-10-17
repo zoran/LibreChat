@@ -6,6 +6,7 @@ import { mkdir, open, rm } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   isUploadPrincipal,
+  readUploadFilenameHeader,
   readUploadSecurityInspection,
   readUploadSecurityExecution,
   matchesUploadSecurityApproval,
@@ -264,6 +265,12 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
       if (typeof id !== 'string' || req.body !== undefined || req.readableEnded) {
         throw new UploadManagementError('invalid_request');
       }
+      const metadata = readUploadFilenameHeader(req.headers['x-upload-filename']);
+      const filenameHeaders = req.rawHeaders?.filter(
+        (name, index) => index % 2 === 0 && name.toLowerCase() === 'x-upload-filename',
+      ).length;
+      if (!metadata || (filenameHeaders !== undefined && filenameHeaders > 1))
+        throw new UploadManagementError('invalid_request');
       const operation = await deps.management.get(principal, id);
       validateRawUploadHeaders(req.headers, operation.declaredBytes);
       signal.throwIfAborted();
@@ -460,7 +467,7 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
       try {
         receipt = await deps.storage.put({
           lease,
-          filename: operation.filename,
+          filename: metadata.filename,
           mediaType: operation.mediaType,
           bytes,
           integrity,
@@ -479,7 +486,14 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
       await heartbeat;
       signal.throwIfAborted();
       await verifyPrincipal();
-      const result = await deps.management.accept(principal, id, lease, receipt, securityApproval);
+      const result = await deps.management.accept(
+        principal,
+        id,
+        lease,
+        receipt,
+        securityApproval,
+        metadata,
+      );
       accepted = true;
       outcome = 'success';
       observe({ kind: 'accepted', bytes: receipt.bytes });

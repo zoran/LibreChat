@@ -81,6 +81,7 @@ const {
 } = require('~/models');
 const initializeOAuthReconnectManager = require('./services/initializeOAuthReconnectManager');
 const { capabilityContextMiddleware } = require('./middleware/roles/capabilities');
+const { createManagedIntakeIngress } = require('./middleware/requireManagedIntake');
 const createValidateImageRequest = require('./middleware/validateImageRequest');
 const { initializeGitHubSkillSync, skillSyncMaintenance } = require('./services/Skills/sync');
 const {
@@ -453,6 +454,7 @@ const startServer = async () => {
     (error, _req, res, next) =>
       error ? res.status(400).json({ code: 'EMAIL_CODE_INVALID_REQUEST' }) : next(),
   );
+  app.use(createManagedIntakeIngress());
   app.use(excludeRumBodyParser(express.json({ limit: '3mb' })));
   app.use(excludeRumBodyParser(express.urlencoded({ extended: true, limit: '3mb' })));
   app.use(handleJsonParseError);

@@ -1,4 +1,5 @@
 /** Private frozen snapshot, validated import and single-owner cutover for the upload repository. */
+import { randomUUID } from 'crypto';
 import {
   UPLOAD_MAX_FILE_BYTES,
   UPLOAD_MAX_TEXT_BYTES,
@@ -6,6 +7,7 @@ import {
   UPLOAD_RETENTION_MS,
   isUploadOriginalIntegrity,
   isUploadStorageReceipt,
+  readUploadAcceptedMetadata,
 } from 'librechat-data-provider';
 import type {
   UploadMigrationPage,
@@ -65,6 +67,9 @@ export function createUploadMigrationMethods(
     return !/[\x00-\x1f]/.test(value);
   };
   const pageKey = (cursor: string | null): string => (cursor == null ? 'first' : `after-${cursor}`);
+  const currentKey = (value: unknown): value is string =>
+    typeof value === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
   function validateTotals(value: ResourceTotals): void {
     if (
       !value ||
@@ -87,13 +92,14 @@ export function createUploadMigrationMethods(
       ) ||
       !text(row.userId, 128) ||
       row.scope?.kind !== 'personal' ||
-      !text(row.idempotencyKey, 128) ||
-      !text(row.filename, 255) ||
+      !currentKey(row.idempotencyKey) ||
+      (row.acceptedAt == null
+        ? row.filename !== undefined
+        : !readUploadAcceptedMetadata({ filename: row.filename })) ||
       !text(row.mediaType, 128) ||
       !integer(row.declaredBytes, UPLOAD_MAX_FILE_BYTES) ||
       row.declaredBytes === 0 ||
-      row.fingerprint !==
-        JSON.stringify([row.scope, row.filename, row.mediaType, row.declaredBytes]) ||
+      row.fingerprint !== JSON.stringify([row.scope, row.mediaType, row.declaredBytes]) ||
       !integer(row.createdAt, 8.64e15 - UPLOAD_RETENTION_MS) ||
       !integer(row.generation) ||
       !integer(row.revision) ||
@@ -185,6 +191,29 @@ export function createUploadMigrationMethods(
     validateUploadMigrationSecurity(row, securityPolicySha256, Date.now());
     return row;
   }
+  async function prepareExportRow(row: StoredUpload, session: ClientSession): Promise<void> {
+    const fingerprint = JSON.stringify([row.scope, row.mediaType, row.declaredBytes]);
+    const legacyFingerprint = JSON.stringify([
+      row.scope,
+      row.filename,
+      row.mediaType,
+      row.declaredBytes,
+    ]);
+    if (
+      !text(row.idempotencyKey, 128) ||
+      (row.fingerprint !== fingerprint &&
+        (!text(row.filename, 255) || row.fingerprint !== legacyFingerprint))
+    )
+      reject('migration_conflict');
+    const previous = uploadDigest(row);
+    // This owner is frozen. Persist redaction and a fresh opaque legacy key atomically with
+    // the page, so replay never resurrects names or derives a secret-bearing key/hash.
+    row.fingerprint = fingerprint;
+    if (row.acceptedAt == null) delete row.filename;
+    if (!currentKey(row.idempotencyKey)) row.idempotencyKey = randomUUID();
+    validateRow(row);
+    if (uploadDigest(row) !== previous) await store.save(row, session);
+  }
   async function exactTotals(global: GlobalState, session: ClientSession): Promise<void> {
     const sum = await store.totals(session);
     if (
@@ -263,7 +292,7 @@ export function createUploadMigrationMethods(
           .session(session)
           .lean<StoredUpload[]>();
         const selected = rows.slice(0, limit);
-        selected.forEach(validateRow);
+        for (const row of selected) await prepareExportRow(row, session);
         const principalIds = [
           ...new Set(selected.map((row) => JSON.stringify([row.tenantId, row.userId]))),
         ];

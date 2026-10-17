@@ -14,6 +14,7 @@ jest.mock('~/server/services/Config', () => ({
 jest.mock('@librechat/api', () => {
   const actualApi = jest.requireActual('../../../../packages/api/src/skills/sync/orchestrator');
   return {
+    getAuthMode: jest.requireActual('../../../../packages/api/src/auth/authMode').getAuthMode,
     createSkillSyncTriggerOrchestrator: actualApi.createSkillSyncTriggerOrchestrator,
     createGitHubSkillSyncRunner: jest.fn((deps) => {
       mockRunnerDeps = deps;
@@ -93,7 +94,10 @@ jest.mock('~/server/services/Files/strategies', () => ({
 jest.mock('~/server/utils/getFileStrategy', () => ({ getFileStrategy: mockGetFileStrategy }));
 
 describe('GitHub skill sync service', () => {
+  const originalAuthMode = process.env.AUTH_MODE;
+
   beforeEach(() => {
+    process.env.AUTH_MODE = 'default';
     jest.resetModules();
     jest.clearAllMocks();
     mockGetAppConfig.mockReset();
@@ -104,6 +108,45 @@ describe('GitHub skill sync service', () => {
     mockRunnerDeps = undefined;
     mockRunnerStatus = undefined;
     mockCreatedRunners.length = 0;
+  });
+
+  afterEach(() => {
+    if (originalAuthMode === undefined) delete process.env.AUTH_MODE;
+    else process.env.AUTH_MODE = originalAuthMode;
+  });
+
+  // Exercise the shared policy; runner/scheduler factories are the observed work sinks.
+  it.each(['email_code', 'transition'])('closes every sync entry in %s mode', async (mode) => {
+    process.env.AUTH_MODE = mode;
+    const service = require('./sync');
+    const api = require('@librechat/api');
+    const config = { skillSync: { github: { enabled: true, runOnStartup: true, sources: [] } } };
+
+    expect(service.initializeGitHubSkillSync(config)).toBeUndefined();
+    await expect(service.maybeRunGitHubSkillSyncForRequest({ config })).resolves.toBe(false);
+    for (const getRunner of [
+      () => service.getGitHubSkillSyncRunner(),
+      () => service.getGitHubSkillSyncRunnerForRequest({ config }),
+      () => service.skillSyncMaintenance.createRunner({}),
+    ]) {
+      expect(getRunner).toThrow(expect.objectContaining({ code: 'managed_upload_required' }));
+    }
+    expect(api.createGitHubSkillSyncRunner).not.toHaveBeenCalled();
+    expect(api.startGitHubSkillSyncScheduler).not.toHaveBeenCalled();
+    expect(mockGetAppConfig).not.toHaveBeenCalled();
+    expect(mockGetStrategyFunctions).not.toHaveBeenCalled();
+    expect(mockGetFileStrategy).not.toHaveBeenCalled();
+  });
+
+  it('does not run a previously obtained runner after Cortex admission closes', async () => {
+    const service = require('./sync');
+    const runner = service.getGitHubSkillSyncRunner();
+    process.env.AUTH_MODE = 'email_code';
+    expect(() => service.getGitHubSkillSyncRunner()).toThrow(
+      expect.objectContaining({ code: 'managed_upload_required' }),
+    );
+    await expect(runner.runOnce()).rejects.toMatchObject({ code: 'managed_upload_required' });
+    expect(mockCreatedRunners[0].runner.runOnce).not.toHaveBeenCalled();
   });
 
   it('resolves sync config from fresh base app config for runner operations', async () => {
@@ -582,14 +625,13 @@ describe('GitHub skill sync service', () => {
     ).rejects.toThrow('Role skill_viewer not found');
     expect(mockGrantPermission).not.toHaveBeenCalled();
   });
-});
-
-it('reuses the scheduled owner and exposes its shared maintenance facade', () => {
-  const service = require('./sync');
-  const first = service.initializeGitHubSkillSync({});
-  const second = service.initializeGitHubSkillSync({});
-  expect(first.scheduler).toBe(second.scheduler);
-  expect(first.runner).toBe(second.runner);
-  expect(typeof service.skillSyncMaintenance.getMaintenanceCensus).toBe('function');
-  service.stopGitHubSkillSyncScheduler();
+  it('reuses the scheduled owner and exposes its shared maintenance facade', () => {
+    const service = require('./sync');
+    const first = service.initializeGitHubSkillSync({});
+    const second = service.initializeGitHubSkillSync({});
+    expect(first.scheduler).toBe(second.scheduler);
+    expect(first.runner).toBe(second.runner);
+    expect(typeof service.skillSyncMaintenance.getMaintenanceCensus).toBe('function');
+    service.stopGitHubSkillSyncScheduler();
+  });
 });

@@ -1,5 +1,9 @@
 import { json, Router } from 'express';
-import { UPLOAD_ERROR_CODES, isUploadPrincipal } from 'librechat-data-provider';
+import {
+  UPLOAD_ERROR_CODES,
+  isUploadPrincipal,
+  readUploadAcceptedMetadata,
+} from 'librechat-data-provider';
 import type {
   ManagedUploadSnapshot,
   ManagedUploadView,
@@ -73,12 +77,13 @@ function operationId(request: Request): string {
 }
 function publicOperation(row: UploadOperation): UploadOperation {
   if (row.scope.kind !== 'personal') throw new UploadManagementError('forbidden');
+  const metadata = row.acceptedAt ? readUploadAcceptedMetadata({ filename: row.filename }) : null;
   return {
     version: 1,
     id: row.id,
     revision: row.revision,
     scope: { kind: 'personal' },
-    filename: row.filename,
+    ...(metadata ?? {}),
     mediaType: row.mediaType,
     declaredBytes: row.declaredBytes,
     actualBytes: row.actualBytes,
@@ -252,12 +257,15 @@ export function createUploadHttpRouter(options: UploadHttpOptions): Router {
     metadata,
     wrap(async (request, response) => {
       const body: unknown = request.body;
-      exact(body, ['filename', 'mediaType', 'declaredBytes', 'idempotencyKey', 'scope']);
+      exact(body, ['mediaType', 'declaredBytes', 'idempotencyKey', 'scope']);
       if (
-        typeof body.filename !== 'string' ||
         typeof body.mediaType !== 'string' ||
         typeof body.declaredBytes !== 'number' ||
-        typeof body.idempotencyKey !== 'string'
+        typeof body.idempotencyKey !== 'string' ||
+        body.idempotencyKey.length !== 36 ||
+        !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+          body.idempotencyKey,
+        )
       )
         invalid();
       if (body.scope !== undefined) {
@@ -265,7 +273,6 @@ export function createUploadHttpRouter(options: UploadHttpOptions): Router {
         if (body.scope.kind !== 'personal') throw new UploadManagementError('forbidden');
       }
       const input: UploadRequest = {
-        filename: body.filename,
         mediaType: body.mediaType,
         declaredBytes: body.declaredBytes,
         idempotencyKey: body.idempotencyKey,

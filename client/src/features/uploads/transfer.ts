@@ -51,7 +51,6 @@ export async function runManagedSelection(files: ExtendedFile[], options: Select
         update('waiting');
         operation = await reserveUpload(
           {
-            filename: file.filename!,
             mediaType: file.type!,
             declaredBytes: file.size,
             idempotencyKey: file.file_id,

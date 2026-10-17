@@ -127,6 +127,22 @@ describe('managed upload admission UI', () => {
       });
     });
 
+  it('shows a neutral label for a resumed reservation without a local or accepted name', () => {
+    mockLocale = 'de';
+    const waiting = {
+      ...operation,
+      filename: undefined,
+      acceptedAt: undefined,
+      expiresAt: undefined,
+      state: 'waiting' as const,
+      canRetryProcessing: false,
+    };
+    read.mockResolvedValue({ ...snapshot, operations: [waiting] });
+    view({ ...file, filename: undefined, managedUpload: { phase: 'waiting', operation: waiting } });
+    expect(screen.getByText('Datei')).toBeVisible();
+    expect(screen.queryByText('retained.txt')).toBeNull();
+  });
+
   it.each(['en', 'de'])(
     'shows the %s classification warning before selection outside closed details',
     (locale) => {

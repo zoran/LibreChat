@@ -328,6 +328,23 @@ der bestehende Upload-Owner speichert den passenden Abschluss vor gewöhnlichem 
 Verbindungsfehlern kann derselbe Cleanup-Owner über die gespeicherte Execution erneut abbrechen und
 den Abschluss prüfen. Lokale Kopien, Scanner und S3-Schreiber benötigen jeweils eigene Nachweise.
 
+Die Reservierung nimmt keinen Dateinamen an. Ihr Fingerprint enthält nur technische Angaben;
+Idempotenzschlüssel sind kanonische UUIDv4-Werte. Der Browser übermittelt den Namen erst mit dem
+Raw-Transfer im begrenzten `x-upload-filename`-Header (`encodeURIComponent`). Der vorhandene
+`accept`-Schritt speichert ihn nach Sicherheitsfreigabe atomar mit dem File; ein Replay kann ihn
+nicht nachträglich ändern. Der eingefrorene Migrationsexport entfernt alte unangenommene Namen
+und Namens-Fingerprints, ersetzt alte freie Idempotenzschlüssel einmalig und erhält Quoten,
+Originale und Bereinigungsverpflichtungen. Die aktuelle Client-/Serverversion wird gemeinsam
+übernommen; alte Reservierungsanfragen mit Namen werden abgewiesen.
+
+Im Cortex-Modus sperrt `createManagedIntakeIngress()` die bisherigen Gesprächs-/Skillimporte und
+Skill-Dateischreibwege bereits vor den allgemeinen Bodyparsern. Route-lokale Prüfungen erhalten
+diese Grenze bei einzeln eingebundenen Routern. Skilllisten, Start und Zeitplan starten im
+Cortex-Modus keine GitHub-Imports; auch direkte Sync-Aufrufe und die Admin-Sync-Endpunkte sind
+gesperrt. Die übrige Credential-Verwaltung bleibt verfügbar. Der generische
+LibreChat-Default-Modus behält sein Verhalten. MCP-/Tool-Ausgaben und weitere
+Inhaltsverbraucher benötigen zusätzlich ihre vollständige Prüfung vor einer Aktivierung.
+
 Der eigenständige Einstieg ist `packages/api/dist/uploads/security/security-entry.cjs`. Er benötigt
 `POD_UID`, `UPLOAD_SECURITY_POLICY_FILE`, `UPLOAD_SECURITY_POLICY_SHA256` und die absoluten
 Zertifikatspfade `UPLOAD_SECURITY_TLS_CA_FILE`, `UPLOAD_SECURITY_TLS_CERT_FILE`,

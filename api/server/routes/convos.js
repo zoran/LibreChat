@@ -56,6 +56,7 @@ const {
 const { forkConversation, duplicateConversation } = require('~/server/utils/import/fork');
 const { createStorage, importFileFilter } = require('~/server/routes/files/multer');
 const requireJwtAuth = require('~/server/middleware/requireJwtAuth');
+const { requireManagedIntake } = require('~/server/middleware/requireManagedIntake');
 const { importConversations } = require('~/server/utils/import');
 const { getAppConfig } = require('~/server/services/Config');
 const subagentThreadTaskStore = require('~/server/services/Endpoints/agents/subagentThreadStore');
@@ -767,6 +768,7 @@ function handleUpload(req, res, next) {
  */
 router.post(
   '/import',
+  requireManagedIntake,
   importIpLimiter,
   importUserLimiter,
   configMiddleware,

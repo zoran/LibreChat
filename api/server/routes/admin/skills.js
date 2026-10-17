@@ -7,6 +7,7 @@ const { upsertSkillSyncCredential, deleteSkillSyncCredential } = require('~/mode
 const { getGitHubSkillSyncRunnerForRequest } = require('~/server/services/Skills/sync');
 const { getAppConfig } = require('~/server/services/Config');
 const configMiddleware = require('~/server/middleware/config/app');
+const { requireManagedIntake } = require('~/server/middleware/requireManagedIntake');
 
 const router = express.Router();
 const requireAdminAccess = requireCapability(SystemCapabilities.ACCESS_ADMIN);
@@ -31,11 +32,17 @@ router.use(
 
 router.get(
   '/sync/status',
+  requireManagedIntake,
   syncAccess.requireReadSkills,
   syncAccess.attachCredentialReadAccess,
   handlers.getSyncStatus,
 );
-router.post('/sync/run', syncAccess.requireSyncRunCapability, handlers.runSync);
+router.post(
+  '/sync/run',
+  requireManagedIntake,
+  syncAccess.requireSyncRunCapability,
+  handlers.runSync,
+);
 router.put(
   '/sync/credentials/:credentialKey',
   syncAccess.requirePlatformManageSkills,

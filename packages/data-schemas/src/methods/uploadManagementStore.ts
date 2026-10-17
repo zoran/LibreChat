@@ -86,7 +86,7 @@ export type StoredUpload = {
   scope: UploadScope;
   idempotencyKey: string;
   fingerprint: string;
-  filename: string;
+  filename?: string;
   mediaType: string;
   declaredBytes: number;
   actualBytes?: number;
@@ -251,7 +251,7 @@ export function project(row: StoredUpload, now: number): UploadOperation {
     id: row._id,
     revision: row.revision,
     scope: row.scope,
-    filename: row.filename,
+    ...(row.acceptedAt == null || row.filename === undefined ? {} : { filename: row.filename }),
     mediaType: row.mediaType,
     declaredBytes: row.declaredBytes,
     actualBytes: row.actualBytes,
