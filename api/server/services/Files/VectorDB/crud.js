@@ -3,19 +3,17 @@ const axios = require('axios');
 const FormData = require('form-data');
 const { logger } = require('@librechat/data-schemas');
 const { FileSources } = require('librechat-data-provider');
-const { logAxiosError, generateShortLivedToken } = require('@librechat/api');
+const { logAxiosError, getSafeErrorMetadata, generateShortLivedToken } = require('@librechat/api');
 
 /**
- * Deletes a file from the vector database. This function takes a file object, constructs the full path, and
- * verifies the path's validity before deleting the file. If the path is invalid, an error is thrown.
+ * Deletes a file's vectors. An explicit 404 confirms they are already absent;
+ * every other rejected request leaves deletion unconfirmed for the File owner.
  *
  * @param {ServerRequest} req - The request object from Express.
- * @param {MongoFile} file - The file object to be deleted. It should have a `filepath` property that is
- *                           a string representing the path of the file relative to the publicPath.
+ * @param {MongoFile} file - The file ID and native embedded flag.
  *
- * @returns {Promise<void>}
- *          A promise that resolves when the file has been successfully deleted, or throws an error if the
- *          file path is invalid or if there is an error in deletion.
+ * @returns {Promise<import('axios').AxiosResponse | void>} The successful response,
+ *          or nothing for explicit absence and the existing no-vector/no-endpoint skips.
  */
 const deleteVectors = async (req, file) => {
   if (!file.embedded || !process.env.RAG_API_URL) {
@@ -33,18 +31,13 @@ const deleteVectors = async (req, file) => {
       data: [file.file_id],
     });
   } catch (error) {
-    logAxiosError({
-      error,
-      message: 'Error deleting vectors',
-    });
-    if (
-      error.response &&
-      error.response.status !== 404 &&
-      (error.response.status < 200 || error.response.status >= 300)
-    ) {
-      logger.warn('Error deleting vectors, file will not be deleted');
-      throw new Error(error.message || 'An error occurred during file deletion.');
+    if (error?.response?.status === 404) {
+      return;
     }
+    logger.warn('Error deleting vectors, file will not be deleted', getSafeErrorMetadata(error));
+    // The File owner logs this error and recognizes missing storage from its message.
+    // Provider text must neither disclose request data nor impersonate confirmed absence.
+    throw new Error('An error occurred during file deletion.');
   }
 };
 

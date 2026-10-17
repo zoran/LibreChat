@@ -24,6 +24,7 @@ export { createModels } from './models';
 export {
   createMethods,
   createCheckpointSourceMethods,
+  snapshotCheckpointSourceBinding,
   resizeRetainedDerivatives,
   createGenerationAdmissionMethods,
   GenerationAdmissionStorageError,

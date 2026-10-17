@@ -285,7 +285,24 @@ const processDeleteRequest = async ({ req, files }) => {
       pendingManagedFiles.set(file.file_id, file);
     }
     const receipt = await GenerationJobManager.revokeFileSourceGenerations(owner, managedIds);
-    replayComplete = receipt?.complete === true && receipt.pending?.length === 0;
+    replayComplete =
+      receipt?.complete === true && Array.isArray(receipt.pending) && receipt.pending.length === 0;
+    if (replayComplete) {
+      try {
+        const purgeCheckpoints = require('@librechat/api').purgeFileSourceCheckpoints;
+        if (typeof purgeCheckpoints !== 'function') throw new Error('Checkpoint purge unavailable');
+        const purge = purgeCheckpoints(
+          owner,
+          managedIds,
+          appConfig?.endpoints?.agents?.checkpointer,
+        );
+        if (purge == null || typeof purge.then !== 'function' || (await purge) !== undefined)
+          throw new Error('Checkpoint purge unconfirmed');
+      } catch {
+        replayComplete = false;
+        logger.warn('Managed checkpoint cleanup remains unconfirmed after source revocation');
+      }
+    }
     await db.redactFileSourceContent(owner, managedIds);
     const pendingIds = new Set(pending.map((file) => file.file_id));
     alreadyCompleted = managedIds.filter((id) => !pendingIds.has(id));

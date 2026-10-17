@@ -181,6 +181,7 @@ jest.mock('@librechat/api', () => {
     })),
     isLeader: jest.fn().mockResolvedValue(true),
     GenerationJobManager: { revokeFileSourceGenerations: jest.fn() },
+    purgeFileSourceCheckpoints: jest.fn().mockResolvedValue(undefined),
   };
 });
 
@@ -3911,5 +3912,161 @@ describe('derived source deletion closure', () => {
     );
     expect(GenerationJobManager.revokeFileSourceGenerations).not.toHaveBeenCalled();
     expect(cleanup.removeFileOriginal).not.toHaveBeenCalled();
+  });
+});
+
+/** Backend composition doubles only; actual Mongo purge semantics belong to the package owner. */
+describe('checkpoint purge joins managed File deletion', () => {
+  const api = require('@librechat/api');
+  const { getUploadRuntime } = require('~/server/services/Uploads');
+  const purge = api.purgeFileSourceCheckpoints;
+  const owner = { userId: 'owner', tenantId: 'tenant' };
+  const checkpointer = { type: 'mongo', checkpointCollectionName: 'configured-checkpoints' };
+  const req = {
+    config: { endpoints: { agents: { checkpointer } } },
+    user: { id: owner.userId, tenantId: owner.tenantId },
+  };
+  const files = ['root', 'child', 'leaf'].map((file_id) => ({
+    file_id,
+    retentionAcceptedAt: new Date(0),
+    source: FileSources.local,
+    filepath: `/owned/${file_id}.txt`,
+  }));
+  let events;
+  beforeEach(() => {
+    jest.clearAllMocks();
+    api.purgeFileSourceCheckpoints = purge;
+    purge.mockReset().mockResolvedValue(undefined);
+    getUploadRuntime.mockReturnValue(undefined);
+    events = [];
+    db.revokeFileSources.mockResolvedValue({ revokedFileIds: ['root', 'child', 'leaf'] });
+    db.getFileSourceDeletionCandidates.mockResolvedValue(files);
+    api.GenerationJobManager.revokeFileSourceGenerations.mockImplementation(async () => {
+      events.push('stop');
+      return { complete: true, pending: [] };
+    });
+    db.redactFileSourceContent.mockImplementation(async () => events.push('redact'));
+    getStrategyFunctions.mockReturnValue({
+      deleteFile: jest.fn(async () => events.push('physical')),
+    });
+    db.prepareFileSourceDeletion.mockImplementation(async (_owner, ids) => ({
+      preparedFileIds: ids,
+    }));
+    db.removeAgentResourceFilesFromAllAgents.mockResolvedValue();
+    db.finalizeFileSourceDeletion.mockImplementation(async (_owner, ids) => {
+      events.push('finalize');
+      return { completedFileIds: ids };
+    });
+  });
+  afterEach(() => {
+    api.purgeFileSourceCheckpoints = purge;
+  });
+
+  it('awaits checkpoint purge of the entire revoked closure after Stop and before finalization', async () => {
+    let release;
+    let entered;
+    const started = new Promise((resolve) => {
+      entered = resolve;
+    });
+    const completion = new Promise((resolve) => {
+      release = resolve;
+    });
+    purge.mockImplementationOnce(async () => {
+      events.push('purge-start');
+      entered();
+      await completion;
+      events.push('purge-end');
+    });
+    const deletion = processDeleteRequest({ req, files: [files[0]] });
+    await Promise.race([
+      started,
+      deletion.then(() => {
+        throw new Error('Purge was bypassed');
+      }),
+    ]);
+    expect(events).toEqual(['stop', 'purge-start']);
+    expect(db.prepareFileSourceDeletion).not.toHaveBeenCalled();
+    expect(db.finalizeFileSourceDeletion).not.toHaveBeenCalled();
+    expect(purge).toHaveBeenCalledWith(owner, ['root', 'child', 'leaf'], checkpointer);
+    release();
+    expect(await deletion).toEqual({
+      deletedFileIds: ['root', 'child', 'leaf'],
+      failedFileIds: [],
+    });
+    expect(events.indexOf('stop')).toBeLessThan(events.indexOf('purge-start'));
+    expect(events.indexOf('purge-end')).toBeLessThan(events.indexOf('finalize'));
+  });
+
+  it('keeps every managed File pending when checkpoint purge rejects while preserving physical cleanup', async () => {
+    purge.mockRejectedValueOnce(new Error('synthetic uncertain purge'));
+    const result = await processDeleteRequest({ req, files: [files[0]] });
+    expect(result).toEqual({ deletedFileIds: [], failedFileIds: ['root', 'child', 'leaf'] });
+    expect(db.prepareFileSourceDeletion).not.toHaveBeenCalled();
+    expect(db.finalizeFileSourceDeletion).not.toHaveBeenCalled();
+    expect(events.filter((event) => event === 'physical')).toHaveLength(3);
+  });
+
+  it.each([false, null, { complete: true }])(
+    'keeps an unexpected checkpoint purge result %p pending',
+    async (result) => {
+      purge.mockResolvedValueOnce(result);
+      expect(await processDeleteRequest({ req, files: [files[0]] })).toEqual({
+        deletedFileIds: [],
+        failedFileIds: ['root', 'child', 'leaf'],
+      });
+      expect(db.finalizeFileSourceDeletion).not.toHaveBeenCalled();
+    },
+  );
+
+  it('keeps managed deletion pending when the checkpoint purge port is missing', async () => {
+    api.purgeFileSourceCheckpoints = undefined;
+    expect(await processDeleteRequest({ req, files: [files[0]] })).toEqual({
+      deletedFileIds: [],
+      failedFileIds: ['root', 'child', 'leaf'],
+    });
+    expect(db.finalizeFileSourceDeletion).not.toHaveBeenCalled();
+  });
+
+  it('does not accept a synchronous undefined as a completed Promise-based checkpoint purge', async () => {
+    purge.mockReturnValueOnce(undefined);
+    expect(await processDeleteRequest({ req, files: [files[0]] })).toEqual({
+      deletedFileIds: [],
+      failedFileIds: ['root', 'child', 'leaf'],
+    });
+    expect(db.finalizeFileSourceDeletion).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    undefined,
+    { complete: false, pending: [] },
+    { complete: true, pending: [{}] },
+    { complete: true },
+    { complete: true, pending: { length: 0 } },
+  ])(
+    'skips checkpoint purge and finalization without confirmed Stop/Drain: %p',
+    async (receipt) => {
+      api.GenerationJobManager.revokeFileSourceGenerations.mockResolvedValueOnce(receipt);
+      expect(await processDeleteRequest({ req, files: [files[0]] })).toEqual({
+        deletedFileIds: [],
+        failedFileIds: ['root', 'child', 'leaf'],
+      });
+      expect(purge).not.toHaveBeenCalled();
+      expect(db.finalizeFileSourceDeletion).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not call checkpoint purge for ordinary files', async () => {
+    db.deleteFiles.mockResolvedValue({ deletedCount: 1 });
+    const ordinary = {
+      file_id: 'ordinary',
+      filepath: '/owned/ordinary.txt',
+      source: FileSources.local,
+    };
+    expect(await processDeleteRequest({ req, files: [ordinary] })).toEqual({
+      deletedFileIds: ['ordinary'],
+      failedFileIds: [],
+    });
+    expect(purge).not.toHaveBeenCalled();
+    expect(db.revokeFileSources).not.toHaveBeenCalled();
   });
 });

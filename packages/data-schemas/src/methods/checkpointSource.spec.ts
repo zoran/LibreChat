@@ -9,7 +9,8 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import { uploadDerivedExpiresAt } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
 import type { IMessage, IMongoFile } from '~/types';
-import { createCheckpointSourceMethods } from './checkpointSource';
+import { createCheckpointSourceMethods, snapshotCheckpointSourceBinding } from './checkpointSource';
+import { sourceSha256 } from './messageSource';
 import { createMessageMethods } from './message';
 import { createFileRetentionMethods, resizeRetainedDerivatives } from './fileRetention';
 import { createFileMethods } from './file';
@@ -622,19 +623,62 @@ describe('atomic checkpoint source witnesses', () => {
       });
       for (const value of [
         accessor,
+        Object.assign(Object.create({ inherited: true }), binding),
+        new Proxy(binding, {}),
         { ...binding, bindingSha256: 'f'.repeat(64) },
         {
           ...binding,
           owner: { ...binding.owner, userId: new mongoose.Types.ObjectId().toString() },
         },
         { ...binding, unexpected: 'x' },
+        { ...binding, unexpected: 'x'.repeat(32769) },
         { ...binding, files: [...binding.files, ...binding.files] },
+        { ...binding, files: Array.from({ length: 65 }, () => binding.files[0]) },
       ]) {
+        expect(() => snapshotCheckpointSourceBinding(owner, value)).toThrow();
         await expect(
           transaction((session) => checkpoint().fenceCheckpointSources(owner, value, session)),
         ).rejects.toThrow();
       }
       expect(reads).toBe(0);
+      expect(await revisions(row, id)).toEqual(before);
+    }));
+
+  it('snapshots an intact expired binding without time authorization and rejects its live fence before writes', async () =>
+    run(async () => {
+      const id = await source();
+      const row = await message([id]);
+      const { binding } = await capture(row);
+      const expired = '2000-01-01T00:00:00.000Z';
+      const payload = {
+        version: binding.version,
+        owner: binding.owner,
+        files: binding.files.map((file) => ({ ...file, expiresAt: expired })),
+        messages: binding.messages.map((message) => ({ ...message, expiresAt: expired })),
+        expiresAt: expired,
+      };
+      const value = { ...payload, bindingSha256: sourceSha256(payload) };
+      const now = jest.spyOn(Date, 'now').mockImplementation(() => {
+        throw new Error('Snapshot must not consult time');
+      });
+      let snapshot;
+      try {
+        snapshot = snapshotCheckpointSourceBinding(owner, value);
+      } finally {
+        now.mockRestore();
+      }
+      expect(snapshot).toEqual(value);
+      expect(Object.isFrozen(snapshot)).toBe(true);
+      expect(Object.isFrozen(snapshot.owner)).toBe(true);
+      expect(Object.isFrozen(snapshot.files[0])).toBe(true);
+      expect(Object.isFrozen(snapshot.messages[0].sourceFileIds)).toBe(true);
+      value.files[0].approvalSha256 = 'f'.repeat(64);
+      expect(snapshot.files[0].approvalSha256).toBe(binding.files[0].approvalSha256);
+      expect(Reflect.set(snapshot.files, '1', binding.files[0])).toBe(false);
+      const before = await revisions(row, id);
+      await expect(
+        transaction((session) => checkpoint().fenceCheckpointSources(owner, snapshot, session)),
+      ).rejects.toThrow();
       expect(await revisions(row, id)).toEqual(before);
     }));
 

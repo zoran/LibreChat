@@ -15,7 +15,11 @@ import type {
   CheckpointTuple,
   PendingWrite,
 } from '@langchain/langgraph-checkpoint';
-import type { IndexBuildOptions, GenerationAdmissionInput } from '@librechat/data-schemas';
+import type {
+  IndexBuildOptions,
+  GenerationAdmissionInput,
+  FileOwnerScope,
+} from '@librechat/data-schemas';
 import type { BaseMessage } from '@librechat/agents/langchain/messages';
 import type { TCheckpointerConfig } from 'librechat-data-provider';
 import type { RunnableConfig } from '@langchain/core/runnables';
@@ -42,6 +46,8 @@ import {
 } from './checkpoints/saver';
 import { checkpointOwnerNamespacePrefix } from '../stream/checkpoints';
 import { resolveCheckpointerConfig } from './checkpoints/config';
+import { checkpointStorageConfigs } from './checkpoints/storage';
+import { purgeCheckpointRows } from './checkpoints/source-retention';
 
 export {
   DurableMongoSaver,
@@ -769,8 +775,7 @@ export async function deleteAgentEventCheckpointReference(
       ? { lc_owner: { $exists: false } }
       : { $or: [{ lc_owner: owner }, { lc_owner: { $exists: false } }] }),
   };
-  await db.collection(resolved.checkpointWritesCollectionName).deleteMany(exact);
-  await db.collection(resolved.checkpointCollectionName).deleteOne(exact);
+  await purgeCheckpointRows(resolved, exact, { singleCheckpoint: true, pendingFirst: true });
   return true;
 }
 
@@ -798,8 +803,7 @@ export async function deleteAgentEventCheckpointReferences(
         },
       ],
     };
-    await db.collection(resolved.checkpointWritesCollectionName).deleteMany(exact);
-    await db.collection(resolved.checkpointCollectionName).deleteMany(exact);
+    await purgeCheckpointRows(resolved, exact, { pendingFirst: true });
   }
 }
 
@@ -1064,10 +1068,7 @@ export async function deleteAgentCheckpoint(
           : legacyCheckpointStorageFilter()),
         checkpoint_id: { $in: generation.checkpointIds },
       };
-      await Promise.all([
-        db.collection(resolved.checkpointCollectionName).deleteMany(filter),
-        db.collection(resolved.checkpointWritesCollectionName).deleteMany(filter),
-      ]);
+      await purgeCheckpointRows(resolved, filter);
       return;
     }
     if (Object.prototype.hasOwnProperty.call(options ?? {}, 'checkpointNamespace')) {
@@ -1092,20 +1093,14 @@ export async function deleteAgentCheckpoint(
         thread_id: threadId,
         checkpoint_ns: generationNamespaceFilter(checkpointNamespace),
       };
-      await Promise.all([
-        db.collection(resolved.checkpointCollectionName).deleteMany(filter),
-        db.collection(resolved.checkpointWritesCollectionName).deleteMany(filter),
-      ]);
+      await purgeCheckpointRows(resolved, filter);
       return;
     }
     const db = mongoose.connection.db;
     if (!db) return;
     const resolved = resolveCheckpointerConfig(cfg);
     const filter = { thread_id: threadId, ...legacyCheckpointStorageFilter() };
-    await Promise.all([
-      db.collection(resolved.checkpointCollectionName).deleteMany(filter),
-      db.collection(resolved.checkpointWritesCollectionName).deleteMany(filter),
-    ]);
+    await purgeCheckpointRows(resolved, filter);
   } catch (err) {
     logger.warn(`[checkpointer] Failed to delete checkpoints for thread ${threadId}:`, err);
     if (options?.throwOnError) {
@@ -1131,10 +1126,7 @@ export async function deleteOwnedActorCheckpointScope(
     checkpoint_ns: generationNamespaceFilter(`${owner}${checkpointNs}`),
     lc_owner: owner,
   };
-  await Promise.all([
-    db.collection(resolved.checkpointCollectionName).deleteMany(filter),
-    db.collection(resolved.checkpointWritesCollectionName).deleteMany(filter),
-  ]);
+  await purgeCheckpointRows(resolved, filter);
 }
 
 /** Delete durable rows by authenticated ownership, independently of job/receipt lifetimes. */
@@ -1168,8 +1160,38 @@ export async function deleteOwnedAgentCheckpoints(
         },
       }),
     };
-    await db.collection(resolved.checkpointCollectionName).deleteMany(filter);
-    await db.collection(resolved.checkpointWritesCollectionName).deleteMany(filter);
+    await purgeCheckpointRows(resolved, filter);
+  }
+}
+
+/** Revoke source copies only after the caller has stopped and drained their generation jobs. */
+export async function purgeFileSourceCheckpoints(
+  owner: FileOwnerScope,
+  fileIds: readonly string[],
+  cfg?: TCheckpointerConfig,
+): Promise<void> {
+  if (
+    !owner ||
+    !/^[a-fA-F0-9]{24}$/.test(owner.userId) ||
+    (owner.tenantId != null && (typeof owner.tenantId !== 'string' || !owner.tenantId.length)) ||
+    !Array.isArray(fileIds) ||
+    fileIds.length > 1024 ||
+    fileIds.some((id) => typeof id !== 'string' || !id.length || id.length > 256)
+  )
+    throw new Error('Checkpoint source cleanup requires a valid owner and file scope');
+  if (!fileIds.length) return;
+  const prefix = checkpointOwnerNamespacePrefix(owner.userId, owner.tenantId ?? undefined);
+  const stores = await checkpointStorageConfigs(owner.userId, owner.tenantId ?? undefined, cfg);
+  const filter = {
+    $or: [
+      { lc_owner: prefix },
+      { checkpoint_ns: { $regex: `^${prefix}` } },
+      { thread_id: { $regex: `^${prefix}` } },
+    ],
+  };
+  for (const storage of stores) {
+    if (storage.type === 'memory') continue;
+    await purgeCheckpointRows(storage, filter, { sourceFileIds: fileIds });
   }
 }
 

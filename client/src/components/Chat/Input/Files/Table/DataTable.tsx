@@ -35,7 +35,7 @@ import { useLocalize, TranslationKeys } from '~/hooks';
 import { cn } from '~/utils';
 import store from '~/store';
 
-interface DataTableProps<TData, TValue> {
+interface DataTableProps<TData extends Pick<TFile, 'file_id'>, TValue> {
   columns: ColumnDef<TData, TValue>[];
   data: TData[];
 }
@@ -57,7 +57,10 @@ type Style = {
   zIndex?: number;
 };
 
-export default function DataTable<TData, TValue>({ columns, data }: DataTableProps<TData, TValue>) {
+export default function DataTable<TData extends Pick<TFile, 'file_id'>, TValue>({
+  columns,
+  data,
+}: DataTableProps<TData, TValue>) {
   const localize = useLocalize();
   const [isDeleting, setIsDeleting] = useState(false);
   const setFiles = useSetRecoilState(store.filesByIndex(0));
@@ -73,6 +76,8 @@ export default function DataTable<TData, TValue>({ columns, data }: DataTablePro
   const table = useReactTable({
     data,
     columns,
+    // Server refreshes may reorder rows; selection must stay with the original File.
+    getRowId: (file) => file.file_id,
     defaultColumn: {
       minSize: 0,
       size: Number.MAX_SAFE_INTEGER,

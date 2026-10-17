@@ -1,6 +1,6 @@
 import { createCheckpointSourceMethods } from './checkpointSource';
 import type { CheckpointSourceMethods } from '~/types/checkpointSource';
-export { createCheckpointSourceMethods } from './checkpointSource';
+export { createCheckpointSourceMethods, snapshotCheckpointSourceBinding } from './checkpointSource';
 export { resizeRetainedDerivatives } from './fileRetention';
 export { FileSourceUnavailableError } from './fileRetention';
 export { MessageVersionConflictError } from './message';

@@ -116,15 +116,18 @@ function captureInput(value: CheckpointSourceInput): CheckpointSourceInput {
 function deadline(value: unknown): number {
   if (typeof value !== 'string' || value.length !== 24) throw new FileSourceUnavailableError();
   const date = new Date(value);
-  const time = liveSourceDeadline(date);
-  if (date.toISOString() !== value) throw new FileSourceUnavailableError();
+  const time = date.getTime();
+  if (!Number.isFinite(time) || date.toISOString() !== value)
+    throw new FileSourceUnavailableError();
   return time;
 }
 
-function bindingSnapshot(
-  owner: ReturnType<typeof ownerSnapshot>,
+/** Canonical immutable data only, including expired bindings for cleanup; never authorization. */
+export function snapshotCheckpointSourceBinding(
+  ownerValue: FileOwnerScope,
   value: CheckpointSourceBinding,
 ): CheckpointSourceBinding {
+  const owner = ownerSnapshot(ownerValue);
   const binding = record(encodeSourceValue(value, MAX_BINDING_BYTES).value, [
     'version',
     'owner',
@@ -198,7 +201,7 @@ function bindingSnapshot(
   const { bindingSha256, ...payload } = binding;
   if (sourceSha256(payload, MAX_BINDING_BYTES) !== bindingSha256)
     throw new FileSourceUnavailableError();
-  return binding as CheckpointSourceBinding;
+  return freeze(binding as CheckpointSourceBinding);
 }
 
 function freeze<T>(value: T): T {
@@ -306,15 +309,18 @@ export function createCheckpointSourceMethods(
         ),
       ).toISOString(),
     };
-    const binding = { ...payload, bindingSha256: sourceSha256(payload, MAX_BINDING_BYTES) };
-    bindingSnapshot(owner, binding);
+    const binding = snapshotCheckpointSourceBinding(owner, {
+      ...payload,
+      bindingSha256: sourceSha256(payload, MAX_BINDING_BYTES),
+    });
+    liveSourceDeadline(new Date(binding.expiresAt));
     for (const source of sources)
       await touchCompleteMessageSource(mongoose, owner, source, session);
     const context = await touchFileSources(mongoose, owner, [...ids], session);
     if (!context || context.sourceFileIds.length !== ids.size)
       throw new FileSourceUnavailableError();
-    deadline(binding.expiresAt);
-    return { binding: freeze(binding), messages: sources.map((source) => source.snapshot) };
+    liveSourceDeadline(new Date(binding.expiresAt));
+    return { binding, messages: sources.map((source) => source.snapshot) };
   }
 
   async function fenceCheckpointSources(
@@ -323,7 +329,8 @@ export function createCheckpointSourceMethods(
     session: ClientSession,
   ): Promise<void> {
     const owner = ownerSnapshot(ownerValue);
-    const binding = bindingSnapshot(owner, value);
+    const binding = snapshotCheckpointSourceBinding(owner, value);
+    liveSourceDeadline(new Date(binding.expiresAt));
     transaction(mongoose, session);
     await touchActiveUserPrincipal(mongoose, owner, session);
     const sources: CompleteMessageSource[] = [];
@@ -349,7 +356,7 @@ export function createCheckpointSourceMethods(
     const context = await touchFileSources(mongoose, owner, ids, session);
     if (!context || context.sourceFileIds.length !== ids.length)
       throw new FileSourceUnavailableError();
-    deadline(binding.expiresAt);
+    liveSourceDeadline(new Date(binding.expiresAt));
   }
   return { captureCheckpointSources, fenceCheckpointSources };
 }
