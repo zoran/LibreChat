@@ -1,12 +1,16 @@
 import React from 'react';
 import { RecoilRoot } from 'recoil';
-import { QueryKeys } from 'librechat-data-provider';
+import { FileSources, QueryKeys } from 'librechat-data-provider';
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { TFile, BatchFile } from 'librechat-data-provider';
 import type { ReactNode } from 'react';
 import { useUploadFileMutation, useDeleteFilesMutation } from '../mutations';
 import { useGetRecentFiles } from '../queries';
+import {
+  useProjectAvailableFilesInfiniteQuery,
+  useProjectFilesQuery,
+} from '../../Projects/queries';
 
 /**
  * The composer palette reads its "your files" section from
@@ -18,6 +22,11 @@ import { useGetRecentFiles } from '../queries';
 const mockGetFiles = jest.fn();
 const mockUploadFile = jest.fn();
 const mockDeleteFiles = jest.fn();
+const mockGetProjectFiles = jest.fn();
+const mockGetAvailableProjectFiles = jest.fn();
+let mockPrincipal: string | undefined = 'user:user-1';
+
+jest.mock('~/utils/session', () => ({ getSessionPrincipal: () => mockPrincipal }));
 
 jest.mock('librechat-data-provider', () => {
   const actual = jest.requireActual('librechat-data-provider');
@@ -28,8 +37,116 @@ jest.mock('librechat-data-provider', () => {
       getFiles: (...args: unknown[]) => mockGetFiles(...args),
       uploadFile: (...args: unknown[]) => mockUploadFile(...args),
       deleteFiles: (...args: unknown[]) => mockDeleteFiles(...args),
+      getProjectFiles: (...args: unknown[]) => mockGetProjectFiles(...args),
+      getAvailableProjectFiles: (...args: unknown[]) => mockGetAvailableProjectFiles(...args),
     },
   };
+});
+
+describe('project availability after original file deletion', () => {
+  const body = {
+    files: [
+      {
+        file_id: 'file-old',
+        filepath: '/files/old.pdf',
+        embedded: true,
+        source: FileSources.local,
+      },
+    ],
+  };
+  const ready = { file_id: 'file-old', filename: 'old.pdf', availability: 'ready' };
+  const retained = { file_id: 'file-kept', filename: 'kept.pdf', availability: 'ready' };
+  const observeProject = (queryClient: QueryClient) =>
+    renderHook(
+      () => ({
+        members: useProjectFilesQuery('project-1'),
+        available: useProjectAvailableFilesInfiniteQuery('project-1', { limit: 5 }),
+        remove: useDeleteFilesMutation({ silent: true }),
+      }),
+      { wrapper: wrapperFor(queryClient) },
+    );
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockPrincipal = 'user:user-1';
+    mockGetProjectFiles.mockResolvedValue([ready, retained]);
+    mockGetAvailableProjectFiles.mockResolvedValue({ files: [makeFile()], nextCursor: null });
+  });
+
+  it.each(['confirmed', 'partial', 'lost reply'])(
+    'refreshes mounted member and eligible-file queries after %s deletion without removing references',
+    async (outcome) => {
+      const queryClient = createClient();
+      const references = { _id: 'project-1', file_ids: ['file-old', 'file-kept'] };
+      queryClient.setQueryData([QueryKeys.project, 'project-1'], references);
+      const { result } = observeProject(queryClient);
+      await waitFor(() => expect(result.current.members.data).toEqual([ready, retained]));
+      await waitFor(() => expect(result.current.available.data?.pages[0].files).toHaveLength(1));
+      mockDeleteFiles.mockImplementationOnce(async () => {
+        mockGetProjectFiles.mockResolvedValue([
+          { file_id: 'file-old', availability: 'unavailable' },
+          retained,
+        ]);
+        mockGetAvailableProjectFiles.mockResolvedValue({ files: [], nextCursor: null });
+        if (outcome === 'lost reply') throw new Error('response lost after deletion');
+        return {
+          message: 'deleted',
+          deletedFileIds: ['file-old'],
+          failedFileIds: outcome === 'partial' ? ['file-kept'] : [],
+        };
+      });
+      const payload =
+        outcome === 'partial'
+          ? {
+              files: [
+                ...body.files,
+                { ...body.files[0], file_id: 'file-kept', filepath: '/files/kept.pdf' },
+              ],
+            }
+          : body;
+      await act(async () => {
+        const deletion = result.current.remove.mutateAsync(payload);
+        if (outcome === 'lost reply') await expect(deletion).rejects.toThrow('response lost');
+        else await deletion;
+      });
+      await waitFor(() =>
+        expect(result.current.members.data).toEqual([
+          { file_id: 'file-old', availability: 'unavailable' },
+          retained,
+        ]),
+      );
+      await waitFor(() => expect(result.current.available.data?.pages[0].files).toEqual([]));
+      expect(mockGetProjectFiles).toHaveBeenCalledTimes(2);
+      expect(mockGetAvailableProjectFiles).toHaveBeenCalledTimes(2);
+      expect(queryClient.getQueryData([QueryKeys.project, 'project-1'])).toEqual(references);
+    },
+  );
+
+  it.each(['principal change', 'session ending'])(
+    'does not refresh project queries for a late deletion after %s',
+    async (boundary) => {
+      const queryClient = createClient();
+      const { result } = observeProject(queryClient);
+      await waitFor(() => expect(result.current.members.data).toEqual([ready, retained]));
+      await waitFor(() => expect(result.current.available.data?.pages[0].files).toHaveLength(1));
+      let finish!: (value: { message: string }) => void;
+      mockDeleteFiles.mockImplementationOnce(() => new Promise((resolve) => (finish = resolve)));
+      let pending!: Promise<unknown>;
+      act(() => {
+        pending = result.current.remove.mutateAsync(body);
+      });
+      await waitFor(() => expect(mockDeleteFiles).toHaveBeenCalledTimes(1));
+      if (boundary === 'principal change') mockPrincipal = 'user:user-2';
+      else window.dispatchEvent(new Event('librechat:auth-session-ending'));
+      await act(async () => {
+        finish({ message: 'deleted' });
+        await pending;
+      });
+      expect(mockGetProjectFiles).toHaveBeenCalledTimes(1);
+      expect(mockGetAvailableProjectFiles).toHaveBeenCalledTimes(1);
+      expect(result.current.members.data).toEqual([ready, retained]);
+    },
+  );
 });
 
 jest.mock('@librechat/client', () => ({

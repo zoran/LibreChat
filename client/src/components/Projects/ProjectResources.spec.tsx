@@ -3,11 +3,13 @@ import { RecoilRoot } from 'recoil';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import type { TChatProjectFile, TFile, TFileUpload } from 'librechat-data-provider';
+import { FileSources, QueryKeys } from 'librechat-data-provider';
+import type { TChatProjectFile, FileLibraryItem, TFileUpload } from 'librechat-data-provider';
 import type * as ClientModule from '@librechat/client';
 import type * as ReactModule from 'react';
 import type { ReactNode } from 'react';
 import ProjectResources from './ProjectResources';
+import { useDeleteFilesMutation } from '~/data-provider/Files/mutations';
 
 const mockUploadMutateAsync = jest.fn();
 const mockCanUseFileSearch = jest.fn(() => true);
@@ -17,6 +19,40 @@ const mockRefetch = jest.fn();
 const mockShowToast = jest.fn();
 const mockPreview = jest.fn();
 const mockPreviewBlob = jest.fn().mockResolvedValue({ data: undefined });
+const mockGetProjectFiles = jest.fn();
+const mockDeleteFiles = jest.fn();
+let mockUseNativeProjectQuery = false;
+let mockLibraryProps: object;
+jest.mock('~/utils/session', () => ({ getSessionPrincipal: () => 'user:user-1' }));
+jest.mock('librechat-data-provider', () => {
+  const actual = jest.requireActual('librechat-data-provider');
+  return {
+    ...actual,
+    dataService: {
+      ...actual.dataService,
+      getProjectFiles: (...args: unknown[]) => mockGetProjectFiles(...args),
+      deleteFiles: (...args: unknown[]) => mockDeleteFiles(...args),
+    },
+  };
+});
+jest.mock('~/features/library', () => ({
+  FileLibrary: (props: { renderSelectionActions: (selection: object) => ReactNode }) => {
+    mockLibraryProps = props;
+    return props.renderSelectionActions({
+      files: [{ file_id: 'library-file' }],
+      disabled: false,
+      clearSelection: jest.fn(),
+    });
+  },
+}));
+jest.mock('./ProjectLibraryAction', () => ({
+  __esModule: true,
+  default: ({ projectId, files }: { projectId: string; files: FileLibraryItem[] }) => (
+    <div data-testid="membership-action">
+      {projectId}:{files.map((file) => file.file_id).join(',')}
+    </div>
+  ),
+}));
 
 let projectFilesState: TChatProjectFile[] = [];
 let mockProjectQueryState = {
@@ -25,16 +61,6 @@ let mockProjectQueryState = {
   isError: false,
   refetch: mockRefetch,
 };
-let mockAvailableFilesState = {
-  data: { pages: [{ files: [] as TFile[], nextCursor: null }] },
-  isLoading: false,
-  isFetchingNextPage: false,
-  hasNextPage: false,
-  fetchNextPage: jest.fn(),
-  isError: false,
-  refetch: mockRefetch,
-};
-
 jest.mock('@librechat/client', () => {
   const React = jest.requireActual<typeof ReactModule>('react');
   const actual = jest.requireActual<typeof ClientModule>('@librechat/client');
@@ -66,8 +92,12 @@ jest.mock('@librechat/client', () => {
 
 jest.mock('~/data-provider', () => ({
   ...jest.requireActual('~/data-provider'),
-  useProjectFilesQuery: () => mockProjectQueryState,
-  useProjectAvailableFilesInfiniteQuery: () => mockAvailableFilesState,
+  useProjectFilesQuery: (
+    ...args: Parameters<(typeof import('~/data-provider'))['useProjectFilesQuery']>
+  ) =>
+    mockUseNativeProjectQuery
+      ? jest.requireActual('~/data-provider').useProjectFilesQuery(...args)
+      : mockProjectQueryState,
   useUploadFileMutation: () => ({ mutateAsync: mockUploadMutateAsync, isLoading: false }),
   useAddProjectFileMutation: () => ({ mutateAsync: mockAddMutateAsync, isLoading: false }),
   useRemoveProjectFileMutation: () => ({ mutateAsync: mockRemoveMutateAsync, isLoading: false }),
@@ -161,6 +191,7 @@ function renderResources() {
 describe('ProjectResources', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockUseNativeProjectQuery = false;
     projectFilesState = [];
     mockProjectQueryState = {
       data: projectFilesState,
@@ -168,18 +199,72 @@ describe('ProjectResources', () => {
       isError: false,
       refetch: mockRefetch,
     };
-    mockAvailableFilesState = {
-      data: { pages: [{ files: [], nextCursor: null }] },
-      isLoading: false,
-      isFetchingNextPage: false,
-      hasNextPage: false,
-      fetchNextPage: jest.fn(),
-      isError: false,
-      refetch: mockRefetch,
-    };
     mockCanUseFileSearch.mockReturnValue(true);
     mockAddMutateAsync.mockResolvedValue({});
     mockRemoveMutateAsync.mockResolvedValue({});
+  });
+
+  it('refreshes a mounted ready reference into an unavailable placeholder after a lost original-delete reply', async () => {
+    mockUseNativeProjectQuery = true;
+    mockGetProjectFiles.mockResolvedValue([
+      { file_id: 'source-one', filename: 'reference.txt', availability: 'ready' },
+    ]);
+    mockDeleteFiles.mockImplementationOnce(async () => {
+      mockGetProjectFiles.mockResolvedValue([
+        { file_id: 'source-one', availability: 'unavailable' },
+      ]);
+      throw new Error('response lost after deletion');
+    });
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+      logger: { log: console.log, warn: console.warn, error: () => undefined },
+    });
+    const references = { ...project, file_ids: ['source-one'] };
+    queryClient.setQueryData([QueryKeys.project, project._id], references);
+    const deleteOriginalLabel = 'Delete original';
+    function DeleteOriginal() {
+      const remove = useDeleteFilesMutation({ silent: true });
+      return (
+        <button
+          onClick={() => {
+            void remove
+              .mutateAsync({
+                files: [
+                  {
+                    file_id: 'source-one',
+                    filepath: '/files/reference.txt',
+                    embedded: true,
+                    source: FileSources.local,
+                  },
+                ],
+              })
+              .catch(() => undefined);
+          }}
+        >
+          {deleteOriginalLabel}
+        </button>
+      );
+    }
+    render(
+      <QueryClientProvider client={queryClient}>
+        <RecoilRoot>
+          <ProjectResources project={project} />
+          <DeleteOriginal />
+        </RecoilRoot>
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByRole('button', { name: 'Preview reference.txt' })).toBeVisible();
+    expect(screen.getByText('Ready')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: 'Delete original' }));
+    expect(await screen.findByText('Unavailable')).toBeVisible();
+    expect(screen.queryByRole('button', { name: 'Preview reference.txt' })).not.toBeInTheDocument();
+    expect(screen.getAllByRole('listitem')).toHaveLength(1);
+    expect(mockGetProjectFiles).toHaveBeenCalledTimes(2);
+    expect(queryClient.getQueryData([QueryKeys.projectFiles, project._id])).toEqual([
+      { file_id: 'source-one', availability: 'unavailable' },
+    ]);
+    expect(queryClient.getQueryData([QueryKeys.project, project._id])).toEqual(references);
+    expect(mockRemoveMutateAsync).not.toHaveBeenCalled();
   });
 
   it('opens a ready source by exact ID without attaching/removing it and restores focus on Escape', async () => {
@@ -341,289 +426,30 @@ describe('ProjectResources', () => {
     });
   });
 
-  it('lists server-filtered files and preserves unit-bearing file sizes', async () => {
-    mockProjectQueryState = {
-      ...mockProjectQueryState,
-      data: [
-        { file_id: 'attached-id', filename: 'attached.txt', availability: 'ready' },
-        { file_id: 'gone-id', availability: 'unavailable' },
-      ],
-    };
-    mockAvailableFilesState = {
-      ...mockAvailableFilesState,
-      data: {
-        pages: [
-          {
-            files: [
-              { ...uploadedFile, file_id: 'ready-id', filename: 'ready.txt', bytes: 12800 },
-            ] as TFile[],
-            nextCursor: null,
-          },
-        ],
-      },
-    };
+  it('composes the selected library IDs with the fixed project and keeps unavailable members', async () => {
+    mockProjectQueryState.data = [{ file_id: 'gone-id', availability: 'unavailable' }];
     renderResources();
     expect(screen.getByText('Unavailable')).toBeInTheDocument();
     const user = userEvent.setup();
     await user.click(screen.getByRole('button', { name: 'Add files' }));
     await user.click(screen.getByRole('menuitem', { name: 'Choose an existing file' }));
-    expect(await screen.findByRole('button', { name: /ready.txt/ })).toHaveTextContent('12.5 KB');
-  });
-
-  it('separates an empty file history from a search that matches nothing', async () => {
-    renderResources();
-    const user = userEvent.setup();
-    await user.click(screen.getByRole('button', { name: 'Add files' }));
-    await user.click(screen.getByRole('menuitem', { name: 'Choose an existing file' }));
-    expect(await screen.findByText('No eligible indexed files')).toBeInTheDocument();
-
-    await user.type(screen.getByRole('searchbox', { name: 'Search files' }), 'invoice');
-    expect(await screen.findByText('No results match your search')).toBeInTheDocument();
-    expect(screen.queryByText('No eligible indexed files')).not.toBeInTheDocument();
-  });
-
-  it('reads an empty category view as a filtered result, not an empty library', async () => {
-    mockAvailableFilesState = {
-      ...mockAvailableFilesState,
-      data: {
-        pages: [{ files: [{ ...uploadedFile, file_id: 'doc-id' }] as TFile[], nextCursor: null }],
-      },
-    };
-    renderResources();
-    const user = userEvent.setup();
-    await user.click(screen.getByRole('button', { name: 'Add files' }));
-    await user.click(screen.getByRole('menuitem', { name: 'Choose an existing file' }));
-    await user.click(await screen.findByRole('radio', { name: 'com_ui_composer_files_images' }));
-
-    expect(await screen.findByText('No results match your search')).toBeInTheDocument();
-    expect(screen.queryByText('No eligible indexed files')).not.toBeInTheDocument();
-  });
-
-  it('retries the page that failed, keeping the files already loaded', async () => {
-    const firstPage = {
-      files: [{ ...uploadedFile, file_id: 'first-id', filename: 'first.txt' }] as TFile[],
-      nextCursor: null,
-    };
-    /* The next page fails: the query reports its error from then on. */
-    const fetchNextPage = jest.fn(async () => {
-      mockAvailableFilesState = { ...mockAvailableFilesState, isError: true };
-      return { isError: true };
-    });
-    mockAvailableFilesState = {
-      ...mockAvailableFilesState,
-      data: { pages: [firstPage] },
-      hasNextPage: true,
-      fetchNextPage,
-    };
-    renderResources();
-    const user = userEvent.setup();
-    await user.click(screen.getByRole('button', { name: 'Add files' }));
-    await user.click(screen.getByRole('menuitem', { name: 'Choose an existing file' }));
-    await user.click(await screen.findByRole('button', { name: 'Load more' }));
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('Could not load project files');
-    expect(screen.getByRole('button', { name: /first.txt/ })).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: 'Retry' }));
-    expect(fetchNextPage).toHaveBeenCalledTimes(2);
-    expect(mockRefetch).not.toHaveBeenCalled();
-  });
-
-  it('forgets a page failure once the query recovers', async () => {
-    const fetchNextPage = jest.fn(async () => {
-      mockAvailableFilesState = { ...mockAvailableFilesState, isError: true };
-      return { isError: true };
-    });
-    mockAvailableFilesState = {
-      ...mockAvailableFilesState,
-      data: {
-        pages: [
-          {
-            files: [{ ...uploadedFile, file_id: 'first-id', filename: 'first.txt' }] as TFile[],
-            nextCursor: null,
-          },
-        ],
-      },
-      hasNextPage: true,
-      fetchNextPage,
-    };
-    const view = renderResources();
-    const user = userEvent.setup();
-    await user.click(screen.getByRole('button', { name: 'Add files' }));
-    await user.click(screen.getByRole('menuitem', { name: 'Choose an existing file' }));
-    await user.click(await screen.findByRole('button', { name: 'Load more' }));
-    expect(await screen.findByRole('alert')).toBeInTheDocument();
-
-    /* The query recovers, then a refresh of the listed files fails. */
-    mockAvailableFilesState = { ...mockAvailableFilesState, isError: false };
-    view.rerender(<ProjectResources project={project} />);
-    await screen.findByRole('button', { name: 'Load more' });
-    mockAvailableFilesState = { ...mockAvailableFilesState, isError: true };
-    view.rerender(<ProjectResources project={project} />);
-
-    await user.click(await screen.findByRole('button', { name: 'Retry' }));
-    expect(mockRefetch).toHaveBeenCalled();
-    expect(fetchNextPage).toHaveBeenCalledTimes(1);
-  });
-
-  it('keeps the current search page failure when an earlier page request settles later', async () => {
-    const settles: Array<(result: { isError: boolean }) => void> = [];
-    const fetchNextPage = jest.fn(
-      () =>
-        new Promise<{ isError: boolean }>((resolve) => {
-          settles.push(resolve);
-        }),
+    expect(await screen.findByTestId('membership-action')).toHaveTextContent(
+      'project-1:library-file',
     );
-    mockAvailableFilesState = {
-      ...mockAvailableFilesState,
-      data: {
-        pages: [
-          {
-            files: [{ ...uploadedFile, file_id: 'first-id', filename: 'first.txt' }] as TFile[],
-            nextCursor: null,
-          },
-        ],
-      },
-      hasNextPage: true,
-      fetchNextPage,
-    };
-    const view = renderResources();
-    const user = userEvent.setup();
-    await user.click(screen.getByRole('button', { name: 'Add files' }));
-    await user.click(screen.getByRole('menuitem', { name: 'Choose an existing file' }));
-    await user.click(await screen.findByRole('button', { name: 'Load more' }));
-    await user.type(screen.getByRole('searchbox', { name: 'Search files' }), 'first');
-    await user.click(screen.getByRole('button', { name: 'Load more' }));
-    expect(fetchNextPage).toHaveBeenCalledTimes(2);
-
-    /* The current search's page fails, then the earlier search's request succeeds. */
-    mockAvailableFilesState = { ...mockAvailableFilesState, isError: true };
-    settles[1]({ isError: true });
-    await Promise.resolve();
-    settles[0]({ isError: false });
-    await Promise.resolve();
-    view.rerender(<ProjectResources project={project} />);
-
-    await user.click(await screen.findByRole('button', { name: 'Retry' }));
-    expect(fetchNextPage).toHaveBeenCalledTimes(3);
-    expect(mockRefetch).not.toHaveBeenCalled();
+    expect(mockLibraryProps).not.toHaveProperty('projectId');
+    expect(mockUploadMutateAsync).not.toHaveBeenCalled();
+    expect(mockRemoveMutateAsync).not.toHaveBeenCalled();
   });
 
-  it('keeps a search page failure after visiting another search', async () => {
-    const fetchNextPage = jest.fn(async () => {
-      mockAvailableFilesState = { ...mockAvailableFilesState, isError: true };
-      return { isError: true };
-    });
-    mockAvailableFilesState = {
-      ...mockAvailableFilesState,
-      data: {
-        pages: [
-          {
-            files: [{ ...uploadedFile, file_id: 'first-id', filename: 'first.txt' }] as TFile[],
-            nextCursor: null,
-          },
-        ],
-      },
-      hasNextPage: true,
-      fetchNextPage,
-    };
-    const view = renderResources();
-    const user = userEvent.setup();
-    await user.click(screen.getByRole('button', { name: 'Add files' }));
-    await user.click(screen.getByRole('menuitem', { name: 'Choose an existing file' }));
-    await user.click(await screen.findByRole('button', { name: 'Load more' }));
-    expect(await screen.findByRole('alert')).toBeInTheDocument();
-
-    /* Another search loads fine; coming back finds the first search's page still missing. */
-    const search = screen.getByRole('searchbox', { name: 'Search files' });
-    await user.type(search, 'other');
-    mockAvailableFilesState = { ...mockAvailableFilesState, isError: false };
-    view.rerender(<ProjectResources project={project} />);
-    /* Back on the first search, whose query still reports the failed page. */
-    mockAvailableFilesState = { ...mockAvailableFilesState, isError: true };
-    await user.clear(search);
-    view.rerender(<ProjectResources project={project} />);
-
-    await user.click(await screen.findByRole('button', { name: 'Retry' }));
-    expect(fetchNextPage).toHaveBeenCalledTimes(2);
-    expect(mockRefetch).not.toHaveBeenCalled();
-  });
-
-  it('refetches the listed files when a refresh of them fails', async () => {
-    const fetchNextPage = jest.fn();
-    mockAvailableFilesState = {
-      ...mockAvailableFilesState,
-      data: {
-        pages: [
-          {
-            files: [{ ...uploadedFile, file_id: 'first-id', filename: 'first.txt' }] as TFile[],
-            nextCursor: null,
-          },
-        ],
-      },
-      hasNextPage: true,
-      fetchNextPage,
-      isError: true,
-    };
-    renderResources();
-    const user = userEvent.setup();
-    await user.click(screen.getByRole('button', { name: 'Add files' }));
-    await user.click(screen.getByRole('menuitem', { name: 'Choose an existing file' }));
-
-    await user.click(await screen.findByRole('button', { name: 'Retry' }));
-    expect(mockRefetch).toHaveBeenCalled();
-    expect(fetchNextPage).not.toHaveBeenCalled();
-  });
-
-  it('names the file limit when attaching an existing file to a full project', async () => {
-    mockAddMutateAsync.mockRejectedValueOnce({
-      message: 'unsafe association detail',
-      response: { status: 409, data: { error: 'Project file limit reached' } },
-    });
-    mockAvailableFilesState = {
-      ...mockAvailableFilesState,
-      data: {
-        pages: [
-          {
-            files: [{ ...uploadedFile, file_id: 'ready-id', filename: 'ready.txt' }] as TFile[],
-            nextCursor: null,
-          },
-        ],
-      },
-    };
-    renderResources();
-    const user = userEvent.setup();
-    await user.click(screen.getByRole('button', { name: 'Add files' }));
-    await user.click(screen.getByRole('menuitem', { name: 'Choose an existing file' }));
-    await user.click(await screen.findByRole('button', { name: /ready.txt/ }));
-    await waitFor(() =>
-      expect(mockShowToast).toHaveBeenLastCalledWith(
-        expect.objectContaining({ message: 'This project can use up to 50 reference files.' }),
-      ),
-    );
-  });
-
-  it('keeps eligible existing files available when device upload is denied', async () => {
+  it('keeps the library picker available when device upload is denied', async () => {
     mockCanUseFileSearch.mockReturnValue(false);
-    mockAvailableFilesState = {
-      ...mockAvailableFilesState,
-      data: {
-        pages: [
-          {
-            files: [{ ...uploadedFile, file_id: 'ready-id', filename: 'ready.txt' }] as TFile[],
-            nextCursor: null,
-          },
-        ],
-      },
-    };
     renderResources();
     const user = userEvent.setup();
     await user.click(screen.getByRole('button', { name: 'Add files' }));
     expect(screen.queryByRole('menuitem', { name: 'Upload file' })).not.toBeInTheDocument();
     await user.click(screen.getByRole('menuitem', { name: 'Choose an existing file' }));
-    await user.click(await screen.findByRole('button', { name: /ready.txt/ }));
-    expect(mockAddMutateAsync).toHaveBeenCalledWith({
-      projectId: 'project-1',
-      file_id: 'ready-id',
-    });
+    expect(await screen.findByTestId('membership-action')).toHaveTextContent(
+      'project-1:library-file',
+    );
   });
 });

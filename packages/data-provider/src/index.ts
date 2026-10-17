@@ -50,6 +50,7 @@ export * from './types/assistants';
 export * from './types/content';
 export * from './types/tools';
 export * from './types/files';
+export * from './file-library';
 export * from './types/mcpServers';
 export * from './types/mutations';
 export * from './types/queries';

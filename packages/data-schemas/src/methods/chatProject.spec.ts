@@ -1,5 +1,5 @@
 import mongoose from 'mongoose';
-import { MongoMemoryServer } from 'mongodb-memory-server';
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import {
   FileContext,
   MAX_CHAT_PROJECT_FILES,
@@ -12,6 +12,7 @@ import {
   type ChatProjectMethods,
 } from './chatProject';
 import { tenantStorage } from '~/config/tenantContext';
+import { createFileMethods } from './file';
 import { createModels } from '~/models';
 
 jest.mock('~/config/winston', () => ({
@@ -21,7 +22,7 @@ jest.mock('~/config/winston', () => ({
   debug: jest.fn(),
 }));
 
-let mongoServer: InstanceType<typeof MongoMemoryServer>;
+let mongoServer: InstanceType<typeof MongoMemoryReplSet>;
 let ChatProject: mongoose.Model<IChatProject>;
 let Conversation: mongoose.Model<IConversation>;
 let File: mongoose.Model<IMongoFile>;
@@ -29,7 +30,7 @@ let methods: ChatProjectMethods;
 let modelsToCleanup: string[] = [];
 
 beforeAll(async () => {
-  mongoServer = await MongoMemoryServer.create();
+  mongoServer = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
   const mongoUri = mongoServer.getUri();
 
   const models = createModels(mongoose);
@@ -560,7 +561,10 @@ describe('persistent Project context', () => {
   const owner = new mongoose.Types.ObjectId().toString();
   const otherOwner = new mongoose.Types.ObjectId().toString();
 
-  async function createReference(fileId: string, overrides: Partial<IMongoFile> = {}) {
+  async function createReference(
+    fileId: string,
+    overrides: Omit<Partial<IMongoFile>, 'tenantId'> & { tenantId?: string | null } = {},
+  ) {
     return File.create({
       user: owner,
       file_id: fileId,
@@ -573,6 +577,243 @@ describe('persistent Project context', () => {
       ...overrides,
     });
   }
+
+  describe('current File eligibility', () => {
+    const policy = 'a'.repeat(64);
+    let previousPolicy: string | undefined;
+    let previousManagedOnly: string | undefined;
+
+    beforeEach(() => {
+      previousPolicy = process.env.UPLOAD_SECURITY_POLICY_SHA256;
+      previousManagedOnly = process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED;
+      process.env.UPLOAD_SECURITY_POLICY_SHA256 = policy;
+      delete process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED;
+    });
+    afterEach(() => {
+      if (previousPolicy === undefined) delete process.env.UPLOAD_SECURITY_POLICY_SHA256;
+      else process.env.UPLOAD_SECURITY_POLICY_SHA256 = previousPolicy;
+      if (previousManagedOnly === undefined) delete process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED;
+      else process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = previousManagedOnly;
+    });
+
+    async function createManagedReference(fileId: string) {
+      const tenantId = tenantStorage.getStore()?.tenantId ?? null;
+      return createReference(fileId, {
+        tenantId,
+        uploadOperationId: fileId,
+        retentionAcceptedAt: new Date(Date.now() - 1_000),
+        expiredAt: new Date(Date.now() + 86_400_000),
+        expiresAt: new Date(Date.now() + 3_600_000),
+        temp_file_id: `temporary-${fileId}`,
+        source: 's3',
+        storageKey: `${tenantId ? `t/${tenantId}/` : ''}managed-uploads/${owner}/${fileId}.1__original`,
+        status: 'ready',
+        securityApproval: {
+          version: 1,
+          decision: 'approved',
+          policySha256: policy,
+          scannerVersion: 'fixture/1',
+          checkedAt: new Date(Date.now() - 1_000).toISOString(),
+          coverage: { complete: true, pages: 1, parts: 1 },
+          subject: {
+            tenantId,
+            userId: owner,
+            operationId: fileId,
+            transferGeneration: 1,
+            mediaType: 'application/pdf',
+            bytes: 100,
+            sha256: 'b'.repeat(64),
+          },
+        },
+      });
+    }
+
+    // Regression: collection admission must use the same current File eligibility as its reader.
+    it.each([
+      ['pending', { status: 'pending' }],
+      ['rejected', { 'securityApproval.decision': 'rejected' }],
+      ['missing-approval', { securityApproval: null }],
+      ['obsolete-policy', { 'securityApproval.policySha256': 'c'.repeat(64) }],
+      ['expired', { expiredAt: new Date(0) }],
+      ['deleting', { deletionRequestedAt: new Date() }],
+      ['deleted', { deletionCompletedAt: new Date() }],
+      ['derived-draft', { derivedOrigin: { version: 1, purpose: 'draft' } }],
+    ])('rejects %s originals without changing membership or upload holds', async (name, fields) => {
+      const project = await methods.createChatProject(owner, { name: 'Eligibility' });
+      const fileId = `blocked-${name}`;
+      const original = await createManagedReference(fileId);
+      await File.collection.updateOne({ _id: original._id }, { $set: fields });
+      await expect(
+        methods.addChatProjectFile(owner, project._id!.toString(), fileId),
+      ).rejects.toThrow('Project file unavailable');
+      expect(await methods.getChatProject(owner, project._id!.toString())).toMatchObject({
+        file_ids: [],
+        contextRevision: project.contextRevision,
+      });
+      expect(await File.findById(original._id).lean()).toMatchObject({
+        expiresAt: original.expiresAt,
+        temp_file_id: original.temp_file_id,
+      });
+    });
+
+    it('admits current approved originals idempotently and preserves original expiry', async () => {
+      process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = 'true';
+      const project = await methods.createChatProject(owner, { name: 'Approved' });
+      const file = await createManagedReference('approved-original');
+      const first = await methods.addChatProjectFile(owner, project._id!.toString(), file.file_id);
+      const replay = await methods.addChatProjectFile(owner, project._id!.toString(), file.file_id);
+      expect(replay?.file_ids).toEqual([file.file_id]);
+      expect(replay?.contextRevision).toBe(first?.contextRevision);
+      expect((await File.findById(file._id).lean())?.expiredAt).toEqual(file.expiredAt);
+      expect(
+        await createFileMethods(mongoose).getProjectFiles({
+          fileIds: replay!.file_ids!,
+          userId: owner,
+        }),
+      ).toHaveLength(1);
+      await createReference('unmanaged-original');
+      await expect(
+        methods.addChatProjectFile(owner, project._id!.toString(), 'unmanaged-original'),
+      ).rejects.toThrow('Project file unavailable');
+    });
+
+    it('scopes managed files and hold mutation to the project tenant with identical file IDs', async () => {
+      const fileId = 'same-managed-id';
+      const first = await tenantStorage.run({ tenantId: 'project-tenant-a' }, async () => ({
+        project: await methods.createChatProject(owner, { name: 'Managed A' }),
+        file: await createManagedReference(fileId),
+      }));
+      const second = await tenantStorage.run({ tenantId: 'project-tenant-b' }, async () => ({
+        project: await methods.createChatProject(owner, { name: 'Managed B' }),
+        file: await createManagedReference(fileId),
+      }));
+      await tenantStorage.run({ tenantId: 'project-tenant-a' }, async () => {
+        expect(
+          await methods.addChatProjectFile(owner, first.project._id!.toString(), fileId),
+        ).toMatchObject({ file_ids: [fileId] });
+        expect(await File.findById(first.file._id).lean()).not.toHaveProperty('expiresAt');
+        expect(
+          await methods.addChatProjectFile(owner, second.project._id!.toString(), fileId),
+        ).toBeNull();
+      });
+      await tenantStorage.run({ tenantId: 'project-tenant-b' }, async () => {
+        expect(await File.findById(second.file._id).lean()).toMatchObject({
+          expiresAt: second.file.expiresAt,
+          temp_file_id: second.file.temp_file_id,
+        });
+        expect(await methods.getChatProject(owner, second.project._id!.toString())).toMatchObject({
+          file_ids: [],
+          contextRevision: second.project.contextRevision,
+        });
+      });
+    });
+
+    it('checks eligibility again before releasing a hold after native revocation', async () => {
+      const project = await methods.createChatProject(owner, { name: 'Revoked before release' });
+      const file = await createManagedReference('revoked-before-release');
+      const updateOne = File.updateOne.bind(File);
+      const spy = jest.spyOn(File, 'updateOne').mockImplementationOnce(((
+        ...args: Parameters<typeof File.updateOne>
+      ) =>
+        createFileMethods(mongoose)
+          .revokeFileSources({ userId: owner }, [file.file_id])
+          .then(() => updateOne(...args))) as unknown as typeof File.updateOne);
+      try {
+        await expect(
+          methods.addChatProjectFile(owner, project._id!.toString(), file.file_id),
+        ).rejects.toThrow('Project file unavailable');
+      } finally {
+        spy.mockRestore();
+      }
+      expect(await methods.getChatProject(owner, project._id!.toString())).toMatchObject({
+        file_ids: [],
+        contextRevision: project.contextRevision,
+      });
+      expect(await File.findById(file._id).lean()).toMatchObject({
+        expiresAt: file.expiresAt,
+        temp_file_id: file.temp_file_id,
+      });
+    });
+
+    it('rolls back membership and hold release when final eligibility changes', async () => {
+      const project = await methods.createChatProject(owner, { name: 'Final policy check' });
+      const file = await createManagedReference('policy-after-release');
+      const updateOne = File.updateOne.bind(File);
+      const spy = jest.spyOn(File, 'updateOne').mockImplementationOnce(((
+        ...args: Parameters<typeof File.updateOne>
+      ) =>
+        updateOne(...args).then((result) => {
+          process.env.UPLOAD_SECURITY_POLICY_SHA256 = 'd'.repeat(64);
+          return result;
+        })) as unknown as typeof File.updateOne);
+      try {
+        await expect(
+          methods.addChatProjectFile(owner, project._id!.toString(), file.file_id),
+        ).rejects.toThrow('Project file unavailable');
+      } finally {
+        spy.mockRestore();
+      }
+      expect(await methods.getChatProject(owner, project._id!.toString())).toMatchObject({
+        file_ids: [],
+        contextRevision: project.contextRevision,
+      });
+      expect(await File.findById(file._id).lean()).toMatchObject({
+        expiresAt: file.expiresAt,
+        temp_file_id: file.temp_file_id,
+      });
+    });
+
+    it.each([
+      ['revoke', false],
+      ['revoke', true],
+      ['expire', false],
+      ['expire', true],
+      ['change-policy', false],
+      ['change-policy', true],
+    ] as const)(
+      'withdraws an unavailable reference after %s during attach (replay=%s)',
+      async (transition, replay) => {
+        const project = await methods.createChatProject(owner, { name: 'Revoked while attaching' });
+        const file = await createManagedReference('revoked-during-attach');
+        if (replay) await methods.addChatProjectFile(owner, project._id!.toString(), file.file_id);
+        const attach = ChatProject.findOneAndUpdate.bind(ChatProject);
+        const spy = jest.spyOn(ChatProject, 'findOneAndUpdate').mockImplementationOnce(((
+          ...args: Parameters<typeof ChatProject.findOneAndUpdate>
+        ) => {
+          const query = attach(...args);
+          const exec = query.exec.bind(query);
+          query.exec = async () => {
+            const result = await exec();
+            if (transition === 'revoke') {
+              await createFileMethods(mongoose).revokeFileSources({ userId: owner }, [
+                file.file_id,
+              ]);
+            } else if (transition === 'expire') {
+              await File.updateOne({ _id: file._id }, { $set: { expiredAt: new Date(0) } });
+            } else {
+              process.env.UPLOAD_SECURITY_POLICY_SHA256 = 'd'.repeat(64);
+            }
+            return result;
+          };
+          return query;
+        }) as unknown as typeof ChatProject.findOneAndUpdate);
+        try {
+          await expect(
+            methods.addChatProjectFile(owner, project._id!.toString(), file.file_id),
+          ).rejects.toThrow('Project file unavailable');
+        } finally {
+          spy.mockRestore();
+        }
+        expect((await methods.getChatProject(owner, project._id!.toString()))?.file_ids).toEqual(
+          [],
+        );
+        expect(await File.findById(file._id).lean()).not.toBeNull();
+        if (transition === 'revoke') {
+          expect((await File.findById(file._id).lean())?.deletionRequestedAt).toBeInstanceOf(Date);
+        }
+      },
+    );
+  });
 
   it('persists instructions independently of description and advances semantic revisions', async () => {
     const project = await methods.createChatProject(owner, {
@@ -786,7 +1027,7 @@ describe('persistent Project context', () => {
     ).toBeNull();
   });
 
-  it('releases the temporary hold before attaching and attaches nothing when the release fails', async () => {
+  it('commits membership with hold release and attaches nothing when the release fails', async () => {
     const project = await methods.createChatProject(owner, { name: 'Holds' });
     const id = project._id!.toString();
     const expiresAt = new Date(Date.now() + 3_600_000);
@@ -806,6 +1047,77 @@ describe('persistent Project context', () => {
     spy.mockRestore();
     expect((await methods.getChatProject(owner, id))?.file_ids).toEqual(['held']);
     expect((await File.findOne({ file_id: 'held-fail' }).lean())?.expiresAt).toEqual(expiresAt);
+  });
+
+  it.each([false, true])(
+    'rolls back a written hold release without changing prior membership (replay=%s)',
+    async (replay) => {
+      const project = await methods.createChatProject(owner, { name: 'Release rollback' });
+      const file = await createReference('release-rollback');
+      const before = replay
+        ? await methods.addChatProjectFile(owner, project._id!.toString(), file.file_id)
+        : project;
+      const expiresAt = new Date(Date.now() + 3_600_000);
+      await File.updateOne(
+        { _id: file._id },
+        { $set: { expiresAt, temp_file_id: 'rollback-temporary' } },
+      );
+      const updateOne = File.updateOne.bind(File);
+      const spy = jest.spyOn(File, 'updateOne').mockImplementationOnce(((
+        ...args: Parameters<typeof File.updateOne>
+      ) =>
+        updateOne(...args).then(() => {
+          throw new Error('release reply failed');
+        })) as unknown as typeof File.updateOne);
+      try {
+        await expect(
+          methods.addChatProjectFile(owner, project._id!.toString(), file.file_id),
+        ).rejects.toThrow('release reply failed');
+      } finally {
+        spy.mockRestore();
+      }
+      expect(await methods.getChatProject(owner, project._id!.toString())).toMatchObject({
+        file_ids: before!.file_ids,
+        contextRevision: before!.contextRevision,
+      });
+      expect(await File.findById(file._id).lean()).toMatchObject({
+        expiresAt,
+        temp_file_id: 'rollback-temporary',
+      });
+    },
+  );
+
+  it('propagates a lost commit reply without compensating the committed attachment', async () => {
+    const project = await methods.createChatProject(owner, { name: 'Unknown commit' });
+    const file = await createReference('commit-reply-lost', {
+      expiresAt: new Date(Date.now() + 3_600_000),
+      temp_file_id: 'commit-temporary',
+    });
+    const startSession = mongoose.startSession.bind(mongoose);
+    const spy = jest.spyOn(mongoose, 'startSession').mockImplementationOnce(async (...args) => {
+      const session = await startSession(...args);
+      const commit = session.commitTransaction.bind(session);
+      jest.spyOn(session, 'commitTransaction').mockImplementationOnce(async () => {
+        await commit();
+        throw new mongoose.mongo.MongoServerError({ message: 'commit reply lost' });
+      });
+      return session;
+    });
+    try {
+      await expect(
+        methods.addChatProjectFile(owner, project._id!.toString(), file.file_id),
+      ).rejects.toThrow('commit reply lost');
+    } finally {
+      spy.mockRestore();
+    }
+    const committed = await methods.getChatProject(owner, project._id!.toString());
+    expect(committed?.file_ids).toEqual([file.file_id]);
+    const original = await File.findById(file._id).lean();
+    expect(original).not.toHaveProperty('expiresAt');
+    expect(original).not.toHaveProperty('temp_file_id');
+    expect(
+      await methods.addChatProjectFile(owner, project._id!.toString(), file.file_id),
+    ).toMatchObject({ file_ids: [file.file_id], contextRevision: committed!.contextRevision });
   });
 
   it('attaches nothing when the file is deleted while the attach is in flight', async () => {
@@ -899,6 +1211,94 @@ describe('persistent Project context', () => {
       });
     });
   });
+
+  it.each(['another Project', 'native usage'] as const)(
+    'does not restore a losing hold after the same file succeeds in %s',
+    async (promotion) => {
+      const first = await methods.createChatProject(owner, { name: 'Losing project' });
+      const second = await methods.createChatProject(owner, { name: 'Successful project' });
+      const shared = await createReference('concurrent-shared', {
+        expiresAt: new Date(Date.now() + 3_600_000),
+        temp_file_id: 'shared-temporary',
+        expiredAt: new Date(Date.now() + 86_400_000),
+      });
+      await createReference('capacity-winner');
+      let reached!: () => void;
+      let resume!: () => void;
+      const admissionReached = new Promise<void>((resolve) => {
+        reached = resolve;
+      });
+      const resumeAdmission = new Promise<void>((resolve) => {
+        resume = resolve;
+      });
+      const findOneAndUpdate = ChatProject.findOneAndUpdate.bind(ChatProject);
+      const spy = jest
+        .spyOn(ChatProject, 'findOneAndUpdate')
+        .mockImplementation((filter, update, options) => {
+          const query = findOneAndUpdate(filter, update, options);
+          const queryFilter = query.getFilter();
+          if (
+            queryFilter._id?.toString() === first._id!.toString() &&
+            queryFilter.file_ids?.$ne === shared.file_id
+          ) {
+            const exec = query.exec.bind(query);
+            query.exec = async () => {
+              reached();
+              await resumeAdmission;
+              return exec();
+            };
+          }
+          return query;
+        });
+      const losing = methods.addChatProjectFile(owner, first._id!.toString(), shared.file_id, {
+        maxFiles: 1,
+      });
+      // Observe rejection immediately while coordinating actual database operations below.
+      const result = losing.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      try {
+        await admissionReached;
+        if (promotion === 'another Project') {
+          expect(
+            await methods.addChatProjectFile(owner, second._id!.toString(), shared.file_id),
+          ).toMatchObject({ file_ids: [shared.file_id] });
+        } else {
+          expect(
+            await createFileMethods(mongoose).updateFileUsage({
+              file_id: shared.file_id,
+              user: owner,
+            }),
+          ).toMatchObject({ usage: 1 });
+        }
+        expect(await File.findById(shared._id).lean()).not.toHaveProperty('expiresAt');
+        await methods.addChatProjectFile(owner, first._id!.toString(), 'capacity-winner', {
+          maxFiles: 1,
+        });
+        resume();
+        expect(await result).toEqual(new Error('Project file limit reached'));
+        expect((await methods.getChatProject(owner, first._id!.toString()))?.file_ids).toEqual([
+          'capacity-winner',
+        ]);
+        const original = await File.findById(shared._id).lean();
+        expect(original).not.toHaveProperty('expiresAt');
+        expect(original).not.toHaveProperty('temp_file_id');
+        expect(original?.expiredAt).toEqual(shared.expiredAt);
+        if (promotion === 'another Project') {
+          expect((await methods.getChatProject(owner, second._id!.toString()))?.file_ids).toEqual([
+            shared.file_id,
+          ]);
+        } else {
+          expect(original?.usage).toBe(1);
+        }
+      } finally {
+        resume();
+        await result;
+        spy.mockRestore();
+      }
+    },
+  );
 
   it('bounds concurrent attachment writes at the Project limit without consuming the losing hold', async () => {
     const project = await methods.createChatProject(owner, { name: 'Almost full' });

@@ -10,6 +10,7 @@ import type { TChatProjectsConfig } from 'librechat-data-provider';
 import type { IChatProject, IChatProjectDocument, IConversation, IMongoFile } from '~/types';
 import { buildRetentionVisibilityFilter } from '~/utils/retention';
 import { isValidObjectIdString } from '~/utils/objectId';
+import { liveFileFilter } from './fileRetention';
 import { escapeRegExp } from '~/utils/string';
 import logger from '~/config/winston';
 
@@ -543,103 +544,105 @@ export function createChatProjectMethods(mongoose: typeof import('mongoose')): C
     return saved ?? (await conflictOrNull());
   }
 
+  /** Membership and permanent use commit together; this path requires Mongo transactions. */
   async function addChatProjectFile(
     user: string,
     projectId: string,
     fileId: string,
     limits?: Partial<ChatProjectLimits>,
   ): Promise<IChatProject | null> {
+    if (!isValidObjectIdString(projectId)) return null;
     const { maxFiles } = resolveChatProjectLimits(limits);
-    const project = await getChatProject(user, projectId);
-    if (!project) {
-      return null;
-    }
-    if (!fileId || typeof fileId !== 'string' || fileId.length > 128) {
-      throw new Error('Project file unavailable');
-    }
-    const alreadyAttached = project.file_ids?.includes(fileId) === true;
-    if (!alreadyAttached && (project.file_ids?.length ?? 0) >= maxFiles) {
-      throw new Error('Project file limit reached');
-    }
-
-    const File = mongoose.models.File as Model<IMongoFile>;
-    const file = await File.findOne({
-      file_id: fileId,
-      user,
-      tenantId: project.tenantId ?? null,
-      embedded: true,
-      context: FileContext.message_attachment,
-      $or: [{ expiredAt: null }, { expiredAt: { $gt: new Date() } }],
-    })
-      .select('_id file_id expiresAt temp_file_id')
-      .lean();
-    if (!file) {
-      throw new Error('Project file unavailable');
-    }
-
-    const released = await File.updateOne(
-      { _id: file._id, file_id: fileId, user, tenantId: project.tenantId ?? null },
-      { $unset: { expiresAt: '', temp_file_id: '' } },
-      { timestamps: false },
-    );
-    if (released.matchedCount === 0) {
-      throw new Error('Project file unavailable');
-    }
-    const restoreTemporaryHold = async (): Promise<void> => {
-      const hold = {
-        ...(file.expiresAt != null ? { expiresAt: file.expiresAt } : {}),
-        ...(file.temp_file_id != null ? { temp_file_id: file.temp_file_id } : {}),
-      };
-      if (Object.keys(hold).length === 0) {
-        return;
-      }
-      try {
-        await File.updateOne({ _id: file._id, user }, { $set: hold }, { timestamps: false });
-      } catch (error) {
-        logger.warn('[chatProject] Failed to restore temporary file hold', error);
-      }
-    };
-
     const ChatProject = mongoose.models.ChatProject as Model<IChatProjectDocument>;
-    /** A file deleted between the release and the attach has already run its project
-     *  cleanup, so the reference added after it would dangle; take it back out. */
-    const dropIfFileDeleted = async (attached: IChatProject): Promise<IChatProject> => {
-      if (await File.exists({ _id: file._id })) {
-        return attached;
-      }
-      await ChatProject.updateOne(
-        { _id: project._id, user, file_ids: fileId },
-        { $pull: { file_ids: fileId }, $inc: { contextRevision: 1 } },
-      );
-      throw new Error('Project file unavailable');
-    };
+    const File = mongoose.models.File as Model<IMongoFile>;
+    const projectFilter = { _id: new mongoose.Types.ObjectId(projectId), user };
+    const session = await mongoose.startSession();
     try {
-      const updated = await ChatProject.findOneAndUpdate(
-        {
-          _id: project._id,
-          user,
-          file_ids: { $ne: fileId },
-          [`file_ids.${maxFiles - 1}`]: { $exists: false },
+      const attached = await session.withTransaction(
+        async () => {
+          const project = await ChatProject.findOne(projectFilter)
+            .session(session)
+            .lean<IChatProject>();
+          if (!project) return null;
+          if (!fileId || typeof fileId !== 'string' || fileId.length > 128) {
+            throw new Error('Project file unavailable');
+          }
+          const alreadyAttached = project.file_ids?.includes(fileId) === true;
+          if (!alreadyAttached && (project.file_ids?.length ?? 0) >= maxFiles) {
+            throw new Error('Project file limit reached');
+          }
+          // Rebuild at each boundary and on native transaction retries.
+          const eligibleFileFilter = (): FilterQuery<IMongoFile> => ({
+            file_id: fileId,
+            user,
+            tenantId: project.tenantId ?? null,
+            embedded: true,
+            context: FileContext.message_attachment,
+            $and: [
+              { $or: [{ expiredAt: null }, { expiredAt: { $gt: new Date() } }] },
+              liveFileFilter(),
+            ],
+          });
+          // An existing unavailable reference may be withdrawn without promoting its File.
+          const unavailable = async (): Promise<undefined> => {
+            if (!alreadyAttached) throw new Error('Project file unavailable');
+            await ChatProject.updateOne(
+              { ...projectFilter, file_ids: fileId },
+              { $pull: { file_ids: fileId }, $inc: { contextRevision: 1 } },
+              { session },
+            );
+            return undefined;
+          };
+          const file = await File.findOne(eligibleFileFilter())
+            .select('_id')
+            .session(session)
+            .lean();
+          if (!file) return unavailable();
+
+          const updated = await ChatProject.findOneAndUpdate(
+            {
+              ...projectFilter,
+              file_ids: { $ne: fileId },
+              [`file_ids.${maxFiles - 1}`]: { $exists: false },
+            },
+            { $addToSet: { file_ids: fileId }, $inc: { contextRevision: 1 } },
+            { new: true, runValidators: true, session },
+          ).lean<IChatProject>();
+          const current =
+            updated ??
+            (await ChatProject.findOne(projectFilter).session(session).lean<IChatProject>());
+          if (!current) return null;
+          if (!current.file_ids?.includes(fileId)) {
+            throw new Error('Project file limit reached');
+          }
+
+          // Never release a hold for an attachment that lost capacity. The existing revision
+          // fence makes even a released hold a real write, so concurrent use/revocation conflicts
+          // on this File and native retries reread both records instead of restoring TTL.
+          const released = await File.updateOne(
+            { _id: file._id, ...eligibleFileFilter() },
+            { $unset: { expiresAt: '', temp_file_id: '' }, $inc: { retentionRevision: 1 } },
+            { session, timestamps: false },
+          );
+          if (released.matchedCount === 0) return unavailable();
+          if (!(await File.exists({ _id: file._id, ...eligibleFileFilter() }).session(session))) {
+            // A final expiry/policy failure aborts the promotion and membership together.
+            throw new Error('Project file unavailable');
+          }
+          return current;
         },
-        { $addToSet: { file_ids: fileId }, $inc: { contextRevision: 1 } },
-        { new: true, runValidators: true },
-      ).lean<IChatProject>();
-      if (updated) {
-        return await dropIfFileDeleted(updated);
-      }
-      const current = await getChatProject(user, projectId);
-      if (current?.file_ids?.includes(fileId)) {
-        return current;
-      }
-      await restoreTemporaryHold();
-      if (!current) {
-        return null;
-      }
-    } catch (error) {
-      await restoreTemporaryHold();
-      throw error;
+        {
+          readConcern: { level: 'snapshot' },
+          writeConcern: { w: 'majority', wtimeout: 2000 },
+          maxCommitTimeMS: 2000,
+          timeoutMS: 8000,
+        },
+      );
+      if (attached === undefined) throw new Error('Project file unavailable');
+      return attached;
+    } finally {
+      await session.endSession();
     }
-    throw new Error('Project file limit reached');
   }
 
   async function removeChatProjectFile(

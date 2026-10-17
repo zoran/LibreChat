@@ -35,7 +35,7 @@ import { useLocalize, TranslationKeys } from '~/hooks';
 import { cn } from '~/utils';
 import store from '~/store';
 
-interface DataTableProps<TData extends Pick<TFile, 'file_id'>, TValue> {
+interface DataTableProps<TData extends TFile, TValue> {
   columns: ColumnDef<TData, TValue>[];
   data: TData[];
 }
@@ -57,7 +57,7 @@ type Style = {
   zIndex?: number;
 };
 
-export default function DataTable<TData extends Pick<TFile, 'file_id'>, TValue>({
+export default function DataTable<TData extends TFile, TValue>({
   columns,
   data,
 }: DataTableProps<TData, TValue>) {
@@ -133,7 +133,7 @@ export default function DataTable<TData extends Pick<TFile, 'file_id'>, TValue>(
             const filesToDelete = table
               .getFilteredSelectedRowModel()
               .rows.map((row) => row.original);
-            deleteFiles({ files: filesToDelete as TFile[], setFiles });
+            deleteFiles({ files: filesToDelete, setFiles });
             setRowSelection({});
           }}
           disabled={!table.getFilteredSelectedRowModel().rows.length || isDeleting}

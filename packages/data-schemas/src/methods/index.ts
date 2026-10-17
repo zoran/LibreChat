@@ -52,6 +52,9 @@ import { createTokenMethods, type TokenMethods } from './token';
 import { createRoleMethods, RoleConflictError } from './role';
 import { createKeyMethods, type KeyMethods } from './key';
 import { createFileMethods } from './file';
+import { createFileLibraryMethods, type FileLibraryMethods } from './fileLibrary';
+export { createFileLibraryMethods, InvalidFileLibraryInputError } from './fileLibrary';
+export type { FileLibraryMethods } from './fileLibrary';
 import { createDocumentWorkspaceMethods, type DocumentWorkspaceMethods } from './documentWorkspace';
 /* Memories */
 import { createMemoryMethods, type MemoryMethods } from './memory';
@@ -283,6 +286,7 @@ export type AllMethods = CheckpointSourceMethods &
   RoleMethods &
   KeyMethods &
   FileMethods &
+  FileLibraryMethods &
   MemoryMethods &
   ToolFavoriteMethods &
   AgentCategoryMethods &
@@ -527,6 +531,7 @@ export function createMethods(
     ...roleMethods,
     ...createKeyMethods(mongoose),
     ...createFileMethods(mongoose),
+    ...createFileLibraryMethods(mongoose),
     ...createDocumentWorkspaceMethods(mongoose),
     ...createMemoryMethods(mongoose),
     ...createToolFavoriteMethods(mongoose),

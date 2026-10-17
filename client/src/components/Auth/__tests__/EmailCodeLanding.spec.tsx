@@ -3,7 +3,6 @@ import { MemoryRouter } from 'react-router-dom';
 import { ThemeContext } from '@librechat/client';
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import type { TStartupConfig } from 'librechat-data-provider';
-import type { ContextType } from 'react';
 import EmailCodeLanding from '../EmailCodeLanding';
 
 let mockAuth: any;
@@ -36,11 +35,16 @@ jest.mock('~/data-provider', () => ({
 const view = () => (
   <RecoilRoot>
     <ThemeContext.Provider
-      value={
-        { theme: 'dark', resolvedMode: 'dark', setTheme: jest.fn() } as ContextType<
-          typeof ThemeContext
-        >
-      }
+      value={{
+        theme: 'dark',
+        resolvedMode: 'dark',
+        highContrast: false,
+        setTheme: jest.fn(),
+        setThemeRGB: jest.fn(),
+        setThemeDefinition: jest.fn(),
+        setThemeName: jest.fn(),
+        resetTheme: jest.fn(),
+      }}
     >
       <MemoryRouter>
         <EmailCodeLanding />

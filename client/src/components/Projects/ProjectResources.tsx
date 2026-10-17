@@ -1,4 +1,4 @@
-import { useDeferredValue, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { v4 } from 'uuid';
 import * as Ariakit from '@ariakit/react';
 import {
@@ -15,17 +15,6 @@ import {
   X,
 } from 'lucide-react';
 import {
-  Alert,
-  Button,
-  DropdownPopup,
-  EmptyState,
-  FileUpload,
-  OGDialog,
-  Spinner,
-  TooltipAnchor,
-  useToastContext,
-} from '@librechat/client';
-import {
   defaultAgentCapabilities,
   EToolResources,
   FileContext,
@@ -33,21 +22,33 @@ import {
   PermissionTypes,
   Permissions,
 } from 'librechat-data-provider';
+import {
+  Alert,
+  Button,
+  DropdownPopup,
+  EmptyState,
+  FileUpload,
+  OGDialog,
+  OGDialogContent,
+  OGDialogHeader,
+  OGDialogTitle,
+  Spinner,
+  TooltipAnchor,
+  useToastContext,
+} from '@librechat/client';
 import type { TChatProjectFile, TError, TFile, TFileUpload } from 'librechat-data-provider';
-import type { FileView } from '~/components/Chat/Input/Composer/Files';
 import {
   useAddProjectFileMutation,
   useGetStartupConfig,
-  useProjectAvailableFilesInfiniteQuery,
   useProjectFilesQuery,
   useRemoveProjectFileMutation,
   useUploadFileMutation,
 } from '~/data-provider';
 import { useAgentCapabilities, useGetAgentsConfig, useHasAccess, useLocalize } from '~/hooks';
 import FileSourceButton from '~/components/Chat/Input/Files/Table/FileSourceButton';
-import FileGrid, { FILE_VIEWS } from '~/components/Chat/Input/Composer/Files';
-import { CatalogContent } from '~/components/Chat/Input/Composer/Catalog';
 import { NotificationSeverity, type LocalizeFunction } from '~/common';
+import ProjectLibraryAction from './ProjectLibraryAction';
+import { FileLibrary } from '~/features/library';
 type ProjectResourcesProps = {
   project: { _id: string; fileCount?: number };
 };
@@ -111,13 +112,6 @@ export default function ProjectResources({ project }: ProjectResourcesProps) {
   const fileMenuId = useId();
   const [isFileMenuOpen, setIsFileMenuOpen] = useState(false);
   const [isPickerOpen, setIsPickerOpen] = useState(false);
-  const [pickerSearch, setPickerSearch] = useState('');
-  const deferredPickerSearch = useDeferredValue(pickerSearch);
-  const [pickerView, setPickerView] = useState<FileView>('all');
-  const fileViewOptions = useMemo(
-    () => FILE_VIEWS.map((option) => ({ value: option.value, label: localize(option.labelKey) })),
-    [localize],
-  );
   const [uploading, setUploading] = useState<UploadState[]>([]);
   const pendingUploadIdsRef = useRef(new Set<string>());
   const optimisticAttachedIdsRef = useRef(new Set<string>());
@@ -140,58 +134,12 @@ export default function ProjectResources({ project }: ProjectResourcesProps) {
       );
     }
   }
-  const availableFilesQuery = useProjectAvailableFilesInfiniteQuery(
-    project._id,
-    { search: deferredPickerSearch || undefined, limit: 20 },
-    { enabled: isPickerOpen },
-  );
-  const {
-    data: availableFilesData,
-    isLoading: isFilesLoading,
-    isFetchingNextPage,
-    isError: isFilesError,
-    hasNextPage,
-    fetchNextPage,
-    refetch: refetchFiles,
-  } = availableFilesQuery;
-  /** The projects and searches whose last error came from loading a further page, so Retry
-   *  fetches that page again rather than refetching what is already listed. Each query
-   *  keeps its own marker until that same query recovers. */
-  const pageQueryKey = `${project._id}\u0000${deferredPickerSearch}`;
-  const [failedPageKeys, setFailedPageKeys] = useState<ReadonlySet<string>>(() => new Set());
-  const nextPageFailed = failedPageKeys.has(pageQueryKey);
-  if (nextPageFailed && !isFilesError) {
-    const next = new Set(failedPageKeys);
-    next.delete(pageQueryKey);
-    setFailedPageKeys(next);
-  }
-  const loadNextPage = () => {
-    const requestKey = pageQueryKey;
-    void fetchNextPage().then((result) =>
-      setFailedPageKeys((previous) => {
-        if (result.isError === previous.has(requestKey)) {
-          return previous;
-        }
-        const next = new Set(previous);
-        if (result.isError) {
-          next.add(requestKey);
-        } else {
-          next.delete(requestKey);
-        }
-        return next;
-      }),
-    );
-  };
   const uploadFile = useUploadFileMutation();
   const addFile = useAddProjectFileMutation();
   const removeFile = useRemoveProjectFileMutation();
   const attachedIds = useMemo(
     () => new Set((projectFiles ?? []).map((file) => file.file_id)),
     [projectFiles],
-  );
-  const availableFiles = useMemo(
-    () => availableFilesData?.pages.flatMap((page) => page.files) ?? [],
-    [availableFilesData?.pages],
   );
   const fileCount = projectFiles?.length ?? project.fileCount ?? 0;
   const getEffectiveFileCount = () => {
@@ -213,45 +161,6 @@ export default function ProjectResources({ project }: ProjectResourcesProps) {
       setOptimisticAttachedIds(remaining);
     }
   }, [attachedIds, optimisticAttachedIds]);
-
-  useEffect(() => {
-    if (
-      isPickerOpen &&
-      !isFilesLoading &&
-      !isFilesError &&
-      availableFiles.length === 0 &&
-      hasNextPage &&
-      !isFetchingNextPage
-    ) {
-      void fetchNextPage();
-    }
-  }, [
-    availableFiles.length,
-    fetchNextPage,
-    hasNextPage,
-    isFilesError,
-    isFilesLoading,
-    isFetchingNextPage,
-    isPickerOpen,
-  ]);
-  useEffect(() => {
-    setPickerSearch('');
-    setPickerView('all');
-  }, [project._id]);
-
-  const addExistingFile = async (fileId: string) => {
-    try {
-      await addFile.mutateAsync({ projectId: project._id, file_id: fileId });
-      setIsPickerOpen(false);
-      setIsFileMenuOpen(false);
-    } catch (error: unknown) {
-      showToast({
-        message: getAssociationErrorMessage(error, localize, projectFileLimit),
-        severity: NotificationSeverity.ERROR,
-        showIcon: true,
-      });
-    }
-  };
 
   const runUpload = async (item: UploadState) => {
     let uploaded = false;
@@ -600,67 +509,16 @@ export default function ProjectResources({ project }: ProjectResourcesProps) {
         triggerRef={pickerMenuRef}
       >
         {isPickerOpen ? (
-          <CatalogContent
-            title={localize('com_ui_project_choose_file')}
-            searchLabel={localize('com_ui_search_files')}
-            search={pickerSearch}
-            onSearchChange={setPickerSearch}
-            filterLabel={localize('com_ui_composer_files_filter')}
-            viewOptions={fileViewOptions}
-            view={pickerView}
-            onViewChange={(value) => setPickerView(value as FileView)}
-          >
-            <FileGrid
-              query={deferredPickerSearch.trim().toLowerCase()}
-              view={pickerView}
-              onAttach={(file) => void addExistingFile(file.file_id)}
-              source={{
-                files: availableFiles,
-                /* A further page can still hold a match for the current search or view. */
-                isLoading: isFilesLoading || isFetchingNextPage,
-                isError: isFilesError,
-                refetch: () => void refetchFiles(),
-              }}
-              disabled={addFile.isLoading || !hasFileCapacity}
-              emptyText={
-                deferredPickerSearch || pickerView !== 'all'
-                  ? localize('com_ui_no_search_results')
-                  : localize('com_ui_project_no_eligible_files')
-              }
+          <OGDialogContent title={localize('com_ui_project_choose_file')} className="w-11/12">
+            <OGDialogHeader>
+              <OGDialogTitle>{localize('com_ui_project_choose_file')}</OGDialogTitle>
+            </OGDialogHeader>
+            <FileLibrary
+              renderSelectionActions={(selection) => (
+                <ProjectLibraryAction {...selection} projectId={project._id} />
+              )}
             />
-            {/* A later page that fails keeps the loaded cards; the grid only shows
-                its own retry while nothing has loaded. */}
-            {isFilesError && availableFiles.length > 0 && (
-              <Alert
-                variant="error"
-                icon={false}
-                role="alert"
-                className="mt-3 flex items-center justify-between"
-              >
-                <span>{localize('com_ui_project_files_error')}</span>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  disabled={isFetchingNextPage}
-                  onClick={() => (nextPageFailed ? loadNextPage() : void refetchFiles())}
-                >
-                  {localize('com_ui_retry')}
-                </Button>
-              </Alert>
-            )}
-            {!isFilesLoading && !isFilesError && hasNextPage && (
-              <Button
-                type="button"
-                variant="outline"
-                className="mt-3 w-full"
-                onClick={loadNextPage}
-                disabled={isFetchingNextPage}
-              >
-                {isFetchingNextPage ? localize('com_ui_loading') : localize('com_ui_load_more')}
-              </Button>
-            )}
-          </CatalogContent>
+          </OGDialogContent>
         ) : null}
       </OGDialog>
     </section>

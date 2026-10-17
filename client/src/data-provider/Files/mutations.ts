@@ -11,6 +11,7 @@ import {
 import type { UseMutationResult } from '@tanstack/react-query';
 import type * as t from 'librechat-data-provider';
 import { invalidateRecentFiles } from '~/utils/files';
+import { getSessionPrincipal } from '~/utils/session';
 import { useGetStartupConfig } from '../Endpoints';
 import { useLocalize } from '~/hooks';
 
@@ -182,7 +183,25 @@ export const useDeleteFilesMutation = (
   const localize = useLocalize();
   const { onSuccess, onError, silent = false, ...options } = _options || {};
   return useMutation([MutationKeys.fileDelete], {
-    mutationFn: (body: t.DeleteFilesBody) => dataService.deleteFiles(body),
+    mutationFn: async (body: t.DeleteFilesBody) => {
+      const principal = getSessionPrincipal();
+      let sessionEnded = false;
+      const endSession = () => {
+        sessionEnded = true;
+      };
+      window.addEventListener('librechat:auth-session-ending', endSession);
+      try {
+        return await dataService.deleteFiles(body);
+      } finally {
+        window.removeEventListener('librechat:auth-session-ending', endSession);
+        // A lost reply can still follow a committed deletion. Read current availability;
+        // project membership remains intact and the server supplies unavailable placeholders.
+        if (principal != null && !sessionEnded && getSessionPrincipal() === principal) {
+          queryClient.invalidateQueries([QueryKeys.projectFiles]);
+          queryClient.invalidateQueries([QueryKeys.projectAvailableFiles]);
+        }
+      }
+    },
     ...options,
     onError: (error, vars, context) => {
       if (!silent && error && typeof error === 'object' && 'response' in error) {

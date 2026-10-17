@@ -1,5 +1,6 @@
 import { Document, Types } from 'mongoose';
 import type {
+  FileLibraryMetadata,
   CodeEnvRef,
   CodeEnvRefMap,
   FileContext,
@@ -105,6 +106,8 @@ export type FileSourceCopyReservation = {
 };
 
 export interface IMongoFile extends Omit<Document, 'model'> {
+  /** Private organization metadata. Absence is revision zero, without a backfill. */
+  library?: FileLibraryMetadata;
   retentionAcceptedAt?: Date;
   retentionRevision?: number;
   /** Includes liabilities whose Message has expired; released by this File's cleanup. */

@@ -21,6 +21,19 @@ const runFileProvenanceSchema = new Schema<RunFileProvenance>(
 
 const file: Schema<IMongoFile> = new Schema(
   {
+    /** Private organization state; only the library port projects or changes it. */
+    library: {
+      type: new Schema(
+        {
+          tags: { type: [String], required: true },
+          archivedAt: { type: String, default: null },
+          revision: { type: Number, required: true, min: 0 },
+        },
+        { _id: false },
+      ),
+      default: undefined,
+      select: false,
+    },
     user: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
@@ -246,6 +259,7 @@ const file: Schema<IMongoFile> = new Schema(
         delete value.securityApproval;
         delete value.derivedOrigin;
         delete value.documentStructure;
+        delete value.library;
         return value;
       },
     },
@@ -256,6 +270,7 @@ const file: Schema<IMongoFile> = new Schema(
         delete value.securityApproval;
         delete value.derivedOrigin;
         delete value.documentStructure;
+        delete value.library;
         return value;
       },
     },

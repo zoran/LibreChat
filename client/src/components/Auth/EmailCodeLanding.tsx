@@ -57,7 +57,7 @@ export default function EmailCodeLanding() {
   let content: ReactNode;
   if (invalid || unavailable) {
     content = (
-      <p role="alert" className="text-status-error-strong text-sm leading-6">
+      <p role="alert" className="text-status-error text-sm leading-6">
         {localize(invalid ? 'com_auth_email_link_invalid' : 'com_auth_email_link_unavailable')}
       </p>
     );

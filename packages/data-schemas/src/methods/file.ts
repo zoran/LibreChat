@@ -648,6 +648,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
         tenantId: tenantId != null && tenantId !== '' ? tenantId : null,
         embedded: true,
         context: FileContext.message_attachment,
+        'library.archivedAt': null,
         $or: [{ expiredAt: null }, { expiredAt: { $gt: now } }],
       },
     ];
@@ -1159,6 +1160,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
       'securityApproval',
       'derivedOrigin',
       'documentStructure',
+      'library',
       'retainedDerivativeBytes',
       'retainedDerivativeReservations',
     ]) {
@@ -1252,6 +1254,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
       'securityApproval',
       'derivedOrigin',
       'documentStructure',
+      'library',
       'retainedDerivativeBytes',
       'retainedDerivativeReservations',
     ]) {

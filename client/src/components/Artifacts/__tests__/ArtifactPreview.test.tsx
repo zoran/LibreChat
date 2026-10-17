@@ -30,7 +30,7 @@ jest.mock('~/hooks', () => ({
 
 const unavailable = 'Vorschau ist für diesen Dateityp nicht verfügbar';
 const props: React.ComponentProps<typeof ArtifactPreview> = {
-  files: { '/index.html': { code: '<p>original</p>' } },
+  files: { '/index.html': '<p>original</p>' },
   fileKey: '/index.html',
   template: 'static',
   sharedProps: {},

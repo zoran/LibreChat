@@ -12,7 +12,11 @@ const userText = 'Meine Notiz über LibreChat bleibt unverändert.';
 const mailAttemptId = 'a'.repeat(43);
 const mailCode = '01234567';
 
-type PresentationFixture = { theme: 'light' | 'dark'; customWelcome?: string };
+type PresentationFixture = {
+  theme: 'light' | 'dark';
+  customWelcome?: string;
+  emailCodeLogin?: boolean;
+};
 
 async function configureBranding(page: Page, fixture: PresentationFixture) {
   await page.addInitScript((theme) => localStorage.setItem('color-theme', theme), fixture.theme);
@@ -23,6 +27,13 @@ async function configureBranding(page: Page, fixture: PresentationFixture) {
       response,
       json: {
         ...startup,
+        ...(fixture.emailCodeLogin
+          ? {
+              authMode: 'email_code',
+              emailCodeEnabled: true,
+              emailCodeDomains: ['example.invalid'],
+            }
+          : {}),
         interface: {
           ...startup.interface,
           appLogo: {
@@ -55,9 +66,50 @@ async function expectThemedLogo(logo: Locator, theme: PresentationFixture['theme
     .toBe(true);
 }
 
+async function expectReadableAuthText(text: Locator) {
+  await expect(text).toBeVisible();
+  await expect
+    .poll(() =>
+      text.evaluate((element) => {
+        const parse = (color: string) => {
+          const channels = color.match(/[\d.]+/g)?.map(Number);
+          if (!/^rgba?\(/.test(color) || !channels || channels.length < 3) {
+            throw new Error(`Expected computed RGB color, received ${color}`);
+          }
+          return { channels: channels.slice(0, 3), alpha: channels[3] ?? 1 };
+        };
+        const luminance = (channels: number[]) => {
+          const [r, g, b] = channels.map((value) => {
+            const channel = value / 255;
+            return channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4;
+          });
+          return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        };
+        const foreground = parse(getComputedStyle(element).color);
+        if (foreground.alpha !== 1) return 0;
+        // These native auth surfaces paint a solid background on an ancestor.
+        let background: number[] | undefined;
+        for (let node: Element | null = element; node; node = node.parentElement) {
+          const style = getComputedStyle(node);
+          if (Number(style.opacity) !== 1) return 0;
+          if (background) continue;
+          const painted = parse(style.backgroundColor);
+          if (painted.alpha === 0) continue;
+          if (painted.alpha !== 1 || style.backgroundImage !== 'none') return 0;
+          background = painted.channels;
+        }
+        if (!background) throw new Error('Auth text must have a painted background');
+        const a = luminance(foreground.channels);
+        const b = luminance(background);
+        return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+      }),
+    )
+    .toBeGreaterThanOrEqual(4.5);
+}
+
 async function signInFixture(page: Page) {
   const email = `presentation-${randomUUID()}@example.invalid`;
-  const password = 'Local-fixture-only-42!';
+  const password = `Presentation-${randomUUID()}!`;
   const registered = await page.request.post('/api/auth/register', {
     data: { name: 'Presentation User', email, password, confirm_password: password },
   });
@@ -202,14 +254,31 @@ async function expectNoOverflow(page: Page) {
 }
 
 async function openSettings(page: Page) {
-  if (!(await page.getByTestId('nav-user').isVisible())) {
+  const account = page.getByTestId('nav-user');
+  const drawer = page.locator('#mobile-drawer');
+  const hasMobileDrawer = (await drawer.count()) > 0;
+  const needsOpen = hasMobileDrawer
+    ? (await drawer.getAttribute('inert')) !== null
+    : !(await account.isVisible());
+  if (needsOpen) {
     await page.getByRole('button', { name: 'Seitenleiste öffnen', exact: true }).click();
+    if (hasMobileDrawer) {
+      // The deferred drawer commit removes inert and hands focus to its close button.
+      await expect(drawer).not.toHaveAttribute('inert', '');
+      await expect(page.getByTestId('close-sidebar-button')).toBeFocused();
+    }
   }
-  await page.getByTestId('nav-user').focus();
-  await page.getByTestId('nav-user').press('Enter');
+  await expect(account).toBeVisible();
+  await account.focus();
+  await expect(account).toBeFocused();
+  await account.press('Enter');
+  await expect(account).toHaveAttribute('aria-expanded', 'true');
   const settings = page.getByTestId('nav-settings');
+  await expect(page.getByRole('menu').filter({ has: settings })).toBeVisible();
+  await expect(settings).toBeVisible();
   await expect(settings).toHaveText('Einstellungen');
   await settings.focus();
+  await expect(settings).toBeFocused();
   await settings.press('Enter');
   await expect(
     page.getByRole('dialog').getByRole('heading', { name: 'Einstellungen', exact: true }),
@@ -246,7 +315,7 @@ test('German presentation survives old English preferences, login, settings, rel
   await page.screenshot({ path: testInfo.outputPath('presentation-login.png') });
 
   const email = `presentation-${randomUUID()}@example.invalid`;
-  const password = 'Local-fixture-only-42!';
+  const password = `Presentation-${randomUUID()}!`;
   const registered = await page.request.post('/api/auth/register', {
     data: { name: 'Presentation User', email, password, confirm_password: password },
   });
@@ -371,6 +440,25 @@ test('German presentation survives old English preferences, login, settings, rel
 });
 
 for (const theme of ['light', 'dark'] as const) {
+  test(`email-code ${theme} label remains readable (controlled startup boundary)`, async ({
+    page,
+    context,
+    baseURL,
+    isMobile,
+  }, testInfo) => {
+    if (!baseURL) throw new Error('Presentation requires its isolated baseURL');
+    await prepareEnglish(context, baseURL, isMobile);
+    // Render the native form without requesting mail from the disabled fixture backend.
+    await configureBranding(page, { theme, emailCodeLogin: true });
+    await page.goto('/login');
+    const form = page.getByRole('region', { name: 'Mit E-Mail-Code anmelden', exact: true });
+    await expect(form.getByRole('textbox', { name: 'E-Mail-Adresse', exact: true })).toBeVisible();
+    await expectThemedLogo(page.getByRole('img', { name: appTitle, exact: true }), theme);
+    await expectReadableAuthText(form.locator('label').filter({ hasText: /^E-Mail-Adresse$/ }));
+    await expectNoOverflow(page);
+    await page.screenshot({ path: testInfo.outputPath(`presentation-email-code-${theme}.png`) });
+  });
+
   test(`mail route resolves authentication and retains ${theme} branding through rejection and recovery (controlled auth boundary)`, async ({
     page,
     context,
@@ -420,9 +508,11 @@ for (const theme of ['light', 'dark'] as const) {
       expect(new URL(page.url()).search).toBe('');
 
       verification.release();
-      await expect(page.getByRole('main').getByRole('alert')).toHaveText(
+      const alert = page.getByRole('main').getByRole('alert');
+      await expect(alert).toHaveText(
         'Dieser Link ist nicht mehr gültig. Fordere einen neuen Code an.',
       );
+      await expectReadableAuthText(alert);
       await expect(status).toHaveCount(0);
       await expectThemedLogo(logo, theme);
       const recovery = page.getByRole('link', { name: 'Neuen Code anfordern', exact: true });

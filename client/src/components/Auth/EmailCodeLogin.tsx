@@ -248,7 +248,7 @@ export default function EmailCodeLogin({
         <p className="text-text-secondary text-sm">{localize('com_auth_email_code_guest_help')}</p>
         {pendingStatus}
         {error && (
-          <p role="alert" className="text-status-error-strong">
+          <p role="alert" className="text-status-error">
             {localize(error)}
           </p>
         )}
@@ -361,7 +361,7 @@ export default function EmailCodeLogin({
       )}
       {pendingStatus}
       {error && (
-        <p role="alert" className="text-status-error-strong">
+        <p role="alert" className="text-status-error">
           {localize(error)}
         </p>
       )}

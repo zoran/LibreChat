@@ -63,12 +63,16 @@ const {
   rejectUnmanagedFileWrites,
   createManagedFileHandlers,
 } = require('./managed');
+const { createFileLibraryHandlers } = require('./library');
 
 const router = express.Router();
 const managed = createManagedFileHandlers();
+const library = createFileLibraryHandlers();
 const scopedFileAccess = (req, res, next) =>
   isCortexFileMode() ? next() : fileAccess(req, res, next);
 router.use(rejectUnmanagedFileWrites);
+router.get('/library', library.list);
+router.patch('/:file_id/library', library.update);
 router.get('/managed/:id', managed.download);
 const AGENT_TOOL_RESOURCE_KEYS = new Set([
   EToolResources.execute_code,

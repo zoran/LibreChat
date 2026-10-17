@@ -70,7 +70,7 @@ function Header({
         aria-keyshortcuts={toggleSidebarAriaKey}
         tabIndex={expanded ? 0 : -1}
         className="shrink-0"
-        onClick={onClose}
+        onClick={() => onClose()}
       >
         <Sidebar className="icon-md" aria-hidden="true" />
       </Button>

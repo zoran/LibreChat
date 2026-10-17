@@ -68,11 +68,6 @@
       "count": 6
     }
   },
-  "client/src/components/Auth/AuthLayout.tsx": {
-    "shadcn/no-inline-styles": {
-      "count": 1
-    }
-  },
   "client/src/components/Auth/ErrorMessage.tsx": {
     "shadcn/no-restyle": {
       "count": 3

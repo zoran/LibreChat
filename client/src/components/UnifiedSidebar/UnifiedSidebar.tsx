@@ -186,7 +186,19 @@ function UnifiedSidebar({
       return;
     }
     const handler = (e: KeyboardEvent) => {
-      if (e.key !== 'Escape') {
+      if (e.key !== 'Escape' || e.defaultPrevented) {
+        return;
+      }
+      // A portaled modal owns its Escape even if it unmounts during dispatch.
+      // The underlying drawer must stay open so its invoker can receive focus.
+      if (
+        e
+          .composedPath()
+          .some(
+            (target) =>
+              target instanceof Element && target.matches('[role="dialog"], [role="alertdialog"]'),
+          )
+      ) {
         return;
       }
       /**

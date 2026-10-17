@@ -1,3 +1,5 @@
+export { createFileLibraryMethods, InvalidFileLibraryInputError } from './methods/fileLibrary';
+export type { FileLibraryMethods } from './methods/fileLibrary';
 export { EMAIL_CODE_IDLE_MS, EMAIL_CODE_ABSOLUTE_MS } from './emailCodePolicy';
 export { FileSourceUnavailableError } from './methods/fileRetention';
 export {
