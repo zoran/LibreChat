@@ -11,6 +11,13 @@ const baseUrl = `${apiBaseUrl()}/api/workspaces`;
 const maxContentBytes = 65_536;
 const maxJsonBytes = 512 * 1024;
 
+/** An immutable content read carries no claim about the workspace's current head. */
+export type WorkspaceRevisionContent = {
+  workspaceId: string;
+  revision: number;
+  bytes: Uint8Array;
+};
+
 export class WorkspaceRequestError extends Error {
   constructor(
     public code: string,
@@ -170,13 +177,22 @@ export const createWorkspace = (format: DocumentWorkspaceFormat, signal: AbortSi
     return created;
   });
 
-async function content(
-  item: DocumentWorkspace,
+async function revisionContent(
+  workspaceId: string,
+  revision: number,
   signal: AbortSignal,
-): Promise<WorkspaceEditorDocument> {
-  if (item.revision === 0) return { workspace: item, bytes: new Uint8Array() };
+): Promise<WorkspaceRevisionContent> {
+  if (
+    typeof workspaceId !== 'string' ||
+    !/^[A-Za-z0-9_.-]{1,128}$/.test(workspaceId) ||
+    workspaceId === '.' ||
+    workspaceId === '..' ||
+    !Number.isSafeInteger(revision) ||
+    revision < 1
+  )
+    throw new WorkspaceRequestError('invalid_request');
   const response = await fetchResponse(
-    `/${encodeURIComponent(item.workspaceId)}/revisions/${item.revision}/content`,
+    `/${encodeURIComponent(workspaceId)}/revisions/${revision}/content`,
     signal,
   );
   if (!response.ok) {
@@ -186,7 +202,19 @@ async function content(
       response.status,
     );
   }
-  return { workspace: item, bytes: await boundedBytes(response, maxContentBytes, signal) };
+  return { workspaceId, revision, bytes: await boundedBytes(response, maxContentBytes, signal) };
+}
+
+export const loadWorkspaceRevision = (id: string, revision: number, signal: AbortSignal) =>
+  limited(signal, 30_000, (bounded) => revisionContent(id, revision, bounded));
+
+async function content(
+  item: DocumentWorkspace,
+  signal: AbortSignal,
+): Promise<WorkspaceEditorDocument> {
+  if (item.revision === 0) return { workspace: item, bytes: new Uint8Array() };
+  const result = await revisionContent(item.workspaceId, item.revision, signal);
+  return { workspace: item, bytes: result.bytes };
 }
 
 export const loadWorkspace = (id: string, signal: AbortSignal) =>

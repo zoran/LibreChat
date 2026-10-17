@@ -2,7 +2,13 @@ import * as mockReact from 'react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import type { DocumentWorkspace } from 'librechat-data-provider';
 import mockGerman from '~/locales/de/translation.json';
-import { createWorkspace, listWorkspaces, loadWorkspace, saveWorkspace } from './api';
+import {
+  createWorkspace,
+  listWorkspaces,
+  loadWorkspace,
+  loadWorkspaceRevision,
+  saveWorkspace,
+} from './api';
 import { WorkspacePanel } from './WorkspacePanel';
 import type { WorkspaceEditorProps } from './WorkspaceEditor';
 
@@ -10,6 +16,7 @@ jest.mock('./api', () => ({
   createWorkspace: jest.fn(),
   listWorkspaces: jest.fn(),
   loadWorkspace: jest.fn(),
+  loadWorkspaceRevision: jest.fn(),
   saveWorkspace: jest.fn(),
 }));
 jest.mock('~/hooks/useLocalize', () => ({
@@ -17,9 +24,12 @@ jest.mock('~/hooks/useLocalize', () => ({
   default: () => (key: string) => (mockGerman as Record<string, string>)[key] ?? key,
 }));
 let mockDisposed = 0;
+let mockEditorProps: WorkspaceEditorProps | null = null;
 /** The editor double keeps local state; API and real Monaco each have their own owner coverage. */
 jest.mock('./WorkspaceEditor', () => ({
-  WorkspaceEditor: function EditorPort({ identity, initial, onSave }: WorkspaceEditorProps) {
+  WorkspaceEditor: function EditorPort(props: WorkspaceEditorProps) {
+    mockEditorProps = props;
+    const { identity, initial, onSave } = props;
     const [value, setValue] = mockReact.useState(() => new TextDecoder().decode(initial.bytes));
     const [error, setError] = mockReact.useState('');
     mockReact.useEffect(() => {
@@ -79,6 +89,7 @@ describe('private workspace panel ownership and draft preservation', () => {
   beforeEach(() => {
     jest.resetAllMocks();
     mockDisposed = 0;
+    mockEditorProps = null;
     (listWorkspaces as jest.Mock).mockResolvedValue({
       workspaces: [item('a'), item('b')],
       nextCursor: null,
@@ -195,6 +206,86 @@ describe('private workspace panel ownership and draft preservation', () => {
     expect(editor).toHaveValue('');
     view.unmount();
   });
+
+  it('composes an explicit historical read without changing the document and preserves edits on404', async () => {
+    const view = render(<WorkspacePanel owner={owner} enabled />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Entwurf a' }));
+    const text = await screen.findByRole('textbox', { name: 'Testentwurf' });
+    fireEvent.change(text, { target: { value: 'Lokale Arbeit' } });
+    (loadWorkspaceRevision as jest.Mock)
+      .mockResolvedValueOnce({
+        workspaceId: 'a',
+        revision: 1,
+        bytes: new TextEncoder().encode('Alt'),
+      })
+      .mockRejectedValueOnce({ code: 'not_found', status: 404 });
+    const signal = new AbortController().signal;
+    await expect(mockEditorProps!.onReadRevision(1, signal)).resolves.toMatchObject({
+      workspaceId: 'a',
+      revision: 1,
+    });
+    expect(loadWorkspaceRevision).toHaveBeenCalledWith('a', 1, expect.any(AbortSignal));
+    await expect(mockEditorProps!.onReadRevision(1, signal)).rejects.toMatchObject({ status: 404 });
+    expect(text).toHaveValue('Lokale Arbeit');
+    expect(mockDisposed).toBe(0);
+    expect(saveWorkspace).not.toHaveBeenCalled();
+    expect(loadWorkspace).toHaveBeenCalledTimes(1);
+    view.unmount();
+  });
+
+  it.each(['owner', 'caller', 'session'])(
+    'aborts the historical read on %s cancellation and rejects a late response',
+    async (kind) => {
+      const request = pending<{ workspaceId: string; revision: number; bytes: Uint8Array }>();
+      (loadWorkspaceRevision as jest.Mock).mockReturnValueOnce(request.promise);
+      const view = render(<WorkspacePanel owner={owner} enabled />);
+      fireEvent.click(await screen.findByRole('button', { name: 'Entwurf a' }));
+      await screen.findByRole('textbox', { name: 'Testentwurf' });
+      const caller = new AbortController();
+      const result = mockEditorProps!
+        .onReadRevision(1, caller.signal)
+        .catch((error: unknown) => error);
+      const signal = (loadWorkspaceRevision as jest.Mock).mock.calls[0][2] as AbortSignal;
+      if (kind === 'owner')
+        view.rerender(<WorkspacePanel owner={{ ...owner, ownerId: 'other' }} enabled />);
+      else if (kind === 'session')
+        act(() => window.dispatchEvent(new Event('librechat:auth-session-ending')));
+      else caller.abort();
+      expect(signal.aborted).toBe(true);
+      await act(async () =>
+        request.resolve({
+          workspaceId: 'a',
+          revision: 1,
+          bytes: new TextEncoder().encode('Private alte Antwort'),
+        }),
+      );
+      expect(await result).toMatchObject({ name: 'AbortError' });
+      expect(screen.queryByDisplayValue('Private alte Antwort')).not.toBeInTheDocument();
+      view.unmount();
+    },
+  );
+
+  it.each([401, 403])(
+    'invalidates the private panel when the historical read returns%s',
+    async (status) => {
+      (loadWorkspaceRevision as jest.Mock).mockRejectedValueOnce({
+        code: 'source_unavailable',
+        status,
+      });
+      const view = render(<WorkspacePanel owner={owner} enabled />);
+      fireEvent.click(await screen.findByRole('button', { name: 'Entwurf a' }));
+      await screen.findByRole('textbox', { name: 'Testentwurf' });
+      await act(async () => {
+        await expect(
+          mockEditorProps!.onReadRevision(1, new AbortController().signal),
+        ).rejects.toMatchObject({ status });
+      });
+      expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+      expect(screen.queryByText('Entwurf a')).not.toBeInTheDocument();
+      expect(mockDisposed).toBe(1);
+      view.unmount();
+    },
+  );
 
   it('clears disabled panels and survives React strict effect replay without a stale response', async () => {
     const stale = pending<{ workspaces: DocumentWorkspace[]; nextCursor: null }>();

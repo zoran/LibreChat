@@ -85,7 +85,7 @@ test('native workspace saves, restores and protects a local draft across hiding 
     if (revision && method === 'GET') {
       counts.content++;
       const body = versions.get(Number(revision[1]));
-      expect(body).toBeDefined();
+      if (!body) return route.fulfill({ status: 404, json: { code: 'not_found' } });
       return route.fulfill({
         contentType: 'text/plain; charset=utf-8',
         headers: { 'Cache-Control': 'no-store' },
@@ -205,7 +205,10 @@ test('native workspace saves, restores and protects a local draft across hiding 
 
   const surface = page.locator('#document-workspace-panel');
   const toggle = page.getByRole('button', { name: 'Dokumentenarbeitsbereich', exact: true });
-  const editor = surface.locator('.monaco-editor').first();
+  const editor = surface
+    .locator('.monaco-editor')
+    .filter({ has: page.getByRole('textbox', { name: 'Dokumenttext', exact: true }) })
+    .first();
   const save = surface.getByRole('button', { name: 'Speichern', exact: true });
   try {
     await page.goto('/c/new');
@@ -267,6 +270,66 @@ test('native workspace saves, restores and protects a local draft across hiding 
       await page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
     ).toBeLessThanOrEqual(1);
     await page.screenshot({ path: testInfo.outputPath('native-workspace-local-draft.png') });
+    const titleLines = await surface
+      .getByRole('heading', { name: title, exact: true })
+      .evaluate((heading) => {
+        const lineHeight = Number.parseFloat(getComputedStyle(heading).lineHeight);
+        return heading.getBoundingClientRect().height / lineHeight;
+      });
+    expect(
+      titleLines,
+      'The editor actions must leave a readable title on a narrow screen',
+    ).toBeLessThanOrEqual(3);
+
+    const compareToggle = surface.getByRole('button', { name: 'Version vergleichen', exact: true });
+    const comparison = surface.getByRole('region', { name: 'Versionen vergleichen', exact: true });
+    await compareToggle.click();
+    await expect(
+      comparison.getByRole('spinbutton', { name: 'Gespeicherte Version', exact: true }),
+    ).toBeFocused();
+    await comparison.getByRole('button', { name: 'Vergleich laden', exact: true }).click();
+    await expect(comparison.locator('.monaco-diff-editor')).toBeVisible();
+    await expect(comparison).toContainText('Gespeicherte Version 1');
+    await expect(comparison.locator('.monaco-diff-editor')).toContainText('LOKALE-AENDERUNG');
+    const snapshotInput = comparison.getByRole('textbox', {
+      name: 'Lokaler Entwurf beim Start des Vergleichs',
+      exact: true,
+    });
+    await snapshotInput.focus();
+    await page.keyboard.type('NICHT-SCHREIBBAR');
+    await expect(comparison.locator('.monaco-diff-editor')).not.toContainText('NICHT-SCHREIBBAR');
+    await expect(editor).not.toContainText('NICHT-SCHREIBBAR');
+    await editor.getByRole('textbox', { name: 'Dokumenttext', exact: true }).focus();
+    await page.keyboard.press('Control+End');
+    await page.keyboard.type(' NEUER-LOKALER-STAND');
+    await expect(comparison.getByRole('status')).toContainText(
+      'Dein Entwurf hat sich inzwischen geändert.',
+    );
+    await expect(comparison.locator('.monaco-diff-editor')).not.toContainText(
+      'NEUER-LOKALER-STAND',
+    );
+    await comparison.getByRole('button', { name: 'Vergleich laden', exact: true }).click();
+    await expect(comparison.locator('.monaco-diff-editor')).toContainText('NEUER-LOKALER-STAND');
+    await expect(comparison.getByRole('status')).toHaveCount(0);
+    await page.screenshot({ path: testInfo.outputPath('native-workspace-version-comparison.png') });
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
+    ).toBeLessThanOrEqual(1);
+    await snapshotInput.press('Escape');
+    await expect(comparison).toHaveCount(0);
+    await expect(compareToggle).toBeFocused();
+    await expect(editor).toContainText('NEUER-LOKALER-STAND');
+    const beforeComparisonUndo = await editor.locator('.view-lines').innerText();
+    await editor.getByRole('textbox', { name: 'Dokumenttext', exact: true }).focus();
+    await page.keyboard.press('Control+z');
+    // Compare the real visible state; Monaco decides which native edit group is undone.
+    await expect
+      .poll(() => editor.locator('.view-lines').innerText())
+      .not.toBe(beforeComparisonUndo);
+    await expect(editor).toContainText(original);
+    await page.keyboard.press('Control+Shift+z');
+    await expect.poll(() => editor.locator('.view-lines').innerText()).toBe(beforeComparisonUndo);
+    expect(counts).toMatchObject({ reservations: 1, tickets: 1, bodies: 1, commits: 1 });
 
     metadata = { ...metadata!, revision: 2, headFileId: randomUUID(), updatedAt: stamp() };
     versions.set(2, Buffer.from(serverUpdate));
@@ -294,6 +357,24 @@ test('native workspace saves, restores and protects a local draft across hiding 
     await expect(editor).toContainText(serverUpdate);
     await expect(editor).not.toContainText('LOKALE-AENDERUNG');
     await expect(save).toBeDisabled();
+    await compareToggle.click();
+    await comparison
+      .getByRole('spinbutton', { name: 'Gespeicherte Version', exact: true })
+      .fill('1');
+    await comparison.getByRole('button', { name: 'Vergleich laden', exact: true }).click();
+    await expect(comparison.locator('.monaco-diff-editor')).toBeVisible();
+    await expect(comparison).toContainText('Gespeicherte Version 1');
+    await expect(editor).toContainText(serverUpdate);
+    versions.delete(1);
+    await comparison.getByRole('button', { name: 'Vergleich laden', exact: true }).click();
+    await expect(comparison.getByRole('alert')).toHaveText(
+      'Diese Version ist nicht mehr verfügbar. Dein Entwurf bleibt geöffnet.',
+    );
+    await expect(comparison.locator('.monaco-diff-editor')).toHaveCount(0);
+    await expect(editor).toContainText(serverUpdate);
+    await expect(save).toBeDisabled();
+    await comparison.getByRole('button', { name: 'Vergleich schließen', exact: true }).click();
+    expect(counts).toMatchObject({ reservations: 2, tickets: 1, bodies: 1, commits: 1 });
     await page.screenshot({ path: testInfo.outputPath('native-workspace-reconciled.png') });
   } finally {
     await testInfo.attach('workspace-server-boundary-fixtures', {

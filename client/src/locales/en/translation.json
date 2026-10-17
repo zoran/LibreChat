@@ -3599,5 +3599,18 @@
   "com_workspace_panel_save_timeout": "Processing could not yet be confirmed. Your changes remain in the open editor. Reload the saved version only after deliberately confirming.",
   "com_workspace_close": "Hide workspace",
   "com_workspace_panel_quota_error": "Your account has reached its draft limit. Contact the AI Center for help.",
-  "com_workspace_panel_rate_error": "Too many requests in a short time. Wait one minute. Unsaved text is kept only in the open editor."
+  "com_workspace_panel_rate_error": "Too many requests in a short time. Wait one minute. Unsaved text is kept only in the open editor.",
+  "com_workspace_compare_open": "Compare version",
+  "com_workspace_compare_title": "Compare versions",
+  "com_workspace_compare_revision": "Saved version",
+  "com_workspace_compare_load": "Load comparison",
+  "com_workspace_compare_loading": "Loading comparison…",
+  "com_workspace_compare_stored": "Saved version {{revision}}",
+  "com_workspace_compare_local": "Local draft when comparison started",
+  "com_workspace_compare_stale": "Your draft has changed. Load the comparison again.",
+  "com_workspace_compare_unavailable": "This version is no longer available. Your draft remains open.",
+  "com_workspace_compare_error": "The version could not be loaded. Try again.",
+  "com_workspace_compare_invalid": "Choose a whole version number between 1 and {{revision}}.",
+  "com_workspace_compare_limit": "To compare, your draft must contain no more than 64 KiB of UTF-8 text.",
+  "com_workspace_compare_close": "Close comparison"
 }

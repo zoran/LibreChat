@@ -8,6 +8,8 @@ import MonacoEditor from '~/components/Artifacts/monaco';
 import useLocalize from '~/hooks/useLocalize';
 import { decodeWorkspaceText } from './codec';
 import { createWorkspaceTextModel } from './model';
+import { WorkspaceRevisionComparison } from './WorkspaceRevisionComparison';
+import type { WorkspaceRevisionContent } from './api';
 import type { WorkspaceSaveEol, WorkspaceTextSnapshot } from './codec';
 import type { WorkspaceEditorIdentity, WorkspaceTextModel } from './model';
 
@@ -17,6 +19,7 @@ export interface WorkspaceEditorProps {
   initial: WorkspaceEditorDocument;
   onSave(input: { baseRevision: number; bytes: Uint8Array }): Promise<WorkspaceEditorDocument>;
   onReload(): Promise<WorkspaceEditorDocument>;
+  onReadRevision(revision: number, signal: AbortSignal): Promise<WorkspaceRevisionContent>;
 }
 
 type Seed = { workspace: DocumentWorkspace; snapshot: WorkspaceTextSnapshot };
@@ -69,7 +72,13 @@ export function WorkspaceEditor(props: WorkspaceEditorProps) {
   return <WorkspaceEditorSession key={key} {...props} />;
 }
 
-function WorkspaceEditorSession({ identity, initial, onSave, onReload }: WorkspaceEditorProps) {
+function WorkspaceEditorSession({
+  identity,
+  initial,
+  onSave,
+  onReload,
+  onReadRevision,
+}: WorkspaceEditorProps) {
   const localize = useLocalize();
   const { resolvedMode, highContrast } = useContext(ThemeContext);
   const remScale = useRemScale();
@@ -94,6 +103,8 @@ function WorkspaceEditorSession({ identity, initial, onSave, onReload }: Workspa
   const [confirmReload, setConfirmReload] = useState(false);
   const keepButton = useRef<HTMLButtonElement>(null);
   const reloadButton = useRef<HTMLButtonElement>(null);
+  const compareButton = useRef<HTMLButtonElement>(null);
+  const [comparing, setComparing] = useState(false);
 
   useEffect(() => {
     if (!seed) return;
@@ -122,6 +133,7 @@ function WorkspaceEditorSession({ identity, initial, onSave, onReload }: Workspa
         setSaveHeld(false);
         setNeedsEol(false);
         setEol('');
+        setComparing(false);
       })
       .catch(() => {
         if (active) setFailure('load');
@@ -147,6 +159,7 @@ function WorkspaceEditorSession({ identity, initial, onSave, onReload }: Workspa
     setPending(null);
     busy.current = false;
     setConfirmReload(false);
+    setComparing(false);
     setFailure('unavailable');
   };
 
@@ -265,7 +278,7 @@ function WorkspaceEditorSession({ identity, initial, onSave, onReload }: Workspa
       }}
     >
       <header className="border-border-light flex shrink-0 flex-wrap items-start justify-between gap-3 border-b p-3">
-        <div className="min-w-0 flex-1">
+        <div className="min-w-0 flex-[1_1_14rem]">
           <h2 className="font-semibold break-words">
             {failure === 'unavailable'
               ? localize('com_workspace_editor_unavailable_title')
@@ -282,6 +295,17 @@ function WorkspaceEditorSession({ identity, initial, onSave, onReload }: Workspa
           <p className="text-text-secondary text-xs">{localize('com_workspace_editor_reminder')}</p>
         </div>
         <div className="flex flex-wrap gap-2">
+          <button
+            ref={compareButton}
+            type="button"
+            className={actionClass}
+            disabled={!session || session.revision < 1 || !!pending}
+            aria-expanded={comparing}
+            aria-controls="workspace-revision-comparison"
+            onClick={() => setComparing(true)}
+          >
+            {localize('com_workspace_compare_open')}
+          </button>
           <button
             ref={reloadButton}
             type="button"
@@ -353,7 +377,23 @@ function WorkspaceEditorSession({ identity, initial, onSave, onReload }: Workspa
           </label>
         </div>
       )}
-      <div className="min-h-72 flex-1">
+      {comparing && session && (
+        <WorkspaceRevisionComparison
+          key={session.model.id}
+          model={session}
+          revision={session.revision}
+          disabled={!!pending}
+          language={workspace.format === 'markdown' ? 'markdown' : 'plaintext'}
+          theme={theme}
+          onReadRevision={onReadRevision}
+          onUnavailable={unavailable}
+          onClose={() => {
+            setComparing(false);
+            compareButton.current?.focus();
+          }}
+        />
+      )}
+      <div className={comparing ? 'min-h-0 flex-1' : 'min-h-72 flex-1'}>
         {session && (
           <MonacoEditor
             path={session.uri}

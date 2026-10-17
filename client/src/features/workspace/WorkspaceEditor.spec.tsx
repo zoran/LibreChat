@@ -54,11 +54,37 @@ jest.mock('@librechat/client', () => ({
 }));
 jest.mock('~/hooks/useLocalize', () => ({
   __esModule: true,
-  default: () => (key: string) => (mockGerman as Record<string, string>)[key] ?? key,
+  default: () => (key: string, values?: { revision?: number }) =>
+    ((mockGerman as Record<string, string>)[key] ?? key).replace(
+      /{{?revision}}?/g,
+      String(values?.revision ?? ''),
+    ),
 }));
 /** A textarea stands in for the native editor. The production codec/model adapter still runs. */
 jest.mock('~/components/Artifacts/monaco', () => ({
   __esModule: true,
+  DiffEditor: ({
+    original,
+    modified,
+    options,
+  }: {
+    original: string;
+    modified: string;
+    options: { originalAriaLabel: string; modifiedAriaLabel: string; readOnly: boolean };
+  }) => (
+    <div>
+      <textarea
+        aria-label={options.originalAriaLabel}
+        value={original}
+        readOnly={options.readOnly}
+      />
+      <textarea
+        aria-label={options.modifiedAriaLabel}
+        value={modified}
+        readOnly={options.readOnly}
+      />
+    </div>
+  ),
   default: function MonacoPortEditor({
     path,
     options,
@@ -83,7 +109,8 @@ jest.mock('~/components/Artifacts/monaco', () => ({
   },
 }));
 
-const bytes = (text: string) => new TextEncoder().encode(text);
+// The jsdom TextEncoder comes from Node; the real API returns a window-owned Uint8Array.
+const bytes = (text: string) => new Uint8Array(new TextEncoder().encode(text));
 const workspace: DocumentWorkspace = {
   workspaceId: 'workspace',
   title: 'Technischer Entwurf',
@@ -111,6 +138,11 @@ function props(initial = document('Original\r\n')): WorkspaceEditorProps {
       bytes: saved,
     })),
     onReload: jest.fn(async () => document('Server\n', 1)),
+    onReadRevision: jest.fn(async (revision) => ({
+      workspaceId: 'workspace',
+      revision,
+      bytes: bytes('Alte Version\r\n'),
+    })),
   };
 }
 function pending<T>() {
@@ -349,6 +381,211 @@ describe('workspace editor view with real codec and model adapter', () => {
     );
     expect(input.onSave).toHaveBeenCalledTimes(1);
     expect(saveButton()).toBeDisabled();
+    view.unmount();
+  });
+
+  const label = (suffix: string, revision?: number) =>
+    (
+      (mockGerman as Record<string, string>)[`com_workspace_compare_${suffix}`] ??
+      `com_workspace_compare_${suffix}`
+    ).replace(/{{?revision}}?/g, String(revision ?? ''));
+  const openComparison = () => fireEvent.click(screen.getByRole('button', { name: label('open') }));
+  const loadComparison = () => fireEvent.click(screen.getByRole('button', { name: label('load') }));
+  const chooseRevision = (value: string) =>
+    fireEvent.change(screen.getByRole('spinbutton', { name: label('revision') }), {
+      target: { value },
+    });
+
+  it('compares a selected saved revision without changing the local model, dirty state or save base', async () => {
+    const input = props(document('Aktuelle Version\r\n', 2));
+    const view = render(<WorkspaceEditor {...input} />);
+    const text = await editor();
+    fireEvent.change(text, { target: { value: 'Lokaler Entwurf\n' } });
+    const model = [...mockModels.values()][0];
+    const version = model.getVersionId();
+    openComparison();
+    expect(input.onReadRevision).not.toHaveBeenCalled();
+    chooseRevision('1');
+    loadComparison();
+    expect(await screen.findByRole('textbox', { name: label('stored', 1) })).toHaveValue(
+      'Alte Version\n',
+    );
+    expect(screen.getByRole('textbox', { name: label('local') })).toHaveValue('Lokaler Entwurf\n');
+    expect(screen.getByRole('textbox', { name: label('stored', 1) })).toHaveAttribute('readonly');
+    expect(text).toHaveValue('Lokaler Entwurf\n');
+    expect(model.getVersionId()).toBe(version);
+    expect(saveButton()).toBeEnabled();
+    expect(input.onSave).not.toHaveBeenCalled();
+    expect(input.onReload).not.toHaveBeenCalled();
+    fireEvent.click(saveButton());
+    await waitFor(() =>
+      expect(input.onSave).toHaveBeenCalledWith({
+        baseRevision: 2,
+        bytes: bytes('Lokaler Entwurf\r\n'),
+      }),
+    );
+    await screen.findByText(label('stale'));
+    view.unmount();
+  });
+
+  it('marks a captured draft stale after edits and captures fresh text only on explicit comparison', async () => {
+    const request = pending<{ workspaceId: string; revision: number; bytes: Uint8Array }>();
+    const input = props(document('Beim Start\n', 2));
+    input.onReadRevision = jest
+      .fn()
+      .mockReturnValueOnce(request.promise)
+      .mockResolvedValue({ workspaceId: 'workspace', revision: 1, bytes: bytes('Alt\n') });
+    const view = render(<WorkspaceEditor {...input} />);
+    const text = await editor();
+    openComparison();
+    chooseRevision('1');
+    loadComparison();
+    fireEvent.change(text, { target: { value: 'Manuelle Änderung\n' } });
+    await act(async () =>
+      request.resolve({ workspaceId: 'workspace', revision: 1, bytes: bytes('Alt\n') }),
+    );
+    expect(screen.getByText(label('stale'))).toBeVisible();
+    expect(screen.getByRole('textbox', { name: label('local') })).toHaveValue('Beim Start\n');
+    expect(text).toHaveValue('Manuelle Änderung\n');
+    loadComparison();
+    await waitFor(() => expect(screen.queryByText(label('stale'))).not.toBeInTheDocument());
+    expect(screen.getByRole('textbox', { name: label('local') })).toHaveValue(
+      'Manuelle Änderung\n',
+    );
+    view.unmount();
+  });
+
+  it('cancels superseded and closed comparison reads and never displays their late bytes', async () => {
+    const first = pending<{ workspaceId: string; revision: number; bytes: Uint8Array }>();
+    const second = pending<{ workspaceId: string; revision: number; bytes: Uint8Array }>();
+    const input = props(document('Lokal', 2));
+    input.onReadRevision = jest
+      .fn()
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+    const view = render(<WorkspaceEditor {...input} />);
+    await editor();
+    openComparison();
+    chooseRevision('1');
+    loadComparison();
+    const firstSignal = (input.onReadRevision as jest.Mock).mock.calls[0][1] as AbortSignal;
+    chooseRevision('2');
+    expect(firstSignal.aborted).toBe(true);
+    loadComparison();
+    await act(async () =>
+      first.resolve({
+        workspaceId: 'workspace',
+        revision: 1,
+        bytes: bytes('Falsche alte Antwort'),
+      }),
+    );
+    expect(screen.queryByDisplayValue('Falsche alte Antwort')).not.toBeInTheDocument();
+    const secondSignal = (input.onReadRevision as jest.Mock).mock.calls[1][1] as AbortSignal;
+    fireEvent.click(screen.getByRole('button', { name: label('close') }));
+    expect(secondSignal.aborted).toBe(true);
+    expect(screen.getByRole('button', { name: label('open') })).toHaveFocus();
+    await act(async () =>
+      second.resolve({
+        workspaceId: 'workspace',
+        revision: 2,
+        bytes: bytes('Geschlossene Antwort'),
+      }),
+    );
+    expect(screen.queryByDisplayValue('Geschlossene Antwort')).not.toBeInTheDocument();
+    expect(await editor()).toHaveValue('Lokal');
+    view.unmount();
+  });
+
+  it('aborts a comparison on owner change and drops its late result', async () => {
+    const request = pending<{ workspaceId: string; revision: number; bytes: Uint8Array }>();
+    const input = props(document('Privat', 1));
+    input.onReadRevision = jest.fn(() => request.promise);
+    const view = render(<WorkspaceEditor {...input} />);
+    await editor();
+    openComparison();
+    loadComparison();
+    const signal = (input.onReadRevision as jest.Mock).mock.calls[0][1] as AbortSignal;
+    view.rerender(
+      <WorkspaceEditor
+        {...input}
+        identity={{ ...input.identity, ownerId: 'other' }}
+        initial={document('Anderer Nutzer', 1)}
+      />,
+    );
+    expect(signal.aborted).toBe(true);
+    await act(async () =>
+      request.resolve({
+        workspaceId: 'workspace',
+        revision: 1,
+        bytes: bytes('Privater alter Vergleich'),
+      }),
+    );
+    expect(await editor()).toHaveValue('Anderer Nutzer');
+    expect(screen.queryByDisplayValue('Privater alter Vergleich')).not.toBeInTheDocument();
+    view.unmount();
+  });
+
+  it('preserves edits for historical404 and rejects malformed or foreign revision content', async () => {
+    const input = props(document('Lokal', 2));
+    input.onReadRevision = jest
+      .fn()
+      .mockRejectedValueOnce({ code: 'not_found', status: 404 })
+      .mockResolvedValueOnce({ workspaceId: 'other', revision: 1, bytes: bytes('Fremd') })
+      .mockResolvedValueOnce({
+        workspaceId: 'workspace',
+        revision: 1,
+        bytes: new Uint8Array([0xff]),
+      });
+    const view = render(<WorkspaceEditor {...input} />);
+    const text = await editor();
+    fireEvent.change(text, { target: { value: 'Behalten' } });
+    openComparison();
+    chooseRevision('1');
+    loadComparison();
+    expect(await screen.findByText(label('unavailable'))).toBeVisible();
+    expect(text).toHaveValue('Behalten');
+    expect(saveButton()).toBeEnabled();
+    loadComparison();
+    expect(await screen.findByText(label('error'))).toBeVisible();
+    expect(screen.queryByDisplayValue('Fremd')).not.toBeInTheDocument();
+    loadComparison();
+    expect(await screen.findByText(label('error'))).toBeVisible();
+    expect(text).toHaveValue('Behalten');
+    view.unmount();
+  });
+
+  it.each([401, 403])(
+    'disposes the editor on historical authorization denial %s',
+    async (status) => {
+      const input = props(document('Privat', 1));
+      input.onReadRevision = jest.fn().mockRejectedValue({ code: 'source_unavailable', status });
+      const view = render(<WorkspaceEditor {...input} />);
+      await editor();
+      openComparison();
+      loadComparison();
+      await waitFor(() =>
+        expect(screen.queryByRole('textbox', { name: 'Dokumenttext' })).not.toBeInTheDocument(),
+      );
+      expect(mockModels.size).toBe(0);
+      view.unmount();
+    },
+  );
+
+  it('rejects invalid revision selections and oversized local comparison text before reading', async () => {
+    const input = props(document('Lokal', 2));
+    const view = render(<WorkspaceEditor {...input} />);
+    const text = await editor();
+    openComparison();
+    chooseRevision('3');
+    loadComparison();
+    expect(screen.getByText(label('invalid', 2))).toBeVisible();
+    expect(input.onReadRevision).not.toHaveBeenCalled();
+    chooseRevision('1');
+    fireEvent.change(text, { target: { value: 'ä'.repeat(32_769) } });
+    loadComparison();
+    expect(screen.getByText(label('limit'))).toBeVisible();
+    expect(input.onReadRevision).not.toHaveBeenCalled();
+    expect(text).toHaveValue('ä'.repeat(32_769));
     view.unmount();
   });
 

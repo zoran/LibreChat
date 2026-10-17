@@ -3679,5 +3679,18 @@
   "com_workspace_panel_save_timeout": "Die Verarbeitung konnte noch nicht bestätigt werden. Deine Änderungen bleiben im geöffneten Editor erhalten. Lade den gespeicherten Stand erst nach bewusster Bestätigung neu.",
   "com_workspace_close": "Arbeitsbereich ausblenden",
   "com_workspace_panel_quota_error": "Für dein Konto ist die Grenze für Entwürfe erreicht. Das AI Center hilft dir weiter.",
-  "com_workspace_panel_rate_error": "Zu viele Anfragen in kurzer Zeit. Warte eine Minute. Ungespeicherter Text bleibt nur im geöffneten Editor erhalten."
+  "com_workspace_panel_rate_error": "Zu viele Anfragen in kurzer Zeit. Warte eine Minute. Ungespeicherter Text bleibt nur im geöffneten Editor erhalten.",
+  "com_workspace_compare_open": "Version vergleichen",
+  "com_workspace_compare_title": "Versionen vergleichen",
+  "com_workspace_compare_revision": "Gespeicherte Version",
+  "com_workspace_compare_load": "Vergleich laden",
+  "com_workspace_compare_loading": "Vergleich wird geladen …",
+  "com_workspace_compare_stored": "Gespeicherte Version {{revision}}",
+  "com_workspace_compare_local": "Lokaler Entwurf beim Start des Vergleichs",
+  "com_workspace_compare_stale": "Dein Entwurf hat sich inzwischen geändert. Lade den Vergleich erneut.",
+  "com_workspace_compare_unavailable": "Diese Version ist nicht mehr verfügbar. Dein Entwurf bleibt geöffnet.",
+  "com_workspace_compare_error": "Die Version konnte nicht geladen werden. Versuch es erneut.",
+  "com_workspace_compare_invalid": "Wähle eine ganze Versionsnummer zwischen 1 und {{revision}}.",
+  "com_workspace_compare_limit": "Für den Vergleich darf dein Entwurf höchstens 64 KiB UTF-8-Text enthalten.",
+  "com_workspace_compare_close": "Vergleich schließen"
 }

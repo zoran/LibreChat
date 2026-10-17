@@ -2,7 +2,13 @@ import { useEffect, useRef, useState } from 'react';
 import type { DocumentWorkspace, DocumentWorkspaceFormat } from 'librechat-data-provider';
 import useLocalize from '~/hooks/useLocalize';
 import type { TranslationKeys } from '~/hooks/useLocalize';
-import { createWorkspace, listWorkspaces, loadWorkspace, saveWorkspace } from './api';
+import {
+  createWorkspace,
+  listWorkspaces,
+  loadWorkspace,
+  loadWorkspaceRevision,
+  saveWorkspace,
+} from './api';
 import { WorkspaceEditor } from './WorkspaceEditor';
 import type { WorkspaceEditorDocument } from './WorkspaceEditor';
 
@@ -333,6 +339,36 @@ function WorkspacePanelSession({ owner }: Pick<WorkspacePanelProps, 'owner'>) {
               workspaceId: document.workspace.workspaceId,
             }}
             initial={document}
+            onReadRevision={async (revision, caller) => {
+              const ownerSignal = controller.current.signal;
+              const combined = new AbortController();
+              const abort = () => combined.abort();
+              ownerSignal.addEventListener('abort', abort, { once: true });
+              caller.addEventListener('abort', abort, { once: true });
+              try {
+                if (!active(ownerSignal) || caller.aborted) abort();
+                combined.signal.throwIfAborted();
+                const loaded = await loadWorkspaceRevision(
+                  document.workspace.workspaceId,
+                  revision,
+                  combined.signal,
+                );
+                if (!active(ownerSignal) || caller.aborted) abort();
+                combined.signal.throwIfAborted();
+                return loaded;
+              } catch (error) {
+                if (
+                  active(ownerSignal) &&
+                  !caller.aborted &&
+                  codeOf(error) === 'source_unavailable'
+                )
+                  invalidate();
+                throw error;
+              } finally {
+                ownerSignal.removeEventListener('abort', abort);
+                caller.removeEventListener('abort', abort);
+              }
+            }}
             onSave={async (input) => {
               const signal = controller.current.signal;
               setEditorBusy(true);

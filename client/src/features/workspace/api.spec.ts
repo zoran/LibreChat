@@ -1,7 +1,13 @@
 import { request } from 'librechat-data-provider';
 import type { DocumentWorkspace, UploadOperation } from 'librechat-data-provider';
 import { sendUploadBody } from '../uploads/api';
-import { createWorkspace, listWorkspaces, loadWorkspace, saveWorkspace } from './api';
+import {
+  createWorkspace,
+  listWorkspaces,
+  loadWorkspace,
+  loadWorkspaceRevision,
+  saveWorkspace,
+} from './api';
 
 jest.mock('librechat-data-provider', () => ({
   apiBaseUrl: () => '',
@@ -83,6 +89,87 @@ describe('workspace API composition through native managed intake', () => {
         cache: 'no-store',
         signal: expect.any(AbortSignal),
       });
+  });
+
+  it('reads only the explicitly selected historical revision without inventing head metadata or writing', async () => {
+    const content = bytes('\uFEFFAlte Version\r\n');
+    respond(content);
+    await expect(loadWorkspaceRevision('draft', 2, new AbortController().signal)).resolves.toEqual({
+      workspaceId: 'draft',
+      revision: 2,
+      bytes: content,
+    });
+    expect(fetches()).toHaveLength(1);
+    expect(fetches()[0]).toEqual([
+      '/api/workspaces/draft/revisions/2/content',
+      expect.objectContaining({ method: 'GET', cache: 'no-store', credentials: 'same-origin' }),
+    ]);
+    expect(fetches()[0][1].body).toBeUndefined();
+    expect(sendUploadBody).not.toHaveBeenCalled();
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it.each([0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Number.NaN])(
+    'rejects invalid historical revision %s before requesting bytes',
+    async (revision) => {
+      await expect(
+        loadWorkspaceRevision('draft', revision, new AbortController().signal),
+      ).rejects.toMatchObject({ code: 'invalid_request' });
+      expect(fetches()).toHaveLength(0);
+      expect(jest.getTimerCount()).toBe(0);
+    },
+  );
+
+  it.each(['', '../other', '.', '..', 'x'.repeat(129)])(
+    'rejects an invalid historical workspace identifier %s',
+    async (id) => {
+      await expect(
+        loadWorkspaceRevision(id, 1, new AbortController().signal),
+      ).rejects.toMatchObject({ code: 'invalid_request' });
+      expect(fetches()).toHaveLength(0);
+    },
+  );
+
+  it.each([401, 403, 404])(
+    'keeps historical HTTP %s distinct from a valid content response',
+    async (status) => {
+      const body = respond({ code: 'not_found' }, status);
+      await expect(
+        loadWorkspaceRevision('draft', 1, new AbortController().signal),
+      ).rejects.toMatchObject({
+        code: status === 404 ? 'not_found' : 'source_unavailable',
+        status,
+      });
+      expect(body.read).not.toHaveBeenCalled();
+      expect(body.cancel).toHaveBeenCalledTimes(1);
+      expect(sendUploadBody).not.toHaveBeenCalled();
+    },
+  );
+
+  it('bounds historical content and rejects a late response after cancellation', async () => {
+    const oversized = respond(new Uint8Array(65_537));
+    await expect(
+      loadWorkspaceRevision('draft', 1, new AbortController().signal),
+    ).rejects.toMatchObject({ code: 'response_limit' });
+    expect(oversized.cancel).toHaveBeenCalledTimes(1);
+    const controller = new AbortController();
+    let release!: (response: unknown) => void;
+    (request.authenticatedFetch as jest.Mock).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    const read = loadWorkspaceRevision('draft', 1, controller.signal);
+    const result = read.catch((error: unknown) => error);
+    controller.abort();
+    release({
+      ok: true,
+      status: 200,
+      body: { getReader: () => ({ read: jest.fn(), cancel: async () => undefined }) },
+    });
+    expect(await result).toMatchObject({ name: 'AbortError' });
+    expect(jest.getTimerCount()).toBe(0);
   });
 
   it('transfers once, waits for bound ready/cleanup status, commits once and reads the exact immutable revision', async () => {
