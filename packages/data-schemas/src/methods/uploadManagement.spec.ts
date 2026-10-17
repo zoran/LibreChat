@@ -31,6 +31,7 @@ describe('durable upload management', () => {
   const other: UploadPrincipal = { ...user, userId: new mongoose.Types.ObjectId().toString() };
   const worker = { hostId: 'host-a', instanceId: 'app-a' };
   const baseline = { originalBytes: 0, objectBytes: 0, textBytes: 0, recordBytes: 0, bundles: 0 };
+  const securityPolicySha256 = 'c'.repeat(64);
   const request = (id: string, bytes = 8) => ({
     operationId: id,
     idempotencyKey: id,
@@ -61,6 +62,23 @@ describe('durable upload management', () => {
     originalAbsent: false,
     textAndHistoryRemoved: false,
   });
+  const approval = (lease: UploadLease, bytes = 8, checkedAt = now) => ({
+    version: 1 as const,
+    decision: 'approved' as const,
+    policySha256: securityPolicySha256,
+    subject: {
+      tenantId: lease.tenantId,
+      userId: lease.userId,
+      operationId: lease.operationId,
+      transferGeneration: lease.generation,
+      mediaType: 'text/plain',
+      bytes,
+      sha256: receipt(lease, bytes).integrity.sha256,
+    },
+    scannerVersion: 'fixture-v1',
+    checkedAt: new Date(checkedAt).toISOString(),
+    coverage: { complete: true as const, pages: 1, parts: 1 },
+  });
 
   beforeAll(async () => {
     mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
@@ -77,9 +95,14 @@ describe('durable upload management', () => {
       for (const name of ['File', 'Message', 'UploadOperation', 'UploadCounter'])
         if (db.models[name]) await db.models[name].deleteMany({});
     }
-    first = createUploadManagementRepository(a, { enabled: true, reconciled: true, baseline });
-    second = createUploadManagementRepository(b);
-    target = createUploadManagementRepository(replacement);
+    first = createUploadManagementRepository(a, {
+      enabled: true,
+      reconciled: true,
+      baseline,
+      securityPolicySha256,
+    });
+    second = createUploadManagementRepository(b, { securityPolicySha256 });
+    target = createUploadManagementRepository(replacement, { securityPolicySha256 });
     await first.initialize();
     await Promise.all([second.initialize(), target.initialize()]);
   });
@@ -89,16 +112,22 @@ describe('durable upload management', () => {
   });
 
   async function accepted(id: string, bytes = 8, at = now, principal = user) {
-    await first.reserve(principal, request(id, bytes), at);
+    const reservation = await first.reserve(principal, request(id, bytes), at);
     const lease = await first.claim({
       kind: 'transfer',
       principal,
-      operationId: id,
+      operationId: reservation.id,
       worker,
       now: at,
     });
     expect(lease).not.toBeNull();
-    const operation = await second.accept(principal, lease!, receipt(lease!, bytes), at);
+    const operation = await second.accept(
+      principal,
+      lease!,
+      receipt(lease!, bytes),
+      approval(lease!, bytes, at),
+      at,
+    );
     await first.confirmCleanup(localGone(lease!), at);
     return { operation, lease: lease! };
   }
@@ -134,7 +163,7 @@ describe('durable upload management', () => {
   }
   async function ready(id: string, bytes = 8, at = now, principal = user) {
     const result = await accepted(id, bytes, at, principal);
-    const lease = await processing(id, at);
+    const lease = await processing(result.operation.id, at);
     await first.publish(lease, { text: 'document', writerStopped: true }, at);
     await second.confirmCleanup(localGone(lease), at);
     return result;
@@ -780,41 +809,51 @@ describe('durable upload management', () => {
     expect((await first.usage(user, now + UPLOAD_WINDOW_MS)).usedBytes).toBe(0);
   }, 30_000);
 
-  it('shares guest quota/idempotence across replicas and retains every accepted debit through delete and replacement', async () => {
-    const guest = { tenantId: null, userId: user.userId, authentication: 'guest' } as const;
-    const duplicate = request('guest-0', UPLOAD_MAX_FILE_BYTES);
-    const pair = await Promise.all([
-      first.reserve(guest, duplicate, now),
-      second.reserve(guest, { ...duplicate, operationId: 'ignored-id' }, now),
-    ]);
-    expect(pair[0].id).toBe(pair[1].id);
-    for (let index = 0; index < 10; index++)
-      await ready(`guest-${index}`, UPLOAD_MAX_FILE_BYTES, now, guest);
-    expect((await first.usage(guest, now)).usedBytes).toBe(UPLOAD_USER_WINDOW_BYTES);
-    expect((await first.usage(user, now)).usedBytes).toBe(0);
-    expect((await first.usage({ ...guest, userId: other.userId }, now)).usedBytes).toBe(0);
-    await expect(second.reserve(guest, request('guest-over', 1), now)).rejects.toMatchObject({
-      code: 'quota_exceeded',
-    });
-    await first.delete(guest, 'guest-0', now + 1);
-    expect((await second.usage(guest, now + 1)).usedBytes).toBe(UPLOAD_USER_WINDOW_BYTES);
-    const task = await first.cleanupForFile({ tenantId: null, userId: guest.userId }, 'guest-0');
-    expect(task?.principal).toEqual(guest);
-    expect(task?.original?.storageKey).toBe(`managed-uploads/${guest.userId}/guest-0.1__original`);
-    const page = await first.exportSnapshot({ epoch: 'guest-move', limit: 100 });
-    await target.importSnapshot(page);
-    await replacement.models.File.insertMany(await a.models.File.find({}).lean());
-    const seal = await first.completeExport('guest-move');
-    await target.completeImport({ receipt: seal, baseline, lifecycleReconciled: true });
-    expect(await target.usage(guest, now)).toEqual(await first.usage(guest, now));
-    expect((await target.get(guest, 'guest-1', now)).expiresAt).toBe(
-      new Date(now + UPLOAD_RETENTION_MS).toISOString(),
-    );
-    expect((await target.usage(guest, now + UPLOAD_WINDOW_MS - 1)).usedBytes).toBe(
-      UPLOAD_USER_WINDOW_BYTES,
-    );
-    expect((await target.usage(guest, now + UPLOAD_WINDOW_MS)).usedBytes).toBe(0);
-  }, 30000);
+  it.each(['concurrent', 'second replica first'] as const)(
+    'shares guest quota/idempotence across replicas and retains every accepted debit through delete and replacement (%s)',
+    async (ordering) => {
+      const guest = { tenantId: null, userId: user.userId, authentication: 'guest' } as const;
+      const duplicate = request('guest-0', UPLOAD_MAX_FILE_BYTES);
+      if (ordering === 'second replica first')
+        await second.reserve(guest, { ...duplicate, operationId: 'ignored-id' }, now);
+      const pair = await Promise.all([
+        first.reserve(guest, duplicate, now),
+        second.reserve(guest, { ...duplicate, operationId: 'ignored-id' }, now),
+      ]);
+      expect(pair[0].id).toBe(pair[1].id);
+      for (let index = 0; index < 10; index++)
+        await ready(`guest-${index}`, UPLOAD_MAX_FILE_BYTES, now, guest);
+      expect((await first.usage(guest, now)).usedBytes).toBe(UPLOAD_USER_WINDOW_BYTES);
+      expect((await first.usage(user, now)).usedBytes).toBe(0);
+      expect((await first.usage({ ...guest, userId: other.userId }, now)).usedBytes).toBe(0);
+      await expect(second.reserve(guest, request('guest-over', 1), now)).rejects.toMatchObject({
+        code: 'quota_exceeded',
+      });
+      await first.delete(guest, pair[0].id, now + 1);
+      expect((await second.usage(guest, now + 1)).usedBytes).toBe(UPLOAD_USER_WINDOW_BYTES);
+      const task = await first.cleanupForFile({ tenantId: null, userId: guest.userId }, pair[0].id);
+      expect(task?.principal).toEqual(guest);
+      expect(task?.original?.storageKey).toBe(
+        `managed-uploads/${guest.userId}/${pair[0].id}.1__original`,
+      );
+      const page = await first.exportSnapshot({ epoch: 'guest-move', limit: 100 });
+      await target.importSnapshot(page);
+      await replacement.models.File.insertMany(
+        await a.models.File.find({}).select('+securityApproval').lean(),
+      );
+      const seal = await first.completeExport('guest-move');
+      await target.completeImport({ receipt: seal, baseline, lifecycleReconciled: true });
+      expect(await target.usage(guest, now)).toEqual(await first.usage(guest, now));
+      expect((await target.get(guest, 'guest-1', now)).expiresAt).toBe(
+        new Date(now + UPLOAD_RETENTION_MS).toISOString(),
+      );
+      expect((await target.usage(guest, now + UPLOAD_WINDOW_MS - 1)).usedBytes).toBe(
+        UPLOAD_USER_WINDOW_BYTES,
+      );
+      expect((await target.usage(guest, now + UPLOAD_WINDOW_MS)).usedBytes).toBe(0);
+    },
+    30000,
+  );
 
   it('does not classify missing or malformed tenant snapshots as guest migrations', async () => {
     const guest = { tenantId: null, userId: user.userId, authentication: 'guest' } as const;
@@ -1045,9 +1084,9 @@ describe('durable upload management', () => {
 
   it('replays durable accept and publish without a second debit, and waits for local cleanup', async () => {
     const { lease } = await accepted('replay');
-    expect((await second.accept(user, lease, receipt(lease), now + 1)).acceptedAt).toBe(
-      new Date(now).toISOString(),
-    );
+    expect(
+      (await second.accept(user, lease, receipt(lease), approval(lease), now + 1)).acceptedAt,
+    ).toBe(new Date(now).toISOString());
     const parser = await processing('replay');
     const result = { text: 'document', writerStopped: true as const };
     const published = await first.publish(parser, result, now);
@@ -1092,7 +1131,7 @@ describe('durable upload management', () => {
       worker,
       now,
     }))!;
-    await second.accept(user, transfer, receipt(transfer), now);
+    await second.accept(user, transfer, receipt(transfer), approval(transfer), now);
     expect(await first.cleanupForFile(other, 'cleanup-proof')).toBeNull();
     expect(
       await first.cleanupForFile({ ...user, tenantId: 'tenant-b' }, 'cleanup-proof'),
@@ -1377,7 +1416,9 @@ describe('durable upload management', () => {
     await target.importSnapshot(pageA);
     await target.importSnapshot(pageB);
     // The owning File migration is separate; this fixture copies its already-accepted immutable data.
-    await replacement.models.File.insertMany(await a.models.File.find({}).lean());
+    await replacement.models.File.insertMany(
+      await a.models.File.find({}).select('+securityApproval').lean(),
+    );
     await expect(target.reserve(user, request('early'), now)).rejects.toMatchObject({
       code: 'migration_conflict',
     });

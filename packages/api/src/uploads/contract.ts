@@ -27,6 +27,9 @@ import type {
   UploadOriginalIntegrity,
   UploadAdmissionPolicy,
   UploadAdmissionCommand,
+  UploadSecuritySubject,
+  UploadSecurityApproval,
+  UploadSecurityInspection,
 } from 'librechat-data-provider';
 
 export interface IdentityPort {
@@ -64,6 +67,15 @@ export interface StoragePort {
     userId: string;
     signal: AbortSignal;
   }): Promise<'absent' | 'unknown'>;
+}
+/** Isolated intake only. A normal parser or successful storage write cannot grant this approval. */
+export interface UploadSecurityPort {
+  readonly policySha256: string;
+  inspect(input: {
+    subject: UploadSecuritySubject;
+    body: AsyncIterable<Uint8Array>;
+    signal: AbortSignal;
+  }): Promise<UploadSecurityInspection>;
 }
 export interface DocumentPort {
   prepare(input: {
@@ -129,6 +141,7 @@ export interface UploadRepository {
     principal: UploadPrincipal,
     lease: UploadLease,
     receipt: UploadStorageReceipt,
+    securityApproval: UploadSecurityApproval,
     now: number,
   ): Promise<UploadOperation>;
   publish(

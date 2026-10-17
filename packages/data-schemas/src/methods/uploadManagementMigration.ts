@@ -29,6 +29,7 @@ import {
   FALLBACK_LIMITS,
   reject,
 } from './uploadManagementStore';
+import { validateUploadMigrationSecurity } from './uploadManagement.security';
 import { readUploadAdmission } from './uploadManagementAdmission';
 
 export type UploadMigrationMethods = {
@@ -47,7 +48,10 @@ export type UploadMigrationMethods = {
 };
 
 /** One private replacement protocol; the existing File/storage owners reconcile their own data. */
-export function createUploadMigrationMethods(store: UploadStore): UploadMigrationMethods {
+export function createUploadMigrationMethods(
+  store: UploadStore,
+  securityPolicySha256?: string,
+): UploadMigrationMethods {
   const keys = Object.keys(RESOURCE_MAX) as (keyof ResourceTotals)[];
   const totalsOf = (source: ResourceTotals): ResourceTotals =>
     Object.fromEntries(keys.map((key) => [key, source[key]])) as ResourceTotals;
@@ -178,6 +182,7 @@ export function createUploadMigrationMethods(store: UploadStore): UploadMigratio
         !Number.isFinite(Date.parse(row.parserExecution.expiresAt)))
     )
       reject('migration_conflict');
+    validateUploadMigrationSecurity(row, securityPolicySha256, Date.now());
     return row;
   }
   async function exactTotals(global: GlobalState, session: ClientSession): Promise<void> {

@@ -18,6 +18,7 @@ import type {
   UploadMigrationReceipt,
   UploadReconciliationSnapshot,
   UploadActivationProof,
+  UploadSecurityApproval,
 } from 'librechat-data-provider';
 import type { ClientSession, Model } from 'mongoose';
 import { tenantStorage, SYSTEM_TENANT_ID, runAsSystem } from '~/config/tenantContext';
@@ -101,6 +102,8 @@ export type StoredUpload = {
   leaseExpiresAt?: number;
   attemptGeneration?: number;
   original?: UploadStorageReceipt;
+  /** Trusted scanner receipt, private to the original transfer rather than processing attempts. */
+  securityApproval?: UploadSecurityApproval;
   originalBytes: number;
   textBytes: number;
   recordBytes: number;
@@ -145,6 +148,8 @@ export type GlobalState = ResourceTotals & {
 };
 export type CounterRow = { _id: string; revision: number; value: GlobalState | { turn: number } };
 export type UploadStoreOptions = {
+  /** Missing/invalid policy closes dependent operations without preventing cleanup or startup. */
+  securityPolicySha256?: string;
   /** Only the trusted activation/reconciliation owner may attest existing occupancy. */
   reconciled?: boolean;
   baseline?: Partial<ResourceTotals>;
@@ -374,6 +379,7 @@ export function createUploadStore(
       writerStopped: Boolean,
       attemptGeneration: Number,
       original: S.Types.Mixed,
+      securityApproval: S.Types.Mixed,
       originalBytes: Number,
       textBytes: Number,
       recordBytes: Number,

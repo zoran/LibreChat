@@ -47,6 +47,10 @@ jobs:
       - run: npm run e2e:prepare
       - name: Verify managed documents reach model-neutral chat context
         run: npm run test:managed-documents
+      - name: Preserve fail-closed upload security contracts
+        run: npm run test:upload-security
+        env:
+          UPLOAD_TEST_TMPDIR: ${{ runner.temp }}/upload-security
       - run: google-chrome --version
       - name: Preserve configured presentation and upstream defaults
         run: npm run test:presentation

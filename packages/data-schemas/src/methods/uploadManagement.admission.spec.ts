@@ -2,7 +2,12 @@
 import mongoose from 'mongoose';
 import { createHash } from 'crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
-import type { UploadAdmissionCommand, UploadLease, UploadPrincipal } from 'librechat-data-provider';
+import type {
+  UploadAdmissionCommand,
+  UploadLease,
+  UploadPrincipal,
+  UploadSecurityApproval,
+} from 'librechat-data-provider';
 import type { GlobalState } from './uploadManagementStore';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createModels } from '~/models';
@@ -16,6 +21,9 @@ describe('durable upload admission pause', () => {
   let second: ReturnType<typeof createUploadManagementRepository>;
   let target: ReturnType<typeof createUploadManagementRepository>;
   const baseline = { originalBytes: 0, objectBytes: 0, textBytes: 0, recordBytes: 0, bundles: 0 };
+  const securityPolicySha256 = 'c'.repeat(64);
+  const original = Buffer.from('document');
+  const originalSha256 = createHash('sha256').update(original).digest('hex');
   const user: UploadPrincipal = {
     tenantId: 'tenant-a',
     userId: new mongoose.Types.ObjectId().toString(),
@@ -32,17 +40,34 @@ describe('durable upload admission pause', () => {
   });
   const receipt = (lease: UploadLease) => ({
     outcome: 'durable' as const,
-    bytes: 8,
+    bytes: original.length,
     source: 's3',
     filepath: `/api/files/download/${lease.operationId}`,
     storageKey: `t/${lease.tenantId}/managed-uploads/${lease.userId}/${lease.operationId}.${lease.generation}__original`,
     integrity: {
       version: 1 as const,
       algorithm: 'sha256' as const,
-      sha256: 'a'.repeat(64),
+      sha256: originalSha256,
       chunkBytes: 262144 as const,
-      chunkSha256: ['b'.repeat(64)],
+      chunkSha256: [originalSha256],
     },
+  });
+  const approval = (lease: UploadLease, now: number): UploadSecurityApproval => ({
+    version: 1,
+    decision: 'approved',
+    policySha256: securityPolicySha256,
+    subject: {
+      tenantId: lease.tenantId,
+      userId: lease.userId,
+      operationId: lease.operationId,
+      transferGeneration: lease.generation,
+      mediaType: 'text/plain',
+      bytes: original.length,
+      sha256: originalSha256,
+    },
+    scannerVersion: 'simulated-admission-fixture-v1',
+    checkedAt: new Date(now).toISOString(),
+    coverage: { complete: true, pages: 1, parts: 1 },
   });
   const localGone = (lease: UploadLease) => ({
     operationId: lease.operationId,
@@ -68,9 +93,14 @@ describe('durable upload admission pause', () => {
       for (const name of ['File', 'Message', 'UploadOperation', 'UploadCounter'])
         if (db.models[name]) await db.models[name].deleteMany({});
     }
-    first = createUploadManagementRepository(a, { enabled: true, reconciled: true, baseline });
-    second = createUploadManagementRepository(b);
-    target = createUploadManagementRepository(replacement);
+    first = createUploadManagementRepository(a, {
+      enabled: true,
+      reconciled: true,
+      baseline,
+      securityPolicySha256,
+    });
+    second = createUploadManagementRepository(b, { securityPolicySha256 });
+    target = createUploadManagementRepository(replacement, { securityPolicySha256 });
     await first.initialize();
     await Promise.all([second.initialize(), target.initialize()]);
   });
@@ -374,7 +404,7 @@ describe('durable upload admission pause', () => {
     const grant = await first.claimWorkBytes({ lease: transfer, requestedBytes: 8, now });
     expect(grant?.bytes).toBe(8);
     await second.completeWorkBytes({ lease: transfer, generation: grant!.generation, now });
-    await first.accept(user, transfer, receipt(transfer), now);
+    await first.accept(user, transfer, receipt(transfer), approval(transfer, now), now);
     await second.confirmCleanup(localGone(transfer), now);
     const prior = (await first.claim({ kind: 'processing', worker, now }))!;
     await first.bindProcessingExecution(

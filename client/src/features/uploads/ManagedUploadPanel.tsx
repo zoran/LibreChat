@@ -30,6 +30,8 @@ const phaseKeys: Record<string, TranslationKeys> = {
 };
 const actionClass =
   'rounded px-2 py-1 text-sm underline underline-offset-2 focus-visible:outline focus-visible:outline-2 disabled:opacity-50';
+const isSecurityFailure = (error?: string) =>
+  error === 'security_rejected' || error === 'security_uninspectable';
 
 export function ManagedUploadPanel() {
   const localize = useLocalize();
@@ -107,32 +109,37 @@ export function ManagedUploadPanel() {
     );
   }
   return (
-    <details className="border-border-light text-text-secondary mb-2 w-full rounded-xl border px-3 py-2 text-sm">
-      <summary className="cursor-pointer rounded focus-visible:outline focus-visible:outline-2">
-        {localize(
-          uploads.isGuestAccount ? 'com_upload_guest_limits_summary' : 'com_upload_limits_summary',
+    <div className="mb-2 w-full text-sm">
+      <p className="text-text-secondary mb-2">{localize('com_upload_security_notice')}</p>
+      <details className="border-border-light text-text-secondary w-full rounded-xl border px-3 py-2 text-sm">
+        <summary className="cursor-pointer rounded focus-visible:outline focus-visible:outline-2">
+          {localize(
+            uploads.isGuestAccount
+              ? 'com_upload_guest_limits_summary'
+              : 'com_upload_limits_summary',
+          )}
+        </summary>
+        {content}
+        {uploads.eligible && uploads.data && (
+          <>
+            {uploads.admissionsPaused !== false && (
+              <p role="status" className="mt-2">
+                {localize(
+                  uploads.admissionsPaused === true
+                    ? 'com_upload_admission_paused'
+                    : 'com_upload_status_unavailable',
+                )}
+              </p>
+            )}
+            {uploads.isError && (
+              <p role="alert" className="mt-2">
+                {localize('com_upload_refresh_failed')}
+              </p>
+            )}
+          </>
         )}
-      </summary>
-      {content}
-      {uploads.eligible && uploads.data && (
-        <>
-          {uploads.admissionsPaused !== false && (
-            <p role="status" className="mt-2">
-              {localize(
-                uploads.admissionsPaused === true
-                  ? 'com_upload_admission_paused'
-                  : 'com_upload_status_unavailable',
-              )}
-            </p>
-          )}
-          {uploads.isError && (
-            <p role="alert" className="mt-2">
-              {localize('com_upload_refresh_failed')}
-            </p>
-          )}
-        </>
-      )}
-    </details>
+      </details>
+    </div>
   );
 }
 
@@ -152,6 +159,10 @@ export function ManagedUploadCard({
   const local = file.managedUpload!;
   const operation =
     uploads.data?.operations.find((row) => row.id === local.operation?.id) ?? local.operation;
+  let error = operation?.error ?? local.error;
+  // A stale generic snapshot must not replace a concrete local security failure with retry advice.
+  if (isSecurityFailure(local.error) && !isSecurityFailure(error)) error = local.error;
+  const securityFailure = isSecurityFailure(error);
   const serverProcessingOrTerminal =
     operation && !['waiting', 'transferring'].includes(operation.state);
   const phase = pending
@@ -160,17 +171,21 @@ export function ManagedUploadCard({
   const terminal = ['ready', 'failed', 'cancelled', 'deleted', 'expired'].includes(phase);
   const progress = local.transfer;
   let errorKey: TranslationKeys = 'com_upload_action_failed';
-  if (local.error === 'quota_exceeded') {
+  if (error === 'security_rejected') {
+    errorKey = 'com_upload_security_rejected';
+  } else if (error === 'security_uninspectable') {
+    errorKey = 'com_upload_security_uninspectable';
+  } else if (error === 'quota_exceeded') {
     errorKey = 'com_upload_quota_exceeded';
-  } else if (local.error === 'queue_full' || local.error === 'capacity_exceeded') {
+  } else if (error === 'queue_full' || error === 'capacity_exceeded') {
     errorKey = 'com_upload_capacity_unavailable';
-  } else if (local.error === 'size_mismatch') {
+  } else if (error === 'size_mismatch') {
     errorKey = 'com_upload_size_mismatch';
-  } else if (local.error === 'admission_paused') {
+  } else if (error === 'admission_paused') {
     errorKey = 'com_upload_admission_paused';
   }
   const action = async (kind: 'cancel' | 'delete' | 'retry') => {
-    if (pending || !operation) return;
+    if (pending || !operation || (kind === 'retry' && securityFailure)) return;
     setPending(kind);
     setActionError(false);
     try {
@@ -193,7 +208,11 @@ export function ManagedUploadCard({
         {file.filename}
       </p>
       <p role="status" aria-live="polite" aria-atomic="true" className="text-text-secondary">
-        {localize(phaseKeys[phase] ?? 'com_upload_failed')}
+        {localize(
+          securityFailure && !pending
+            ? 'com_upload_failed'
+            : (phaseKeys[phase] ?? 'com_upload_failed'),
+        )}
       </p>
       {phase === 'transferring' && progress && (
         <>
@@ -231,12 +250,12 @@ export function ManagedUploadCard({
       {operation?.cleanupPending && (
         <p className="mt-1">{localize('com_upload_cleanup_pending')}</p>
       )}
-      {(actionError || local.error) && (
+      {(actionError || error) && (
         <p role="alert" className="mt-1">
           {localize(errorKey)}
         </p>
       )}
-      {phase === 'failed' && !operation?.acceptedAt && (
+      {phase === 'failed' && !operation?.acceptedAt && !securityFailure && (
         <p>{localize('com_upload_retry_from_start')}</p>
       )}
       <div className="mt-2 flex flex-wrap gap-2">
@@ -250,7 +269,7 @@ export function ManagedUploadCard({
             {localize('com_upload_cancel')}
           </button>
         )}
-        {operation?.canRetryProcessing && (
+        {operation?.canRetryProcessing && !securityFailure && (
           <button
             type="button"
             className={actionClass}

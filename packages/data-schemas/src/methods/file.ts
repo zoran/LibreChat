@@ -399,6 +399,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
     const files = await File.find({
       file_id: { $in: fileIds },
       tenantId: tenantId ?? null,
+      ...liveFileFilter(),
     }).lean<PlainFileDocument[]>();
     return files.map(({ user, _id, ...file }) => ({
       ...file,
@@ -410,13 +411,15 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
 
   async function findRunArtifactFile(scope: RunArtifactScope): Promise<RunArtifactFile | null> {
     const File = mongoose.models.File as Model<IMongoFile>;
-    const file = await File.findOne(runArtifactIdentityFilter(scope)).lean<RunArtifactDocument>();
+    const file = await File.findOne({
+      $and: [runArtifactIdentityFilter(scope), liveFileFilter()],
+    }).lean<RunArtifactDocument>();
     return file == null ? null : serializeRunArtifact(file, scope);
   }
 
   async function listRunArtifacts(scope: RunArtifactRunScope): Promise<RunArtifactFile[]> {
     const File = mongoose.models.File as Model<IMongoFile>;
-    const files = await File.find(runArtifactFilter(scope))
+    const files = await File.find({ $and: [runArtifactFilter(scope), liveFileFilter()] })
       .sort({ createdAt: 1, file_id: 1 })
       .lean<RunArtifactDocument[]>();
     return files.map((file) => serializeRunArtifact(file));
@@ -1106,6 +1109,8 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
     disableTTL?: boolean,
     options?: { retention?: FileRetentionAdmission },
   ): Promise<IMongoFile | null> {
+    if (Object.keys(data).some((key) => key.startsWith('$')))
+      throw new FileSourceUnavailableError();
     const File = mongoose.models.File as Model<IMongoFile>;
     const fileData: (Partial<IMongoFile> | CodeFileCommitData) & {
       expiresAt?: Date;
@@ -1126,6 +1131,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
       'deletionRequestedAt',
       'deletionCompletedAt',
       'uploadOperationId',
+      'securityApproval',
       'retainedDerivativeBytes',
       'retainedDerivativeReservations',
     ]) {
@@ -1205,6 +1211,8 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
     data: (Partial<IMongoFile> & { file_id: string }) | CodeFileCommitData,
     extraFilter?: FilterQuery<IMongoFile>,
   ): Promise<IMongoFile | null> {
+    if (Object.keys(data).some((key) => key.startsWith('$')))
+      throw new FileSourceUnavailableError();
     const File = mongoose.models.File as Model<IMongoFile>;
     const { file_id, ...update } = data;
     const current = await File.findOne({ file_id }).lean<IMongoFile>();
@@ -1214,6 +1222,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
       'deletionRequestedAt',
       'deletionCompletedAt',
       'uploadOperationId',
+      'securityApproval',
       'retainedDerivativeBytes',
       'retainedDerivativeReservations',
     ]) {
@@ -1496,7 +1505,11 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
     const File = mongoose.models.File as Model<IMongoFile>;
     const bulkOperations = updates.map((update) => ({
       updateOne: {
-        filter: { file_id: update.file_id, ...liveFileFilter() },
+        filter: {
+          file_id: update.file_id,
+          uploadOperationId: { $exists: false },
+          ...liveFileFilter(),
+        },
         update: {
           $set: {
             filepath: update.filepath,

@@ -213,6 +213,7 @@ const file: Schema<IMongoFile> = new Schema(
     },
     // Managed upload publication joins the existing File lifecycle transaction.
     uploadOperationId: { type: String },
+    securityApproval: { type: mongoose.Schema.Types.Mixed, select: false },
     deletionRequestedAt: { type: Date },
     deletionCompletedAt: { type: Date },
     expiredAt: {
@@ -239,6 +240,7 @@ const file: Schema<IMongoFile> = new Schema(
       transform: (_doc, value) => {
         delete value.retainedDerivativeBytes;
         delete value.retainedDerivativeReservations;
+        delete value.securityApproval;
         return value;
       },
     },
@@ -246,6 +248,7 @@ const file: Schema<IMongoFile> = new Schema(
       transform: (_doc, value) => {
         delete value.retainedDerivativeBytes;
         delete value.retainedDerivativeReservations;
+        delete value.securityApproval;
         return value;
       },
     },

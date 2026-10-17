@@ -1,4 +1,6 @@
 /** Versioned plain-data contract for managed uploads; no persistence or HTTP dependencies. */
+import type { UploadSecurityApproval } from './upload-security';
+
 export const UPLOAD_CONTRACT_VERSION = 1;
 export const UPLOAD_MAX_FILE_BYTES = 31_457_280;
 export const UPLOAD_USER_WINDOW_BYTES = 314_572_800;
@@ -127,6 +129,8 @@ export const UPLOAD_ERROR_CODES = [
   'size_mismatch',
   'storage_uncertain',
   'processing_failed',
+  'security_rejected',
+  'security_uninspectable',
   'expired',
   'cancelled',
   'unavailable',
@@ -240,6 +244,8 @@ export type UploadProcessingInput = {
   mediaType: string;
   bytes: number;
   original: UploadStorageReceipt;
+  /** Private scanner approval for this immutable original, never client-supplied metadata. */
+  securityApproval: UploadSecurityApproval;
 };
 export type UploadCleanupTask = {
   operationId: string;

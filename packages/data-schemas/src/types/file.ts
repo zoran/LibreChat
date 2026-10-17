@@ -5,6 +5,9 @@ import type {
   FileContext,
   RunFileProvenance,
   TFile,
+  UploadSecurityApproval,
+  UploadPrincipal,
+  UploadStorageReceipt,
 } from 'librechat-data-provider';
 
 export type RunArtifactRunScope = {
@@ -103,6 +106,8 @@ export interface IMongoFile extends Omit<Document, 'model'> {
   retainedDerivativeBytes?: number;
   retainedDerivativeReservations?: Array<Omit<FileSourceCopyReservation, 'fileId'>>;
   uploadOperationId?: string;
+  /** Private immutable upload-owner proof; never part of TFile or client projections. */
+  securityApproval?: UploadSecurityApproval;
   deletionRequestedAt?: Date;
   deletionCompletedAt?: Date;
   user: Types.ObjectId;
@@ -205,3 +210,15 @@ export interface IMongoFile extends Omit<Document, 'model'> {
   updatedAt?: Date;
   tenantId?: string;
 }
+
+export type ManagedUploadAcceptance = {
+  principal: UploadPrincipal;
+  operationId: string;
+  filename: string;
+  mediaType: string;
+  receipt: UploadStorageReceipt;
+  transferGeneration: number;
+  securityApproval: UploadSecurityApproval;
+  acceptedAt: number;
+  expiresAt: number;
+};

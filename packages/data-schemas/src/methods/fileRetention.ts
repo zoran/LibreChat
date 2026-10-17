@@ -4,12 +4,16 @@ import {
   UPLOAD_RETENTION_MS,
   isUploadPrincipal,
 } from 'librechat-data-provider';
-import type { UploadPrincipal, UploadStorageReceipt } from 'librechat-data-provider';
 import type { ClientSession, FilterQuery, Model } from 'mongoose';
-import type { FileOwnerScope, FileSourceCopyReservation } from '~/types/file';
+import type {
+  FileOwnerScope,
+  FileSourceCopyReservation,
+  ManagedUploadAcceptance,
+} from '~/types/file';
 import type { IMongoFile, SourceRetentionContext } from '~/types';
 import type { RetainedTextAllocation } from '~/types/message';
 import { adjustRetainedTextBytes, RESOURCE_MAX } from './uploadManagementStore';
+import { approvedFileFilter, captureManagedFileApproval } from './fileSecurity';
 import { tenantStorage, SYSTEM_TENANT_ID } from '~/config/tenantContext';
 
 /** Covers the BSON receipt and its bounded array-key overhead until File cleanup. */
@@ -123,9 +127,13 @@ function managedFileScope(owner: FileOwnerScope): FilterQuery<IMongoFile> {
 
 /** Unmanaged files keep upstream semantics. Managed files never outlive original admission. */
 export function liveFileFilter(): FilterQuery<IMongoFile> {
+  const security = approvedFileFilter();
+  const managedOnly = process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED === 'true';
   return {
     $or: [
-      { retentionAcceptedAt: null },
+      ...(!managedOnly
+        ? [{ retentionAcceptedAt: null, uploadOperationId: { $exists: false } }]
+        : []),
       {
         retentionAcceptedAt: { $ne: null },
         $and: [
@@ -145,7 +153,10 @@ export function liveFileFilter(): FilterQuery<IMongoFile> {
         deletionRequestedAt: null,
         deletionCompletedAt: null,
         expiredAt: { $gt: new Date() },
-        $or: [{ uploadOperationId: { $exists: false } }, { status: 'ready' }],
+        $or: [
+          ...(!managedOnly ? [{ uploadOperationId: { $exists: false } }] : []),
+          { status: 'ready', ...security },
+        ],
       },
     ],
   };
@@ -202,7 +213,10 @@ export async function touchFileSources(
   return context;
 }
 
-export function createFileRetentionMethods(mongoose: typeof import('mongoose')): {
+export function createFileRetentionMethods(
+  mongoose: typeof import('mongoose'),
+  options: { securityPolicySha256?: string } = {},
+): {
   reserveFileSourceCopies(
     owner: FileOwnerScope,
     input: { reservationId: string; sourceFileIds: readonly string[]; bytes: number },
@@ -438,11 +452,13 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
   ): Promise<void> {
     const File = mongoose.models.File as Model<IMongoFile>;
     const owner = fileSourceScope(input.principal);
+    const securityApproval = captureManagedFileApproval(input, options.securityPolicySha256);
     if (
       !session.inTransaction() ||
       !isUploadPrincipal(input.principal) ||
       input.expiresAt !== input.acceptedAt + UPLOAD_RETENTION_MS ||
-      input.receipt.outcome !== 'durable'
+      input.receipt.outcome !== 'durable' ||
+      !securityApproval
     )
       throw new FileSourceUnavailableError();
     await File.create(
@@ -451,6 +467,7 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
           ...owner,
           file_id: input.operationId,
           uploadOperationId: input.operationId,
+          securityApproval,
           filename: input.filename,
           type: input.mediaType,
           bytes: input.receipt.bytes,
@@ -478,6 +495,7 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
       expiredAt: { $gt: new Date(now) },
       deletionRequestedAt: null,
       deletionCompletedAt: null,
+      ...approvedFileFilter(options.securityPolicySha256, now),
     };
   }
   async function claimManagedUploadProcessing(
@@ -557,6 +575,7 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
       expiredAt: { $gt: new Date(now) },
       deletionRequestedAt: null,
       deletionCompletedAt: null,
+      ...approvedFileFilter(options.securityPolicySha256, now),
     })
       .select('file_id status')
       .lean<IMongoFile[]>();
@@ -693,12 +712,4 @@ export function createFileRetentionMethods(mongoose: typeof import('mongoose')):
   };
 }
 
-export type ManagedUploadAcceptance = {
-  principal: UploadPrincipal;
-  operationId: string;
-  filename: string;
-  mediaType: string;
-  receipt: UploadStorageReceipt;
-  acceptedAt: number;
-  expiresAt: number;
-};
+export type { ManagedUploadAcceptance } from '~/types/file';

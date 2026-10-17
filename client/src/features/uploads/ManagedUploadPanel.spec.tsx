@@ -128,6 +128,118 @@ describe('managed upload admission UI', () => {
     });
 
   it.each(['en', 'de'])(
+    'shows the %s classification warning before selection outside closed details',
+    (locale) => {
+      mockLocale = locale;
+      read.mockResolvedValue({ ...snapshot, operations: [] });
+      const rendered = render(
+        <QueryClientProvider client={client}>
+          <ManagedUploadPanel />
+        </QueryClientProvider>,
+      );
+      const warning = screen.getByText(
+        locale === 'de'
+          ? 'Lade keine Dokumente hoch, die als VS-NfD oder höher eingestuft sind. Nutze dafür ausschließlich zugelassene Systeme.'
+          : 'Do not upload documents classified as VS-NfD or higher. Use only approved systems for these documents.',
+      );
+      expect(warning).toBeVisible();
+      expect(warning.closest('details')).toBeNull();
+      expect(rendered.container.querySelector('details')).not.toHaveAttribute('open');
+      expect(screen.queryByRole('alert')).toBeNull();
+      rendered.unmount();
+    },
+  );
+
+  it.each(
+    ['en', 'de'].flatMap((locale) =>
+      (['security_rejected', 'security_uninspectable'] as const).flatMap((error) =>
+        (['local', 'snapshot'] as const).map((source) => ({ locale, error, source })),
+      ),
+    ),
+  )(
+    'explains $source $error in $locale without a retry or deletion promise',
+    async ({ locale, error, source }) => {
+      mockLocale = locale;
+      const stale = {
+        ...operation,
+        acceptedAt: undefined,
+        expiresAt: undefined,
+        // A stale capability bit must not offer a way around a security failure.
+        canRetryProcessing: true,
+      };
+      read.mockResolvedValue({
+        ...snapshot,
+        operations: [{ ...stale, error: source === 'snapshot' ? error : undefined }],
+      });
+      const rendered = view({
+        ...file,
+        managedUpload: {
+          phase: 'failed',
+          operation: stale,
+          error: source === 'local' ? error : undefined,
+        },
+      });
+      await waitFor(() => expect(mockStreams).toHaveLength(1));
+      const alert = await screen.findByRole('alert');
+      const reasons =
+        locale === 'de'
+          ? {
+              security_rejected: /Kennzeichnung als VS-NfD oder höher/,
+              security_uninspectable: /nicht sicher geprüft werden/,
+            }
+          : {
+              security_rejected: /marking of VS-NfD or higher/,
+              security_uninspectable: /could not be safely inspected/,
+            };
+      expect(alert).toHaveTextContent(reasons[error]);
+      expect(alert).toHaveTextContent(
+        locale === 'de' ? /nicht in Cortex übernommen/ : /not accepted into Cortex/,
+      );
+      expect(alert).not.toHaveTextContent(
+        /security_rejected|security_uninspectable|scanner|sha256|classification_marking/i,
+      );
+      expect(alert).not.toHaveTextContent(/gelöscht|entfernt|deleted|removed/i);
+      const translations = locale === 'de' ? mockGerman : mockEnglish;
+      expect(screen.getByText(translations.com_upload_cleanup_pending)).toBeInTheDocument();
+      expect(screen.queryByText(translations.com_upload_retry_from_start)).toBeNull();
+      expect(
+        screen.queryByRole('button', { name: translations.com_upload_retry_processing }),
+      ).toBeNull();
+      expect(changeUpload).not.toHaveBeenCalled();
+      rendered.unmount();
+    },
+  );
+
+  it('keeps a local safety failure visible over a generic stale server error', async () => {
+    read.mockResolvedValue({ ...snapshot, operations: [{ ...operation, error: 'unavailable' }] });
+    const rendered = view({
+      ...file,
+      managedUpload: { phase: 'failed', operation, error: 'security_rejected' },
+    });
+    await waitFor(() => expect(mockStreams).toHaveLength(1));
+    expect(screen.getByRole('alert')).toHaveTextContent(/marking of VS-NfD or higher/);
+    expect(screen.queryByRole('button', { name: 'Retry processing' })).toBeNull();
+    rendered.unmount();
+  });
+
+  it('does not label rejected content deleted when its cleanup remains unconfirmed', async () => {
+    mockLocale = 'de';
+    read.mockResolvedValue({
+      ...snapshot,
+      operations: [
+        { ...operation, state: 'deleted', error: 'security_rejected', cleanupPending: true },
+      ],
+    });
+    const rendered = view();
+    expect(await screen.findByRole('alert')).toHaveTextContent(/nicht in Cortex übernommen/);
+    expect(screen.queryByText('Gelöscht')).toBeNull();
+    expect(
+      screen.getByText('Bereinigung steht noch aus. Der Speicher ist noch reserviert.'),
+    ).toBeInTheDocument();
+    rendered.unmount();
+  });
+
+  it.each(['en', 'de'])(
     'updates an open %s panel from status without an HTTP fetch',
     async (locale) => {
       mockLocale = locale;

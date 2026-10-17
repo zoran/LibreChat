@@ -36,6 +36,7 @@ describe('durable managed original integrity', () => {
   };
   const worker = { hostId: 'host-a', instanceId: 'app-a' };
   const baseline = { originalBytes: 0, objectBytes: 0, textBytes: 0, recordBytes: 0, bundles: 0 };
+  const securityPolicySha256 = 'c'.repeat(64);
   const request = (id: string, bytes = 8, filename = 'note.txt', mediaType = 'text/plain') => ({
     operationId: id,
     idempotencyKey: id,
@@ -62,6 +63,23 @@ describe('durable managed original integrity', () => {
     originalAbsent: false,
     textAndHistoryRemoved: false,
   });
+  const approval = (lease: UploadLease, original = receipt(lease)) => ({
+    version: 1 as const,
+    decision: 'approved' as const,
+    policySha256: securityPolicySha256,
+    subject: {
+      tenantId: lease.tenantId,
+      userId: lease.userId,
+      operationId: lease.operationId,
+      transferGeneration: lease.generation,
+      mediaType: 'text/plain',
+      bytes: original.bytes,
+      sha256: original.integrity.sha256,
+    },
+    scannerVersion: 'fixture-v1',
+    checkedAt: new Date(now).toISOString(),
+    coverage: { complete: true as const, pages: 1, parts: 1 },
+  });
 
   beforeAll(async () => {
     mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
@@ -78,9 +96,14 @@ describe('durable managed original integrity', () => {
       for (const name of ['File', 'UploadOperation', 'UploadCounter'])
         if (db.models[name]) await db.models[name].deleteMany({});
     }
-    first = createUploadManagementRepository(a, { enabled: true, reconciled: true, baseline });
-    second = createUploadManagementRepository(b);
-    target = createUploadManagementRepository(replacement);
+    first = createUploadManagementRepository(a, {
+      enabled: true,
+      reconciled: true,
+      baseline,
+      securityPolicySha256,
+    });
+    second = createUploadManagementRepository(b, { securityPolicySha256 });
+    target = createUploadManagementRepository(replacement, { securityPolicySha256 });
     await first.initialize();
     await Promise.all([second.initialize(), target.initialize()]);
   });
@@ -104,7 +127,7 @@ describe('durable managed original integrity', () => {
   async function accepted(id = 'identity') {
     const lease = await transfer(id);
     const original = receipt(lease);
-    const operation = await first.accept(user, lease, original, now);
+    const operation = await first.accept(user, lease, original, approval(lease, original), now);
     await first.confirmCleanup(localGone(lease), now);
     return { lease, original, operation };
   }
@@ -120,7 +143,13 @@ describe('durable managed original integrity', () => {
     async (_name, change) => {
       const lease = await transfer();
       await expect(
-        first.accept(user, lease, { ...receipt(lease), ...change } as UploadStorageReceipt, now),
+        first.accept(
+          user,
+          lease,
+          { ...receipt(lease), ...change } as UploadStorageReceipt,
+          approval(lease),
+          now,
+        ),
       ).rejects.toMatchObject({ code: 'invalid_request' });
       const row = await b.models.UploadOperation.findById(lease.operationId).lean<StoredUpload>();
       expect(row).toMatchObject({
@@ -144,13 +173,13 @@ describe('durable managed original integrity', () => {
     const lease = await transfer();
     const original = receipt(lease);
     const expected = JSON.parse(JSON.stringify(original));
-    const acceptance = first.accept(user, lease, original, now);
+    const acceptance = first.accept(user, lease, original, approval(lease, original), now);
     original.integrity.chunkSha256[0] = 'c'.repeat(64);
     const operation = await acceptance;
     const stored = await b.models.UploadOperation.findById(lease.operationId).lean<StoredUpload>();
     expect(stored!.original).toEqual(expected);
     const replay = Object.fromEntries(Object.entries(expected).reverse()) as UploadStorageReceipt;
-    expect(await second.accept(user, lease, replay, now + 1)).toEqual(operation);
+    expect(await second.accept(user, lease, replay, approval(lease), now + 1)).toEqual(operation);
     expect(await first.usage(user, now + 1)).toMatchObject({
       usedBytes: 8,
       reservedBytes: 0,
@@ -178,7 +207,13 @@ describe('durable managed original integrity', () => {
         lease.operationId,
       ).lean<StoredUpload>();
       await expect(
-        second.accept(user, lease, { ...original, ...change } as UploadStorageReceipt, now + 1),
+        second.accept(
+          user,
+          lease,
+          { ...original, ...change } as UploadStorageReceipt,
+          approval(lease),
+          now + 1,
+        ),
       ).rejects.toMatchObject({ code: 'idempotency_conflict' });
       expect(await a.models.UploadOperation.findById(lease.operationId).lean()).toEqual(before);
       expect(await first.usage(user, now + 1)).toMatchObject({
@@ -192,7 +227,13 @@ describe('durable managed original integrity', () => {
   it('binds an accepted replay to the original transfer generation', async () => {
     const { lease, original } = await accepted();
     await expect(
-      second.accept(user, { ...lease, generation: lease.generation + 1 }, original, now + 1),
+      second.accept(
+        user,
+        { ...lease, generation: lease.generation + 1 },
+        original,
+        approval(lease),
+        now + 1,
+      ),
     ).rejects.toMatchObject({ code: 'lease_lost' });
     expect(await first.usage(user, now + 1)).toMatchObject({ usedBytes: 8 });
   });
@@ -204,8 +245,8 @@ describe('durable managed original integrity', () => {
       { ...receipt(lease), integrity: { ...manifest(), sha256: 'c'.repeat(64) } },
     ];
     const results = await Promise.allSettled([
-      first.accept(user, lease, originals[0], now),
-      second.accept(user, lease, originals[1], now),
+      first.accept(user, lease, originals[0], approval(lease, originals[0]), now),
+      second.accept(user, lease, originals[1], approval(lease, originals[1]), now),
     ]);
     expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
     const refused = results.find((result) => result.status === 'rejected') as PromiseRejectedResult;
@@ -228,10 +269,7 @@ describe('durable managed original integrity', () => {
       { $unset: { 'original.integrity': 1 } },
     );
     const parser = await second.claim({ kind: 'processing', worker, now });
-    expect(parser).not.toBeNull();
-    await expect(first.getProcessingInput(parser!, now)).rejects.toMatchObject({
-      code: 'not_ready',
-    });
+    expect(parser).toBeNull();
     expect(await first.usage(user, now)).toMatchObject({ usedBytes: 8, retainedBytes: 8 });
   });
 
@@ -267,7 +305,9 @@ describe('durable managed original integrity', () => {
     const page = await first.exportSnapshot({ epoch: 'move' });
     await target.importSnapshot(page);
     await target.importSnapshot(page);
-    await replacement.models.File.insertMany(await a.models.File.find({}).lean());
+    await replacement.models.File.insertMany(
+      await a.models.File.find({}).select('+securityApproval').lean(),
+    );
     const seal = await first.completeExport('move');
     await target.completeImport({ receipt: seal, baseline, lifecycleReconciled: true });
     expect(
@@ -288,7 +328,7 @@ describe('durable managed original integrity', () => {
     );
     await a.models.UploadOperation.updateOne(
       { _id: lease.operationId },
-      { $unset: { 'original.integrity': 1 } },
+      { $unset: { 'original.integrity': 1, securityApproval: 1 } },
     );
     const page = await first.exportSnapshot({ epoch: 'removed' });
     await target.importSnapshot(page);
@@ -298,6 +338,7 @@ describe('durable managed original integrity', () => {
       lease.operationId,
     ).lean<StoredUpload>();
     expect(stored!.original).not.toHaveProperty('integrity');
+    expect(stored).not.toHaveProperty('securityApproval');
     expect(stored).toMatchObject({ originalBytes: 0, originalRemoved: true, actualBytes: 8 });
     expect(await target.usage(user, now + 1)).toMatchObject({
       usedBytes: 8,
@@ -329,7 +370,7 @@ describe('durable managed original integrity', () => {
       etag: 'é'.repeat(512),
       versionId: 'é'.repeat(512),
     };
-    await first.accept(owner, lease, original, now);
+    await first.accept(owner, lease, original, approval(lease, original), now);
     const row = (await b.models.UploadOperation.findById(id).lean<StoredUpload>())!;
     const largest: StoredUpload = {
       ...row,

@@ -1,18 +1,30 @@
 import path from 'node:path';
 import { createReadStream } from 'node:fs';
 import { performance } from 'node:perf_hooks';
+import { finished } from 'node:stream/promises';
 import { mkdir, open, rm } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
-import { isUploadPrincipal } from 'librechat-data-provider';
+import {
+  isUploadPrincipal,
+  readUploadSecurityInspection,
+  matchesUploadSecurityApproval,
+} from 'librechat-data-provider';
 import type {
   UploadPrincipal,
   UploadWorker,
   UploadLease,
   UploadByteLease,
   UploadErrorCode,
+  UploadSecurityApproval,
+  UploadSecuritySubject,
 } from 'librechat-data-provider';
 import type { Request, RequestHandler } from 'express';
-import type { StoragePort, UploadAttemptPort, UploadAttemptRegistration } from '../contract';
+import type {
+  StoragePort,
+  UploadAttemptPort,
+  UploadAttemptRegistration,
+  UploadSecurityPort,
+} from '../contract';
 import type { UploadManagement } from '../management';
 import { UploadManagementError, isUploadManagementError } from '../errors';
 import { attemptOriginalPath, uploadAttemptId } from '../processing/paths';
@@ -38,6 +50,7 @@ export type RawUploadBodyDependencies = {
   >;
   principal(request: Request): Promise<UploadPrincipal>;
   storage: StoragePort;
+  security: UploadSecurityPort;
   worker: UploadWorker;
   stagingRoot: string;
   /** Shared durable byte allocator; no local fallback can mint a new allowance. */
@@ -118,6 +131,9 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
     let stagingAttempted = false;
     let accepted = false;
     let storing = false;
+    let inspectionPending = false;
+    // No scanner work exists before dispatch; afterward only its validated attestation can settle it.
+    let scannerSettled = true;
     let storageOutcome: 'not_started' | 'durable' | 'unknown' | 'absent' = 'not_started';
     let errorCode: UploadErrorCode = 'unavailable';
     let admittedPrincipal: UploadPrincipal | undefined;
@@ -130,9 +146,11 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
     let claimUncertain = false;
     let idleTimer: NodeJS.Timeout | undefined;
     const timedOut = () => {
+      const code = inspectionPending ? 'security_uninspectable' : 'unavailable';
+      if (inspectionPending) errorCode = code;
       if (!res.destroyed && !res.headersSent) {
         res.setHeader('connection', 'close');
-        res.status(408).json({ code: 'unavailable' });
+        res.status(inspectionPending ? 422 : 408).json({ code });
       }
       controller.abort();
       // Also close an unread body while a bounded repository call is settling.
@@ -290,6 +308,103 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
       clearTimeout(idleTimer);
       signal.throwIfAborted();
       await verifyPrincipal();
+      const subject: UploadSecuritySubject = Object.freeze({
+        tenantId: principal.tenantId,
+        userId: principal.userId,
+        operationId: lease.operationId,
+        transferGeneration: lease.generation,
+        mediaType: operation.mediaType,
+        bytes,
+        sha256: integrity.sha256,
+      });
+      let securityApproval: UploadSecurityApproval;
+      errorCode = 'security_uninspectable';
+      let securityRejected = false;
+      try {
+        if (typeof deps.security?.inspect !== 'function')
+          throw new UploadManagementError('security_uninspectable');
+        // The extra byte detects an appended file while keeping this independent read bounded.
+        const scan = createReadStream(filePath, {
+          start: 0,
+          end: bytes,
+          highWaterMark: MAX_SLICE,
+          signal,
+        });
+        const scanClosed = finished(scan, { cleanup: true }).catch(() => undefined);
+        const scanIntegrity = createOriginalIntegrity(bytes);
+        let scanComplete = false;
+        const scanBody = (async function* () {
+          for await (const chunk of scan) {
+            signal.throwIfAborted();
+            scanIntegrity.update(chunk);
+            yield chunk;
+          }
+          signal.throwIfAborted();
+          if (scanIntegrity.finish().sha256 !== integrity.sha256)
+            throw new UploadManagementError('security_uninspectable');
+          scanComplete = true;
+        })();
+        let abortInspection!: () => void;
+        const aborted = new Promise<never>((_resolve, reject) => {
+          abortInspection = () => reject(new UploadManagementError('security_uninspectable'));
+          signal.addEventListener('abort', abortInspection, { once: true });
+        });
+        try {
+          signal.throwIfAborted();
+          inspectionPending = true;
+          const inspection = Promise.resolve()
+            .then(() => {
+              signal.throwIfAborted();
+              scannerSettled = false;
+              return deps.security.inspect({ subject, body: scanBody, signal });
+            })
+            .finally(() => {
+              inspectionPending = false;
+            });
+          const result = await Promise.race([inspection, aborted]);
+          signal.throwIfAborted();
+          const inspected = readUploadSecurityInspection(result);
+          if (!inspected) throw new UploadManagementError('security_uninspectable');
+          scannerSettled = true;
+          const { decision } = inspected;
+          if (decision.decision !== 'approved') {
+            securityRejected = decision.decision === 'rejected';
+            throw new UploadManagementError(
+              securityRejected ? 'security_rejected' : 'security_uninspectable',
+            );
+          }
+          if (!scanComplete) throw new UploadManagementError('security_uninspectable');
+          // Keep the checked receipt independent of later mutation by an adapter.
+          securityApproval = Object.freeze({
+            ...decision,
+            subject: Object.freeze({ ...decision.subject }),
+            coverage: Object.freeze({ ...decision.coverage }),
+          });
+          if (
+            !matchesUploadSecurityApproval(
+              securityApproval,
+              subject,
+              deps.security.policySha256,
+              now(),
+            )
+          )
+            throw new UploadManagementError('security_uninspectable');
+        } finally {
+          signal.removeEventListener('abort', abortInspection);
+          scan.destroy();
+          await scanClosed;
+        }
+      } catch {
+        if (signal.aborted) signal.throwIfAborted();
+        if (securityRejected) throw new UploadManagementError('security_rejected');
+        throw new UploadManagementError('security_uninspectable');
+      }
+      await verifyPrincipal();
+      if (
+        !matchesUploadSecurityApproval(securityApproval, subject, deps.security.policySha256, now())
+      )
+        throw new UploadManagementError('security_uninspectable');
+      errorCode = 'unavailable';
       storing = true;
       storageOutcome = 'unknown';
       stage = { name: 'storage', startedAt: performance.now() };
@@ -318,7 +433,7 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
       await heartbeat;
       signal.throwIfAborted();
       await verifyPrincipal();
-      const result = await deps.management.accept(principal, id, lease, receipt);
+      const result = await deps.management.accept(principal, id, lease, receipt, securityApproval);
       accepted = true;
       outcome = 'success';
       observe({ kind: 'accepted', bytes: receipt.bytes });
@@ -344,6 +459,8 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
         else if (errorCode === 'not_found') status = 404;
         else if (errorCode === 'not_ready') status = 409;
         else if (errorCode === 'invalid_request' || errorCode === 'size_mismatch') status = 400;
+        else if (errorCode === 'security_rejected' || errorCode === 'security_uninspectable')
+          status = 422;
         res.status(status).json({ code: errorCode });
       }
     } finally {
@@ -356,7 +473,8 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
       req.off('aborted', disconnected);
       res.off('close', disconnected);
       // Do not release shared reservations here: unknown storage/DB outcomes need
-      // the existing durable cleanup owner. Local removal itself is idempotent.
+      // the existing durable cleanup owner. Scanner promise settlement or local input
+      // removal cannot establish that its execution and transient copies are gone.
       let localCopiesAbsent = !stagingAttempted;
       if (directory) {
         try {
@@ -366,7 +484,7 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
           /* cleanup owner retries */
         }
       }
-      if (lease && localCopiesAbsent && storageOutcome !== 'unknown') {
+      if (lease && localCopiesAbsent && storageOutcome !== 'unknown' && scannerSettled) {
         await deps.management
           .confirmCleanup({
             operationId: lease.operationId,
@@ -382,7 +500,10 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
       // writer identity stays unknown; recovery must not adopt and remove it.
       registration?.settle({
         writerStopped:
-          storageOutcome !== 'unknown' && !claimUncertain && !(stagingAttempted && !directory),
+          storageOutcome !== 'unknown' &&
+          scannerSettled &&
+          !claimUncertain &&
+          !(stagingAttempted && !directory),
         localCopiesAbsent,
         storageOutcome,
       });

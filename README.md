@@ -312,3 +312,25 @@ We thank [Locize](https://locize.com) for their translation management tools tha
 ## Optional browser workspaces
 
 For automatic browser access with separate private histories, see [browser workspaces](docs/browser-sessions.md). The feature is off by default.
+
+### Sicherheitsgrenze für verwaltete Dokumente
+
+Die verwaltete Upload-Erweiterung verwendet weiterhin LibreChats Datei-IDs, private Projekte und
+bestehenden MongoDB-/File-Lifecycle. Ein positiver serverseitiger Sicherheitsnachweis muss vor
+gewöhnlichem Storage an die tatsächlichen Bytes, den Besitzer, die ursprüngliche Transfergeneration
+und die aktuelle Policy gebunden sein. Der Nachweis bleibt privat; normale Datei-Updates können ihn
+nicht erteilen. Fehlende, veraltete oder beschädigte Nachweise schließen nachgelagerte Zugriffe.
+
+`UploadSecurityPort` liefert ausschließlich den aktuellen `UploadSecurityInspection`-Vertrag mit
+Entscheidung und ausdrücklich bestätigtem Prozessende sowie bereinigten Scannerkopien. Eine beendete
+RPC-Promise oder lokal entfernte Eingabedatei belegt keine beendete entfernte Ausführung. Solche
+ungeklärten Fälle bleiben gesperrt und beim vorhandenen Cleanup-Owner. `UPLOAD_SECURITY_POLICY_SHA256`
+bindet die aktive Policy; ohne gültige Policy gibt es keine Freigabe.
+
+`UPLOAD_TEST_TMPDIR=/absoluter/privater/testpfad npm run test:upload-security` prüft diese Verträge,
+Raw-Transport, echte Mongo-Transaktionen,
+File-Verbraucher und UI-Meldungen nach dem gewöhnlichen Paketbuild. Der normale CI-Owner führt diese
+Regressionskarte auch bei späteren Updates aus. Erkennungsregeln und der begrenzte TXT-Prüfkern sind
+keine Sandbox und keine vollständige Sicherheitsabnahme. Ein realer isolierter Scanner, vollständige
+Format-/Eingangspfadabdeckung und dauerhafte Abbruch-/Bereinigungsnachweise müssen vor Aktivierung
+integriert und qualifiziert sein; diese Änderung aktiviert keine neue Dateifunktion.

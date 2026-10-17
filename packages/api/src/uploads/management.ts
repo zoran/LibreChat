@@ -10,6 +10,7 @@ import type {
   UploadCleanupProof,
   UploadErrorCode,
   UploadParserExecution,
+  UploadSecurityApproval,
 } from 'librechat-data-provider';
 import type { UploadRepository, IdentityPort, ResourcePort, TelemetryPort } from './contract';
 import { UploadManagementError, isUploadManagementError } from './errors';
@@ -45,6 +46,7 @@ export interface UploadManagement {
     id: string,
     lease: UploadLease,
     receipt: UploadStorageReceipt,
+    securityApproval: UploadSecurityApproval,
   ): Promise<UploadOperation>;
   cancel(principal: UploadPrincipal, id: string): Promise<UploadOperation>;
   delete(principal: UploadPrincipal, id: string): Promise<UploadOperation>;
@@ -177,10 +179,11 @@ export function createUploadManagement(deps: UploadManagementDependencies): Uplo
       id: string,
       lease: UploadLease,
       receipt: UploadStorageReceipt,
+      securityApproval: UploadSecurityApproval,
     ) {
       if (lease.operationId !== id) throw new UploadManagementError('lease_lost');
       await get(principal, id);
-      return emit(repository.accept(principal, lease, receipt, now()));
+      return emit(repository.accept(principal, lease, receipt, securityApproval, now()));
     },
     async cancel(principal: UploadPrincipal, id: string) {
       await get(principal, id);

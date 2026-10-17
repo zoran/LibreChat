@@ -26,6 +26,7 @@ import type {
   UploadParserExecution,
   UploadWorker,
   UploadLocalReservations,
+  UploadSecurityApproval,
 } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
 import type {
@@ -53,6 +54,11 @@ import {
   PROCESS_MS,
   RESOURCE_MAX,
 } from './uploadManagementStore';
+import {
+  captureUploadSecurityApproval,
+  hasCurrentUploadSecurityApproval,
+  requireUploadSecurityApproval,
+} from './uploadManagement.security';
 import { createUploadAdmissionMethods, readUploadAdmission } from './uploadManagementAdmission';
 import { createUploadMigrationMethods } from './uploadManagementMigration';
 import { createUploadControlMethods } from './uploadManagementControl';
@@ -83,6 +89,7 @@ export type UploadManagementRepository = UploadControlMethods &
       principal: UploadPrincipal,
       lease: UploadLease,
       receipt: UploadStorageReceipt,
+      securityApproval: UploadSecurityApproval,
       now: number,
     ): Promise<UploadOperation>;
     publish(
@@ -123,7 +130,10 @@ export function createUploadManagementRepository(
   options: UploadStoreOptions = {},
 ): UploadManagementRepository {
   const store = createUploadStore(mongoose, options);
-  const lifecycle = createFileRetentionMethods(mongoose);
+  const lifecycle = createFileRetentionMethods(mongoose, {
+    securityPolicySha256: options.securityPolicySha256,
+  });
+  const securityPolicySha256 = options.securityPolicySha256;
   const principalOf = storedUploadPrincipal;
   const cleanupTask = (row: StoredUpload): UploadCleanupTask => ({
     operationId: row._id,
@@ -350,6 +360,11 @@ export function createUploadManagementRepository(
       const heads = new Map<string, { row: StoredUpload; turn: number }>();
       for (const row of rows) {
         if (
+          kind === 'processing' &&
+          !hasCurrentUploadSecurityApproval(row, securityPolicySha256, now)
+        )
+          continue;
+        if (
           (kind === 'transfer' && row.createdAt + WAIT_MS <= now) ||
           (kind === 'processing' &&
             (row.expiresAt! <= now || row.processingQueuedAt! + PROCESS_MS <= now))
@@ -443,7 +458,7 @@ export function createUploadManagementRepository(
   return {
     initialize: store.initialize,
     ...createUploadControlMethods(store),
-    ...createUploadMigrationMethods(store),
+    ...createUploadMigrationMethods(store, securityPolicySha256),
     ...createUploadActivationMethods(store),
     ...createUploadAdmissionMethods(store),
     reserve,
@@ -506,7 +521,9 @@ export function createUploadManagementRepository(
         return leaseFor(row);
       });
     },
-    async accept(principal, lease, receipt, now) {
+    async accept(principal, lease, receipt, securityApproval, now) {
+      const approval = captureUploadSecurityApproval(securityApproval);
+      if (!approval) reject('security_uninspectable');
       // Capture the trusted acknowledgement before awaiting Mongo; callers retain no mutable
       // reference to the identity that this transaction may commit or replay.
       const outcome = receipt?.outcome;
@@ -536,6 +553,10 @@ export function createUploadManagementRepository(
             reject('lease_lost');
           if (!original || !row.original || uploadDigest(original) !== uploadDigest(row.original))
             reject('idempotency_conflict');
+          requireUploadSecurityApproval(row, securityPolicySha256, now);
+          requireUploadSecurityApproval(row, securityPolicySha256, now, approval, original);
+          if (uploadDigest(approval) !== uploadDigest(row.securityApproval))
+            reject('idempotency_conflict');
           return project(row, now);
         }
         assertLease(row, lease, now);
@@ -555,6 +576,13 @@ export function createUploadManagementRepository(
           !isUploadOriginalIntegrity(original.integrity, original.bytes)
         )
           reject('invalid_request');
+        row.securityApproval = requireUploadSecurityApproval(
+          row,
+          securityPolicySha256,
+          now,
+          approval,
+          original,
+        );
         await store.touchPrincipal(principal, session);
         row.acceptedAt = now;
         row.expiresAt = now + UPLOAD_RETENTION_MS;
@@ -573,9 +601,11 @@ export function createUploadManagementRepository(
           {
             principal,
             operationId: row._id,
+            transferGeneration: row.attemptGeneration!,
             filename: row.filename,
             mediaType: row.mediaType,
             receipt: original,
+            securityApproval: row.securityApproval,
             acceptedAt: now,
             expiresAt: row.expiresAt,
           },
@@ -605,8 +635,10 @@ export function createUploadManagementRepository(
           row.worker?.hostId === lease.hostId &&
           row.worker?.instanceId === lease.instanceId &&
           row.publishedDigest === digest
-        )
+        ) {
+          requireUploadSecurityApproval(row, securityPolicySha256, now);
           return project(row, now);
+        }
         assertLease(row, lease, now);
         if (
           row.state !== 'processing' ||
@@ -615,6 +647,7 @@ export function createUploadManagementRepository(
           !row.parserExecution
         )
           reject('lease_lost');
+        requireUploadSecurityApproval(row, securityPolicySha256, now);
         await lifecycle.publishManagedUpload(
           principalOf(row),
           row._id,
@@ -643,6 +676,7 @@ export function createUploadManagementRepository(
     async retryProcessing(principal, id, now) {
       return store.transaction(async (session, global) => {
         const row = await owned(principal, id, session);
+        if (row.acceptedAt != null) requireUploadSecurityApproval(row, securityPolicySha256, now);
         if (
           row.state === 'queued_processing' ||
           row.state === 'processing' ||
@@ -725,6 +759,7 @@ export function createUploadManagementRepository(
         mediaType: row.mediaType,
         bytes: row.actualBytes!,
         original: row.original,
+        securityApproval: requireUploadSecurityApproval(row, securityPolicySha256, now),
       };
     },
     async bindProcessingExecution(lease, execution, now) {
@@ -749,6 +784,7 @@ export function createUploadManagementRepository(
           (row.parserExecution && uploadDigest(row.parserExecution) !== uploadDigest(execution))
         )
           reject('lease_lost');
+        requireUploadSecurityApproval(row, securityPolicySha256, now);
         if (row.parserExecution) return;
         row.parserExecution = { ...execution };
         await store.save(row, session);

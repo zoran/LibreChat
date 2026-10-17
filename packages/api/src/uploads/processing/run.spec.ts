@@ -2,6 +2,7 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import type { UploadProcessingInput } from 'librechat-data-provider';
 import type { S3Client } from '@aws-sdk/client-s3';
 import { createManagedS3Storage } from '../storage';
 import { processNextManagedUpload } from './run';
@@ -46,6 +47,44 @@ function integrityFor(original: Buffer) {
   };
 }
 
+// Simulated prior intake, bound to the original bytes and transfer generation 1.
+// The current processing lease is generation 2 and cannot replace that identity.
+function processingInputFor(original: Buffer): UploadProcessingInput {
+  const integrity = integrityFor(original);
+  return {
+    operationId: lease.operationId,
+    attemptGeneration: 1,
+    filename: 'note.txt',
+    bytes: original.length,
+    mediaType: 'text/plain',
+    original: {
+      outcome: 'durable',
+      source: 's3',
+      bytes: original.length,
+      storageKey: `t/${lease.tenantId}/managed-uploads/${lease.userId}/${lease.operationId}.1__original`,
+      filepath: `/api/files/managed/${lease.operationId}`,
+      integrity,
+    },
+    securityApproval: {
+      version: 1,
+      decision: 'approved',
+      policySha256: 'c'.repeat(64),
+      subject: {
+        tenantId: lease.tenantId,
+        userId: lease.userId,
+        operationId: lease.operationId,
+        transferGeneration: 1,
+        mediaType: 'text/plain',
+        bytes: original.length,
+        sha256: integrity.sha256,
+      },
+      scannerVersion: 'simulated-admission-fixture-v1',
+      checkedAt: new Date(1_000).toISOString(),
+      coverage: { complete: true, pages: 1, parts: 1 },
+    },
+  };
+}
+
 describe('one managed processing claim', () => {
   let root: string;
   beforeAll(async () => {
@@ -66,11 +105,7 @@ describe('one managed processing claim', () => {
   ) {
     const management = {
       claimProcessing: jest.fn(async () => lease),
-      getProcessingInput: jest.fn(async () => ({
-        bytes: 5,
-        mediaType: 'text/plain',
-        original: {},
-      })),
+      getProcessingInput: jest.fn(async () => processingInputFor(Buffer.from('hello'))),
       renew: jest.fn(async () => lease),
       bindProcessingExecution: jest.fn(async (): Promise<void> => undefined),
       claimWorkBytes: jest.fn(async (_lease, bytes: number) => ({
@@ -110,19 +145,15 @@ describe('one managed processing claim', () => {
     integrity = integrityFor(original),
   ) {
     const deps = fixture();
+    const input = processingInputFor(original);
     const receipt = {
-      outcome: 'durable' as const,
-      source: 's3',
-      bytes: original.length,
-      storageKey: 't/tenant/managed-uploads/user/op.2__original',
-      filepath: '/api/files/managed/op',
+      ...input.original,
       versionId: 'recorded-version',
       etag: 'unchanged-etag',
       integrity,
     };
     deps.management.getProcessingInput.mockResolvedValue({
-      bytes: original.length,
-      mediaType: 'text/plain',
+      ...input,
       original: receipt,
     });
     // Network boundaries deliberately do not coincide with the receipt blocks.
@@ -407,11 +438,9 @@ describe('one managed processing claim', () => {
   it('paces S3 read slices through shared grants and aborts before consuming an ungranted remainder', async () => {
     const deps = fixture();
     const bytes = 64 * 1024 + 1;
-    deps.management.getProcessingInput.mockResolvedValue({
-      bytes,
-      mediaType: 'text/plain',
-      original: {},
-    });
+    deps.management.getProcessingInput.mockResolvedValue(
+      processingInputFor(Buffer.alloc(bytes, 65)),
+    );
     deps.storage.read = async function* () {
       yield Buffer.alloc(bytes, 65);
     };

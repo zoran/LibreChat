@@ -303,6 +303,48 @@ describe('upload HTTP boundary', () => {
     expect(await call('GET')).toEqual({ status: 503, data: { code: 'unavailable' } });
   });
 
+  it.each(['security_rejected', 'security_uninspectable'] as const)(
+    'returns safe HTTP 422 for %s from metadata admission and processing retry',
+    async (code) => {
+      const failure = Object.assign(new UploadManagementError(code), {
+        reason: 'private-scanner-reason',
+        scannerVersion: 'internal-revision',
+        sha256: 'a'.repeat(64),
+      });
+      management.reserve.mockRejectedValueOnce(failure);
+      expect(
+        await call('POST', '/api/uploads/operations', {
+          filename: 'note.txt',
+          mediaType: 'text/plain',
+          declaredBytes: 5,
+          idempotencyKey: 'new',
+        }),
+      ).toEqual({ status: 422, data: { code } });
+      management.retryProcessing.mockRejectedValueOnce(failure);
+      expect(await call('POST', '/api/uploads/operations/operation/retry', {})).toEqual({
+        status: 422,
+        data: { code },
+      });
+    },
+  );
+
+  it.each(['security_rejected', 'security_uninspectable'] as const)(
+    'preserves %s and pending cleanup on reload without disclosing scanner evidence',
+    async (error) => {
+      const publicRow = { ...operation, state: 'failed', error, cleanupPending: true };
+      management.list.mockResolvedValue([
+        {
+          ...publicRow,
+          securityApproval: { policySha256: 'a'.repeat(64), scannerVersion: 'internal-revision' },
+          reason: 'private-scanner-reason',
+        },
+      ]);
+      const result = await call('GET');
+      expect(result.status).toBe(200);
+      expect(result.data).toHaveProperty('operations', [publicRow]);
+    },
+  );
+
   it('uses the separate raw body router before a global parser and authenticates before reading', async () => {
     const payload = 'x'.repeat(5000);
     expect(

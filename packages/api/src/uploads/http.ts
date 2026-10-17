@@ -43,6 +43,8 @@ const safeStatuses: Partial<Record<UploadErrorCode, number>> = {
   not_ready: 409,
   lease_lost: 409,
   size_mismatch: 400,
+  security_rejected: 422,
+  security_uninspectable: 422,
   expired: 410,
   cancelled: 409,
 };
