@@ -1,4 +1,5 @@
 /** Private frozen snapshot, validated import and single-owner cutover for the upload repository. */
+import { mongo } from 'mongoose';
 import { randomUUID } from 'crypto';
 import {
   UPLOAD_MAX_FILE_BYTES,
@@ -8,6 +9,9 @@ import {
   isUploadOriginalIntegrity,
   isUploadStorageReceipt,
   readUploadAcceptedMetadata,
+  readUploadDerivedOrigin,
+  uploadReservationFingerprint,
+  uploadDerivedExpiresAt,
 } from 'librechat-data-provider';
 import type {
   UploadMigrationPage,
@@ -82,6 +86,31 @@ export function createUploadMigrationMethods(
   function validateRow(value: unknown): StoredUpload {
     if (!value || typeof value !== 'object' || Array.isArray(value)) reject('migration_conflict');
     const row = value as StoredUpload;
+    const origin =
+      row.derivedOrigin === undefined ? undefined : readUploadDerivedOrigin(row.derivedOrigin);
+    if (origin === null) reject('migration_conflict');
+    if (
+      origin &&
+      (!['text/plain', 'text/csv'].includes(row.mediaType) ||
+        row.declaredBytes > 65_536 ||
+        mongo.BSON.calculateObjectSize({ derivedOrigin: origin, fingerprint: row.fingerprint }) >
+          UPLOAD_RECORD_BYTES / 2 ||
+        (row.original && row.original.filepath !== `/api/files/managed/${row._id}`))
+    )
+      reject('migration_conflict');
+    if (
+      origin?.ancestors.some(
+        (source) =>
+          source.subject.operationId === row._id ||
+          source.subject.userId !== row.userId ||
+          source.subject.tenantId !== row.tenantId ||
+          (row.acceptedAt != null && source.expiresAt <= row.acceptedAt),
+      )
+    )
+      reject('migration_conflict');
+    const derived = origin
+      ? { binding: origin.binding, directSourceFileIds: origin.directSourceFileIds }
+      : undefined;
     if (
       Object.keys(row).some((key) => !store.Operation.schema.path(key)) ||
       !id(row._id) ||
@@ -100,7 +129,7 @@ export function createUploadMigrationMethods(
       !text(row.mediaType, 128) ||
       !integer(row.declaredBytes, UPLOAD_MAX_FILE_BYTES) ||
       row.declaredBytes === 0 ||
-      row.fingerprint !== JSON.stringify([row.scope, row.mediaType, row.declaredBytes]) ||
+      row.fingerprint !== uploadReservationFingerprint(row, derived) ||
       !integer(row.createdAt, 8.64e15 - UPLOAD_RETENTION_MS) ||
       !integer(row.generation) ||
       !integer(row.revision) ||
@@ -151,7 +180,7 @@ export function createUploadMigrationMethods(
       if (
         !integer(row.acceptedAt, 8.64e15 - UPLOAD_RETENTION_MS) ||
         row.acceptedAt < row.createdAt ||
-        row.expiresAt !== row.acceptedAt + UPLOAD_RETENTION_MS ||
+        row.expiresAt !== uploadDerivedExpiresAt(row.acceptedAt, origin) ||
         row.actualBytes !== row.declaredBytes ||
         row.fileId !== row._id ||
         !row.attemptGeneration ||
@@ -194,7 +223,15 @@ export function createUploadMigrationMethods(
     return row;
   }
   async function prepareExportRow(row: StoredUpload, session: ClientSession): Promise<void> {
-    const fingerprint = JSON.stringify([row.scope, row.mediaType, row.declaredBytes]);
+    const origin =
+      row.derivedOrigin === undefined ? undefined : readUploadDerivedOrigin(row.derivedOrigin);
+    if (origin === null) reject('migration_conflict');
+    const fingerprint = uploadReservationFingerprint(
+      row,
+      origin
+        ? { binding: origin.binding, directSourceFileIds: origin.directSourceFileIds }
+        : undefined,
+    );
     const legacyFingerprint = JSON.stringify([
       row.scope,
       row.filename,
@@ -204,7 +241,7 @@ export function createUploadMigrationMethods(
     if (
       !text(row.idempotencyKey, 128) ||
       (row.fingerprint !== fingerprint &&
-        (!text(row.filename, 255) || row.fingerprint !== legacyFingerprint))
+        (origin !== undefined || !text(row.filename, 255) || row.fingerprint !== legacyFingerprint))
     )
       reject('migration_conflict');
     const previous = uploadDigest(row);

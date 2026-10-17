@@ -4,6 +4,7 @@ import type {
   UploadPrincipal,
   UploadScope,
   UploadReserveInput,
+  UploadDerivedReserveInput,
   UploadOperation,
   UploadUsage,
   UploadLease,
@@ -178,6 +179,11 @@ export interface UploadRepository {
   reserve(
     principal: UploadPrincipal,
     request: UploadReserveInput,
+    now: number,
+  ): Promise<UploadOperation>;
+  reserveDerived(
+    principal: UploadPrincipal,
+    request: UploadDerivedReserveInput,
     now: number,
   ): Promise<UploadOperation>;
   get(principal: UploadPrincipal, id: string, now: number): Promise<UploadOperation>;

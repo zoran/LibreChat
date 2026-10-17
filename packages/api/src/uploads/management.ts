@@ -3,11 +3,14 @@ import {
   UPLOAD_MAX_FILE_BYTES,
   isUploadPrincipal,
   readUploadAcceptedMetadata,
+  readUploadDerivedIntent,
+  uploadReservationFingerprint,
 } from 'librechat-data-provider';
 import type {
   ManagedDocumentResult,
   UploadPrincipal,
   UploadRequest,
+  UploadDerivedRequest,
   UploadOperation,
   UploadWorker,
   UploadLease,
@@ -61,6 +64,10 @@ function reservationData(value: unknown, allowed: readonly string[]): Record<str
 
 export interface UploadManagement {
   reserve(principal: UploadPrincipal, request: UploadRequest): Promise<UploadOperation>;
+  reserveDerived(
+    principal: UploadPrincipal,
+    request: UploadDerivedRequest,
+  ): Promise<UploadOperation>;
   get(principal: UploadPrincipal, id: string): Promise<UploadOperation>;
   list(principal: UploadPrincipal): Promise<UploadOperation[]>;
   usage(principal: UploadPrincipal): ReturnType<UploadRepository['usage']>;
@@ -147,61 +154,81 @@ export function createUploadManagement(deps: UploadManagementDependencies): Uplo
     observe((telemetry) => telemetry.transition(operation.state));
     return operation;
   }
+  async function reserve(
+    principal: UploadPrincipal,
+    input: UploadRequest | UploadDerivedRequest,
+    derivedMode: boolean,
+  ) {
+    const data = reservationData(input, [
+      'mediaType',
+      'declaredBytes',
+      'idempotencyKey',
+      'scope',
+      ...(derivedMode ? ['derived'] : []),
+    ]);
+    const derived = derivedMode ? readUploadDerivedIntent(data.derived) : undefined;
+    if (derivedMode && !derived) throw new UploadManagementError('invalid_request');
+    const suppliedScope =
+      data.scope === undefined
+        ? { kind: 'personal' }
+        : reservationData(data.scope, ['kind', 'workspaceId']);
+    if (suppliedScope.kind === 'workspace') throw new UploadManagementError('forbidden');
+    if (suppliedScope.kind !== 'personal' || Object.keys(suppliedScope).length !== 1)
+      throw new UploadManagementError('invalid_request');
+    const scope = { kind: 'personal' } as const;
+    if (
+      typeof data.declaredBytes !== 'number' ||
+      !Number.isSafeInteger(data.declaredBytes) ||
+      data.declaredBytes <= 0 ||
+      data.declaredBytes > UPLOAD_MAX_FILE_BYTES ||
+      typeof data.mediaType !== 'string' ||
+      typeof data.idempotencyKey !== 'string' ||
+      data.idempotencyKey.length !== 36 ||
+      !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+        data.idempotencyKey,
+      )
+    ) {
+      throw new UploadManagementError('invalid_request');
+    }
+    const request: UploadRequest = {
+      mediaType: data.mediaType,
+      declaredBytes: data.declaredBytes,
+      idempotencyKey: data.idempotencyKey,
+      scope,
+    };
+    if (
+      derived &&
+      (!['text/plain', 'text/csv'].includes(request.mediaType) || request.declaredBytes > 65_536)
+    )
+      throw new UploadManagementError('invalid_request');
+    await authorize(principal, scope);
+    if (!MEDIA_TYPES.has(request.mediaType)) throw new UploadManagementError('unsupported_type');
+    const fingerprint = uploadReservationFingerprint({ ...request, scope }, derived ?? undefined);
+    const previous = await repository.findReservation(
+      principal,
+      request.idempotencyKey,
+      fingerprint,
+      now(),
+    );
+    if (previous) return previous;
+    await resources.assertSafe({ phase: 'admission' });
+    return emit(
+      derived
+        ? repository.reserveDerived(
+            principal,
+            { ...request, scope, fingerprint, operationId: (deps.newId ?? randomUUID)(), derived },
+            now(),
+          )
+        : repository.reserve(
+            principal,
+            { ...request, scope, fingerprint, operationId: (deps.newId ?? randomUUID)() },
+            now(),
+          ),
+    );
+  }
   return {
-    async reserve(principal: UploadPrincipal, input: UploadRequest) {
-      const data = reservationData(input, [
-        'mediaType',
-        'declaredBytes',
-        'idempotencyKey',
-        'scope',
-      ]);
-      const suppliedScope =
-        data.scope === undefined
-          ? { kind: 'personal' }
-          : reservationData(data.scope, ['kind', 'workspaceId']);
-      if (suppliedScope.kind === 'workspace') throw new UploadManagementError('forbidden');
-      if (suppliedScope.kind !== 'personal' || Object.keys(suppliedScope).length !== 1)
-        throw new UploadManagementError('invalid_request');
-      const scope = { kind: 'personal' } as const;
-      if (
-        typeof data.declaredBytes !== 'number' ||
-        !Number.isSafeInteger(data.declaredBytes) ||
-        data.declaredBytes <= 0 ||
-        data.declaredBytes > UPLOAD_MAX_FILE_BYTES ||
-        typeof data.mediaType !== 'string' ||
-        typeof data.idempotencyKey !== 'string' ||
-        data.idempotencyKey.length !== 36 ||
-        !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
-          data.idempotencyKey,
-        )
-      ) {
-        throw new UploadManagementError('invalid_request');
-      }
-      const request: UploadRequest = {
-        mediaType: data.mediaType,
-        declaredBytes: data.declaredBytes,
-        idempotencyKey: data.idempotencyKey,
-        scope,
-      };
-      await authorize(principal, scope);
-      if (!MEDIA_TYPES.has(request.mediaType)) throw new UploadManagementError('unsupported_type');
-      const fingerprint = JSON.stringify([scope, request.mediaType, request.declaredBytes]);
-      const previous = await repository.findReservation(
-        principal,
-        request.idempotencyKey,
-        fingerprint,
-        now(),
-      );
-      if (previous) return previous;
-      await resources.assertSafe({ phase: 'admission' });
-      return emit(
-        repository.reserve(
-          principal,
-          { ...request, scope, fingerprint, operationId: (deps.newId ?? randomUUID)() },
-          now(),
-        ),
-      );
-    },
+    reserve: (principal, input) => reserve(principal, input, false),
+    reserveDerived: (principal, input) => reserve(principal, input, true),
     get,
     async list(principal: UploadPrincipal) {
       await authorize(principal);

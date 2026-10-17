@@ -1,11 +1,21 @@
 /** File lifecycle authority shared by File CRUD and transactional Message admission. */
 import {
   UPLOAD_MAX_TEXT_BYTES,
-  UPLOAD_RETENTION_MS,
+  UPLOAD_DERIVED_MAX_SOURCES,
+  UPLOAD_DERIVED_MAX_DESCENDANTS,
   isUploadPrincipal,
+  readUploadSecuritySubject,
+  readUploadDerivedIntent,
+  readUploadDerivedOrigin,
+  uploadDerivedExpiresAt,
   readManagedDocumentResult,
 } from 'librechat-data-provider';
-import type { ManagedDocumentResult } from 'librechat-data-provider';
+import type {
+  ManagedDocumentResult,
+  UploadDerivedIntent,
+  UploadDerivedOrigin,
+  UploadDerivedSource,
+} from 'librechat-data-provider';
 import type { ClientSession, FilterQuery, Model } from 'mongoose';
 import type {
   FileOwnerScope,
@@ -132,6 +142,8 @@ export function liveFileFilter(): FilterQuery<IMongoFile> {
   const security = approvedFileFilter();
   const managedOnly = process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED === 'true';
   return {
+    // Draft access belongs to a later explicit Workspace consumer, never native attachments.
+    derivedOrigin: { $exists: false },
     $or: [
       ...(!managedOnly
         ? [{ retentionAcceptedAt: null, uploadOperationId: { $exists: false } }]
@@ -224,8 +236,21 @@ export function createFileRetentionMethods(
     input: { reservationId: string; sourceFileIds: readonly string[]; bytes: number },
   ): Promise<FileSourceCopyReservation>;
   releaseFileSourceCopies(owner: FileOwnerScope, receipt: FileSourceCopyReservation): Promise<void>;
+  captureManagedUploadOrigin(
+    owner: FileOwnerScope,
+    intent: UploadDerivedIntent,
+    now: number,
+    session: ClientSession,
+  ): Promise<UploadDerivedOrigin>;
   acceptManagedUpload(input: ManagedUploadAcceptance, session: ClientSession): Promise<void>;
   claimManagedUploadProcessing(
+    owner: FileOwnerScope,
+    operationId: string,
+    generation: number,
+    now: number,
+    session: ClientSession,
+  ): Promise<void>;
+  assertManagedUploadProcessing(
     owner: FileOwnerScope,
     operationId: string,
     generation: number,
@@ -245,7 +270,7 @@ export function createFileRetentionMethods(
     operationId: string,
     now: number,
     session: ClientSession,
-  ): Promise<void>;
+  ): Promise<{ revokedFileIds: string[] }>;
   getManagedUploadAvailability(
     owner: FileOwnerScope,
     operationIds: readonly string[],
@@ -261,12 +286,120 @@ export function createFileRetentionMethods(
     owner: FileOwnerScope,
     fileIds: readonly string[],
   ): Promise<IMongoFile[]>;
-  revokeFileSources(owner: FileOwnerScope, fileIds: readonly string[]): Promise<void>;
+  revokeFileSources(
+    owner: FileOwnerScope,
+    fileIds: readonly string[],
+  ): Promise<{ revokedFileIds: string[] }>;
+  prepareFileSourceDeletion(
+    owner: FileOwnerScope,
+    fileIds: readonly string[],
+  ): Promise<{ preparedFileIds: string[] }>;
   finalizeFileSourceDeletion(
     owner: FileOwnerScope,
     fileIds: readonly string[],
   ): Promise<{ completedFileIds: string[] }>;
 } {
+  /** Capture the existing File authority, including private drafts, in the caller's transaction. */
+  async function captureManagedUploadOrigin(
+    owner: FileOwnerScope,
+    value: UploadDerivedIntent,
+    now: number,
+    session: ClientSession,
+  ): Promise<UploadDerivedOrigin> {
+    const intent = readUploadDerivedIntent(value);
+    const scope = managedFileScope(owner);
+    if (!intent || !session.inTransaction() || !Number.isSafeInteger(now) || now < 0)
+      throw new FileSourceUnavailableError();
+    const File = mongoose.models.File as Model<IMongoFile>;
+    const live = {
+      ...scope,
+      retentionAcceptedAt: { $ne: null },
+      status: 'ready',
+      expiredAt: { $gt: new Date(now) },
+      deletionRequestedAt: null,
+      deletionCompletedAt: null,
+      ...approvedFileFilter(options.securityPolicySha256, now),
+    };
+    const load = async (ids: string[]): Promise<IMongoFile[]> => {
+      const rows = await File.find({ ...live, file_id: { $in: ids } })
+        .select('file_id expiredAt +securityApproval +derivedOrigin')
+        .session(session)
+        .lean<IMongoFile[]>();
+      if (rows.length !== ids.length) throw new FileSourceUnavailableError();
+      return rows;
+    };
+    const sourceOf = (row: IMongoFile): UploadDerivedSource => {
+      const subject = readUploadSecuritySubject(row.securityApproval?.subject);
+      const expiresAt = new Date(row.expiredAt!).getTime();
+      if (!subject || subject.operationId !== row.file_id || !Number.isSafeInteger(expiresAt))
+        throw new FileSourceUnavailableError();
+      return { subject, policySha256: row.securityApproval!.policySha256, expiresAt };
+    };
+    const lineageOf = (row: IMongoFile): UploadDerivedOrigin | undefined => {
+      if (row.derivedOrigin === undefined) return undefined;
+      const lineage = readUploadDerivedOrigin(row.derivedOrigin);
+      if (
+        !lineage ||
+        lineage.ancestors.some((source) => source.subject.operationId === row.file_id)
+      )
+        throw new FileSourceUnavailableError();
+      return lineage;
+    };
+    const sources = new Map<string, UploadDerivedSource>();
+    const add = (source: UploadDerivedSource): void => {
+      const previous = sources.get(source.subject.operationId);
+      if (previous && JSON.stringify(previous) !== JSON.stringify(source))
+        throw new FileSourceUnavailableError();
+      sources.set(source.subject.operationId, source);
+      if (sources.size > UPLOAD_DERIVED_MAX_SOURCES) throw new FileSourceUnavailableError();
+    };
+    for (const row of await load(intent.directSourceFileIds)) {
+      add(sourceOf(row));
+      for (const source of lineageOf(row)?.ancestors ?? []) add(source);
+    }
+    const ids = [...sources.keys()].sort();
+    const rows = await load(ids);
+    const lineages = new Map(rows.map((row) => [row.file_id, lineageOf(row)]));
+    for (const row of rows) {
+      if (JSON.stringify(sourceOf(row)) !== JSON.stringify(sources.get(row.file_id)))
+        throw new FileSourceUnavailableError();
+      const lineage = lineages.get(row.file_id);
+      if (!lineage) continue;
+      const ancestorIds = new Set(lineage.ancestors.map((source) => source.subject.operationId));
+      for (const source of lineage.ancestors) {
+        const id = source.subject.operationId;
+        if (
+          JSON.stringify(source) !== JSON.stringify(sources.get(id)) ||
+          (lineages.get(id)?.ancestors ?? []).some(
+            (ancestor) => !ancestorIds.has(ancestor.subject.operationId),
+          )
+        )
+          throw new FileSourceUnavailableError();
+      }
+    }
+    const origin = readUploadDerivedOrigin({
+      version: 1,
+      ...intent,
+      ancestors: [...sources.values()],
+    });
+    if (!origin) throw new FileSourceUnavailableError();
+    const touched = await File.updateMany(
+      { ...live, file_id: { $in: ids } },
+      { $inc: { retentionRevision: 1 } },
+      { session, timestamps: false },
+    );
+    if (touched.matchedCount !== ids.length) throw new FileSourceUnavailableError();
+    return origin;
+  }
+
+  function descendantFilter(scope: FilterQuery<IMongoFile>, id: string): FilterQuery<IMongoFile> {
+    return {
+      ...scope,
+      'derivedOrigin.ancestors.subject.operationId': id,
+      deletionCompletedAt: null,
+    };
+  }
+
   async function reserveFileSourceCopies(
     owner: FileOwnerScope,
     input: {
@@ -455,32 +588,56 @@ export function createFileRetentionMethods(
     const File = mongoose.models.File as Model<IMongoFile>;
     const owner = fileSourceScope(input.principal);
     const securityApproval = captureManagedFileApproval(input, options.securityPolicySha256);
+    const origin =
+      input.derivedOrigin === undefined ? undefined : readUploadDerivedOrigin(input.derivedOrigin);
+    const accepted = { ...input, receipt: { ...input.receipt }, principal: { ...input.principal } };
     if (
       !session.inTransaction() ||
       !isUploadPrincipal(input.principal) ||
-      input.expiresAt !== input.acceptedAt + UPLOAD_RETENTION_MS ||
+      (input.derivedOrigin !== undefined && !origin) ||
+      input.expiresAt !== uploadDerivedExpiresAt(input.acceptedAt, origin ?? undefined) ||
       input.receipt.outcome !== 'durable' ||
       !securityApproval
     )
       throw new FileSourceUnavailableError();
+    if (origin) {
+      if (origin.ancestors.some((source) => source.subject.operationId === accepted.operationId))
+        throw new FileSourceUnavailableError();
+      const actual = await captureManagedUploadOrigin(
+        accepted.principal,
+        { binding: origin.binding, directSourceFileIds: origin.directSourceFileIds },
+        accepted.acceptedAt,
+        session,
+      );
+      if (JSON.stringify(actual) !== JSON.stringify(origin)) throw new FileSourceUnavailableError();
+      for (const source of origin.ancestors) {
+        const count = await File.countDocuments(
+          descendantFilter(managedFileScope(accepted.principal), source.subject.operationId),
+        )
+          .limit(UPLOAD_DERIVED_MAX_DESCENDANTS + 1)
+          .session(session);
+        if (count >= UPLOAD_DERIVED_MAX_DESCENDANTS) throw new FileSourceUnavailableError();
+      }
+    }
     await File.create(
       [
         {
           ...owner,
-          file_id: input.operationId,
-          uploadOperationId: input.operationId,
+          file_id: accepted.operationId,
+          uploadOperationId: accepted.operationId,
           securityApproval,
-          filename: input.filename,
-          type: input.mediaType,
-          bytes: input.receipt.bytes,
-          filepath: input.receipt.filepath,
-          source: input.receipt.source,
-          storageKey: input.receipt.storageKey,
+          ...(origin ? { derivedOrigin: origin } : {}),
+          filename: accepted.filename,
+          type: accepted.mediaType,
+          bytes: accepted.receipt.bytes,
+          filepath: accepted.receipt.filepath,
+          source: accepted.receipt.source,
+          storageKey: accepted.receipt.storageKey,
           object: 'file',
           context: 'message_attachment',
           status: 'pending',
-          retentionAcceptedAt: new Date(input.acceptedAt),
-          expiredAt: new Date(input.expiresAt),
+          retentionAcceptedAt: new Date(accepted.acceptedAt),
+          expiredAt: new Date(accepted.expiresAt),
           retentionRevision: 0,
           llmDeliveryPath: 'text',
         },
@@ -561,26 +718,87 @@ export function createFileRetentionMethods(
     );
     if (result.matchedCount !== 1) throw new FileSourceUnavailableError();
   }
+  async function assertManagedUploadProcessing(
+    owner: FileOwnerScope,
+    operationId: string,
+    generation: number,
+    now: number,
+    session: ClientSession,
+  ): Promise<void> {
+    if (
+      !session.inTransaction() ||
+      !Number.isSafeInteger(generation) ||
+      generation < 1 ||
+      !Number.isSafeInteger(now) ||
+      now < 0
+    )
+      throw new FileSourceUnavailableError();
+    const File = mongoose.models.File as Model<IMongoFile>;
+    const result = await File.updateOne(
+      { ...managedFilter(owner, operationId, now), previewRevision: String(generation) },
+      { $inc: { retentionRevision: 1 } },
+      { session, timestamps: false },
+    );
+    if (result.matchedCount !== 1) throw new FileSourceUnavailableError();
+  }
+
+  /** The ancestor write serializes every admission with its bounded reverse-lineage revoke. */
+  async function revokeSourceClosure(
+    owner: FileOwnerScope,
+    operationId: string,
+    now: number,
+    session: ClientSession,
+  ): Promise<{ revokedFileIds: string[] }> {
+    const scope = managedFileScope(owner);
+    if (!session.inTransaction() || !Number.isSafeInteger(now) || now < 0)
+      throw new FileSourceUnavailableError();
+    const File = mongoose.models.File as Model<IMongoFile>;
+    const root = await File.findOne({
+      ...scope,
+      file_id: operationId,
+      retentionAcceptedAt: { $ne: null },
+    })
+      .select('file_id deletionRequestedAt')
+      .session(session)
+      .lean<IMongoFile>();
+    if (!root) throw new FileSourceUnavailableError();
+    await File.updateOne(
+      { ...scope, _id: root._id },
+      {
+        $set: { deletionRequestedAt: root.deletionRequestedAt ?? new Date(now) },
+        $inc: { retentionRevision: 1 },
+        $unset: { deletionRetryAt: 1 },
+      },
+      { session, timestamps: false },
+    );
+    const descendants = await File.find(descendantFilter(scope, operationId))
+      .select('file_id')
+      .limit(UPLOAD_DERIVED_MAX_DESCENDANTS + 1)
+      .session(session)
+      .lean<IMongoFile[]>();
+    if (descendants.length > UPLOAD_DERIVED_MAX_DESCENDANTS) throw new FileSourceUnavailableError();
+    const revokedFileIds = [
+      ...new Set([operationId, ...descendants.map((row) => row.file_id)]),
+    ].sort();
+    await File.updateMany(
+      { ...scope, file_id: { $in: revokedFileIds }, deletionRequestedAt: null },
+      {
+        $set: { deletionRequestedAt: new Date(now) },
+        $inc: { retentionRevision: 1 },
+        $unset: { deletionRetryAt: 1 },
+      },
+      { session, timestamps: false },
+    );
+    return { revokedFileIds };
+  }
+
   async function revokeManagedUpload(
     owner: FileOwnerScope,
     operationId: string,
     now: number,
     session: ClientSession,
-  ): Promise<void> {
-    const File = mongoose.models.File as Model<IMongoFile>;
-    await File.updateOne(
-      {
-        ...managedFileScope(owner),
-        file_id: operationId,
-        uploadOperationId: operationId,
-        deletionRequestedAt: null,
-      },
-      {
-        $set: { deletionRequestedAt: new Date(now) },
-        $inc: { retentionRevision: 1 },
-      },
-      { session, timestamps: false },
-    );
+  ): Promise<{ revokedFileIds: string[] }> {
+    return revokeSourceClosure(owner, operationId, now, session);
   }
   async function getManagedUploadAvailability(
     owner: FileOwnerScope,
@@ -591,6 +809,7 @@ export function createFileRetentionMethods(
     const rows = await File.find({
       ...managedFileScope(owner),
       uploadOperationId: { $in: operationIds },
+      derivedOrigin: { $exists: false },
       expiredAt: { $gt: new Date(now) },
       deletionRequestedAt: null,
       deletionCompletedAt: null,
@@ -620,7 +839,9 @@ export function createFileRetentionMethods(
       ...managedFileScope(owner),
       file_id: { $in: [...new Set(fileIds)] },
       retentionAcceptedAt: { $ne: null },
-    }).lean<IMongoFile[]>();
+    })
+      .select('+derivedOrigin')
+      .lean<IMongoFile[]>();
   }
 
   async function getFileSourceDeletionCandidates(
@@ -633,32 +854,49 @@ export function createFileRetentionMethods(
   async function revokeFileSources(
     owner: FileOwnerScope,
     fileIds: readonly string[],
-  ): Promise<void> {
+  ): Promise<{ revokedFileIds: string[] }> {
     const ids = [...new Set(fileIds)];
-    if (!ids.length) return;
-    const rows = await loadFileSourceRecords(owner, ids);
-    if (rows.length !== ids.length) throw new FileSourceUnavailableError();
-    const File = mongoose.models.File as Model<IMongoFile>;
-    await File.updateMany(
-      {
-        ...managedFileScope(owner),
-        file_id: { $in: ids },
-        retentionAcceptedAt: { $ne: null },
-        deletionRequestedAt: null,
-      },
-      {
-        $set: { deletionRequestedAt: new Date() },
-        $inc: { retentionRevision: 1 },
-        $unset: { deletionRetryAt: 1 },
-      },
-      { timestamps: false },
-    );
+    if (!ids.length) return { revokedFileIds: [] };
+    const scope = fileSourceScope(owner);
+    const capturedOwner = { userId: scope.user, tenantId: scope.tenantId };
+    if (ids.some((id) => typeof id !== 'string' || id.length === 0 || id.length > 128))
+      throw new FileSourceUnavailableError();
+    const revoked = new Set<string>();
+    for (const id of ids) {
+      const session = await mongoose.startSession();
+      try {
+        const result = await session.withTransaction(
+          () => revokeSourceClosure(capturedOwner, id, Date.now(), session),
+          { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } },
+        );
+        for (const revokedId of result.revokedFileIds) revoked.add(revokedId);
+      } finally {
+        await session.endSession();
+      }
+    }
+    return { revokedFileIds: [...revoked].sort() };
   }
 
-  /** Only deletion composition calls this after storage, Message and replay completion. */
-  async function finalizeFileSourceDeletion(owner: FileOwnerScope, fileIds: readonly string[]) {
+  /** Content removal and final completion share one idempotent, child-fenced transaction. */
+  async function settleFileSourceDeletion(
+    owner: FileOwnerScope,
+    fileIds: readonly string[],
+    finalize: boolean,
+  ): Promise<string[]> {
+    const scope = fileSourceScope(owner);
+    const capturedOwner = { userId: scope.user, tenantId: scope.tenantId };
     const File = mongoose.models.File as Model<IMongoFile>;
-    const rows = await loadFileSourceRecords(owner, fileIds);
+    const rows = await loadFileSourceRecords(capturedOwner, fileIds);
+    const depth = new Map<string, number>();
+    for (const row of rows) {
+      const origin =
+        row.derivedOrigin === undefined ? undefined : readUploadDerivedOrigin(row.derivedOrigin);
+      if (row.derivedOrigin !== undefined && !origin) throw new FileSourceUnavailableError();
+      depth.set(row.file_id, origin?.ancestors.length ?? 0);
+    }
+    rows.sort(
+      (a, b) => depth.get(b.file_id)! - depth.get(a.file_id)! || a.file_id.localeCompare(b.file_id),
+    );
     const completedFileIds: string[] = [];
     const keep = new Set([
       '_id',
@@ -673,19 +911,28 @@ export function createFileRetentionMethods(
       'deletionRequestedAt',
       'deletionCompletedAt',
       'retainedDerivativeBytes',
+      ...(!finalize ? ['derivedOrigin', 'uploadOperationId'] : []),
     ]);
     for (const row of rows) {
       const session = await mongoose.startSession();
       try {
-        await session.withTransaction(
+        const completed = await session.withTransaction(
           async () => {
-            const current = await File.findOne({ ...managedFileScope(owner), _id: row._id })
+            const current = await File.findOne({ ...managedFileScope(capturedOwner), _id: row._id })
               .select(
-                '+retainedDerivativeBytes +retainedDerivativeReservations +documentStructure +securityApproval',
+                '+retainedDerivativeBytes +retainedDerivativeReservations +documentStructure +securityApproval +derivedOrigin',
               )
               .session(session)
               .lean<IMongoFile>();
             if (!current?.deletionRequestedAt) throw new FileSourceUnavailableError();
+            if (current.deletionCompletedAt) return true;
+            const pendingChild = await File.findOne(
+              descendantFilter(managedFileScope(capturedOwner), current.file_id),
+            )
+              .select('_id')
+              .session(session)
+              .lean();
+            if (pendingChild) return false;
             if (
               !Number.isSafeInteger(current.retainedDerivativeBytes) ||
               current.retainedDerivativeBytes! < 0
@@ -698,37 +945,53 @@ export function createFileRetentionMethods(
                 .map((key) => [key, 1]),
             );
             await File.updateOne(
-              { ...managedFileScope(owner), _id: row._id, deletionRequestedAt: { $ne: null } },
+              {
+                ...managedFileScope(capturedOwner),
+                _id: row._id,
+                deletionRequestedAt: { $ne: null },
+              },
               {
                 $unset: unset,
                 $set: {
                   retainedDerivativeBytes: 0,
-                  deletionCompletedAt: current.deletionCompletedAt ?? new Date(),
+                  ...(finalize ? { deletionCompletedAt: new Date() } : {}),
                 },
               },
               { session, timestamps: false },
             );
+            return true;
           },
           { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } },
         );
+        if (completed) completedFileIds.push(row.file_id);
       } finally {
         await session.endSession();
       }
-      completedFileIds.push(row.file_id);
     }
-    return { completedFileIds };
+    return completedFileIds;
+  }
+  /** Keep reverse lineage until the existing Upload cleanup acknowledgement is known. */
+  async function prepareFileSourceDeletion(owner: FileOwnerScope, fileIds: readonly string[]) {
+    return { preparedFileIds: await settleFileSourceDeletion(owner, fileIds, false) };
+  }
+  /** Only deletion composition calls this after the real Upload cleanup acknowledgement. */
+  async function finalizeFileSourceDeletion(owner: FileOwnerScope, fileIds: readonly string[]) {
+    return { completedFileIds: await settleFileSourceDeletion(owner, fileIds, true) };
   }
   return {
+    captureManagedUploadOrigin,
     reserveFileSourceCopies,
     releaseFileSourceCopies,
     acceptManagedUpload,
     claimManagedUploadProcessing,
+    assertManagedUploadProcessing,
     publishManagedUpload,
     revokeManagedUpload,
     getManagedUploadAvailability,
     touchManagedUploadForRetry,
     getFileSourceDeletionCandidates,
     revokeFileSources,
+    prepareFileSourceDeletion,
     finalizeFileSourceDeletion,
   };
 }

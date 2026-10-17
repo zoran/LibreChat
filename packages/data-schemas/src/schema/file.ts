@@ -216,6 +216,7 @@ const file: Schema<IMongoFile> = new Schema(
     // Managed upload publication joins the existing File lifecycle transaction.
     uploadOperationId: { type: String },
     securityApproval: { type: mongoose.Schema.Types.Mixed, select: false },
+    derivedOrigin: { type: mongoose.Schema.Types.Mixed, select: false },
     deletionRequestedAt: { type: Date },
     deletionCompletedAt: { type: Date },
     expiredAt: {
@@ -243,6 +244,7 @@ const file: Schema<IMongoFile> = new Schema(
         delete value.retainedDerivativeBytes;
         delete value.retainedDerivativeReservations;
         delete value.securityApproval;
+        delete value.derivedOrigin;
         delete value.documentStructure;
         return value;
       },
@@ -252,6 +254,7 @@ const file: Schema<IMongoFile> = new Schema(
         delete value.retainedDerivativeBytes;
         delete value.retainedDerivativeReservations;
         delete value.securityApproval;
+        delete value.derivedOrigin;
         delete value.documentStructure;
         return value;
       },
@@ -268,6 +271,15 @@ file.index(
   },
 );
 file.index({ expiredAt: 1 });
+file.index(
+  {
+    user: 1,
+    tenantId: 1,
+    'derivedOrigin.ancestors.subject.operationId': 1,
+    deletionCompletedAt: 1,
+  },
+  { name: 'file_derived_ancestors' },
+);
 file.index({ deletionCompletedAt: 1, deletionRequestedAt: 1, deletionRetryAt: 1 });
 file.index(
   { user: 1, tenantId: 1, context: 1, _id: -1 },

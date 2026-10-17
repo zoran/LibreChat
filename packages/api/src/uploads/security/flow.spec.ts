@@ -4,12 +4,20 @@ import mongoose from 'mongoose';
 import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import { UPLOAD_RETENTION_MS } from 'librechat-data-provider';
 import { createHash, randomUUID, X509Certificate } from 'node:crypto';
 import { createModels, createUploadManagementRepository } from '@librechat/data-schemas';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
-import type { UploadSecurityInspection, UploadSecurityExecution } from 'librechat-data-provider';
+import type {
+  UploadDerivedOrigin,
+  UploadSecurityApproval,
+  UploadSecurityInspection,
+  UploadSecurityExecution,
+} from 'librechat-data-provider';
+import type { IMongoFile } from '@librechat/data-schemas';
 import type { Request, Response } from 'express';
 import type { StoragePort, UploadSecurityPort } from '../contract';
+import { extractManagedDocument } from '~/files/documents/managed';
 import { createSecurityTlsFixture } from './tls-fixture.helper';
 import { createRawUploadBodyHandler } from '../transport/body';
 import { createHttpUploadSecurityPort } from './transport';
@@ -146,6 +154,233 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
     }
     if (!complete) throw new Error('Security service did not confirm complete shutdown');
   }, 30_000);
+
+  /** Same raw/scanner path; only the ordinary storage byte effect is a local fixture. */
+  async function ingestDerivedFlow(id: string, bytes: Buffer) {
+    const put = jest.fn(async (input: Parameters<StoragePort['put']>[0]) => {
+      expect(input.securityApproval).toMatchObject({
+        decision: 'approved',
+        subject: {
+          operationId: id,
+          bytes: bytes.length,
+          sha256: createHash('sha256').update(bytes).digest('hex'),
+        },
+      });
+      expect(await observer.models.File.countDocuments({ file_id: id })).toBe(0);
+      const chunks: Buffer[] = [];
+      for await (const chunk of input.body) {
+        input.signal.throwIfAborted();
+        chunks.push(Buffer.from(chunk));
+      }
+      await writeFile(path.join(ordinaryRoot, id), Buffer.concat(chunks), {
+        flag: 'wx',
+        mode: 0o600,
+      });
+      return {
+        outcome: 'durable' as const,
+        source: 's3',
+        bytes: input.bytes,
+        integrity: input.integrity,
+        filepath: `/api/files/managed/${id}`,
+        storageKey: `t/${input.lease.tenantId}/managed-uploads/${input.lease.userId}/${id}.${input.lease.generation}__original`,
+      };
+    });
+    const request = Object.assign(new PassThrough(), {
+      params: { id },
+      body: undefined,
+      headers: {
+        'content-type': 'application/octet-stream',
+        'content-length': String(bytes.length),
+        'x-upload-filename': encodeURIComponent('Abgeleiteter Entwurf.txt'),
+      },
+    });
+    const response = Object.assign(new EventEmitter(), {
+      writableEnded: false,
+      destroyed: false,
+      headersSent: false,
+      statusCode: 0,
+      value: undefined as unknown,
+      setHeader() {},
+      status(code: number) {
+        this.statusCode = code;
+        return this;
+      },
+      json(value: unknown) {
+        this.value = value;
+        this.headersSent = true;
+        this.writableEnded = true;
+        return this;
+      },
+    });
+    const handler = createRawUploadBodyHandler({
+      management,
+      principal: async () => principal,
+      storage: { put },
+      security: port,
+      worker,
+      stagingRoot,
+      claimBytes: management.claimWorkBytes,
+      completeBytes: management.completeWorkBytes,
+      deadlineMs: 15_000,
+    });
+    const done = handler(
+      request as unknown as Request,
+      response as unknown as Response,
+      (error) => {
+        if (error) throw error;
+      },
+    );
+    request.end(bytes);
+    await done;
+    expect(await readdir(stagingRoot)).toEqual([]);
+    return { response, put };
+  }
+
+  async function publishDerivedFlow(id: string) {
+    const lease = await management.claimProcessing(worker);
+    expect(lease?.operationId).toBe(id);
+    const input = await management.getProcessingInput(lease!);
+    expect(input.securityApproval.subject.operationId).toBe(id);
+    // This receipt represents the joined in-process extractor below, not an isolated parser job.
+    await management.bindProcessingExecution(lease!, {
+      attemptId: `${id}.${lease!.generation}`,
+      instanceId: 'flow-inline-extractor',
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    });
+    const { text, structure } = await extractManagedDocument({
+      filePath: path.join(ordinaryRoot, id),
+      mediaType: 'text/plain',
+    });
+    await management.publish(lease!, { text, structure, writerStopped: true });
+    await management.confirmCleanup({
+      operationId: id,
+      generation: lease!.generation,
+      writerStopped: true,
+      localCopiesAbsent: true,
+      originalAbsent: false,
+      textAndHistoryRemoved: false,
+    });
+    return management.get(principal, id);
+  }
+
+  it.each(['approved', 'marked'] as const)(
+    'keeps native derived %s bytes behind the same real scanner and source lifecycle',
+    async (decision) => {
+      const sourceBytes = Buffer.from('Unmarkierter Quellentext für den abgeleiteten Entwurf.');
+      const source = await management.reserve(principal, {
+        idempotencyKey: randomUUID(),
+        mediaType: 'text/plain',
+        declaredBytes: sourceBytes.length,
+      });
+      const uploadedSource = await ingestDerivedFlow(source.id, sourceBytes);
+      expect(uploadedSource.response.statusCode).toBe(202);
+      const readySource = await publishDerivedFlow(source.id);
+      expect(readySource).toMatchObject({ state: 'ready', canUseInComposer: true });
+      const sourceFile = await observer.models.File.findOne({ file_id: source.id })
+        .select('+securityApproval')
+        .lean<IMongoFile>();
+      expect(sourceFile).toMatchObject({ status: 'ready', text: sourceBytes.toString('utf8') });
+
+      const bytes = Buffer.from(
+        decision === 'marked'
+          ? 'Einstufung: VS-VERTRAULICH\nNeu erzeugter Entwurf.'
+          : 'Abgeleiteter Entwurf aus einer freigegebenen Quelle.',
+      );
+      const derived = await management.reserveDerived(principal, {
+        idempotencyKey: randomUUID(),
+        mediaType: 'text/plain',
+        declaredBytes: bytes.length,
+        derived: {
+          binding: { purpose: 'workspace-draft', sourceId: 'flow-draft', sourceRevision: 1 },
+          directSourceFileIds: [source.id],
+        },
+      });
+      const captured = await observer.models.UploadOperation.findById(derived.id).lean<{
+        derivedOrigin?: UploadDerivedOrigin;
+      }>();
+      expect(captured?.derivedOrigin).toMatchObject({
+        version: 1,
+        directSourceFileIds: [source.id],
+        ancestors: [
+          {
+            subject: sourceFile!.securityApproval!.subject,
+            policySha256,
+            expiresAt: Date.parse(readySource.expiresAt!),
+          },
+        ],
+      });
+      const received = await ingestDerivedFlow(derived.id, bytes);
+      const stored = await observer.models.UploadOperation.findById(derived.id).lean<{
+        securityApproval?: UploadSecurityApproval;
+      }>();
+      expect(stored).toMatchObject({
+        derivedOrigin: captured!.derivedOrigin,
+        securitySettlement: { writerStopped: true, transientDataRemoved: true },
+        stagingHeld: false,
+        cleanupPending: false,
+      });
+      if (decision === 'marked') {
+        expect(received.response.statusCode).toBe(422);
+        expect(received.response.value).toEqual({ code: 'security_rejected' });
+        expect(received.put).not.toHaveBeenCalled();
+        expect(stored).not.toHaveProperty('securityApproval');
+        expect(stored).not.toHaveProperty('original');
+        expect(await observer.models.File.findOne({ file_id: derived.id })).toBeNull();
+        expect(await readdir(ordinaryRoot)).toEqual([source.id]);
+        expect(await management.claimProcessing(worker)).toBeNull();
+      } else {
+        expect(received.response.statusCode).toBe(202);
+        expect(received.put).toHaveBeenCalledTimes(1);
+        expect(await readFile(path.join(ordinaryRoot, derived.id))).toEqual(bytes);
+        expect(stored?.securityApproval).toMatchObject({
+          scannerVersion: 'txt-csv-worker-v2',
+          subject: {
+            operationId: derived.id,
+            sha256: createHash('sha256').update(bytes).digest('hex'),
+          },
+        });
+        const ready = await publishDerivedFlow(derived.id);
+        expect(ready).toMatchObject({
+          state: 'ready',
+          canUseInComposer: false,
+          expiresAt: readySource.expiresAt,
+        });
+        expect(Date.parse(ready.acceptedAt!) + UPLOAD_RETENTION_MS).toBeGreaterThan(
+          Date.parse(ready.expiresAt!),
+        );
+        const file = await observer.models.File.findOne({ file_id: derived.id })
+          .select('+derivedOrigin')
+          .lean();
+        expect(file).toMatchObject({
+          status: 'ready',
+          text: bytes.toString('utf8'),
+          derivedOrigin: captured!.derivedOrigin,
+          expiredAt: new Date(ready.expiresAt!),
+        });
+        expect(
+          await observer.models.File.findOne({ file_id: derived.id }).lean(),
+        ).not.toHaveProperty('derivedOrigin');
+      }
+      const publicOperations = await management.list(principal);
+      for (const operation of publicOperations) {
+        expect(operation).not.toHaveProperty('derivedOrigin');
+        expect(operation).not.toHaveProperty('securityApproval');
+      }
+      expect(await management.get(principal, source.id)).toEqual(readySource);
+      expect(await readFile(path.join(ordinaryRoot, source.id))).toEqual(sourceBytes);
+      expect(
+        await observer.models.File.findOne({ file_id: source.id })
+          .select('+securityApproval')
+          .lean(),
+      ).toMatchObject({
+        status: 'ready',
+        securityApproval: sourceFile!.securityApproval,
+        text: sourceBytes.toString('utf8'),
+        expiredAt: sourceFile!.expiredAt,
+      });
+    },
+    30_000,
+  );
 
   it('rejects a policy hash that does not bind the actual policy bytes', async () => {
     await expect(

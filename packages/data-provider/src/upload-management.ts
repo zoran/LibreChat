@@ -5,6 +5,7 @@ import type {
   UploadSecuritySettlement,
 } from './upload-security';
 import type { UploadPromotionRecord } from './upload-intake';
+import type { UploadDerivedIntent } from './upload-derived';
 
 export const UPLOAD_CONTRACT_VERSION = 1;
 export const UPLOAD_MAX_FILE_BYTES = 31_457_280;
@@ -330,6 +331,9 @@ export type UploadCleanupProof = {
   securitySettlement?: UploadSecuritySettlement;
 };
 export type UploadReserveInput = UploadRequest & { operationId: string; fingerprint: string };
+/** Trusted internal consumers only; the public UploadRequest remains unchanged. */
+export type UploadDerivedRequest = UploadRequest & { derived: UploadDerivedIntent };
+export type UploadDerivedReserveInput = UploadReserveInput & { derived: UploadDerivedIntent };
 export type UploadClaimInput = {
   kind: 'transfer' | 'processing';
   worker: UploadWorker;

@@ -3,7 +3,6 @@ import {
   UPLOAD_MAX_FILE_BYTES,
   UPLOAD_USER_WINDOW_BYTES,
   UPLOAD_WINDOW_MS,
-  UPLOAD_RETENTION_MS,
   UPLOAD_REPLAY_MS,
   UPLOAD_MAX_TEXT_BYTES,
   UPLOAD_RECORD_BYTES,
@@ -14,10 +13,15 @@ import {
   matchesUploadSecurityExecution,
   readUploadAcceptedMetadata,
   readManagedDocumentResult,
+  readUploadDerivedIntent,
+  readUploadDerivedOrigin,
+  uploadReservationFingerprint,
+  uploadDerivedExpiresAt,
 } from 'librechat-data-provider';
 import type {
   UploadPrincipal,
   UploadReserveInput,
+  UploadDerivedReserveInput,
   UploadOperation,
   UploadUsage,
   UploadLease,
@@ -79,9 +83,9 @@ import {
   readStoredUploadPromotion,
 } from './uploadManagementIntake';
 import { createUploadAdmissionMethods, readUploadAdmission } from './uploadManagementAdmission';
+import { createFileRetentionMethods, FileSourceUnavailableError } from './fileRetention';
 import { createUploadMigrationMethods } from './uploadManagementMigration';
 import { createUploadControlMethods } from './uploadManagementControl';
-import { createFileRetentionMethods } from './fileRetention';
 
 export type UploadManagementRepository = UploadControlMethods &
   UploadMigrationMethods &
@@ -98,6 +102,11 @@ export type UploadManagementRepository = UploadControlMethods &
     reserve(
       principal: UploadPrincipal,
       input: UploadReserveInput,
+      now: number,
+    ): Promise<UploadOperation>;
+    reserveDerived(
+      principal: UploadPrincipal,
+      input: UploadDerivedReserveInput,
       now: number,
     ): Promise<UploadOperation>;
     get(principal: UploadPrincipal, id: string, now: number): Promise<UploadOperation>;
@@ -307,8 +316,9 @@ export function createUploadManagementRepository(
   }
   async function reserve(
     principal: UploadPrincipal,
-    input: UploadReserveInput,
+    input: UploadReserveInput | UploadDerivedReserveInput,
     now: number,
+    derivedMode = false,
   ): Promise<UploadOperation> {
     principalFilter(principal);
     const allowed = new Set([
@@ -318,6 +328,7 @@ export function createUploadManagementRepository(
       'mediaType',
       'declaredBytes',
       'scope',
+      ...(derivedMode ? ['derived'] : []),
     ]);
     if (
       !input ||
@@ -342,9 +353,13 @@ export function createUploadManagementRepository(
     if (input.scope !== undefined && input.scope.kind !== 'personal') reject('forbidden');
     if (input.scope !== undefined && Reflect.ownKeys(input.scope).some((key) => key !== 'kind'))
       reject('invalid_request');
+    const derived = derivedMode
+      ? readUploadDerivedIntent('derived' in input ? input.derived : undefined)
+      : undefined;
+    if (derivedMode && !derived) reject('invalid_request');
     const scope = { kind: 'personal' as const };
     // Snapshot the technical reservation before any await; never retain caller metadata.
-    input = { ...input, scope: { kind: 'personal' } };
+    input = { ...input, ...(derived ? { derived } : {}), scope: { kind: 'personal' } };
     if (
       !Number.isSafeInteger(input.declaredBytes) ||
       input.declaredBytes <= 0 ||
@@ -360,7 +375,14 @@ export function createUploadManagementRepository(
       input.mediaType.length > 128
     )
       reject('invalid_request');
-    const fingerprint = JSON.stringify([scope, input.mediaType, input.declaredBytes]);
+    const fingerprint = uploadReservationFingerprint({ ...input, scope }, derived ?? undefined);
+    // Current native TXT/CSV qualification leaves bounded room for all three integrity copies.
+    // Never impose a late journal size rejection after a writer or durable PUT has started.
+    if (
+      derived &&
+      (!['text/plain', 'text/csv'].includes(input.mediaType) || input.declaredBytes > 65_536)
+    )
+      reject('invalid_request');
     if (fingerprint !== input.fingerprint) reject('invalid_request');
     return store.transaction(async (session, global) => {
       const owner = principalFilter(principal);
@@ -391,6 +413,27 @@ export function createUploadManagementRepository(
         global.bundles >= RESOURCE_MAX.bundles
       )
         reject('capacity_exceeded');
+      let derivedOrigin;
+      if (derived) {
+        try {
+          derivedOrigin = await lifecycle.captureManagedUploadOrigin(
+            principal,
+            derived,
+            now,
+            session,
+          );
+        } catch (error) {
+          if (error instanceof FileSourceUnavailableError) reject('not_found');
+          throw error;
+        }
+        // Reserve half of the existing record allowance for the native bounded receipt/worker
+        // journal, before any external writer exists. Never reject cleanup because of row size.
+        if (
+          mongoose.mongo.BSON.calculateObjectSize({ derivedOrigin, fingerprint }) >
+          UPLOAD_RECORD_BYTES / 2
+        )
+          reject('capacity_exceeded');
+      }
       const row: StoredUpload = {
         _id: input.operationId,
         tenantId: principal.tenantId,
@@ -398,6 +441,7 @@ export function createUploadManagementRepository(
         scope,
         idempotencyKey: input.idempotencyKey,
         fingerprint,
+        ...(derivedOrigin ? { derivedOrigin } : {}),
         mediaType: input.mediaType,
         declaredBytes: input.declaredBytes,
         state: 'waiting',
@@ -573,7 +617,8 @@ export function createUploadManagementRepository(
     ...createUploadActivationMethods(store),
     ...createUploadAdmissionMethods(store),
     ...createUploadIntakeMethods(store, securityPolicySha256, applyCleanup),
-    reserve,
+    reserve: (principal, input, now) => reserve(principal, input, now),
+    reserveDerived: (principal, input, now) => reserve(principal, input, now, true),
     usage,
     async findReservation(principal, key, fingerprint, now) {
       const row = await store.Operation.findOne({
@@ -699,6 +744,11 @@ export function createUploadManagementRepository(
         : undefined;
       return store.transaction(async (session) => {
         const row = await owned(principal, lease.operationId, session);
+        if (
+          row.derivedOrigin !== undefined &&
+          original?.filepath !== `/api/files/managed/${row._id}`
+        )
+          reject('invalid_request');
         if (row.acceptedAt != null) {
           if (
             lease.kind !== 'transfer' ||
@@ -715,6 +765,7 @@ export function createUploadManagementRepository(
           requireUploadSecurityApproval(row, securityPolicySha256, now, approval, original);
           if (uploadDigest(approval) !== uploadDigest(row.securityApproval))
             reject('idempotency_conflict');
+          await lifecycle.touchManagedUploadForRetry(principal, row._id, now, session);
           return project(row, now);
         }
         assertLease(row, lease, now);
@@ -743,9 +794,12 @@ export function createUploadManagementRepository(
           original,
         );
         await store.touchPrincipal(principal, session);
+        const derivedOrigin =
+          row.derivedOrigin === undefined ? undefined : readUploadDerivedOrigin(row.derivedOrigin);
+        if (derivedOrigin === null) reject('not_found');
         row.acceptedAt = now;
         row.filename = acceptedMetadata.filename;
-        row.expiresAt = now + UPLOAD_RETENTION_MS;
+        row.expiresAt = uploadDerivedExpiresAt(now, derivedOrigin);
         row.fileId = row._id;
         row.actualBytes = original.bytes;
         row.original = original;
@@ -768,6 +822,7 @@ export function createUploadManagementRepository(
             securityApproval: row.securityApproval,
             acceptedAt: now,
             expiresAt: row.expiresAt,
+            ...(derivedOrigin ? { derivedOrigin } : {}),
           },
           session,
         );
@@ -818,6 +873,13 @@ export function createUploadManagementRepository(
           row.publishedDigest === digest
         ) {
           requireUploadSecurityApproval(row, securityPolicySha256, now);
+          await lifecycle.assertManagedUploadProcessing(
+            principalOf(row),
+            row._id,
+            lease.generation,
+            now,
+            session,
+          );
           return project(row, now);
         }
         assertLease(row, lease, now);
@@ -909,27 +971,38 @@ export function createUploadManagementRepository(
       });
     },
     async getProcessingInput(lease, now) {
-      const row = await store.Operation.findById(lease.operationId).lean<StoredUpload>();
-      assertLease(row, lease, now);
-      if (
-        row.slot !== 'processing' ||
-        !readUploadAcceptedMetadata({ filename: row.filename }) ||
-        !isUploadStorageReceipt(row.original) ||
-        row.original.outcome !== 'durable' ||
-        row.original.bytes !== row.actualBytes ||
-        !isUploadOriginalIntegrity(row.original.integrity, row.actualBytes!) ||
-        row.expiresAt! <= now
-      )
-        reject('not_ready');
-      return {
-        operationId: row._id,
-        attemptGeneration: row.attemptGeneration!,
-        filename: row.filename!,
-        mediaType: row.mediaType,
-        bytes: row.actualBytes!,
-        original: row.original,
-        securityApproval: requireUploadSecurityApproval(row, securityPolicySha256, now),
-      };
+      return store.transaction(async (session) => {
+        const row = await store.Operation.findById(lease.operationId)
+          .session(session)
+          .lean<StoredUpload>();
+        assertLease(row, lease, now);
+        if (
+          row.slot !== 'processing' ||
+          !readUploadAcceptedMetadata({ filename: row.filename }) ||
+          !isUploadStorageReceipt(row.original) ||
+          row.original.outcome !== 'durable' ||
+          row.original.bytes !== row.actualBytes ||
+          !isUploadOriginalIntegrity(row.original.integrity, row.actualBytes!) ||
+          row.expiresAt! <= now
+        )
+          reject('not_ready');
+        await lifecycle.assertManagedUploadProcessing(
+          principalOf(row),
+          row._id,
+          lease.generation,
+          now,
+          session,
+        );
+        return {
+          operationId: row._id,
+          attemptGeneration: row.attemptGeneration!,
+          filename: row.filename!,
+          mediaType: row.mediaType,
+          bytes: row.actualBytes!,
+          original: row.original,
+          securityApproval: requireUploadSecurityApproval(row, securityPolicySha256, now),
+        };
+      });
     },
     async bindProcessingExecution(lease, execution, now) {
       if (
@@ -954,6 +1027,13 @@ export function createUploadManagementRepository(
         )
           reject('lease_lost');
         requireUploadSecurityApproval(row, securityPolicySha256, now);
+        await lifecycle.assertManagedUploadProcessing(
+          principalOf(row),
+          row._id,
+          lease.generation,
+          now,
+          session,
+        );
         if (row.parserExecution) return;
         row.parserExecution = { ...execution };
         await store.save(row, session);

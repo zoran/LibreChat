@@ -192,7 +192,7 @@ export function createManagedUploadCleanup(options: {
       if (proof.writerStopped) await confirm(task, proof);
       return proof;
     },
-    /** File composition calls only after generation purge, Message redaction and File finalization. */
+    /** After generation purge, Message redaction and File-content preparation; final File completion follows this ACK. */
     async finishFileDeletion(task: UploadCleanupTask, proof: UploadCleanupProof): Promise<void> {
       if (!task.fileId || !['deleted', 'expired'].includes(task.state) || !proof.originalAbsent) {
         throw new Error('Managed original absence required');

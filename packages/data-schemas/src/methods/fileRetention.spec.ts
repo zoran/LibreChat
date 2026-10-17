@@ -120,11 +120,12 @@ describe('source-dependent message retention', () => {
                 .messages;
         expect(rows).toHaveLength(1);
         expect(rows[0]).toMatchObject({
+          __v: 3,
           text: 'ordinary transcript',
           quotes: ['independent quotation'],
           quoteSourceRefs: [{ messageId, quoteIndex: 0, messageVersion: 3 }],
         });
-        for (const field of ['_id', 'user', '__v', 'quoteSourceRetention']) {
+        for (const field of ['_id', 'user', 'quoteSourceRetention']) {
           expect(rows[0]).not.toHaveProperty(field);
         }
         expect(findMessages).toHaveBeenCalledTimes(1);
@@ -219,7 +220,8 @@ describe('source-dependent message retention', () => {
         quotes: ['independent excerpt'],
       });
       for (const message of visible) {
-        for (const field of ['_id', 'user', '__v', 'quoteSourceRetention']) {
+        expect(Number.isSafeInteger(message.__v)).toBe(true);
+        for (const field of ['_id', 'user', 'quoteSourceRetention']) {
           expect(message).not.toHaveProperty(field);
         }
       }

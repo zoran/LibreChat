@@ -243,23 +243,50 @@ const processDeleteRequest = async ({ req, files }) => {
   const uploadCleanup = require('~/server/services/Uploads').getUploadRuntime()?.cleanup;
   const uploadTasks = new Map();
   const uploadProofs = new Map();
+  const begunFileIds = new Set();
   for (const file of files) {
     const task = uploadCleanup && (await uploadCleanup.beginFileDeletion(owner, file.file_id));
+    begunFileIds.add(file.file_id);
     if (task) uploadTasks.set(file.file_id, task);
     else if (file.uploadOperationId) throw new Error('MANAGED_UPLOAD_CLEANUP_UNAVAILABLE');
   }
-  const managedIds = files
+  const requestedManagedIds = files
     .filter((file) => file.retentionAcceptedAt != null || uploadTasks.has(file.file_id))
     .map((file) => file.file_id);
+  let managedIds = requestedManagedIds;
+  const pendingManagedFiles = new Map();
   let replayComplete = true;
   let alreadyCompleted = [];
   if (managedIds.length > 0) {
-    await db.revokeFileSources(owner, managedIds);
+    const revoked = await db.revokeFileSources(owner, managedIds);
+    if (
+      !Array.isArray(revoked?.revokedFileIds) ||
+      revoked.revokedFileIds.some((id) => typeof id !== 'string' || !id) ||
+      requestedManagedIds.some((id) => !revoked.revokedFileIds.includes(id))
+    ) {
+      throw new Error('MANAGED_FILE_REVOKE_UNCONFIRMED');
+    }
+    managedIds = [...new Set(revoked.revokedFileIds)];
+    // The atomic File fence includes every descendant. Fence all corresponding
+    // Upload operations before generation, provider or physical cleanup work.
+    for (const id of managedIds) {
+      if (begunFileIds.has(id)) continue;
+      const task = uploadCleanup && (await uploadCleanup.beginFileDeletion(owner, id));
+      begunFileIds.add(id);
+      if (task) uploadTasks.set(id, task);
+    }
+    // Ordinary reads hide revoked content. This owner alone can recover locators
+    // and private lineage, including descendants absent from the request.
+    const pending = await db.getFileSourceDeletionCandidates(owner, managedIds);
+    for (const file of pending) {
+      if (!managedIds.includes(file.file_id)) throw new Error('MANAGED_FILE_REVOKE_UNCONFIRMED');
+      if (file.uploadOperationId && !uploadTasks.has(file.file_id))
+        throw new Error('MANAGED_UPLOAD_CLEANUP_UNAVAILABLE');
+      pendingManagedFiles.set(file.file_id, file);
+    }
     const receipt = await GenerationJobManager.revokeFileSourceGenerations(owner, managedIds);
     replayComplete = receipt?.complete === true && receipt.pending?.length === 0;
     await db.redactFileSourceContent(owner, managedIds);
-    // Ordinary reads hide revoked content; only this fixed owner may recover deletion locators.
-    const pending = await db.getFileSourceDeletionCandidates(owner, managedIds);
     const pendingIds = new Set(pending.map((file) => file.file_id));
     alreadyCompleted = managedIds.filter((id) => !pendingIds.has(id));
     files = [...files.filter((file) => !managedIds.includes(file.file_id)), ...pending];
@@ -365,61 +392,96 @@ const processDeleteRequest = async ({ req, files }) => {
 
   await Promise.allSettled(promises);
   const deletedFileIds = [...resolvedFileIds];
-  let metadataDeletedFileIds = deletedFileIds;
-  if (deletedFileIds.length > 0) {
+  const metadataDeletedFileIds = new Set();
+  const failManagedFile = (fileId) => {
+    failedFileIds.add(fileId);
+    const pending = pendingManagedFiles.get(fileId);
+    // A finalized replay row no longer supplies private lineage. Confirm it
+    // first; an unknown acknowledgement conservatively holds every requested root.
+    const ancestors = pending
+      ? (pending.derivedOrigin?.ancestors ?? []).map((source) => source.subject.operationId)
+      : requestedManagedIds;
+    for (const id of ancestors) {
+      if (managedIds.includes(id)) failedFileIds.add(id);
+    }
+  };
+  for (const id of managedIds) {
+    if (!replayComplete || failedFileIds.has(id)) failManagedFile(id);
+  }
+
+  const ordinaryIds = deletedFileIds.filter((id) => !managedIds.includes(id));
+  if (ordinaryIds.length > 0) {
     try {
-      const ordinaryIds = deletedFileIds.filter((fileId) => !managedIds.includes(fileId));
-      if (ordinaryIds.length > 0) await db.deleteFiles(ordinaryIds);
-      const managedDeleted = deletedFileIds.filter(
-        (fileId) => managedIds.includes(fileId) && !failedFileIds.has(fileId),
-      );
-      if (managedDeleted.length > 0 && replayComplete) {
-        const result = await db.finalizeFileSourceDeletion(owner, managedDeleted);
-        for (const id of managedDeleted) {
-          if (!result.completedFileIds.includes(id)) failedFileIds.add(id);
-        }
-      } else {
-        managedDeleted.forEach((id) => failedFileIds.add(id));
-      }
-      metadataDeletedFileIds = deletedFileIds.filter((id) => !failedFileIds.has(id));
+      await db.deleteFiles(ordinaryIds);
+      ordinaryIds.forEach((id) => metadataDeletedFileIds.add(id));
     } catch (error) {
       logger.error('Error deleting file metadata after storage deletion', error);
-      deletedFileIds.forEach((fileId) => failedFileIds.add(fileId));
-      metadataDeletedFileIds = [];
       throw error;
     }
-    /* The only place a delete removes agent references, and it runs after the metadata delete
-       succeeded: a file that kept its storage, its chunks or its record keeps its references too,
-       so the agent it was removed from can be asked again (see issue #12776). */
-    if (metadataDeletedFileIds.length > 0) {
-      try {
-        await db.removeAgentResourceFilesFromAllAgents({ file_ids: metadataDeletedFileIds });
-      } catch (error) {
-        // A fulfilled deletion response must retain an unconfirmed metadata child.
-        // Maintenance uses the existing failed-file result instead of inferring idle.
-        metadataDeletedFileIds.forEach((fileId) => failedFileIds.add(fileId));
-        logger.error('Error cleaning up orphaned agent file references', error);
-      }
+    try {
+      await db.removeAgentResourceFilesFromAllAgents({ file_ids: ordinaryIds });
+    } catch (error) {
+      ordinaryIds.forEach((id) => failedFileIds.add(id));
+      logger.error('Error cleaning up orphaned agent file references', error);
     }
   }
 
-  if (!replayComplete) managedIds.forEach((id) => failedFileIds.add(id));
-  for (const fileId of metadataDeletedFileIds) {
-    const task = uploadTasks.get(fileId);
-    if (!task || failedFileIds.has(fileId)) continue;
+  // Prepare deepest descendants without discarding lineage. Only an acknowledged
+  // Upload cleanup permits final completion; unknown replies remain discoverable.
+  const depth = (id) => {
+    const pending = pendingManagedFiles.get(id);
+    return pending ? (pending.derivedOrigin?.ancestors.length ?? 0) : Infinity;
+  };
+  const depths = [...new Set(managedIds.map(depth))].sort((a, b) => b - a);
+  for (const level of depths) {
+    const ids = managedIds.filter(
+      (id) => depth(id) === level && resolvedFileIds.has(id) && !failedFileIds.has(id),
+    );
+    if (!ids.length) continue;
+    let prepared;
     try {
-      const proof = uploadProofs.get(fileId);
-      if (!proof) throw new Error('MANAGED_UPLOAD_CLEANUP_PENDING');
-      // All existing File, Message and generation steps above have settled.
-      await uploadCleanup.finishFileDeletion(task, proof);
+      const result = await db.prepareFileSourceDeletion(owner, ids);
+      prepared = ids.filter((id) => result.preparedFileIds.includes(id));
+      for (const id of ids) {
+        if (!prepared.includes(id)) failManagedFile(id);
+      }
     } catch (error) {
-      failedFileIds.add(fileId);
-      logger.error('Error confirming managed file resource cleanup', error);
+      logger.error('Error deleting file metadata after storage deletion', error);
+      throw error;
+    }
+    if (!prepared.length) continue;
+    try {
+      await db.removeAgentResourceFilesFromAllAgents({ file_ids: prepared });
+    } catch (error) {
+      prepared.forEach(failManagedFile);
+      logger.error('Error cleaning up orphaned agent file references', error);
+      continue;
+    }
+    const confirmed = [];
+    for (const fileId of prepared) {
+      const task = uploadTasks.get(fileId);
+      try {
+        if (task) {
+          const proof = uploadProofs.get(fileId);
+          if (!proof) throw new Error('MANAGED_UPLOAD_CLEANUP_PENDING');
+          await uploadCleanup.finishFileDeletion(task, proof);
+        }
+        confirmed.push(fileId);
+      } catch (error) {
+        failManagedFile(fileId);
+        logger.error('Error confirming managed file resource cleanup', error);
+      }
+    }
+    if (!confirmed.length) continue;
+    const result = await db.finalizeFileSourceDeletion(owner, confirmed);
+    for (const fileId of confirmed) {
+      if (result.completedFileIds.includes(fileId)) metadataDeletedFileIds.add(fileId);
+      else failManagedFile(fileId);
     }
   }
   return {
-    deletedFileIds: metadataDeletedFileIds.filter(
-      (id) => !uploadTasks.has(id) || !failedFileIds.has(id),
+    deletedFileIds: [...metadataDeletedFileIds].filter(
+      (id) => !managedIds.includes(id) || !failedFileIds.has(id),
     ),
     failedFileIds: [...failedFileIds],
   };

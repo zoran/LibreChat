@@ -1149,6 +1149,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
       'deletionCompletedAt',
       'uploadOperationId',
       'securityApproval',
+      'derivedOrigin',
       'documentStructure',
       'retainedDerivativeBytes',
       'retainedDerivativeReservations',
@@ -1241,6 +1242,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
       'deletionCompletedAt',
       'uploadOperationId',
       'securityApproval',
+      'derivedOrigin',
       'documentStructure',
       'retainedDerivativeBytes',
       'retainedDerivativeReservations',
@@ -1250,6 +1252,13 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
       }
     }
     if (current?.retentionAcceptedAt) {
+      if (
+        current.uploadOperationId != null &&
+        'expiredAt' in update &&
+        (update.expiredAt == null ||
+          new Date(update.expiredAt).getTime() !== new Date(current.expiredAt!).getTime())
+      )
+        throw new FileSourceUnavailableError();
       for (const key of [
         'user',
         'tenantId',

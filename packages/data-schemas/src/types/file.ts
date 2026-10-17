@@ -9,6 +9,7 @@ import type {
   UploadPrincipal,
   UploadStorageReceipt,
   DocumentStructure,
+  UploadDerivedOrigin,
 } from 'librechat-data-provider';
 
 export type RunArtifactRunScope = {
@@ -109,6 +110,8 @@ export interface IMongoFile extends Omit<Document, 'model'> {
   uploadOperationId?: string;
   /** Private immutable upload-owner proof; never part of TFile or client projections. */
   securityApproval?: UploadSecurityApproval;
+  /** Private immutable source identities; ordinary File consumers must not expose drafts. */
+  derivedOrigin?: UploadDerivedOrigin;
   /** Private derived structure, bound to the immutable accepted original and File lifecycle. */
   documentStructure?: DocumentStructure;
   deletionRequestedAt?: Date;
@@ -222,6 +225,7 @@ export type ManagedUploadAcceptance = {
   receipt: UploadStorageReceipt;
   transferGeneration: number;
   securityApproval: UploadSecurityApproval;
+  derivedOrigin?: UploadDerivedOrigin;
   acceptedAt: number;
   expiresAt: number;
 };

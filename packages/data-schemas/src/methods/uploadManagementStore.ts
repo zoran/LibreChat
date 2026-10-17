@@ -5,6 +5,7 @@ import { createHash, randomInt, randomUUID } from 'crypto';
 import { isUploadPrincipal } from 'librechat-data-provider';
 import type {
   UploadPrincipal,
+  UploadDerivedOrigin,
   UploadScope,
   UploadState,
   UploadErrorCode,
@@ -88,6 +89,7 @@ export type StoredUpload = {
   scope: UploadScope;
   idempotencyKey: string;
   fingerprint: string;
+  derivedOrigin?: UploadDerivedOrigin;
   filename?: string;
   mediaType: string;
   declaredBytes: number;
@@ -275,7 +277,11 @@ export function project(row: StoredUpload, now: number): UploadOperation {
     fileId: row.fileId,
     error: row.error,
     cleanupPending: row.cleanupPending,
-    canUseInComposer: row.state === 'ready' && row.expiresAt != null && row.expiresAt > now,
+    canUseInComposer:
+      row.derivedOrigin === undefined &&
+      row.state === 'ready' &&
+      row.expiresAt != null &&
+      row.expiresAt > now,
     canRetryProcessing:
       row.state === 'failed' &&
       row.acceptedAt != null &&
@@ -378,6 +384,7 @@ export function createUploadStore(
       scope: S.Types.Mixed,
       idempotencyKey: String,
       fingerprint: String,
+      derivedOrigin: S.Types.Mixed,
       filename: String,
       mediaType: String,
       declaredBytes: Number,
