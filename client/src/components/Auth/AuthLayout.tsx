@@ -5,11 +5,11 @@ import { hasPublishedPolicies } from '~/utils/policies';
 import { TranslationKeys, useLocalize } from '~/hooks';
 import SocialLoginRender from './SocialLoginRender';
 import { BlinkAnimation } from './BlinkAnimation';
-import LegalConsent from './LegalConsent';
-import { cn } from '~/utils';
 import AppLogo from '~/components/ui/AppLogo';
+import LegalConsent from './LegalConsent';
 import { Banner } from '../Banners';
 import Footer from './Footer';
+import { cn } from '~/utils';
 
 function AuthLayout({
   children,
@@ -92,12 +92,8 @@ function AuthLayout({
     <div className="bg-surface-primary relative flex min-h-screen flex-col">
       <Banner />
       <BlinkAnimation active={isFetching}>
-        <div className="mt-6 h-10 w-full bg-cover">
-          <AppLogo
-            startupConfig={startupConfig}
-            fallbackSrc="assets/logo.svg"
-            className="h-full w-full object-contain"
-          />
+        <div className="mt-6 flex w-full justify-center px-6">
+          <AppLogo startupConfig={startupConfig} fallbackSrc="assets/logo.svg" />
         </div>
       </BlinkAnimation>
       <DisplayError />

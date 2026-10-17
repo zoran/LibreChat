@@ -1,6 +1,7 @@
 import { useTheme } from '@librechat/client';
 import type { TStartupConfig } from 'librechat-data-provider';
 import { getAppTitle } from '~/utils/presentation';
+import cn from '~/utils/cn';
 
 /** Deployment identity, independent of model/provider identity and OS theme preference. */
 export default function AppLogo({
@@ -29,6 +30,14 @@ export default function AppLogo({
       : wordmark) ?? fallbackSrc;
 
   return src ? (
-    <img src={src} alt={getAppTitle(startupConfig?.appTitle)} className={className} />
+    <img
+      src={src}
+      alt={getAppTitle(startupConfig?.appTitle)}
+      className={cn(
+        'w-auto max-w-full shrink-0 object-contain',
+        wordmark ? 'h-16 sm:h-20' : 'h-10',
+        className,
+      )}
+    />
   ) : null;
 }

@@ -1,5 +1,3 @@
-import AppLogo from '~/components/ui/AppLogo';
-import { emailCodeGreeting } from '~/utils/emailCodeGreeting';
 import { useMemo, useCallback, useState, useEffect, useRef } from 'react';
 import { HatGlasses } from 'lucide-react';
 import { easings } from '@react-spring/web';
@@ -11,8 +9,10 @@ import { useGetEndpointsQuery, useGetStartupConfig } from '~/data-provider';
 import { getIconEndpoint, getEntity, getModelSpec } from '~/utils';
 import { useLocalize, useAuthContext, useGreeting } from '~/hooks';
 import { useChatSettings } from '~/Providers/ChatSettingsContext';
+import { emailCodeGreeting } from '~/utils/emailCodeGreeting';
 import AgentContact from '~/components/Agents/AgentContact';
 import ConvoIcon from '~/components/Endpoints/ConvoIcon';
+import AppLogo from '~/components/ui/AppLogo';
 
 const containerClassName =
   'shadow-stroke relative flex h-full items-center justify-center rounded-full bg-presentation text-text-primary dark:after:shadow-none ';
@@ -140,7 +140,7 @@ export default function Landing({ centerFormOnLanding }: { centerFormOnLanding: 
     <div
       className={`flex h-full transform-gpu flex-col items-center justify-center pb-16 transition-all duration-200 ${centerFormOnLanding ? 'max-h-full sm:max-h-0' : 'max-h-full'} ${getDynamicMargin}`}
     >
-      <AppLogo startupConfig={startupConfig} className="mb-4 h-7 max-w-full object-contain" />
+      <AppLogo startupConfig={startupConfig} className="mb-4" />
       <div ref={contentRef} className="flex flex-col items-center gap-0 p-2">
         <div
           className={`flex ${textHasMultipleLines ? 'flex-col' : 'flex-col md:flex-row'} items-center justify-center gap-2`}

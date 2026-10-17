@@ -1,6 +1,6 @@
 import { JSDOM } from 'jsdom';
-import { emailCodeLink } from './emailCodeLink';
 import { emailCodeMessage } from './emailCodeMessage';
+import { emailCodeLink } from './emailCodeLink';
 
 const link = emailCodeLink('https://portal.example.test/chat/', 'a'.repeat(43), '01234567');
 const input = { appTitle: 'Example Portal', code: '01234567', locale: 'de', link };
@@ -29,9 +29,13 @@ describe('email-code message presentation', () => {
     expect(anchor.getAttribute('href')).toBe(link);
     expect(anchor.getAttribute('aria-label')).toContain(input.code);
     expect(message.text).toContain(link);
-    expect(message.text).toContain('von Hand eingeben');
+    const instruction = 'Geben Sie diesen Code auf der Anmeldeseite ein:';
+    expect(anchor.previousElementSibling?.textContent).toBe(instruction);
+    expect(message.text.indexOf(instruction)).toBeLessThan(message.text.indexOf(input.code));
+    expect(message.text.indexOf('Alternativ')).toBeGreaterThan(message.text.indexOf(input.code));
+    expect(message.text).toContain('im selben Browser');
+    expect(document.body.textContent).toContain('denselben Browser');
     expect(message.text).toContain('zehn Minuten');
-    expect(message.text).toContain('einen neuen Code');
     expect(new URL(anchor.href).search).toBe('');
     expect(
       document.querySelectorAll('script, form, iframe, img, link, style, input, object'),
@@ -58,6 +62,6 @@ describe('email-code message presentation', () => {
     const plain = emailCodeMessage({ ...input, link: undefined });
     expect(plain.html).toBeUndefined();
     expect(plain.text).toContain('01234567');
-    expect(plain.text).not.toContain('Öffnen Sie den Link');
+    expect(plain.text).not.toContain('anklicken');
   });
 });

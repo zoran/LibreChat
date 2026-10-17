@@ -1,10 +1,10 @@
-import AppLogo from '~/components/ui/AppLogo';
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import copy from 'copy-to-clipboard';
 import type { TStartupConfig } from 'librechat-data-provider';
 import CopyButton from '~/components/Messages/Content/CopyButton';
 import { getAppTitle, getAppVersion } from '~/utils/presentation';
 import { useGetStartupConfig } from '~/data-provider';
+import AppLogo from '~/components/ui/AppLogo';
 import { useLocalize } from '~/hooks';
 
 const UNKNOWN_PLACEHOLDER = '—';
@@ -85,10 +85,7 @@ function About() {
 
   return (
     <div className="text-text-primary flex flex-col text-sm">
-      <AppLogo
-        startupConfig={startupConfig}
-        className="mb-4 h-7 max-w-full self-start object-contain"
-      />
+      <AppLogo startupConfig={startupConfig} className="mb-4 self-start" />
       <dl className="divide-border-light flex flex-col divide-y">
         <Row label={localize('com_nav_about_version')} value={version} />
         <Row
