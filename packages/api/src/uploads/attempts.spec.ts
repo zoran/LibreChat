@@ -119,7 +119,8 @@ describe('local reservations in the existing attempt record', () => {
       if (action === 'close')
         expect(await journal.close(AbortSignal.abort())).toEqual({ complete: false });
       release();
-      await expect(pending).resolves.toBeInstanceOf(Error);
+      if (action === 'abort') await expect(pending).resolves.toBe(controller.signal.reason);
+      else await expect(pending).resolves.toBeInstanceOf(Error);
       expect(() => registration.bind(binding)).toThrow();
       registration.settle(stopped);
       expect(await journal.close()).toEqual({ complete: true });
