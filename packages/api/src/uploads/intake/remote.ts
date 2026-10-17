@@ -10,6 +10,9 @@ import {
   readUploadAcceptedMetadata,
   readUploadPromotionInput,
   readUploadPromotionRecord,
+  readUploadIntakeRecovery,
+  matchesUploadSecurityExecution,
+  isCompleteUploadSecuritySettlement,
 } from 'librechat-data-provider';
 import type {
   UploadPrincipal,
@@ -21,12 +24,19 @@ import type {
 import type { Request, RequestHandler } from 'express';
 import type { RawUploadBodyDependencies } from '../transport/body';
 import type { IntakeChannel } from './channel';
+import { cancelSecurityExecution } from '../security/cancellation';
 import { createRawUploadBodyHandler } from '../transport/body';
 import { UploadManagementError } from '../errors';
 
 export type RemoteIntakeBodyOptions = Omit<
   RawUploadBodyDependencies,
-  'management' | 'principal' | 'storage' | 'claimBytes' | 'completeBytes'
+  | 'management'
+  | 'principal'
+  | 'storage'
+  | 'claimBytes'
+  | 'completeBytes'
+  | 'recoverAttempt'
+  | 'requiresCleanupAcknowledgement'
 > & { channel: IntakeChannel };
 export type RemoteIntakeBodyHandler = RequestHandler & {
   principal(request: Request): Promise<UploadPrincipal>;
@@ -419,6 +429,73 @@ export function createRemoteIntakeBodyHandler(
       async completeBytes(lease: UploadLease, generation: number): Promise<void> {
         await call({ action: 'complete-bytes', lease: readLease(lease), generation }, true);
       },
+      recoverAttempt: (async (lease, proof, signal) => {
+        if (!bound || !sameLease(lease, bound)) fail('lease_lost');
+        const readRecovery = (value: unknown) => {
+          const recovered = readUploadIntakeRecovery(value);
+          if (
+            !recovered ||
+            recovered.operationId !== operationId ||
+            recovered.transferGeneration !== bound!.generation ||
+            !isDeepStrictEqual(recovered.worker, worker) ||
+            (proof.securityExecution &&
+              (!recovered.securityExecution ||
+                !matchesUploadSecurityExecution(
+                  proof.securityExecution,
+                  recovered.securityExecution,
+                ))) ||
+            (prepared &&
+              (!recovered.promotion ||
+                recovered.promotion.promotionId !== prepared.promotionId ||
+                !isDeepStrictEqual(recovered.promotion.worker, prepared.worker)))
+          )
+            fail('lease_lost');
+          return recovered;
+        };
+        const recovered = readRecovery(
+          await call(
+            {
+              action: 'seal-recovery',
+              transferGeneration: bound.generation,
+            },
+            true,
+            signal,
+          ),
+        );
+        if (recovered.acknowledged || proof.localWriterStopped !== true) return recovered;
+        let settlement = recovered.securitySettlement;
+        if (
+          recovered.securityExecution &&
+          !isCompleteUploadSecuritySettlement(settlement, recovered.securityExecution)
+        ) {
+          settlement =
+            (await cancelSecurityExecution(
+              options.security,
+              recovered.securityExecution,
+              signal,
+            )) ?? undefined;
+          if (!settlement) return recovered;
+        } else if (!recovered.securityExecution && proof.securityPending) return recovered;
+        signal.throwIfAborted();
+        return readRecovery(
+          await call(
+            {
+              action: 'confirm-recovery',
+              settlement: {
+                version: 1,
+                operationId,
+                transferGeneration: bound.generation,
+                worker,
+                localWriterStopped: true,
+                localCopiesAbsent: proof.localCopiesAbsent === true,
+                ...(settlement ? { securitySettlement: settlement } : {}),
+              },
+            },
+            true,
+            signal,
+          ),
+        );
+      }) satisfies NonNullable<RawUploadBodyDependencies['recoverAttempt']>,
       close() {
         clearTimeout(timer);
         controller.abort();
@@ -456,6 +533,8 @@ export function createRemoteIntakeBodyHandler(
         storage: current.storage,
         claimBytes: current.claimBytes,
         completeBytes: current.completeBytes,
+        recoverAttempt: current.recoverAttempt,
+        requiresCleanupAcknowledgement: true,
       });
       await body(request, response, next);
     } finally {

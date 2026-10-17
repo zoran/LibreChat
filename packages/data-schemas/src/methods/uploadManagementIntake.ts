@@ -1,6 +1,9 @@
 /** Private Intake capability and App-promotion fences on the existing transactional upload row. */
 import {
   readUploadIntakeGrant,
+  readUploadIntakeRecoveryBinding,
+  readUploadIntakeRecovery,
+  readUploadIntakeLocalSettlement,
   readUploadPromotionInput,
   readUploadPromotionRecord,
   readUploadPromotionSettlement,
@@ -19,11 +22,18 @@ import type {
   UploadStorageReceipt,
   UploadAcceptedMetadata,
   UploadSecurityApproval,
+  UploadCleanupProof,
+  UploadIntakeRecoveryBinding,
+  UploadIntakeRecovery,
+  UploadIntakeLocalSettlement,
 } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
-import type { StoredUpload, UploadStore } from './uploadManagementStore';
+import type { StoredUpload, UploadStore, GlobalState } from './uploadManagementStore';
+import {
+  hasCompleteUploadSecurityExecution,
+  recordUploadSecuritySettlement,
+} from './uploadManagement.security';
 import { principalFilter, assertLease, uploadDigest, reject } from './uploadManagementStore';
-import { hasCompleteUploadSecurityExecution } from './uploadManagement.security';
 
 export type UploadIntakeReference = {
   grant: UploadIntakeGrant;
@@ -31,6 +41,15 @@ export type UploadIntakeReference = {
   generation?: number;
 };
 export type UploadIntakeMethods = {
+  sealIntakeRecovery(
+    binding: UploadIntakeRecoveryBinding,
+    now: number,
+  ): Promise<UploadIntakeRecovery>;
+  confirmIntakeRecovery(
+    binding: UploadIntakeRecoveryBinding,
+    settlement: UploadIntakeLocalSettlement,
+    now: number,
+  ): Promise<UploadIntakeRecovery>;
   issueIntake(
     principal: UploadPrincipal,
     id: string,
@@ -77,6 +96,7 @@ function currentIntake(
   if (
     !hash(capabilitySha256) ||
     row.intake?.capabilitySha256 !== capabilitySha256 ||
+    row.intake.closed === true ||
     !grant ||
     Date.parse(grant.expiresAt) <= now ||
     !['waiting', 'transferring'].includes(row.state)
@@ -162,6 +182,10 @@ export function validateUploadMigrationIntake(row: StoredUpload): void {
       row.intake &&
       (!hash(row.intake.capabilitySha256) ||
         !grantOf(row) ||
+        (row.intake.closed !== undefined && row.intake.closed !== true) ||
+        (row.intake.cleanupAcknowledged !== undefined && row.intake.cleanupAcknowledged !== true) ||
+        ((row.intake.closed || row.intake.cleanupAcknowledged) &&
+          row.intake.generation === undefined) ||
         (row.intake.generation !== undefined &&
           (row.intake.generation !== row.attemptGeneration ||
             !row.intake.worker?.hostId ||
@@ -171,6 +195,14 @@ export function validateUploadMigrationIntake(row: StoredUpload): void {
           (row.intake.worker !== undefined || row.attemptGeneration != null || row.promotion)))
     )
       reject('migration_conflict');
+    if (row.intake?.cleanupAcknowledged) {
+      recoveryView(row);
+      if (
+        (row.workerGeneration ?? row.generation) === row.intake.generation &&
+        (!row.writerStopped || row.stagingHeld)
+      )
+        reject('migration_conflict');
+    }
     const promotion = readStoredUploadPromotion(row);
     if (promotion && !promotion.writerStopped) reject('migration_conflict');
     if (promotion && !hasCompleteUploadSecurityExecution(row)) reject('migration_conflict');
@@ -183,9 +215,34 @@ export function validateUploadMigrationIntake(row: StoredUpload): void {
   }
 }
 
+/** Only a permanently fenced reference can prove that no future App writer will start. */
+function recoveryView(row: StoredUpload): UploadIntakeRecovery {
+  const promotion = readStoredUploadPromotion(row);
+  const storageOutcome =
+    promotion?.state === 'writing' ? 'unknown' : (promotion?.receipt?.outcome ?? 'not_started');
+  const result = readUploadIntakeRecovery({
+    version: 1,
+    operationId: row._id,
+    transferGeneration: row.intake!.generation,
+    worker: row.intake!.worker,
+    closed: true,
+    acknowledged: row.intake!.cleanupAcknowledged === true,
+    storageOutcome,
+    appWriterStopped: storageOutcome !== 'unknown',
+    ...(promotion
+      ? { promotion: { promotionId: promotion.promotionId, worker: promotion.worker } }
+      : {}),
+    ...(row.securityExecution ? { securityExecution: row.securityExecution } : {}),
+    ...(row.securitySettlement ? { securitySettlement: row.securitySettlement } : {}),
+  });
+  if (!result) reject('unavailable');
+  return result;
+}
+
 export function createUploadIntakeMethods(
   store: UploadStore,
-  policySha256?: string,
+  policySha256: string | undefined,
+  applyCleanup: (row: StoredUpload, proof: UploadCleanupProof, global: GlobalState) => void,
 ): UploadIntakeMethods {
   async function owned(
     principal: UploadPrincipal,
@@ -226,7 +283,84 @@ export function createUploadIntakeMethods(
     )
       reject('lease_lost');
   }
+  async function recoveryRow(
+    binding: UploadIntakeRecoveryBinding,
+    session?: ClientSession,
+  ): Promise<StoredUpload> {
+    const row = await store.Operation.findById(binding.operationId)
+      .session(session ?? null)
+      .lean<StoredUpload>();
+    if (
+      !row?.intake ||
+      row.intake.capabilitySha256 !== binding.capabilitySha256 ||
+      row.intake.generation !== binding.transferGeneration ||
+      row.attemptGeneration !== binding.transferGeneration ||
+      !sameWorker(row.intake.worker, binding.worker) ||
+      ((row.workerGeneration ?? row.generation) === binding.transferGeneration &&
+        !sameWorker(row.worker, binding.worker))
+    )
+      reject('unauthorized');
+    return row;
+  }
   return {
+    async sealIntakeRecovery(value, _now) {
+      const binding = readUploadIntakeRecoveryBinding(value);
+      if (!binding) reject('invalid_request');
+      const prior = await recoveryRow(binding);
+      if (prior.intake!.closed) return recoveryView(prior);
+      return store.transaction(async (session) => {
+        const row = await recoveryRow(binding, session);
+        row.intake!.closed = true;
+        const result = recoveryView(row);
+        await store.save(row, session);
+        return result;
+      });
+    },
+    async confirmIntakeRecovery(value, localValue, _now) {
+      const binding = readUploadIntakeRecoveryBinding(value);
+      const local = readUploadIntakeLocalSettlement(localValue);
+      if (!binding || !local) reject('invalid_request');
+      if (
+        local.operationId !== binding.operationId ||
+        local.transferGeneration !== binding.transferGeneration ||
+        !sameWorker(local.worker, binding.worker)
+      )
+        reject('unauthorized');
+      function check(row: StoredUpload): UploadIntakeRecovery {
+        if (!row.intake!.closed) reject('not_ready');
+        if (local!.securitySettlement)
+          recordUploadSecuritySettlement(row, local!.securitySettlement);
+        return recoveryView(row);
+      }
+      // A historical acknowledgement cannot touch a subsequently claimed processing attempt.
+      const prior = await recoveryRow(binding);
+      const previous = check(prior);
+      if (previous.acknowledged) return previous;
+      return store.transaction(async (session, global) => {
+        const row = await recoveryRow(binding, session);
+        const result = check(row);
+        if (result.acknowledged) return result;
+        if (
+          result.appWriterStopped &&
+          (!row.securityExecution || hasCompleteUploadSecurityExecution(row))
+        ) {
+          applyCleanup(
+            row,
+            {
+              operationId: binding.operationId,
+              generation: binding.transferGeneration,
+              writerStopped: true,
+              localCopiesAbsent: local.localCopiesAbsent,
+              originalAbsent: ['not_started', 'absent'].includes(result.storageOutcome),
+              textAndHistoryRemoved: false,
+            },
+            global,
+          );
+        }
+        await store.save(row, session);
+        return recoveryView(row);
+      });
+    },
     async issueIntake(principal, id, capabilitySha256, value, now) {
       principal = { ...principal };
       const grant = readUploadIntakeGrant(value);
@@ -260,7 +394,7 @@ export function createUploadIntakeMethods(
         _id: id,
         'intake.capabilitySha256': capabilitySha256,
       }).lean<StoredUpload>();
-      if (!row) reject('unauthorized');
+      if (!row || row.intake?.closed) reject('unauthorized');
       const grant = grantOf(row);
       if (!grant || Date.parse(grant.expiresAt) <= now) reject('unauthorized');
       const intake = row.intake!;

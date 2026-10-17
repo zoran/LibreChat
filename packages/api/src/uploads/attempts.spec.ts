@@ -1,4 +1,5 @@
-import type { UploadAttemptBinding } from './contract';
+import type { UploadIntakeRecovery, UploadSecurityExecution } from 'librechat-data-provider';
+import type { UploadAttemptBinding, UploadAttemptSettlement } from './contract';
 import { createUploadAttemptJournal } from './attempts';
 
 const worker = { hostId: 'host', instanceId: 'current' };
@@ -166,18 +167,23 @@ describe('shared upload attempt journal', () => {
     [stopped, true],
     [{ ...stopped, storageOutcome: 'unknown' as const }, false],
     [{ ...stopped, securityPending: true }, false],
-  ])('retains uncertainty after bounded receipt eviction: %j', async (first, complete) => {
-    const journal = createUploadAttemptJournal(worker);
-    for (let generation = 1; generation <= 257; generation++) {
-      const registration = journal.attempts.begin(jest.fn());
-      registration.bind({ ...binding, generation });
-      registration.settle(generation === 1 ? first : stopped);
-    }
-    expect(await journal.attempts.stopAndJoin(task, signal())).toEqual(unknown);
-    journal.attempts.recordCleanup(task, stopped);
-    expect((await journal.maintenance.getMaintenanceCensus(null)).complete).toBe(complete);
-    await expect(journal.close()).resolves.toEqual({ complete });
-  });
+  ])(
+    'evicts only completed receipts while retaining unresolved evidence: %j',
+    async (first, complete) => {
+      const journal = createUploadAttemptJournal(worker);
+      for (let generation = 1; generation <= 257; generation++) {
+        const registration = journal.attempts.begin(jest.fn());
+        registration.bind({ ...binding, generation });
+        registration.settle(generation === 1 ? first : stopped);
+      }
+      expect(await journal.attempts.stopAndJoin(task, signal())).toEqual(
+        complete ? unknown : { ...first, writerStopped: first.storageOutcome !== 'unknown' },
+      );
+      journal.attempts.recordCleanup(task, stopped);
+      expect((await journal.maintenance.getMaintenanceCensus(null)).complete).toBe(complete);
+      await expect(journal.close()).resolves.toEqual({ complete });
+    },
+  );
 
   test.each([
     { ...stopped, writerStopped: false },
@@ -188,5 +194,410 @@ describe('shared upload attempt journal', () => {
     journal.attempts.begin(jest.fn()).settle(proof);
     expect((await journal.maintenance.getMaintenanceCensus(null)).complete).toBe(false);
     await expect(journal.close()).resolves.toEqual({ complete: false });
+  });
+});
+
+describe('bound technical recovery in the existing journal', () => {
+  const local = {
+    writerStopped: false,
+    localWriterStopped: true,
+    localCopiesAbsent: true,
+    storageOutcome: 'unknown' as const,
+    acknowledgementPending: true,
+  };
+  const execution: UploadSecurityExecution = {
+    version: 1,
+    attemptId: 'operation.1',
+    instanceId: '11111111-1111-4111-8111-111111111111',
+    executionId: '22222222-2222-4222-8222-222222222222',
+    expiresAt: '2026-10-17T00:00:00.000Z',
+  };
+  const view = (overrides: Partial<UploadIntakeRecovery> = {}): UploadIntakeRecovery => ({
+    version: 1,
+    operationId: binding.operationId,
+    transferGeneration: binding.generation,
+    worker: { ...worker },
+    closed: true,
+    acknowledged: true,
+    storageOutcome: 'durable',
+    appWriterStopped: true,
+    ...overrides,
+  });
+  const journals: ReturnType<typeof createUploadAttemptJournal>[] = [];
+  const create = () => {
+    const value = createUploadAttemptJournal(worker);
+    journals.push(value);
+    return value;
+  };
+  afterEach(async () => {
+    await Promise.all(journals.splice(0).map((j) => j.close(AbortSignal.abort())));
+  });
+  function fixture(
+    handler: (
+      proof: UploadAttemptSettlement,
+      signal: AbortSignal,
+    ) => Promise<UploadIntakeRecovery | null> = jest.fn(async () => view()),
+    proof: UploadAttemptSettlement = local,
+  ) {
+    const journal = create();
+    const registration = journal.attempts.begin(jest.fn());
+    registration.bind(binding);
+    registration.recover!(handler);
+    registration.settle(proof);
+    return { journal, registration, handler };
+  }
+
+  it.each(['not_started', 'absent', 'durable'] as const)(
+    'recovers confirmed %s only after actual local completion',
+    async (storageOutcome) => {
+      const { journal, handler } = fixture(jest.fn(async () => view({ storageOutcome })));
+      expect(await journal.recoverPending(signal())).toEqual({
+        attempted: 1,
+        settled: 1,
+        pending: 0,
+      });
+      expect(handler).toHaveBeenCalledWith(local, expect.any(AbortSignal));
+      expect(await journal.attempts.stopAndJoin(task, signal())).toMatchObject({
+        writerStopped: true,
+        localWriterStopped: true,
+        storageOutcome,
+        acknowledgementPending: false,
+      });
+      expect(await journal.close()).toEqual({ complete: true });
+      expect(handler).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('requires registration once, after bind and before settlement', () => {
+    const journal = create();
+    const registration = journal.attempts.begin(jest.fn());
+    const handler = jest.fn(async () => view());
+    expect(() => registration.recover!(handler)).toThrow();
+    registration.bind(binding);
+    registration.recover!(handler);
+    expect(() => registration.recover!(handler)).toThrow();
+    registration.settle(local);
+    expect(() => registration.recover!(handler)).toThrow();
+  });
+
+  it('does not recover an active writer or one lacking actual local stop/copy evidence', async () => {
+    const journal = create();
+    const handler = jest.fn(async () => view());
+    const registration = journal.attempts.begin(jest.fn());
+    registration.bind(binding);
+    registration.recover!(handler);
+    expect((await journal.recoverPending(signal())).attempted).toBe(0);
+    registration.settle({ ...local, localWriterStopped: false });
+    expect((await journal.recoverPending(signal())).attempted).toBe(0);
+    expect(handler).not.toHaveBeenCalled();
+    const noCopies = fixture(
+      jest.fn(async () => view()),
+      { ...local, localCopiesAbsent: false },
+    );
+    expect((await noCopies.journal.recoverPending(signal())).attempted).toBe(0);
+  });
+
+  it.each([
+    null,
+    { operationId: 'foreign' },
+    { transferGeneration: 2 },
+    { worker: { ...worker, instanceId: 'old' } },
+    { closed: false },
+    { extra: true },
+    { version: 2 },
+    { securityExecution: { ...execution, attemptId: 'other.1' } },
+    {
+      securityExecution: execution,
+      securitySettlement: {
+        execution: { ...execution, executionId: '33333333-3333-4333-8333-333333333333' },
+        writerStopped: true,
+        transientDataRemoved: true,
+      },
+    },
+  ])('rejects missing, foreign, stale and malformed recovery %j', async (patch) => {
+    const candidate = patch === null ? null : { ...view(), ...patch };
+    const { journal } = fixture(jest.fn(async () => candidate as UploadIntakeRecovery));
+    expect(await journal.recoverPending(signal())).toEqual({
+      attempted: 1,
+      settled: 0,
+      pending: 1,
+    });
+    expect(await journal.attempts.stopAndJoin(task, signal())).toEqual(local);
+  });
+
+  it('does not invoke recovery getters', async () => {
+    const getter = jest.fn(() => true);
+    const candidate = view();
+    Object.defineProperty(candidate, 'acknowledged', { get: getter });
+    const { journal } = fixture(jest.fn(async () => candidate));
+    expect((await journal.recoverPending(signal())).settled).toBe(0);
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it('keeps unknown App writers and missing acknowledgements in census and drain', async () => {
+    const handler = jest.fn(async () =>
+      view({ storageOutcome: 'unknown', appWriterStopped: false, acknowledged: false }),
+    );
+    const { journal } = fixture(handler);
+    await journal.recoverPending(signal());
+    expect(await journal.attempts.stopAndJoin(task, signal())).toEqual(local);
+    handler.mockResolvedValue(view({ acknowledged: false }));
+    await journal.recoverPending(signal());
+    expect((await journal.maintenance.getMaintenanceCensus(null)).complete).toBe(false);
+    journal.attempts.recordCleanup(task, { ...stopped, acknowledgementPending: false });
+    expect((await journal.maintenance.getMaintenanceCensus(null)).complete).toBe(false);
+    expect(await journal.close()).toEqual({ complete: false });
+    handler.mockResolvedValue(view());
+    expect(await journal.close()).toEqual({ complete: true });
+  });
+
+  it('retains scanner pending until its exact pinned execution is fully settled', async () => {
+    const handler = jest.fn(async () =>
+      view({ acknowledged: false, securityExecution: execution }),
+    );
+    const { journal } = fixture(handler, { ...local, securityPending: true });
+    await journal.recoverPending(signal());
+    const other = { ...execution, executionId: '33333333-3333-4333-8333-333333333333' };
+    handler.mockResolvedValue(
+      view({
+        securityExecution: other,
+        securitySettlement: { execution: other, writerStopped: true, transientDataRemoved: true },
+      }),
+    );
+    expect((await journal.recoverPending(signal())).settled).toBe(0);
+    handler.mockResolvedValue(
+      view({
+        securityExecution: execution,
+        securitySettlement: { execution, writerStopped: true, transientDataRemoved: true },
+      }),
+    );
+    expect((await journal.recoverPending(signal())).settled).toBe(1);
+    expect(await journal.attempts.stopAndJoin(task, signal())).toMatchObject({
+      securityPending: false,
+      acknowledgementPending: false,
+    });
+  });
+
+  it('does not clear pending scanner evidence when the recovery omits execution', async () => {
+    const { journal } = fixture(
+      jest.fn(async () => view()),
+      { ...local, securityPending: true },
+    );
+    expect((await journal.recoverPending(signal())).settled).toBe(0);
+  });
+
+  it('binds the actual initial scanner execution and snapshots it independently', async () => {
+    const expected = { ...execution };
+    const changed = { ...execution, executionId: '33333333-3333-4333-8333-333333333333' };
+    const handler = jest.fn<Promise<UploadIntakeRecovery>, [UploadAttemptSettlement, AbortSignal]>(
+      async () =>
+        view({
+          securityExecution: changed,
+          securitySettlement: {
+            execution: changed,
+            writerStopped: true,
+            transientDataRemoved: true,
+          },
+        }),
+    );
+    const { journal } = fixture(handler, {
+      ...local,
+      securityPending: true,
+      securityExecution: expected,
+    });
+    expected.executionId = changed.executionId;
+    const returned = await journal.attempts.stopAndJoin(task, signal());
+    returned.securityExecution!.executionId = changed.executionId;
+    expect((await journal.recoverPending(signal())).settled).toBe(0);
+    expect(handler.mock.calls[0][0].securityExecution).toEqual(execution);
+    expect(Object.isFrozen(handler.mock.calls[0][0])).toBe(true);
+    expect(Object.isFrozen(handler.mock.calls[0][0].securityExecution)).toBe(true);
+    handler.mockResolvedValue(
+      view({
+        securityExecution: execution,
+        securitySettlement: { execution, writerStopped: true, transientDataRemoved: true },
+      }),
+    );
+    expect((await journal.recoverPending(signal())).settled).toBe(1);
+  });
+
+  it('does not complete a remote registration without a proven local stop', async () => {
+    const { journal, handler } = fixture(
+      jest.fn(async () => view()),
+      {
+        ...stopped,
+        acknowledgementPending: false,
+      },
+    );
+    expect((await journal.recoverPending(signal())).attempted).toBe(0);
+    expect(await journal.close()).toEqual({ complete: false });
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it('quarantines malformed or foreign initial scanner evidence', async () => {
+    const { journal, handler } = fixture(
+      jest.fn(async () => view()),
+      {
+        ...local,
+        securityExecution: { ...execution, attemptId: 'foreign.1' },
+      },
+    );
+    expect((await journal.recoverPending(signal())).attempted).toBe(0);
+    expect(handler).not.toHaveBeenCalled();
+    expect(await journal.close()).toEqual({ complete: false });
+  });
+
+  it('does not replace a known remote outcome with a contradictory response', async () => {
+    const { journal } = fixture(
+      jest.fn(async () => view({ storageOutcome: 'absent' })),
+      {
+        ...local,
+        storageOutcome: 'durable',
+        writerStopped: true,
+      },
+    );
+    expect((await journal.recoverPending(signal())).settled).toBe(0);
+    expect(await journal.attempts.stopAndJoin(task, signal())).toMatchObject({
+      storageOutcome: 'durable',
+      acknowledgementPending: true,
+    });
+  });
+
+  it('bounds an uncooperative callback, prevents overlap and ignores its late result', async () => {
+    let resolve!: (value: UploadIntakeRecovery) => void;
+    const handler = jest.fn(
+      () =>
+        new Promise<UploadIntakeRecovery>((done) => {
+          resolve = done;
+        }),
+    );
+    const { journal } = fixture(handler);
+    const controller = new AbortController();
+    const recovering = journal.recoverPending(controller.signal);
+    await Promise.resolve();
+    expect((await journal.recoverPending(signal())).attempted).toBe(0);
+    controller.abort();
+    expect(await recovering).toEqual({ attempted: 1, settled: 0, pending: 1 });
+    expect((await journal.recoverPending(signal())).attempted).toBe(0);
+    resolve(view());
+    await new Promise((done) => setImmediate(done));
+    expect(await journal.attempts.stopAndJoin(task, signal())).toEqual(local);
+    handler.mockResolvedValue(view());
+    expect((await journal.recoverPending(signal())).settled).toBe(1);
+    expect(handler).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not let callback mutation or a stale response overwrite newer local evidence', async () => {
+    let resolve!: (value: UploadIntakeRecovery) => void;
+    const handler = jest.fn((proof: UploadAttemptSettlement) => {
+      try {
+        proof.localCopiesAbsent = false;
+      } catch {
+        /* frozen snapshot */
+      }
+      return new Promise<UploadIntakeRecovery>((done) => {
+        resolve = done;
+      });
+    });
+    const { journal } = fixture(handler);
+    const running = journal.recoverPending(signal());
+    await Promise.resolve();
+    journal.attempts.recordCleanup(task, { ...local, securityPending: true });
+    resolve(view());
+    expect((await running).settled).toBe(0);
+    expect(await journal.attempts.stopAndJoin(task, signal())).toMatchObject({
+      localCopiesAbsent: true,
+      securityPending: true,
+    });
+  });
+
+  it('keeps thrown recovery incomplete and permits a later bounded retry', async () => {
+    const handler = jest.fn(async (): Promise<UploadIntakeRecovery> => {
+      throw new Error('disconnect');
+    });
+    const { journal } = fixture(handler);
+    expect((await journal.recoverPending(signal())).settled).toBe(0);
+    handler.mockResolvedValue(view());
+    expect((await journal.recoverPending(signal())).settled).toBe(1);
+  });
+
+  it('close joins local work before recovery and keeps pending acknowledgements visible', async () => {
+    const journal = create();
+    const handler = jest.fn(async () => view());
+    const registration = journal.attempts.begin(jest.fn());
+    registration.bind(binding);
+    registration.recover!(handler);
+    const closing = journal.close();
+    await Promise.resolve();
+    expect(handler).not.toHaveBeenCalled();
+    registration.settle(local);
+    expect(await closing).toEqual({ complete: true });
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains 256 unresolved receipts and refuses the next registration before any claim', async () => {
+    const journal = create();
+    for (let generation = 1; generation <= 256; generation++) {
+      const registration = journal.attempts.begin(jest.fn());
+      registration.bind({ ...binding, generation });
+      registration.settle(local);
+    }
+    expect(() => journal.attempts.begin(jest.fn())).toThrow('queue_full');
+    expect(await journal.attempts.stopAndJoin(task, signal())).toEqual(local);
+    expect(await journal.close()).toEqual({ complete: false });
+  });
+
+  it('reserves journal capacity for unbound registrations and obeys the recovery batch limit', async () => {
+    const journal = create();
+    const handlers: jest.Mock[] = [];
+    for (let generation = 1; generation <= 256; generation++) {
+      const registration = journal.attempts.begin(jest.fn());
+      registration.bind({ ...binding, generation });
+      const handler = jest.fn(async () => view({ transferGeneration: generation }));
+      handlers.push(handler);
+      registration.recover!(handler);
+      registration.settle(local);
+    }
+    expect(await journal.recoverPending(signal(), 2)).toEqual({
+      attempted: 2,
+      settled: 2,
+      pending: 254,
+    });
+    const first = journal.attempts.begin(jest.fn());
+    const second = journal.attempts.begin(jest.fn());
+    expect(() => journal.attempts.begin(jest.fn())).toThrow('queue_full');
+    first.settle(stopped);
+    second.settle(stopped);
+    expect(handlers.filter((handler) => handler.mock.calls.length)).toHaveLength(2);
+    await expect(journal.recoverPending(signal(), 0)).rejects.toThrow();
+    await expect(journal.recoverPending(signal(), 257)).rejects.toThrow();
+  });
+
+  it('advances the bounded batch past an unresolved earlier record', async () => {
+    const journal = create();
+    const callbacks = [
+      jest.fn(async () =>
+        view({ storageOutcome: 'unknown', appWriterStopped: false, acknowledged: false }),
+      ),
+      jest.fn(async () => view({ transferGeneration: 2 })),
+    ];
+    for (let generation = 1; generation <= 2; generation++) {
+      const registration = journal.attempts.begin(jest.fn());
+      registration.bind({ ...binding, generation });
+      registration.recover!(callbacks[generation - 1]);
+      registration.settle(local);
+    }
+    expect(await journal.recoverPending(signal(), 1)).toEqual({
+      attempted: 1,
+      settled: 0,
+      pending: 2,
+    });
+    expect(await journal.recoverPending(signal(), 1)).toEqual({
+      attempted: 1,
+      settled: 1,
+      pending: 1,
+    });
+    expect(callbacks[0]).toHaveBeenCalledTimes(1);
+    expect(callbacks[1]).toHaveBeenCalledTimes(1);
   });
 });

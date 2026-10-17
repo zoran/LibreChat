@@ -5,6 +5,8 @@ import {
   UPLOAD_INTEGRITY_CHUNK_BYTES,
   UPLOAD_MAX_FILE_BYTES,
   readUploadIntakeGrant,
+  readUploadIntakeRecovery,
+  readUploadIntakeLocalSettlement,
   readUploadPromotionInput,
   readUploadPromotionRecord,
   readUploadPromotionSettlement,
@@ -41,6 +43,8 @@ export type IntakeControlOptions = {
     | 'beginPromotion'
     | 'settlePromotion'
     | 'getPromotion'
+    | 'sealIntakeRecovery'
+    | 'confirmIntakeRecovery'
   >;
   identityRepository: Pick<EmailCodeRepository, 'readEmailCodeIdentity'>;
   management: Pick<
@@ -273,9 +277,48 @@ export function createIntakeControlHandlers(options: IntakeControlOptions): Inta
       'get-promotion': [],
       accept: ['lease', 'promotionId'],
       'confirm-cleanup': ['proof'],
+      'seal-recovery': ['transferGeneration'],
+      'confirm-recovery': ['settlement'],
     };
     if (!Object.prototype.hasOwnProperty.call(shapes, command.action)) fail();
     fields(command, ['action', ...shapes[command.action]]);
+    if (command.action === 'seal-recovery' || command.action === 'confirm-recovery') {
+      signal.throwIfAborted();
+      const settlement =
+        command.action === 'confirm-recovery'
+          ? readUploadIntakeLocalSettlement(command.settlement)
+          : undefined;
+      if (settlement === null) fail();
+      if (
+        settlement &&
+        (settlement.operationId !== ctx.operationId || !sameWorker(settlement.worker, ctx.worker))
+      )
+        fail('lease_lost');
+      const generation = settlement?.transferGeneration ?? command.transferGeneration;
+      if (!integer(generation)) fail();
+      // Technical cleanup retains only the original capability/worker binding after grant loss.
+      const binding = {
+        version: 1 as const,
+        operationId: ctx.operationId,
+        transferGeneration: generation,
+        worker: ctx.worker,
+        capabilitySha256: createHash('sha256').update(ctx.capability).digest('hex'),
+      };
+      const recovered = readUploadIntakeRecovery(
+        settlement
+          ? await repository.confirmIntakeRecovery(binding, settlement, now())
+          : await repository.sealIntakeRecovery(binding, now()),
+      );
+      signal.throwIfAborted();
+      if (
+        !recovered ||
+        recovered.operationId !== ctx.operationId ||
+        recovered.transferGeneration !== generation ||
+        !sameWorker(recovered.worker, ctx.worker)
+      )
+        fail('lease_lost');
+      return recovered;
+    }
     const held = command.lease === undefined ? undefined : lease(command.lease);
     const auth = await authorize(ctx, signal);
     if (held) bound(held, ctx, auth);

@@ -5,6 +5,7 @@ import mongoose from 'mongoose';
 import { request } from 'node:http';
 import assert from 'node:assert/strict';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import { readUploadIntakeRecovery } from 'librechat-data-provider';
 import { createHash, randomBytes, randomUUID, X509Certificate } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import {
@@ -82,7 +83,17 @@ describe('isolated Intake through native authority, scanner and App promotion', 
   let ordinaryRoot: string;
   let grant: UploadIntakeGrant;
   let cancelBeforePromotion: boolean;
+  let revokeAfterClaim: boolean;
+  let losePromotionReply: boolean;
+  let unknownStorageOutcome: boolean;
+  let loseFirstRecoveryRequest: boolean;
+  let recoveryRequests: number;
+  let lostReplies: number;
+  let ordinaryBytes: number;
   let expectedCompleteDrain: boolean;
+  let expectedAppDrain: boolean;
+  let intakeDrain: { complete: boolean } | undefined;
+  let claimedLease: UploadLease | undefined;
   let promotionLease: UploadLease | undefined;
   const certificate = (name: string) => readFile(path.join(tls!.directory, name));
   const stored = (id: string) =>
@@ -91,6 +102,9 @@ describe('isolated Intake through native authority, scanner and App promotion', 
       securitySettlement?: UploadSecuritySettlement;
       securityApproval?: UploadSecurityApproval;
       promotion?: UploadPromotionRecord;
+      intake?: { closed?: boolean; cleanupAcknowledged?: boolean };
+      writerStopped?: boolean;
+      cleanupPending: boolean;
     }>();
 
   beforeAll(async () => {
@@ -186,7 +200,14 @@ describe('isolated Intake through native authority, scanner and App promotion', 
       if (db.models[name]) await db.models[name].deleteMany({});
     for (const name of await readdir(ordinaryRoot)) await rm(path.join(ordinaryRoot, name));
     cancelBeforePromotion = false;
+    revokeAfterClaim = losePromotionReply = unknownStorageOutcome = false;
+    loseFirstRecoveryRequest = false;
+    recoveryRequests = 0;
+    lostReplies = ordinaryBytes = 0;
     expectedCompleteDrain = true;
+    expectedAppDrain = true;
+    intakeDrain = undefined;
+    claimedLease = undefined;
     promotionLease = undefined;
     repository = createUploadManagementRepository(db, {
       enabled: true,
@@ -236,13 +257,15 @@ describe('isolated Intake through native authority, scanner and App promotion', 
       for await (const chunk of input.body) {
         input.signal.throwIfAborted();
         chunks.push(Buffer.from(chunk));
+        ordinaryBytes += chunk.byteLength;
       }
       await writeFile(path.join(ordinaryRoot, input.lease.operationId), Buffer.concat(chunks), {
         flag: 'wx',
         mode: 0o600,
       });
       return {
-        outcome: 'durable',
+        // The unknown variant models an unconfirmed remote PUT; it is never a stopped-writer proof.
+        outcome: unknownStorageOutcome ? 'unknown' : 'durable',
         source: 's3',
         bytes: input.bytes,
         integrity: input.integrity,
@@ -289,13 +312,39 @@ describe('isolated Intake through native authority, scanner and App promotion', 
     });
     const observedChannel: IntakeChannel = {
       async control(input) {
+        if ((input.command as { action?: string })?.action === 'seal-recovery') {
+          recoveryRequests += 1;
+          if (loseFirstRecoveryRequest) {
+            loseFirstRecoveryRequest = false;
+            throw new Error('Synthetic loss of first technical recovery request');
+          }
+        }
         if ((input.command as { action?: string })?.action === 'prepare-promotion') {
           promotionLease = (input.command as { input: { lease: UploadLease } }).input.lease;
           if (cancelBeforePromotion) await management.cancel(grant.principal, input.operationId);
         }
-        return channel.control(input);
+        const result = await channel.control(input);
+        if ((input.command as { action?: string })?.action === 'claim' && result !== null) {
+          claimedLease = result as UploadLease;
+          if (revokeAfterClaim)
+            await identity.revokeEmailCodeSession(
+              grant.sessionId,
+              grant.principal.userId,
+              tenantId,
+            );
+        }
+        return result;
       },
-      promote: (input) => channel.promote(input),
+      async promote(input) {
+        const result = await channel.promote(input);
+        if (losePromotionReply) {
+          // Fault injection discards only a completed real mTLS response, never App work or receipts.
+          assert.equal((await stored(input.operationId))?.promotion?.state, 'settled');
+          lostReplies += 1;
+          throw new Error('Synthetic loss of successful promotion reply');
+        }
+        return result;
+      },
     };
     intake = await startIntakeService({
       channel: observedChannel,
@@ -319,13 +368,13 @@ describe('isolated Intake through native authority, scanner and App promotion', 
   }, 20_000);
 
   afterEach(async () => {
-    const raw = await intake?.close(AbortSignal.timeout(5_000));
+    const raw = intakeDrain ?? (await intake?.close(AbortSignal.timeout(5_000)));
     intake = undefined;
     const app = await control?.close(AbortSignal.timeout(5_000));
     control = undefined;
     const attempts = await journal?.close(AbortSignal.timeout(5_000));
     assert.equal(app?.complete, true);
-    assert.equal(attempts?.complete, true);
+    assert.equal(attempts?.complete, expectedAppDrain);
     assert.equal(raw?.complete, expectedCompleteDrain);
     assert.equal((await readdir(stagingRoot)).length, 0);
   }, 20_000);
@@ -410,6 +459,36 @@ describe('isolated Intake through native authority, scanner and App promotion', 
     expect(ordinaryPut).not.toHaveBeenCalled();
     expect(await readdir(ordinaryRoot)).toEqual([]);
     expect(await observer.models.File.countDocuments({})).toBe(0);
+  }
+
+  async function recovery(input: { operationId: string; capability: string }) {
+    intakeDrain = await intake!.close(AbortSignal.timeout(5_000));
+    const value = readUploadIntakeRecovery(
+      await channel.control({
+        ...input,
+        command: { action: 'seal-recovery', transferGeneration: claimedLease!.generation },
+        signal: AbortSignal.timeout(5_000),
+      }),
+    );
+    expect(value).not.toBeNull();
+    expect(value).toMatchObject({
+      operationId: input.operationId,
+      transferGeneration: claimedLease!.generation,
+      worker: intakeWorker,
+      closed: true,
+    });
+    return value!;
+  }
+
+  async function rejectsUserWork(input: { operationId: string; capability: string }) {
+    const promotionId = (await stored(input.operationId))?.promotion?.promotionId ?? randomUUID();
+    for (const command of [
+      { action: 'claim' },
+      { action: 'accept', lease: claimedLease, promotionId },
+    ])
+      await expect(
+        channel.control({ ...input, command, signal: AbortSignal.timeout(5_000) }),
+      ).rejects.toMatchObject({ code: 'unauthorized' });
   }
 
   it('accepts actual scanned bytes once, and rejects body replay and duplicate promotion without another source read', async () => {
@@ -514,18 +593,113 @@ describe('isolated Intake through native authority, scanner and App promotion', 
     const bytes = Buffer.from('Zulässiger Text, dessen Vorgang abgebrochen wird.');
     const issued = await ticket(bytes);
     cancelBeforePromotion = true;
-    expectedCompleteDrain = false; // A failed remote storage call without a receipt retains its unresolved journal entry.
     const response = await submit(issued, bytes);
     expect(response.status).toBeGreaterThanOrEqual(400);
     expect(promotionLease).toBeDefined();
-    await expect(
-      channel.control({
-        ...issued,
-        command: { action: 'renew', lease: promotionLease },
-        signal: AbortSignal.timeout(5_000),
-      }),
-    ).rejects.toMatchObject({ code: 'lease_lost' });
+    expect(await recovery(issued)).toMatchObject({
+      acknowledged: true,
+      storageOutcome: 'not_started',
+      appWriterStopped: true,
+    });
+    expect(intakeDrain).toEqual({ complete: true });
+    expect(await stored(issued.operationId)).toMatchObject({
+      state: 'cancelled',
+      intake: { closed: true, cleanupAcknowledged: true },
+    });
+    await rejectsUserWork(issued);
     await noOrdinaryContent();
     expect(await stored(issued.operationId)).not.toHaveProperty('promotion');
+  }, 30_000);
+
+  it.each(['revoked-after-claim', 'lost-successful-promotion-reply'] as const)(
+    'recovers %s through the bound technical path without reopening user authority or sending bytes twice',
+    async (fault) => {
+      const bytes = Buffer.from('Zulässiger Text für technische Bereinigung.');
+      const issued = await ticket(bytes);
+      revokeAfterClaim = fault === 'revoked-after-claim';
+      losePromotionReply = fault === 'lost-successful-promotion-reply';
+      const response = await submit(issued, bytes);
+      expect(response.status).toBeGreaterThanOrEqual(400);
+      expect(claimedLease).toBeDefined();
+      const view = await recovery(issued);
+      expect(view).toMatchObject({
+        acknowledged: true,
+        appWriterStopped: true,
+        storageOutcome: revokeAfterClaim ? 'not_started' : 'durable',
+      });
+      expect(intakeDrain).toEqual({ complete: true });
+      expect(await stored(issued.operationId)).toMatchObject({
+        intake: { closed: true, cleanupAcknowledged: true },
+      });
+      await rejectsUserWork(issued);
+      expect(await observer.models.File.countDocuments({})).toBe(0);
+      if (revokeAfterClaim) {
+        await noOrdinaryContent();
+      } else {
+        expect(lostReplies).toBe(1);
+        expect(ordinaryPut).toHaveBeenCalledTimes(1);
+        expect(ordinaryBytes).toBe(bytes.length);
+        expect(await readFile(path.join(ordinaryRoot, issued.operationId))).toEqual(bytes);
+        expect(await stored(issued.operationId)).toMatchObject({
+          promotion: { state: 'settled', writerStopped: true, receipt: { outcome: 'durable' } },
+        });
+      }
+    },
+    30_000,
+  );
+
+  it('retries a lost technical recovery request while the service stays open, without a new upload', async () => {
+    const bytes = Buffer.from('Technische Bereinigung ohne neuen Browseraufruf.');
+    const issued = await ticket(bytes);
+    losePromotionReply = loseFirstRecoveryRequest = true;
+    expect((await submit(issued, bytes)).status).toBeGreaterThanOrEqual(400);
+    const until = Date.now() + 5000;
+    let recovered = false;
+    while (Date.now() < until) {
+      const row = await stored(issued.operationId);
+      const census = await intake!.maintenance.getMaintenanceCensus(null);
+      if (row?.intake?.cleanupAcknowledged === true && census.complete) {
+        recovered = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(recovered).toBe(true);
+    expect(recoveryRequests).toBeGreaterThanOrEqual(2);
+    expect(intakeDrain).toBeUndefined();
+    expect(lostReplies).toBe(1);
+    expect(ordinaryPut).toHaveBeenCalledTimes(1);
+    expect(ordinaryBytes).toBe(bytes.length);
+    expect(await stored(issued.operationId)).toMatchObject({
+      intake: { closed: true, cleanupAcknowledged: true },
+      promotion: { state: 'settled', writerStopped: true, receipt: { outcome: 'durable' } },
+    });
+    await rejectsUserWork(issued);
+    expect(await observer.models.File.countDocuments({})).toBe(0);
+  }, 30_000);
+
+  it('keeps an unknown App PUT incomplete after technical recovery and refuses user replay', async () => {
+    const bytes = Buffer.from('Unbestätigter tatsächlicher App-Schreibversuch.');
+    const issued = await ticket(bytes);
+    unknownStorageOutcome = true;
+    expectedCompleteDrain = expectedAppDrain = false;
+    const response = await submit(issued, bytes);
+    expect(response.status).toBeGreaterThanOrEqual(400);
+    expect(await recovery(issued)).toMatchObject({
+      acknowledged: false,
+      storageOutcome: 'unknown',
+      appWriterStopped: false,
+    });
+    expect(intakeDrain).toEqual({ complete: false });
+    expect(await stored(issued.operationId)).toMatchObject({
+      cleanupPending: true,
+      intake: { closed: true },
+      promotion: { state: 'writing', writerStopped: false },
+    });
+    expect((await stored(issued.operationId))?.intake?.cleanupAcknowledged).not.toBe(true);
+    await rejectsUserWork(issued);
+    expect(ordinaryPut).toHaveBeenCalledTimes(1);
+    expect(ordinaryBytes).toBe(bytes.length);
+    expect(await observer.models.File.countDocuments({})).toBe(0);
   }, 30_000);
 });

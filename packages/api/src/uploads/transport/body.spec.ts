@@ -640,6 +640,74 @@ describe('raw upload body admission and streaming', () => {
       securityPending: true,
     });
   });
+  it.each(['scanner', 'storage'] as const)(
+    'joins an aborted %s byte producer before attesting local cleanup',
+    async (stage) => {
+      let stop!: () => void;
+      let entered!: () => void;
+      let finish!: () => void;
+      const blocked = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const release = new Promise<void>((resolve) => {
+        finish = resolve;
+      });
+      const ticket = { bind: jest.fn(), settle: jest.fn() };
+      const test = fixture('hello', {
+        attempts: {
+          begin: (abort: () => void) => {
+            stop = abort;
+            return ticket;
+          },
+        } as never,
+      });
+      let claims = 0;
+      const claim = test.claimBytes.getMockImplementation()!;
+      test.claimBytes.mockImplementation(async (held, bytes) => {
+        if (++claims === (stage === 'scanner' ? 2 : 3)) {
+          entered();
+          await release;
+        }
+        return claim(held, bytes);
+      });
+      test.security.cancel.mockImplementationOnce(async ({ execution }) => ({
+        execution,
+        writerStopped: true,
+        transientDataRemoved: true,
+      }));
+      if (stage === 'storage') {
+        const put = test.storage.put.getMockImplementation()!;
+        test.storage.put.mockImplementationOnce(async (input) => {
+          const signal = (input as typeof input & { signal: AbortSignal }).signal;
+          const aborted = new Promise<never>((_resolve, reject) => {
+            signal.addEventListener('abort', () => reject(new Error('Transport interrupted')), {
+              once: true,
+            });
+          });
+          return Promise.race([put(input), aborted]);
+        });
+      }
+      const done = test.run();
+      test.req.end('hello');
+      await blocked;
+      let settledBeforeRelease = false;
+      let acknowledgedBeforeRelease = false;
+      try {
+        stop();
+        await Promise.race([done, new Promise((resolve) => setTimeout(resolve, 30))]);
+        settledBeforeRelease = ticket.settle.mock.calls.length > 0;
+        acknowledgedBeforeRelease = test.management.confirmCleanup.mock.calls.length > 0;
+      } finally {
+        finish();
+        await done;
+      }
+      expect(settledBeforeRelease).toBe(false);
+      expect(acknowledgedBeforeRelease).toBe(false);
+      expect(ticket.settle).toHaveBeenCalledTimes(1);
+      expect(test.management.accept).not.toHaveBeenCalled();
+      await expect(readFile(test.ordinaryPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    },
+  );
   it('does not reuse an approval when the active policy changes during inspection', async () => {
     const test = fixture();
     const inspect = test.security.inspect.getMockImplementation()!;

@@ -3,6 +3,7 @@ jest.mock('librechat-data-provider', () => ({
   ...jest.requireActual('../../../../data-provider/src/upload-management'),
   ...jest.requireActual('../../../../data-provider/src/upload-security'),
   ...jest.requireActual('../../../../data-provider/src/upload-intake'),
+  ...jest.requireActual('../../../../data-provider/src/upload-intake-recovery'),
 }));
 import { createHash } from 'node:crypto';
 import { UPLOAD_MAX_FILE_BYTES, UPLOAD_INTEGRITY_CHUNK_BYTES } from 'librechat-data-provider';
@@ -13,6 +14,7 @@ import type {
   UploadPromotionRecord,
   UploadStorageReceipt,
   UploadOperation,
+  UploadIntakeRecovery,
 } from 'librechat-data-provider';
 import { createIntakeControlHandlers } from './control';
 import type { IntakeControlOptions } from './control';
@@ -120,7 +122,19 @@ function fixture() {
     declaredBytes: 5,
   } as UploadOperation;
   const journal = createUploadAttemptJournal(app);
+  const recovery: UploadIntakeRecovery = {
+    version: 1,
+    operationId,
+    transferGeneration: 1,
+    worker: intake,
+    closed: true,
+    acknowledged: false,
+    storageOutcome: 'not_started',
+    appWriterStopped: true,
+  };
   const repository: IntakeControlOptions['repository'] = {
+    sealIntakeRecovery: jest.fn(async () => copy(recovery)),
+    confirmIntakeRecovery: jest.fn(async () => ({ ...copy(recovery), acknowledged: true })),
     readIntake: jest.fn(async (_id, hash) => {
       if (hash !== createHash('sha256').update(capability).digest('hex'))
         throw new UploadManagementError('unauthorized');
@@ -217,6 +231,75 @@ describe('application intake control', () => {
   });
   afterAll(() => {
     process.env = original;
+  });
+
+  it('allows only bound technical recovery after native session revocation', async () => {
+    const f = fixture();
+    f.revoke();
+    const result = await f.command({ action: 'seal-recovery', transferGeneration: 1 });
+    expect(result).toMatchObject({ closed: true, acknowledged: false });
+    const binding = {
+      version: 1,
+      operationId,
+      transferGeneration: 1,
+      worker: intake,
+      capabilitySha256: createHash('sha256').update(capability).digest('hex'),
+    };
+    expect(f.repository.sealIntakeRecovery).toHaveBeenCalledWith(binding, now);
+    const settlement = {
+      version: 1,
+      operationId,
+      transferGeneration: 1,
+      worker: intake,
+      localWriterStopped: true,
+      localCopiesAbsent: true,
+    };
+    await expect(f.command({ action: 'confirm-recovery', settlement })).resolves.toMatchObject({
+      acknowledged: true,
+    });
+    expect(f.repository.confirmIntakeRecovery).toHaveBeenCalledWith(binding, settlement, now);
+    expect(f.identityRepository.readEmailCodeIdentity).not.toHaveBeenCalled();
+    expect(f.repository.readIntake).not.toHaveBeenCalled();
+    await expect(f.command({ action: 'claim' })).rejects.toMatchObject({ code: 'unauthorized' });
+    expect(f.repository.claim).not.toHaveBeenCalled();
+    expect(f.storage.put).not.toHaveBeenCalled();
+  });
+
+  it('rejects recovery identity injection and malformed or foreign repository views', async () => {
+    const f = fixture();
+    await expect(
+      f.command({ action: 'seal-recovery', transferGeneration: 1, worker: app }),
+    ).rejects.toMatchObject({ code: 'invalid_request' });
+    await expect(
+      f.command({
+        action: 'confirm-recovery',
+        settlement: {
+          version: 1,
+          operationId,
+          transferGeneration: 1,
+          worker: app,
+          localWriterStopped: true,
+          localCopiesAbsent: true,
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'lease_lost' });
+    expect(f.repository.sealIntakeRecovery).not.toHaveBeenCalled();
+    expect(f.repository.confirmIntakeRecovery).not.toHaveBeenCalled();
+    jest.mocked(f.repository.sealIntakeRecovery).mockResolvedValueOnce({
+      version: 1,
+      operationId,
+      transferGeneration: 2,
+      worker: intake,
+      closed: true,
+      acknowledged: false,
+      storageOutcome: 'not_started',
+      appWriterStopped: true,
+    });
+    await expect(
+      f.command({ action: 'seal-recovery', transferGeneration: 1 }),
+    ).rejects.toMatchObject({
+      code: 'lease_lost',
+    });
   });
 
   it('uses body-free durable preparation, the real App writer and only the stored receipt at accept', async () => {

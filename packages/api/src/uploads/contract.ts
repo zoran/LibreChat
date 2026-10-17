@@ -33,6 +33,7 @@ import type {
   UploadAcceptedMetadata,
   UploadSecurityExecution,
   UploadSecuritySettlement,
+  UploadIntakeRecovery,
 } from 'librechat-data-provider';
 
 export interface IdentityPort {
@@ -111,15 +112,28 @@ export interface DocumentPort {
 export type UploadAttemptSettlement = {
   /** Includes remote storage writers, not merely the local HTTP/SDK promise. */
   writerStopped: boolean;
+  /** Actual local join, independently of an unknown remote storage result. */
+  localWriterStopped?: boolean;
   localCopiesAbsent: boolean;
   storageOutcome?: 'not_started' | 'absent' | 'durable' | 'unknown';
   /** Independent scanner obligation; local/S3 completion cannot settle it. */
   securityPending?: boolean;
+  /** Actual known scanner execution; a recovery response cannot replace this identity. */
+  securityExecution?: UploadSecurityExecution;
+  /** The durable owner has not acknowledged this exact local cleanup obligation. */
+  acknowledgementPending?: boolean;
 };
 /** Actual local writer identity, independent of whether its work owns the transfer lease. */
 export type UploadAttemptBinding = UploadWorker & { operationId: string; generation: number };
 export type UploadAttemptRegistration = {
   bind(binding: UploadAttemptBinding): void;
+  /** Register once after bind and before settle; recovery must never start document work. */
+  recover?(
+    handler: (
+      proof: UploadAttemptSettlement,
+      signal: AbortSignal,
+    ) => Promise<UploadIntakeRecovery | null>,
+  ): void;
   settle(proof: UploadAttemptSettlement): void;
 };
 export type UploadAttemptPort = {

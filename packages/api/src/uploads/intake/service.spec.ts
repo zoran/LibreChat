@@ -156,10 +156,33 @@ describe('isolated intake HTTP service with real router, socket lifecycle and at
     });
     const pending = call(f.service.address.port);
     await started;
+    expect(f.service.maintenance.pauseAdmissions('maintenance-test')).toBe(true);
+    expect(await f.service.maintenance.getMaintenanceCensus('maintenance-test')).toMatchObject({
+      admissionClosed: true,
+      complete: false,
+    });
+    expect(f.service.maintenance.resumeAdmissions('maintenance-test')).toBe(false);
+    expect(await call(f.service.address.port)).toMatchObject({ status: 503 });
     expect(await f.service.close(AbortSignal.timeout(20))).toEqual({ complete: false });
     release();
     await pending;
     expect(await f.service.close()).toEqual({ complete: true });
+  });
+  it('pauses admission before native authorization and resumes only the matching maintenance scope', async () => {
+    const f = await setup();
+    expect(f.service.maintenance.pauseAdmissions('maintenance-a')).toBe(true);
+    expect(await call(f.service.address.port)).toMatchObject({ status: 503 });
+    expect(f.control).not.toHaveBeenCalled();
+    expect(await f.service.maintenance.getMaintenanceCensus('maintenance-a')).toEqual({
+      admissionClosed: true,
+      queuedContinuations: 0,
+      pendingWrites: 0,
+      complete: true,
+    });
+    expect(f.service.maintenance.resumeAdmissions('maintenance-b')).toBe(false);
+    expect(f.service.maintenance.resumeAdmissions('maintenance-a')).toBe(true);
+    expect(await call(f.service.address.port)).toMatchObject({ status: 401 });
+    expect(f.control).toHaveBeenCalledTimes(1);
   });
   it('preserves unknown staging data and refuses to attest complete cleanup', async () => {
     const f = await setup();

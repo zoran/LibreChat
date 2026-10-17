@@ -21,12 +21,14 @@ import type {
   UploadSecuritySubject,
   UploadSecurityExecution,
   UploadSecuritySettlement,
+  UploadIntakeRecovery,
 } from 'librechat-data-provider';
 import type { Request, RequestHandler } from 'express';
 import type {
   StoragePort,
   UploadAttemptPort,
   UploadAttemptRegistration,
+  UploadAttemptSettlement,
   UploadSecurityPort,
 } from '../contract';
 import type { UploadManagement } from '../management';
@@ -73,6 +75,12 @@ export type RawUploadBodyDependencies = {
   idleMs?: number;
   now?: () => number;
   attempts?: UploadAttemptPort;
+  requiresCleanupAcknowledgement?: boolean;
+  recoverAttempt?(
+    lease: UploadLease,
+    proof: UploadAttemptSettlement,
+    signal: AbortSignal,
+  ): Promise<UploadIntakeRecovery | null>;
   observe?(observation: RawUploadObservation): void | Promise<void>;
 };
 
@@ -286,6 +294,12 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
       }
       finishStage('success');
       registration?.bind(lease);
+      if (deps.recoverAttempt && registration?.recover) {
+        const boundLease = Object.freeze({ ...lease });
+        registration.recover((proof, recoverySignal) =>
+          deps.recoverAttempt!(boundLease, proof, recoverySignal),
+        );
+      }
       signal.throwIfAborted();
       await verifyPrincipal();
       const attemptId = uploadAttemptId(lease);
@@ -444,6 +458,8 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
         } finally {
           signal.removeEventListener('abort', abortInspection);
           scan.destroy();
+          // A closed file stream does not join a producer awaiting a byte-budget response.
+          await scanBody.return(undefined).catch(() => undefined);
           await scanClosed;
           clearTimeout(idleTimer);
         }
@@ -463,6 +479,8 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
       stage = { name: 'storage', startedAt: performance.now() };
       // Apply the same aggregate traffic budget to S3 egress: staging never creates a burst.
       const stream = createReadStream(filePath, { highWaterMark: MAX_SLICE, signal });
+      const storageStreamClosed = finished(stream, { cleanup: true }).catch(() => undefined);
+      const storageBody = budgeted(stream);
       let receipt;
       try {
         receipt = await deps.storage.put({
@@ -472,11 +490,13 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
           mediaType: operation.mediaType,
           bytes,
           integrity,
-          body: budgeted(stream),
+          body: storageBody,
           signal,
         });
       } finally {
         stream.destroy();
+        await storageBody.return(undefined).catch(() => undefined);
+        await storageStreamClosed;
       }
       storageOutcome = receipt.outcome;
       if (receipt.outcome !== 'durable') throw new UploadManagementError('storage_uncertain');
@@ -556,6 +576,7 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
           /* cleanup owner retries */
         }
       }
+      let cleanupAcknowledged = false;
       if (lease && localCopiesAbsent && storageOutcome !== 'unknown' && scannerSettled) {
         await deps.management
           .confirmCleanup({
@@ -567,6 +588,9 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
             textAndHistoryRemoved: false,
             ...(securitySettlement ? { securitySettlement } : {}),
           })
+          .then(() => {
+            cleanupAcknowledged = true;
+          })
           .catch(() => undefined);
       }
       // A directory we failed to create may belong to another invocation. Its
@@ -577,6 +601,17 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
         localCopiesAbsent,
         storageOutcome,
         securityPending: !scannerSettled,
+        ...(deps.recoverAttempt
+          ? {
+              localWriterStopped: !claimUncertain && !(stagingAttempted && !directory),
+              ...(securityExecution ? { securityExecution } : {}),
+            }
+          : {}),
+        ...(deps.requiresCleanupAcknowledgement && lease
+          ? {
+              acknowledgementPending: !cleanupAcknowledged,
+            }
+          : {}),
       });
       observe({
         kind: 'stage',

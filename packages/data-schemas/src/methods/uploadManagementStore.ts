@@ -116,6 +116,8 @@ export type StoredUpload = {
     grant: UploadIntakeGrant;
     worker?: UploadWorker;
     generation?: number;
+    closed?: true;
+    cleanupAcknowledged?: true;
   };
   /** App writer is independent of the Intake transfer and scanner execution. */
   promotion?: UploadPromotionRecord;
@@ -305,6 +307,7 @@ export function assertLease(
     row._id !== lease.operationId ||
     row.generation !== lease.generation ||
     row.slot !== lease.kind ||
+    (lease.kind === 'transfer' && row.intake?.closed === true) ||
     row.tenantId !== lease.tenantId ||
     row.userId !== lease.userId ||
     row.worker?.hostId !== lease.hostId ||

@@ -261,6 +261,48 @@ export function createUploadManagementRepository(
       row.cleanupPending = false;
     }
   }
+  function applyCleanup(row: StoredUpload, proof: UploadCleanupProof, global: GlobalState): void {
+    const settlement =
+      proof.securitySettlement === undefined
+        ? undefined
+        : readUploadSecuritySettlement(proof.securitySettlement);
+    if (settlement === null) reject('invalid_request');
+    if ((row.workerGeneration ?? row.generation) !== proof.generation) reject('lease_lost');
+    if (settlement) recordUploadSecuritySettlement(row, settlement);
+    if (row.securityExecution && !hasCompleteUploadSecurityExecution(row)) reject('not_ready');
+    if (!hasStoppedUploadPromotion(row)) reject('not_ready');
+    if (!proof.writerStopped) reject('not_ready');
+    row.writerStopped = true;
+    if (row.slot && ['transferring', 'processing'].includes(row.state))
+      terminal(row, global, 'failed', 'processing_failed');
+    delete row.slot;
+    delete row.leaseExpiresAt;
+    if (proof.localCopiesAbsent) row.stagingHeld = false;
+    const removeOriginal = row.acceptedAt == null || ['deleted', 'expired'].includes(row.state);
+    if (proof.originalAbsent && removeOriginal) {
+      global.originalBytes -= row.originalBytes;
+      global.objectBytes -= row.originalBytes;
+      row.originalBytes = 0;
+      row.originalRemoved = true;
+    }
+    if (proof.textAndHistoryRemoved && row.state !== 'ready') {
+      global.textBytes -= row.textBytes;
+      row.textBytes = 0;
+      row.textRemoved = true;
+    }
+    row.cleanupPending =
+      row.stagingHeld || (removeOriginal && (row.originalBytes > 0 || row.textBytes > 0));
+    // Preserve the original Intake acknowledgement before a later processing claim replaces
+    // the active worker fields. This bit never attests that later processing generation.
+    if (
+      row.intake?.generation === proof.generation &&
+      row.attemptGeneration === proof.generation &&
+      row.intake.worker?.hostId === row.worker?.hostId &&
+      row.intake.worker?.instanceId === row.worker?.instanceId &&
+      proof.localCopiesAbsent
+    )
+      row.intake.cleanupAcknowledged = true;
+  }
   async function reserve(
     principal: UploadPrincipal,
     input: UploadReserveInput,
@@ -528,7 +570,7 @@ export function createUploadManagementRepository(
     ...createUploadMigrationMethods(store, securityPolicySha256),
     ...createUploadActivationMethods(store),
     ...createUploadAdmissionMethods(store),
-    ...createUploadIntakeMethods(store, securityPolicySha256),
+    ...createUploadIntakeMethods(store, securityPolicySha256, applyCleanup),
     reserve,
     usage,
     async findReservation(principal, key, fingerprint, now) {
@@ -834,32 +876,12 @@ export function createUploadManagementRepository(
         const row = await store.Operation.findById(proof.operationId)
           .session(session)
           .lean<StoredUpload>();
-        if (!row || (row.workerGeneration ?? row.generation) !== proof.generation)
-          reject('lease_lost');
-        if (settlement) recordUploadSecuritySettlement(row, settlement);
-        if (row.securityExecution && !hasCompleteUploadSecurityExecution(row)) reject('not_ready');
-        if (!hasStoppedUploadPromotion(row)) reject('not_ready');
-        if (!proof.writerStopped) reject('not_ready');
-        row.writerStopped = true;
-        if (row.slot && ['transferring', 'processing'].includes(row.state))
-          terminal(row, global, 'failed', 'processing_failed');
-        delete row.slot;
-        delete row.leaseExpiresAt;
-        if (proof.localCopiesAbsent) row.stagingHeld = false;
-        const removeOriginal = row.acceptedAt == null || ['deleted', 'expired'].includes(row.state);
-        if (proof.originalAbsent && removeOriginal) {
-          global.originalBytes -= row.originalBytes;
-          global.objectBytes -= row.originalBytes;
-          row.originalBytes = 0;
-          row.originalRemoved = true;
-        }
-        if (proof.textAndHistoryRemoved && row.state !== 'ready') {
-          global.textBytes -= row.textBytes;
-          row.textBytes = 0;
-          row.textRemoved = true;
-        }
-        row.cleanupPending =
-          row.stagingHeld || (removeOriginal && (row.originalBytes > 0 || row.textBytes > 0));
+        if (!row) reject('lease_lost');
+        applyCleanup(
+          row,
+          { ...proof, ...(settlement ? { securitySettlement: settlement } : {}) },
+          global,
+        );
         await store.save(row, session);
         return project(row, now);
       });

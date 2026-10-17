@@ -33,6 +33,11 @@ export async function startIntakeService(options: IntakeServiceOptions): Promise
     throw new Error('Invalid intake configuration');
   const journal = createUploadAttemptJournal(options.worker);
   const active = new Set<Promise<unknown>>();
+  let stopped = false;
+  let pausedBy: string | null = null;
+  let recoveryTimer: NodeJS.Timeout | undefined;
+  let recoveryFlight: Promise<unknown> | undefined;
+  let recoveryController: AbortController | undefined;
   function track<T>(pending: Promise<T>): Promise<T> {
     active.add(pending);
     void pending.finally(() => active.delete(pending)).catch(() => undefined);
@@ -42,9 +47,28 @@ export async function startIntakeService(options: IntakeServiceOptions): Promise
     control: (input) => track(options.channel.control(input)),
     promote: (input) => track(options.channel.promote(input)),
   };
+  function recover(): void {
+    if (stopped || recoveryFlight) return;
+    clearTimeout(recoveryTimer);
+    recoveryController = new AbortController();
+    const signal = AbortSignal.any([recoveryController.signal, AbortSignal.timeout(5000)]);
+    recoveryFlight = track(
+      journal
+        .recoverPending(signal, 16)
+        .catch(() => undefined)
+        .finally(() => {
+          recoveryFlight = undefined;
+          recoveryController = undefined;
+          if (!stopped) {
+            recoveryTimer = setTimeout(recover, 1000);
+            recoveryTimer.unref();
+          }
+        }),
+    );
+  }
   const remote = createRemoteIntakeBodyHandler({ ...options, channel, attempts: journal.attempts });
   const body: RequestHandler = (request, response, next) =>
-    track(Promise.resolve(remote(request, response, next)));
+    track(Promise.resolve(remote(request, response, next)).finally(recover));
   const router = createUploadBodyRouter({
     allowedOrigins: options.allowedOrigins,
     principal: remote.principal,
@@ -52,12 +76,11 @@ export async function startIntakeService(options: IntakeServiceOptions): Promise
   });
   const app = express();
   app.disable('x-powered-by');
-  let stopped = false;
   app.use((request, response, next) => {
     request.pause();
     response.setHeader('Cache-Control', 'no-store');
     response.setHeader('Connection', 'close');
-    if (stopped) {
+    if (stopped || pausedBy !== null) {
       response.status(503).json({ code: 'unavailable' });
       return;
     }
@@ -101,13 +124,33 @@ export async function startIntakeService(options: IntakeServiceOptions): Promise
       resolve();
     });
   });
+  recoveryTimer = setTimeout(recover, 1000);
+  recoveryTimer.unref();
+  const maintenance: ApplicationWorkPort = {
+    pauseAdmissions(requestId) {
+      if (stopped || !journal.maintenance.pauseAdmissions(requestId)) return false;
+      pausedBy = requestId;
+      return true;
+    },
+    resumeAdmissions(requestId) {
+      if (stopped || active.size || !journal.maintenance.resumeAdmissions(requestId)) return false;
+      pausedBy = null;
+      return true;
+    },
+    async getMaintenanceCensus(requestId) {
+      const census = await journal.maintenance.getMaintenanceCensus(requestId);
+      return { ...census, complete: census.complete && active.size === 0 };
+    },
+  };
   let closed: Promise<void> | undefined;
   return {
     address: server.address() as AddressInfo,
-    maintenance: journal.maintenance,
+    maintenance,
     async close(signal: AbortSignal = AbortSignal.timeout(10_000)): Promise<{ complete: boolean }> {
       if (!stopped) {
         stopped = true;
+        clearTimeout(recoveryTimer);
+        recoveryController?.abort();
         closed = new Promise((resolve) => server.close(() => resolve()));
       }
       const journalResult = journal.close(signal);
