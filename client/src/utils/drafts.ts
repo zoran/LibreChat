@@ -455,10 +455,12 @@ const resolveBrowserTabId = (): string => {
     if (documentTabId != null && stored === documentTabId) {
       return documentTabId;
     }
-    const navigationType =
+    const navigationEntry =
       typeof performance.getEntriesByType === 'function'
-        ? performance.getEntriesByType('navigation')[0]?.type
+        ? performance.getEntriesByType('navigation')[0]
         : undefined;
+    const navigationType =
+      navigationEntry && 'type' in navigationEntry ? navigationEntry.type : undefined;
     if (
       stored != null &&
       stored !== '' &&

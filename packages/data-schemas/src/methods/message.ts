@@ -16,6 +16,8 @@ import type {
   QuoteSourceRetention,
   ResolvedQuoteRetention,
   RetainedTextAllocation,
+  MessageArtifactSourceInput,
+  CapturedMessageArtifactSource,
 } from '~/types/message';
 import type { SchemaWithMeiliMethods } from '~/models/plugins/mongoMeili';
 import type { AppConfig, IConversation, IMessage } from '~/types';
@@ -34,6 +36,7 @@ import { activeExpirationFilter, createFallbackRetentionDate } from '~/utils/ret
 import { fitBoundAppSnapshots, hasBoundAppSnapshots } from './appSnapshots';
 import { tenantSafeBulkWrite } from '~/utils/tenantBulkWrite';
 import { publicMessageProjection } from '~/schema/message';
+import { createMessageArtifactSourceMethods } from './messageArtifactSource';
 import { tenantStorage } from '~/config/tenantContext';
 import logger from '~/config/winston';
 
@@ -829,6 +832,11 @@ export interface PrivateTextRead {
 }
 
 export interface MessageMethods {
+  captureMessageArtifactSource(
+    owner: FileOwnerScope,
+    input: MessageArtifactSourceInput,
+    session: ClientSession,
+  ): Promise<CapturedMessageArtifactSource>;
   resolveQuoteRetention(
     owner: FileOwnerScope,
     entries: readonly { text: string; sourceRef?: QuoteSourceRef | null }[],
@@ -5545,6 +5553,7 @@ export function createMessageMethods(
   }
 
   return {
+    ...createMessageArtifactSourceMethods(mongoose),
     resolveQuoteRetention,
     resolveFileRetentionContext,
     redactFileSourceContent,

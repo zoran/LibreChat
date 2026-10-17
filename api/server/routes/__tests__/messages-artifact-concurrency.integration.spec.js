@@ -89,6 +89,14 @@ describe('artifact HTTP compare-and-set against real native Mongo methods', () =
   });
   beforeEach(async () => {
     db.getMessage = methods.getMessage;
+    await runAsSystem(() =>
+      mongoose.models.User.create({
+        _id: owner.userId,
+        tenantId: owner.tenantId,
+        email: 'artifact-cas@example.test',
+        emailVerified: true,
+      }),
+    );
     await createUploadManagementRepository(mongoose, {
       enabled: true,
       reconciled: true,
@@ -97,6 +105,7 @@ describe('artifact HTTP compare-and-set against real native Mongo methods', () =
   afterEach(async () => {
     db.getMessage = methods.getMessage;
     await runAsSystem(async () => {
+      await mongoose.models.User.deleteMany({});
       await mongoose.models.Message.deleteMany({});
       await mongoose.models.File.deleteMany({});
     });

@@ -156,9 +156,25 @@ const acceptTermsController = async (req, res) => {
 };
 
 const deleteUserFiles = async (req) => {
-  const userFiles = await db.getFiles({ user: req.user.id });
+  const owner = { userId: req.user.id, tenantId: req.user.tenantId || null };
+  const userFiles = await db.getAccountFileCleanupCandidates(owner);
+  if (
+    !Array.isArray(userFiles) ||
+    userFiles.some((file) => typeof file?.file_id !== 'string' || !file.file_id)
+  ) {
+    throw new Error('Account file inventory is not confirmed');
+  }
+  const requestedIds = userFiles.map((file) => file.file_id);
   const result = await processDeleteRequest({ req, files: userFiles });
-  if (!result || !Array.isArray(result.failedFileIds) || result.failedFileIds.length) {
+  const deletedIds = new Set(Array.isArray(result?.deletedFileIds) ? result.deletedFileIds : []);
+  if (
+    !result ||
+    !Array.isArray(result.failedFileIds) ||
+    result.failedFileIds.length ||
+    !Array.isArray(result.deletedFileIds) ||
+    result.deletedFileIds.some((id) => typeof id !== 'string' || !id) ||
+    requestedIds.some((id) => !deletedIds.has(id))
+  ) {
     throw new Error('Account file cleanup is not confirmed');
   }
 };
@@ -528,6 +544,16 @@ const deleteUserController = async (req, res) => {
 
     // Preserve a retryable account/session and all retained custody until physical cleanup is confirmed.
     await deleteUserFiles(req);
+    if (
+      !(triggerDeletionFence instanceof Date) ||
+      !Number.isFinite(triggerDeletionFence.getTime())
+    ) {
+      throw new Error('Account deletion fence is unavailable');
+    }
+    await db.deleteAccountDocumentWorkspaces(
+      { userId: user.id, tenantId: user.tenantId || null },
+      triggerDeletionFence,
+    );
     await db.deleteFiles(null, user.id);
     await db.deleteMessages({ user: user.id });
     await db.deleteAllUserSessions({ userId: user.id });

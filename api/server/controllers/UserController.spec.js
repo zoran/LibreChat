@@ -77,6 +77,8 @@ jest.mock('~/models', () => {
     findUser: jest.fn().mockResolvedValue(null),
     findToken: jest.fn(),
     getFiles: jest.fn().mockResolvedValue([]),
+    getAccountFileCleanupCandidates: jest.fn().mockResolvedValue([]),
+    deleteAccountDocumentWorkspaces: jest.fn().mockResolvedValue(undefined),
     removeUserFromAllGroups: jest.fn().mockImplementation(async (userId) => {
       const Group = _mongoose.models.Group;
       await Group.updateMany({ memberIds: userId }, { $pullAll: { memberIds: [userId] } });
@@ -452,7 +454,7 @@ describe('getUserController', () => {
         backupCodes: [{ codeHash: 'backup-code' }],
         pendingTotpSecret: 'pending-totp-secret',
         pendingBackupCodes: [{ codeHash: 'pending-backup-code' }],
-        refreshToken: [{ refreshToken: 'legacy-refresh-token' }],
+        refreshToken: [{ refreshToken: 'fixture-legacy-refresh-token' }],
         googleId: 'google-id',
         openidId: 'openid-id',
         openidIssuer: 'openid-issuer',
@@ -463,12 +465,12 @@ describe('getUserController', () => {
           refresh_token: 'refresh-token',
         },
         openidTokens: {
-          access_token: 'openid-access-token',
-          refresh_token: 'openid-refresh-token',
+          access_token: 'fixture-openid-access-token',
+          refresh_token: 'fixture-openid-refresh-token',
         },
         tokenset: {
-          access_token: 'tokenset-access-token',
-          refresh_token: 'tokenset-refresh-token',
+          access_token: 'fixture-tokenset-access-token',
+          refresh_token: 'fixture-tokenset-refresh-token',
         },
         safeLookingRuntimeField: 'internal-value',
       },
@@ -572,6 +574,119 @@ describe('deleteUserController', () => {
     mockQuiesceUserSchedules.mockResolvedValue(true);
   });
 
+  it('passes every private file lifecycle candidate through existing cleanup with authenticated scope', async () => {
+    const db = require('~/models');
+    const { processDeleteRequest } = require('~/server/services/Files/process');
+    const id = new mongoose.Types.ObjectId();
+    const userId = String(id);
+    const tenantId = 'tenant-a';
+    const files = [
+      { file_id: 'ordinary', source: 'local', filepath: '/ordinary', user: id, tenantId },
+      ...['private-derived', 'expired', 'pending', 'revoked'].map((file_id) => ({
+        file_id,
+        user: id,
+        tenantId,
+        source: 's3',
+        filepath: `/api/files/managed/${file_id}`,
+        uploadOperationId: file_id,
+        retentionAcceptedAt: new Date('2026-10-01T00:00:00.000Z'),
+      })),
+    ];
+    db.getAccountFileCleanupCandidates.mockResolvedValueOnce(files);
+    processDeleteRequest.mockResolvedValueOnce({
+      deletedFileIds: files.map((file) => file.file_id),
+      failedFileIds: [],
+    });
+    const req = {
+      user: { id: userId, _id: id, tenantId },
+      body: { userId: 'other-user', tenantId: 'other-tenant', files: ['other-file'] },
+    };
+
+    await deleteUserController(req, mockRes);
+
+    expect(db.getAccountFileCleanupCandidates).toHaveBeenCalledWith({ userId, tenantId });
+    expect(db.getFiles).not.toHaveBeenCalled();
+    expect(processDeleteRequest).toHaveBeenCalledWith({ req, files });
+    expect(db.deleteAccountDocumentWorkspaces).toHaveBeenCalledWith(
+      { userId, tenantId },
+      beginAgentTriggerUserDeletion.mock.calls[0][1],
+    );
+    expect(mockRes.status).toHaveBeenCalledWith(200);
+    expect(processDeleteRequest.mock.invocationCallOrder[0]).toBeLessThan(
+      db.deleteAccountDocumentWorkspaces.mock.invocationCallOrder[0],
+    );
+    expect(db.deleteAccountDocumentWorkspaces.mock.invocationCallOrder[0]).toBeLessThan(
+      db.deleteFiles.mock.invocationCallOrder[0],
+    );
+    expect(db.deleteAccountDocumentWorkspaces.mock.invocationCallOrder[0]).toBeLessThan(
+      db.deleteAllUserSessions.mock.invocationCallOrder[0],
+    );
+    expect(processDeleteRequest.mock.invocationCallOrder[0]).toBeLessThan(
+      db.deleteUserById.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('does not fall back to ordinary files when account file enumeration rejects the scope', async () => {
+    const db = require('~/models');
+    const { processDeleteRequest } = require('~/server/services/Files/process');
+    const id = new mongoose.Types.ObjectId();
+    db.getAccountFileCleanupCandidates.mockRejectedValueOnce(
+      new Error('Document source unavailable'),
+    );
+
+    await deleteUserController(
+      { user: { id: String(id), _id: id, tenantId: 'tenant-a' } },
+      mockRes,
+    );
+
+    expect(mockRes.status).toHaveBeenCalledWith(500);
+    expect(db.getFiles).not.toHaveBeenCalled();
+    expect(processDeleteRequest).not.toHaveBeenCalled();
+    expect(db.deleteAccountDocumentWorkspaces).not.toHaveBeenCalled();
+    expect(db.deleteFiles).not.toHaveBeenCalled();
+    expect(db.deleteAllUserSessions).not.toHaveBeenCalled();
+    expect(db.deleteUserById).not.toHaveBeenCalled();
+    expect(mockRestoreUserSchedules).toHaveBeenCalled();
+  });
+
+  it.each([
+    ['missing', undefined],
+    ['missing success IDs', { failedFileIds: [] }],
+    ['missing candidate', { deletedFileIds: ['ordinary'], failedFileIds: [] }],
+    [
+      'malformed success IDs',
+      { deletedFileIds: ['ordinary', 'private-derived', null], failedFileIds: [] },
+    ],
+  ])(
+    'preserves File custody and the account when File cleanup acknowledgement is %s',
+    async (_label, result) => {
+      const db = require('~/models');
+      const { processDeleteRequest } = require('~/server/services/Files/process');
+      const id = new mongoose.Types.ObjectId();
+      db.getAccountFileCleanupCandidates.mockResolvedValueOnce([
+        { file_id: 'ordinary', user: id, source: 'local' },
+        {
+          file_id: 'private-derived',
+          user: id,
+          source: 's3',
+          uploadOperationId: 'private-derived',
+          retentionAcceptedAt: new Date(),
+        },
+      ]);
+      processDeleteRequest.mockResolvedValueOnce(result);
+
+      await deleteUserController({ user: { id: String(id), _id: id } }, mockRes);
+
+      expect(mockRes.status).toHaveBeenCalledWith(500);
+      expect(db.deleteAccountDocumentWorkspaces).not.toHaveBeenCalled();
+      expect(db.deleteFiles).not.toHaveBeenCalled();
+      expect(db.deleteAllUserSessions).not.toHaveBeenCalled();
+      expect(db.deleteUserById).not.toHaveBeenCalled();
+      expect(mockRestoreUserSchedules).toHaveBeenCalled();
+      expect(mockCancelAgentTriggerUserPurge).toHaveBeenCalled();
+    },
+  );
+
   it.each(['throw', 'unconfirmed'])(
     'preserves account and File custody when managed cleanup is %s',
     async (failure) => {
@@ -590,10 +705,71 @@ describe('deleteUserController', () => {
         mockRes,
       );
       expect(mockRes.status).toHaveBeenCalledWith(500);
+      expect(db.deleteAccountDocumentWorkspaces).not.toHaveBeenCalled();
       expect(db.deleteFiles).not.toHaveBeenCalled();
       expect(db.deleteUserById).not.toHaveBeenCalled();
     },
   );
+
+  it('retains the account when the Workspace cleanup port is missing', async () => {
+    const db = require('~/models');
+    const original = db.deleteAccountDocumentWorkspaces;
+    const id = new mongoose.Types.ObjectId();
+    try {
+      db.deleteAccountDocumentWorkspaces = undefined;
+      await deleteUserController({ user: { id: String(id), _id: id } }, mockRes);
+      expect(mockRes.status).toHaveBeenCalledWith(500);
+      expect(db.deleteFiles).not.toHaveBeenCalled();
+      expect(db.deleteAllUserSessions).not.toHaveBeenCalled();
+      expect(db.deleteUserById).not.toHaveBeenCalled();
+      expect(mockRestoreUserSchedules).toHaveBeenCalled();
+    } finally {
+      db.deleteAccountDocumentWorkspaces = original;
+    }
+  });
+
+  it('never invokes Workspace metadata deletion without an acquired deletion fence', async () => {
+    const db = require('~/models');
+    const id = new mongoose.Types.ObjectId();
+    beginAgentTriggerUserDeletion.mockResolvedValueOnce('missing');
+
+    await deleteUserController({ user: { id: String(id), _id: id } }, mockRes);
+
+    expect(mockRes.status).toHaveBeenCalledWith(500);
+    expect(db.deleteAccountDocumentWorkspaces).not.toHaveBeenCalled();
+    expect(db.deleteFiles).not.toHaveBeenCalled();
+    expect(db.deleteAllUserSessions).not.toHaveBeenCalled();
+    expect(db.deleteUserById).not.toHaveBeenCalled();
+  });
+
+  it('uses existing recovery when Workspace cleanup rejects a stale deletion fence', async () => {
+    const db = require('~/models');
+    const id = new mongoose.Types.ObjectId();
+    db.deleteAccountDocumentWorkspaces.mockRejectedValueOnce(
+      Object.assign(new Error('Workspace unavailable'), { code: 'not_found' }),
+    );
+
+    await deleteUserController(
+      { user: { id: String(id), _id: id, tenantId: 'tenant-a' } },
+      mockRes,
+    );
+
+    const fence = beginAgentTriggerUserDeletion.mock.calls[0][1];
+    expect(db.deleteAccountDocumentWorkspaces).toHaveBeenCalledWith(
+      { userId: String(id), tenantId: 'tenant-a' },
+      fence,
+    );
+    expect(mockRes.status).toHaveBeenCalledWith(500);
+    expect(db.deleteFiles).not.toHaveBeenCalled();
+    expect(db.deleteAllUserSessions).not.toHaveBeenCalled();
+    expect(db.deleteUserById).not.toHaveBeenCalled();
+    expect(mockRestoreUserSchedules).toHaveBeenCalledWith(String(id), expect.any(String));
+    expect(mockCancelAgentTriggerUserPurge).toHaveBeenCalledWith(String(id), fence);
+    expect(cancelAgentTriggerUserDeletion).toHaveBeenCalledWith(String(id), fence);
+    expect(mockRestoreUserSchedules.mock.invocationCallOrder[0]).toBeLessThan(
+      cancelAgentTriggerUserDeletion.mock.invocationCallOrder[0],
+    );
+  });
 
   it('should return 200 on successful deletion', async () => {
     const userId = new mongoose.Types.ObjectId();
@@ -755,6 +931,14 @@ describe('deleteUserController', () => {
     await deleteUserController(
       { user: { id: userId.toString(), _id: userId, tenantId: '' } },
       mockRes,
+    );
+    expect(require('~/models').getAccountFileCleanupCandidates).toHaveBeenCalledWith({
+      userId: userId.toString(),
+      tenantId: null,
+    });
+    expect(require('~/models').deleteAccountDocumentWorkspaces).toHaveBeenCalledWith(
+      { userId: userId.toString(), tenantId: null },
+      beginAgentTriggerUserDeletion.mock.calls[0][1],
     );
     expect(mockDeleteOwnedAgentCheckpoints).toHaveBeenCalledWith(
       userId.toString(),

@@ -52,8 +52,14 @@ describe('original-bound managed document structure', () => {
     await db.models.File.init();
   });
   beforeEach(async () => {
-    for (const name of ['File', 'Message', 'UploadOperation', 'UploadCounter'])
+    for (const name of ['User', 'File', 'Message', 'UploadOperation', 'UploadCounter'])
       if (db.models[name]) await db.models[name].deleteMany({});
+    await db.models.User.create({
+      _id: user.userId,
+      tenantId: user.tenantId,
+      email: 'upload-structure@example.test',
+      emailVerified: true,
+    });
     repository = createUploadManagementRepository(db, {
       enabled: true,
       reconciled: true,

@@ -88,8 +88,14 @@ describe('private derived upload reservations', () => {
     await db.models.File.init();
   });
   beforeEach(async () => {
-    for (const name of ['File', 'Message', 'UploadOperation', 'UploadCounter'])
+    for (const name of ['User', 'File', 'Message', 'UploadOperation', 'UploadCounter'])
       if (db.models[name]) await db.models[name].deleteMany({});
+    await db.models.User.create({
+      _id: user.userId,
+      tenantId: user.tenantId,
+      email: 'derived@example.test',
+      emailVerified: true,
+    });
     repository = createUploadManagementRepository(db, {
       enabled: true,
       reconciled: true,
@@ -135,7 +141,7 @@ describe('private derived upload reservations', () => {
       at,
     );
   }
-  async function process(lease: UploadLease, at: number) {
+  async function process(lease: UploadLease, at: number, beforePublish?: () => Promise<void>) {
     await repository.confirmCleanup(
       {
         operationId: lease.operationId,
@@ -168,6 +174,7 @@ describe('private derived upload reservations', () => {
         quality: { status: 'complete' as const, warnings: [] },
       },
     };
+    await beforePublish?.();
     await repository.publish(processing, result, at);
     await repository.confirmCleanup(
       {
@@ -191,6 +198,99 @@ describe('private derived upload reservations', () => {
   const operations = () =>
     db.connection.db!.collection<StoredUpload>(db.models.UploadOperation.collection.name);
   const raw = (id: string) => operations().findOne({ _id: id });
+
+  async function fenceUser() {
+    await db.models.User.updateOne(
+      { _id: user.userId },
+      { $set: { agentTriggerDeletionStartedAt: new Date(now) } },
+    );
+  }
+  it('rejects an earlier save intent and ordinary admission after account deletion without new Files', async () => {
+    await source();
+    const derived = intent();
+    const request = { ...reservation('derived', derived), derived };
+    await db.models.User.deleteOne({ _id: user.userId });
+    await expect(repository.reserveDerived(user, request, now)).rejects.toMatchObject({
+      code: 'principal_unavailable',
+    });
+    await expect(repository.reserve(user, reservation('ordinary'), now)).rejects.toMatchObject({
+      code: 'principal_unavailable',
+    });
+    expect(await raw('derived')).toBeNull();
+    expect(await raw('ordinary')).toBeNull();
+    expect(await db.models.File.countDocuments()).toBe(1);
+  });
+  it('fences both reservation replay paths while preserving cancellation for a deleted account', async () => {
+    const request = reservation('pending');
+    await repository.reserve(user, request, now);
+    await db.models.User.deleteOne({ _id: user.userId });
+    await expect(repository.reserve(user, request, now)).rejects.toMatchObject({
+      code: 'principal_unavailable',
+    });
+    await expect(
+      repository.findReservation(user, request.idempotencyKey, request.fingerprint, now),
+    ).rejects.toMatchObject({ code: 'principal_unavailable' });
+    expect((await repository.cancel(user, 'pending', now)).state).toBe('cancelled');
+    expect(await db.models.File.countDocuments()).toBe(0);
+  });
+  it.each([false, true])(
+    'fences acceptance including replay=%s after native deletion starts',
+    async (replay) => {
+      await repository.reserve(user, reservation('pending'), now);
+      const lease = await transfer('pending', now);
+      if (replay) await accept(lease, now);
+      await fenceUser();
+      await expect(accept(lease, now)).rejects.toMatchObject({ code: 'principal_unavailable' });
+      expect(await db.models.File.countDocuments()).toBe(replay ? 1 : 0);
+      if (!replay) expect((await raw('pending'))!.acceptedAt).toBeUndefined();
+    },
+  );
+  it.each([false, true])(
+    'fences publishing including replay=%s without materializing late results',
+    async (replay) => {
+      await repository.reserve(user, reservation('pending'), now);
+      const lease = await transfer('pending', now);
+      await accept(lease, now);
+      if (replay) {
+        const { processing, result } = await process(lease, now);
+        await fenceUser();
+        await expect(repository.publish(processing, result, now)).rejects.toMatchObject({
+          code: 'principal_unavailable',
+        });
+      } else {
+        await expect(process(lease, now, fenceUser)).rejects.toMatchObject({
+          code: 'principal_unavailable',
+        });
+        expect((await raw('pending'))!.state).toBe('processing');
+        expect((await raw('pending'))!.publishedDigest).toBeUndefined();
+      }
+    },
+  );
+  it('reads only the exact private derived binding before File acceptance and hides internal receipts', async () => {
+    await source();
+    const derived = intent();
+    await repository.reserveDerived(user, { ...reservation('derived', derived), derived }, now);
+    const status = await repository.getDerivedOperation(user, 'derived', derived.binding, now);
+    expect(status).toMatchObject({ id: 'derived', state: 'waiting' });
+    expect(status).not.toHaveProperty('derivedOrigin');
+    expect(status).not.toHaveProperty('securityApproval');
+    expect(status).not.toHaveProperty('original');
+    await expect(
+      repository.getDerivedOperation(user, 'source', derived.binding, now),
+    ).rejects.toMatchObject({ code: 'not_found' });
+    await expect(
+      repository.getDerivedOperation(
+        user,
+        'derived',
+        { ...derived.binding, sourceRevision: 2 },
+        now,
+      ),
+    ).rejects.toMatchObject({ code: 'not_found' });
+    await fenceUser();
+    await expect(
+      repository.getDerivedOperation(user, 'derived', derived.binding, now),
+    ).rejects.toMatchObject({ code: 'principal_unavailable' });
+  });
 
   it('keeps ordinary exact28-day admission and rejects derived injection into its port', async () => {
     await source();

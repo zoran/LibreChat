@@ -22,6 +22,7 @@ import AddMultiConvo from './AddMultiConvo';
 import { useHasAccess } from '~/hooks';
 import { cn } from '~/utils';
 import store from '~/store';
+import { WorkspaceToggle } from '~/features/workspace/WorkspaceSurface';
 
 const defaultInterface = getConfigDefaults().interface;
 
@@ -115,6 +116,7 @@ function Header({
       </div>
 
       <div className={cn('flex shrink-0 items-center gap-2', hiddenBehindNav)}>
+        {!readOnly && <WorkspaceToggle />}
         {showTemporaryChat && <TemporaryChatIndicator />}
         {!isNewChat && <NewChat className={isSmallScreen ? undefined : 'hidden'} />}
         {!isNewChat && parentConversationId == null && (

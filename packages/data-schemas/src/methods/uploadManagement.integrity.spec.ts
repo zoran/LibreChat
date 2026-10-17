@@ -115,8 +115,14 @@ describe('durable managed original integrity', () => {
   });
   beforeEach(async () => {
     for (const db of [a, replacement]) {
-      for (const name of ['File', 'UploadOperation', 'UploadCounter'])
+      for (const name of ['User', 'File', 'UploadOperation', 'UploadCounter'])
         if (db.models[name]) await db.models[name].deleteMany({});
+      await db.models.User.create({
+        _id: user.userId,
+        tenantId: user.tenantId,
+        email: 'upload-integrity@example.test',
+        emailVerified: true,
+      });
     }
     first = createUploadManagementRepository(a, {
       enabled: true,
@@ -414,7 +420,17 @@ describe('durable managed original integrity', () => {
 
   it('keeps the maximum supported original manifest and bounded record inside its existing 32 KiB charge', async () => {
     const id = 'a'.repeat(128);
-    const owner = { ...user, tenantId: 't'.repeat(128) };
+    const owner = {
+      ...user,
+      userId: new mongoose.Types.ObjectId().toString(),
+      tenantId: 't'.repeat(128),
+    };
+    await a.models.User.create({
+      _id: owner.userId,
+      tenantId: owner.tenantId,
+      email: 'upload-long-tenant@example.test',
+      emailVerified: true,
+    });
     const filename = '界'.repeat(255);
     const input = {
       ...request(id, UPLOAD_MAX_FILE_BYTES, 'text/plain'),

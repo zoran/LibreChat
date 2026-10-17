@@ -18,6 +18,7 @@ import { lazyWithRecovery } from '~/lib/assets/lazy';
 import { useSetFilesToDelete } from '~/hooks';
 import { failedFileIdsFrom } from '~/utils';
 import store from '~/store';
+import { WorkspaceSurface } from '~/features/workspace/WorkspaceSurface';
 
 const Artifacts = lazyWithRecovery(() => import('~/components/Artifacts/Artifacts'));
 const SubagentThreadPanel = lazyWithRecovery(
@@ -178,13 +179,15 @@ export default function Presentation({
             enabled={conversationEndpoint === EModelEndpoint.agents && conversationAgentId != null}
             isSubmitting={isSubmitting}
           >
-            <SidePanelGroup panel={panelElement}>
-              <main className="flex h-full flex-col overflow-y-auto" role="main">
-                <MessageSurfaceContext.Provider value="bg-surface-canvas">
-                  {children}
-                </MessageSurfaceContext.Provider>
-              </main>
-            </SidePanelGroup>
+            <WorkspaceSurface>
+              <SidePanelGroup panel={panelElement}>
+                <main className="flex h-full flex-col overflow-y-auto" role="main">
+                  <MessageSurfaceContext.Provider value="bg-surface-canvas">
+                    {children}
+                  </MessageSurfaceContext.Provider>
+                </main>
+              </SidePanelGroup>
+            </WorkspaceSurface>
           </ParentSubagentsProvider>
           {isUndocked && artifactsElement != null && (
             <UndockedArtifacts hidden={routePending}>{artifactsElement}</UndockedArtifacts>

@@ -39,12 +39,13 @@ const request = require('supertest');
 const express = require('express');
 const configRoute = require('../config');
 
-function createApp(user) {
+function createApp(user, authenticationClass) {
   const app = express();
   app.disable('x-powered-by');
   if (user) {
     app.use((req, _res, next) => {
       req.user = user;
+      req.authenticationClass = authenticationClass;
       next();
     });
   }
@@ -121,9 +122,69 @@ afterEach(() => {
   delete process.env.LANGFUSE_SAMPLE_RATE;
   delete process.env.TENANT_ISOLATION_STRICT;
   delete process.env.CODE_ENVIRONMENT_DECISION_VERSION;
+  delete process.env.CORTEX_DOCUMENT_WORKSPACE_ENABLED;
+  delete process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED;
 });
 
 describe('GET /api/config', () => {
+  describe('document workspace startup capability', () => {
+    beforeEach(() => {
+      delete process.env.CORTEX_DOCUMENT_WORKSPACE_ENABLED;
+      delete process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED;
+      mockGetAppConfig.mockResolvedValue(baseAppConfig);
+    });
+
+    it('defaults to disabled before and after login', async () => {
+      for (const user of [null, mockUser]) {
+        const response = await request(createApp(user)).get('/api/config').expect(200);
+        expect(response.body.documentWorkspace).toEqual({ enabled: false, eligible: false });
+      }
+    });
+
+    it.each([
+      ['false', 'false', false],
+      ['true', 'false', false],
+      ['false', 'true', false],
+      ['true', 'true', true],
+    ])('requires both feature flags (%s, %s)', async (workspace, uploads, enabled) => {
+      process.env.CORTEX_DOCUMENT_WORKSPACE_ENABLED = workspace;
+      process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = uploads;
+      const response = await request(
+        createApp({ ...mockUser, provider: 'email_code' }, 'verified-email'),
+      )
+        .get('/api/config')
+        .expect(200);
+      expect(response.body.documentWorkspace).toEqual({ enabled, eligible: true });
+    });
+
+    it('never advertises an eligible workspace before login', async () => {
+      process.env.CORTEX_DOCUMENT_WORKSPACE_ENABLED = 'true';
+      process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = 'true';
+      const response = await request(createApp(null)).get('/api/config').expect(200);
+      expect(response.body.documentWorkspace).toEqual({ enabled: true, eligible: false });
+    });
+
+    it.each([
+      ['email_code', 'verified-email', true],
+      ['email_code', undefined, false],
+      ['email_code', 'guest', false],
+      ['browser', 'guest', false],
+      ['browser', 'verified-email', false],
+      ['local', undefined, false],
+      ['local', 'verified-email', false],
+    ])(
+      'binds eligibility to provider %s and authentication %s',
+      async (provider, auth, eligible) => {
+        process.env.CORTEX_DOCUMENT_WORKSPACE_ENABLED = 'true';
+        process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = 'true';
+        const response = await request(createApp({ ...mockUser, provider }, auth))
+          .get('/api/config')
+          .expect(200);
+        expect(response.body.documentWorkspace).toEqual({ enabled: true, eligible });
+      },
+    );
+  });
+
   it.each([null, mockUser])(
     'exposes the same public presentation before and after login (%p)',
     async (user) => {

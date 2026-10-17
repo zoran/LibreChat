@@ -3206,6 +3206,7 @@ export type TStartupConfig = {
   emailCodeDomains?: string[];
   /** UI capability only; every operation independently authorizes the server identity. */
   managedUploads?: { enabled: boolean; eligible: boolean };
+  documentWorkspace?: { enabled: boolean; eligible: boolean };
   conversationTitleOwnershipVersion?: typeof CONVERSATION_TITLE_OWNERSHIP_VERSION;
   appTitle: string;
   /** Public deployment presentation; older servers may omit these fields. */

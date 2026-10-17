@@ -22,6 +22,7 @@ import type {
   UploadPrincipal,
   UploadReserveInput,
   UploadDerivedReserveInput,
+  UploadDerivedBinding,
   UploadOperation,
   UploadUsage,
   UploadLease,
@@ -86,6 +87,7 @@ import { createUploadAdmissionMethods, readUploadAdmission } from './uploadManag
 import { createFileRetentionMethods, FileSourceUnavailableError } from './fileRetention';
 import { createUploadMigrationMethods } from './uploadManagementMigration';
 import { createUploadControlMethods } from './uploadManagementControl';
+import { touchActiveUserPrincipal } from './userPrincipal';
 
 export type UploadManagementRepository = UploadControlMethods &
   UploadMigrationMethods &
@@ -110,6 +112,12 @@ export type UploadManagementRepository = UploadControlMethods &
       now: number,
     ): Promise<UploadOperation>;
     get(principal: UploadPrincipal, id: string, now: number): Promise<UploadOperation>;
+    getDerivedOperation(
+      principal: UploadPrincipal,
+      id: string,
+      expectedBinding: UploadDerivedBinding,
+      now: number,
+    ): Promise<UploadOperation>;
     list(principal: UploadPrincipal, now: number): Promise<UploadOperation[]>;
     usage(principal: UploadPrincipal, now: number): Promise<UploadUsage>;
     claim(input: UploadClaimInput): Promise<UploadLease | null>;
@@ -321,6 +329,7 @@ export function createUploadManagementRepository(
     derivedMode = false,
   ): Promise<UploadOperation> {
     principalFilter(principal);
+    principal = { ...principal };
     const allowed = new Set([
       'operationId',
       'idempotencyKey',
@@ -386,6 +395,7 @@ export function createUploadManagementRepository(
     if (fingerprint !== input.fingerprint) reject('invalid_request');
     return store.transaction(async (session, global) => {
       const owner = principalFilter(principal);
+      await touchActiveUserPrincipal(mongoose, owner, session);
       const previous = await store.Operation.findOne({
         ...owner,
         idempotencyKey: input.idempotencyKey,
@@ -621,13 +631,38 @@ export function createUploadManagementRepository(
     reserveDerived: (principal, input, now) => reserve(principal, input, now, true),
     usage,
     async findReservation(principal, key, fingerprint, now) {
-      const row = await store.Operation.findOne({
-        ...principalFilter(principal),
-        idempotencyKey: key,
-      }).lean<StoredUpload>();
-      if (!row) return null;
-      if (row.fingerprint !== fingerprint) reject('idempotency_conflict');
-      return project(row, now);
+      const owner = principalFilter(principal);
+      return store.transaction(async (session) => {
+        await touchActiveUserPrincipal(mongoose, owner, session);
+        const row = await store.Operation.findOne({ ...owner, idempotencyKey: key })
+          .session(session)
+          .lean<StoredUpload>();
+        if (!row) return null;
+        if (row.fingerprint !== fingerprint) reject('idempotency_conflict');
+        return project(row, now);
+      });
+    },
+    async getDerivedOperation(principal, id, expectedBinding, now) {
+      principalFilter(principal);
+      principal = { ...principal };
+      const binding = readUploadDerivedIntent({
+        binding: expectedBinding,
+        directSourceFileIds: [],
+      })?.binding;
+      if (!binding) reject('invalid_request');
+      return store.transaction(async (session) => {
+        await touchActiveUserPrincipal(mongoose, principal, session);
+        const row = await owned(principal, id, session);
+        const origin = readUploadDerivedOrigin(row.derivedOrigin);
+        if (
+          !origin ||
+          origin.binding.purpose !== binding.purpose ||
+          origin.binding.sourceId !== binding.sourceId ||
+          origin.binding.sourceRevision !== binding.sourceRevision
+        )
+          reject('not_found');
+        return project(row, now);
+      });
     },
     async get(principal, id, now) {
       const row = await owned(principal, id);
@@ -721,6 +756,8 @@ export function createUploadManagementRepository(
       });
     },
     async accept(principal, lease, receipt, securityApproval, metadata, now) {
+      principalFilter(principal);
+      principal = { ...principal };
       const acceptedMetadata = readUploadAcceptedMetadata(metadata);
       if (!acceptedMetadata) reject('invalid_request');
       const approval = captureUploadSecurityApproval(securityApproval);
@@ -744,6 +781,7 @@ export function createUploadManagementRepository(
         : undefined;
       return store.transaction(async (session) => {
         const row = await owned(principal, lease.operationId, session);
+        await touchActiveUserPrincipal(mongoose, principal, session);
         if (
           row.derivedOrigin !== undefined &&
           original?.filepath !== `/api/files/managed/${row._id}`
@@ -856,6 +894,9 @@ export function createUploadManagementRepository(
         const row = await store.Operation.findById(lease.operationId)
           .session(session)
           .lean<StoredUpload>();
+        if (!row || row.tenantId !== lease.tenantId || row.userId !== lease.userId)
+          reject('lease_lost');
+        await touchActiveUserPrincipal(mongoose, principalOf(row), session);
         if (
           row &&
           (document.structure.source.sha256 !== row.original?.integrity?.sha256 ||

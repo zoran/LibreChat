@@ -69,6 +69,29 @@ export type ResolvedQuoteRetention = {
 
 export type RetainedTextAllocation = { fileId: string; bytes: number };
 
+/** An exact authorized native artifact snapshot; no caller-provided source lists or bytes. */
+export type MessageArtifactSourceInput = Readonly<{
+  conversationId: string;
+  messageId: string;
+  expectedVersion: number | null;
+  artifactIndex: number;
+}>;
+
+/** Transient bytes for security intake. Persist only the anchor and authorized File references. */
+export type CapturedMessageArtifactSource = {
+  anchor: {
+    conversationId: string;
+    messageId: string;
+    messageVersion: number | null;
+    artifactIndex: number;
+    source: 'text' | 'content';
+    partIndex?: number;
+  };
+  artifact: { content: string; header: string };
+  sourceFileIds: string[];
+  sourceExpiresAt: Date;
+};
+
 // @ts-ignore
 export interface IMessage extends Document {
   __v?: number;

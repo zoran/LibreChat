@@ -119,3 +119,4 @@ export * from './types/scheduleConsent';
 
 export * from './approval';
 export * from './upload-derived';
+export type * from './document-workspace';

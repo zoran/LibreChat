@@ -21,6 +21,7 @@ import {
   fileSourceScope,
 } from './fileRetention';
 import { tenantSafeBulkWrite } from '~/utils/tenantBulkWrite';
+import { createFileWorkspaceMethods } from './fileWorkspace';
 import { escapeRegExp } from '~/utils/string';
 import logger from '../config/winston';
 
@@ -302,105 +303,112 @@ function serializeRunArtifact(
 /** Factory function that takes mongoose instance and returns the file methods */
 export function createFileMethods(mongoose: typeof import('mongoose')): ReturnType<
   typeof createFileRetentionMethods
-> & {
-  getRunFileCandidates: (fileIds: readonly string[], tenantId?: string | null) => Promise<TFile[]>;
-  claimRunArtifactFile: (scope: RunArtifactScope) => Promise<RunArtifactClaim>;
-  publishRunArtifactFile: (input: PublishRunArtifactInput) => Promise<RunArtifactFile>;
-  findRunArtifactFile: (scope: RunArtifactScope) => Promise<RunArtifactFile | null>;
-  listRunArtifacts: (scope: RunArtifactRunScope) => Promise<RunArtifactFile[]>;
-  findFileById: (file_id: string, options?: Record<string, unknown>) => Promise<IMongoFile | null>;
-  getFiles: (
-    filter: FilterQuery<IMongoFile>,
-    _sortOptions?: Record<string, SortOrder> | null,
-    selectFields?: Record<string, 0 | 1> | string | null,
-    limit?: number | null,
-  ) => Promise<IMongoFile[] | null>;
-  getProjectFiles: (options: ProjectFilesOptions) => Promise<ProjectFileRecord[]>;
-  getAvailableProjectFiles: (
-    options: AvailableProjectFilesOptions,
-  ) => Promise<AvailableProjectFilesResult>;
-  getExpiredFiles: (limit?: number, options?: ExpiredFileQueryOptions) => Promise<IMongoFile[]>;
-  incrementFileDeletionAttempts: (file_id: string) => Promise<number>;
-  deferExpiredFile: (file_id: string, deletionRetryAt: Date) => Promise<void>;
-  getToolFilesByIds: (
-    fileIds: string[],
-    toolResourceSet?: Set<EToolResources>,
-    ownerScope?: FileOwnerScope,
-  ) => Promise<IMongoFile[]>;
-  getCodeGeneratedFiles: (
-    conversationId: string,
-    threadFileIds?: string[],
-    ownerScope?: FileOwnerScope,
-  ) => Promise<IMongoFile[]>;
-  getUserCodeFiles: (fileIds: string[], ownerScope: FileOwnerScope) => Promise<IMongoFile[]>;
-  getDeferredProvisionFiles: (
-    fileIds: string[],
-    ownerScope: FileOwnerScope,
-    resources?: {
-      code?: boolean;
-      search?: boolean;
-      codeRouteKey?: string;
-      searchNamespaces?: string[];
-      hydrateProvisioned?: boolean;
-    },
-  ) => Promise<IMongoFile[]>;
-  claimCodeFile: (data: {
-    filename: string;
-    conversationId: string;
-    file_id: string;
-    user: string;
-    tenantId?: string | null;
-    sourceDispatchedAt?: number;
-  }) => Promise<IMongoFile>;
-  commitCodeFile: (data: CodeFileCommitData, sourceDispatchedAt?: number) => Promise<boolean>;
-  createFile: (
-    data: Partial<IMongoFile>,
-    disableTTL?: boolean,
-    options?: { retention?: FileRetentionAdmission },
-  ) => Promise<IMongoFile | null>;
-  updateFile: (
-    data: Partial<IMongoFile> & { file_id: string },
-    extraFilter?: FilterQuery<IMongoFile>,
-  ) => Promise<IMongoFile | null>;
-  updateFileCodeEnvRef: (data: {
-    file_id: string;
-    routeKey: string;
-    ref: CodeEnvRef;
-    legacyRef?: CodeEnvRef;
-  }) => Promise<IMongoFile | null>;
-  addFileEmbeddedEntity: (data: {
-    file_id: string;
-    entityId: string;
-  }) => Promise<IMongoFile | null>;
-  updateFileUsage: (data: {
-    file_id: string;
-    inc?: number;
-    user?: string;
-    tenantId?: string | null;
-  }) => Promise<IMongoFile | null>;
-  deleteFile: (file_id: string) => Promise<IMongoFile | null>;
-  deleteFiles: (file_ids: string[], user?: string) => Promise<{ deletedCount?: number }>;
-  deleteFileByFilter: (filter: FilterQuery<IMongoFile>) => Promise<IMongoFile | null>;
-  batchUpdateFiles: (
-    updates: Array<{
+> &
+  ReturnType<typeof createFileWorkspaceMethods> & {
+    getRunFileCandidates: (
+      fileIds: readonly string[],
+      tenantId?: string | null,
+    ) => Promise<TFile[]>;
+    claimRunArtifactFile: (scope: RunArtifactScope) => Promise<RunArtifactClaim>;
+    publishRunArtifactFile: (input: PublishRunArtifactInput) => Promise<RunArtifactFile>;
+    findRunArtifactFile: (scope: RunArtifactScope) => Promise<RunArtifactFile | null>;
+    listRunArtifacts: (scope: RunArtifactRunScope) => Promise<RunArtifactFile[]>;
+    findFileById: (
+      file_id: string,
+      options?: Record<string, unknown>,
+    ) => Promise<IMongoFile | null>;
+    getFiles: (
+      filter: FilterQuery<IMongoFile>,
+      _sortOptions?: Record<string, SortOrder> | null,
+      selectFields?: Record<string, 0 | 1> | string | null,
+      limit?: number | null,
+    ) => Promise<IMongoFile[] | null>;
+    getProjectFiles: (options: ProjectFilesOptions) => Promise<ProjectFileRecord[]>;
+    getAvailableProjectFiles: (
+      options: AvailableProjectFilesOptions,
+    ) => Promise<AvailableProjectFilesResult>;
+    getExpiredFiles: (limit?: number, options?: ExpiredFileQueryOptions) => Promise<IMongoFile[]>;
+    incrementFileDeletionAttempts: (file_id: string) => Promise<number>;
+    deferExpiredFile: (file_id: string, deletionRetryAt: Date) => Promise<void>;
+    getToolFilesByIds: (
+      fileIds: string[],
+      toolResourceSet?: Set<EToolResources>,
+      ownerScope?: FileOwnerScope,
+    ) => Promise<IMongoFile[]>;
+    getCodeGeneratedFiles: (
+      conversationId: string,
+      threadFileIds?: string[],
+      ownerScope?: FileOwnerScope,
+    ) => Promise<IMongoFile[]>;
+    getUserCodeFiles: (fileIds: string[], ownerScope: FileOwnerScope) => Promise<IMongoFile[]>;
+    getDeferredProvisionFiles: (
+      fileIds: string[],
+      ownerScope: FileOwnerScope,
+      resources?: {
+        code?: boolean;
+        search?: boolean;
+        codeRouteKey?: string;
+        searchNamespaces?: string[];
+        hydrateProvisioned?: boolean;
+      },
+    ) => Promise<IMongoFile[]>;
+    claimCodeFile: (data: {
+      filename: string;
+      conversationId: string;
       file_id: string;
-      filepath: string;
-      storageKey?: string;
-      storageRegion?: string;
-    }>,
-  ) => Promise<void>;
-  updateFilesUsage: (
-    files: Array<{ file_id: string }>,
-    fileIds?: string[],
-    options?: { user?: string; tenantId?: string | null },
-  ) => Promise<IMongoFile[]>;
-  extendFilesTTL: (
-    fileIds: string[],
-    hold: { renewMs: number; maxLifetimeMs: number },
-    owner: { user: string; tenantId?: string | null },
-  ) => Promise<number>;
-  sweepOrphanedPreviews: (maxAgeMs?: number) => Promise<number>;
-} {
+      user: string;
+      tenantId?: string | null;
+      sourceDispatchedAt?: number;
+    }) => Promise<IMongoFile>;
+    commitCodeFile: (data: CodeFileCommitData, sourceDispatchedAt?: number) => Promise<boolean>;
+    createFile: (
+      data: Partial<IMongoFile>,
+      disableTTL?: boolean,
+      options?: { retention?: FileRetentionAdmission },
+    ) => Promise<IMongoFile | null>;
+    updateFile: (
+      data: Partial<IMongoFile> & { file_id: string },
+      extraFilter?: FilterQuery<IMongoFile>,
+    ) => Promise<IMongoFile | null>;
+    updateFileCodeEnvRef: (data: {
+      file_id: string;
+      routeKey: string;
+      ref: CodeEnvRef;
+      legacyRef?: CodeEnvRef;
+    }) => Promise<IMongoFile | null>;
+    addFileEmbeddedEntity: (data: {
+      file_id: string;
+      entityId: string;
+    }) => Promise<IMongoFile | null>;
+    updateFileUsage: (data: {
+      file_id: string;
+      inc?: number;
+      user?: string;
+      tenantId?: string | null;
+    }) => Promise<IMongoFile | null>;
+    deleteFile: (file_id: string) => Promise<IMongoFile | null>;
+    deleteFiles: (file_ids: string[], user?: string) => Promise<{ deletedCount?: number }>;
+    deleteFileByFilter: (filter: FilterQuery<IMongoFile>) => Promise<IMongoFile | null>;
+    batchUpdateFiles: (
+      updates: Array<{
+        file_id: string;
+        filepath: string;
+        storageKey?: string;
+        storageRegion?: string;
+      }>,
+    ) => Promise<void>;
+    updateFilesUsage: (
+      files: Array<{ file_id: string }>,
+      fileIds?: string[],
+      options?: { user?: string; tenantId?: string | null },
+    ) => Promise<IMongoFile[]>;
+    extendFilesTTL: (
+      fileIds: string[],
+      hold: { renewMs: number; maxLifetimeMs: number },
+      owner: { user: string; tenantId?: string | null },
+    ) => Promise<number>;
+    sweepOrphanedPreviews: (maxAgeMs?: number) => Promise<number>;
+  } {
   /** Hydrates only host-selected IDs; the caller applies its existing agent-file authorization. */
   async function getRunFileCandidates(
     fileIds: readonly string[],
@@ -1717,6 +1725,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
 
   return {
     ...createFileRetentionMethods(mongoose),
+    ...createFileWorkspaceMethods(mongoose),
     getRunFileCandidates,
     claimRunArtifactFile,
     publishRunArtifactFile,

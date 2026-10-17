@@ -48,6 +48,7 @@ import { createTokenMethods, type TokenMethods } from './token';
 import { createRoleMethods, RoleConflictError } from './role';
 import { createKeyMethods, type KeyMethods } from './key';
 import { createFileMethods } from './file';
+import { createDocumentWorkspaceMethods, type DocumentWorkspaceMethods } from './documentWorkspace';
 /* Memories */
 import { createMemoryMethods, type MemoryMethods } from './memory';
 /* Tool Favorites */
@@ -264,6 +265,7 @@ export {
 };
 
 export type AllMethods = ToolApprovalGrantStorage &
+  DocumentWorkspaceMethods &
   UserMethods &
   BrowserMethods &
   EmailCodeRepository &
@@ -519,6 +521,7 @@ export function createMethods(
     ...roleMethods,
     ...createKeyMethods(mongoose),
     ...createFileMethods(mongoose),
+    ...createDocumentWorkspaceMethods(mongoose),
     ...createMemoryMethods(mongoose),
     ...createToolFavoriteMethods(mongoose),
     ...createAgentCategoryMethods(mongoose),

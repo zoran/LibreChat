@@ -1,5 +1,15 @@
 export { EMAIL_CODE_IDLE_MS, EMAIL_CODE_ABSOLUTE_MS } from './emailCodePolicy';
 export { FileSourceUnavailableError } from './methods/fileRetention';
+export {
+  DocumentWorkspaceError,
+  createDocumentWorkspaceMethods,
+} from './methods/documentWorkspace';
+export type { DocumentWorkspaceMethods } from './methods/documentWorkspace';
+export type {
+  WorkspaceFileReference,
+  WorkspaceFileSource,
+  AccountFileCleanupCandidate,
+} from './methods/fileWorkspace';
 export { createUploadManagementRepository } from './methods/uploadManagement';
 export type { UploadManagementRepository } from './methods/uploadManagement';
 export { createEmailCodeMethods } from './methods/emailCode';

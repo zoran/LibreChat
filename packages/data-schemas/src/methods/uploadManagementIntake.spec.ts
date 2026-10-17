@@ -114,9 +114,16 @@ describe('private Intake and App-promotion transaction fences', () => {
     await Promise.all([a.models.File.init(), b.models.File.init(), replacement.models.File.init()]);
   });
   beforeEach(async () => {
-    for (const db of [a, replacement])
-      for (const name of ['File', 'Message', 'UploadOperation', 'UploadCounter'])
+    for (const db of [a, replacement]) {
+      for (const name of ['User', 'File', 'Message', 'UploadOperation', 'UploadCounter'])
         if (db.models[name]) await db.models[name].deleteMany({});
+      await db.models.User.create({
+        _id: user.userId,
+        tenantId: user.tenantId,
+        email: 'upload-intake@example.test',
+        emailVerified: true,
+      });
+    }
     first = createUploadManagementRepository(a, {
       enabled: true,
       reconciled: true,

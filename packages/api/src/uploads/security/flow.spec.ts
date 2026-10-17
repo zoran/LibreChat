@@ -103,8 +103,14 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
   }, 30_000);
 
   beforeEach(async () => {
-    for (const name of ['File', 'Message', 'UploadOperation', 'UploadCounter'])
+    for (const name of ['User', 'File', 'Message', 'UploadOperation', 'UploadCounter'])
       if (db.models[name]) await db.models[name].deleteMany({});
+    await db.models.User.create({
+      _id: principal.userId,
+      tenantId: principal.tenantId,
+      email: 'scanner-flow@example.test',
+      emailVerified: true,
+    });
     for (const name of await readdir(ordinaryRoot)) await rm(path.join(ordinaryRoot, name));
     repository = createUploadManagementRepository(db, {
       enabled: true,

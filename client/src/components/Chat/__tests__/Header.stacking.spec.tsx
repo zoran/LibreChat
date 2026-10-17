@@ -54,6 +54,7 @@ jest.mock('../ExportAndShareMenu', () => () => null);
 jest.mock('../SubagentThreadLink', () => () => null);
 jest.mock('../Menus/BookmarkMenu', () => () => null);
 jest.mock('../AddMultiConvo', () => () => null);
+jest.mock('~/features/workspace/WorkspaceSurface', () => ({ WorkspaceToggle: () => null }));
 
 describe('Header stacking', () => {
   const backgroundTasks = jest.requireMock('../BackgroundTasks').BackgroundTasksButton as jest.Mock;

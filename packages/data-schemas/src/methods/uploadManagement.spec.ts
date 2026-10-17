@@ -37,6 +37,12 @@ describe('durable upload management', () => {
     authentication: 'verified-email',
   };
   const other: UploadPrincipal = { ...user, userId: new mongoose.Types.ObjectId().toString() };
+  const guest: UploadPrincipal = {
+    tenantId: null,
+    userId: new mongoose.Types.ObjectId().toString(),
+    authentication: 'guest',
+  };
+  const stranger: UploadPrincipal = { ...guest, userId: new mongoose.Types.ObjectId().toString() };
   const worker = { hostId: 'host-a', instanceId: 'app-a' };
   const baseline = { originalBytes: 0, objectBytes: 0, textBytes: 0, recordBytes: 0, bundles: 0 };
   const securityPolicySha256 = 'c'.repeat(64);
@@ -136,8 +142,16 @@ describe('durable upload management', () => {
   });
   beforeEach(async () => {
     for (const db of [a, replacement]) {
-      for (const name of ['File', 'Message', 'UploadOperation', 'UploadCounter'])
+      for (const name of ['User', 'File', 'Message', 'UploadOperation', 'UploadCounter'])
         if (db.models[name]) await db.models[name].deleteMany({});
+      await db.models.User.create(
+        [user, other, guest, stranger].map((principal) => ({
+          _id: principal.userId,
+          tenantId: principal.tenantId,
+          email: `${principal.userId}@upload.example.test`,
+          emailVerified: principal.authentication === 'verified-email',
+        })),
+      );
     }
     first = createUploadManagementRepository(a, {
       enabled: true,
@@ -179,12 +193,13 @@ describe('durable upload management', () => {
   }
 
   it('keeps explicit null guest rows isolated from both other users and missing tenant data', async () => {
-    const guest = { tenantId: null, userId: user.userId, authentication: 'guest' } as const;
-    const stranger = { ...guest, userId: other.userId };
     const row = await first.reserve(guest, request('guest-reservation'), now);
     expect(await second.get(guest, row.id, now)).toMatchObject({ id: row.id });
     await expect(second.get(stranger, row.id, now)).rejects.toMatchObject({ code: 'not_found' });
     await expect(second.get(user, row.id, now)).rejects.toMatchObject({ code: 'not_found' });
+    await expect(second.get({ ...user, userId: guest.userId }, row.id, now)).rejects.toMatchObject({
+      code: 'not_found',
+    });
     const stored = await a.models.UploadOperation.findById(row.id).lean();
     expect(stored).toHaveProperty('tenantId', null);
     await a.connection
@@ -1064,7 +1079,6 @@ describe('durable upload management', () => {
   it.each(['concurrent', 'second replica first'] as const)(
     'shares guest quota/idempotence across replicas and retains every accepted debit through delete and replacement (%s)',
     async (ordering) => {
-      const guest = { tenantId: null, userId: user.userId, authentication: 'guest' } as const;
       const duplicate = request('guest-0', UPLOAD_MAX_FILE_BYTES);
       if (ordering === 'second replica first')
         await second.reserve(guest, { ...duplicate, operationId: 'ignored-id' }, now);
@@ -1076,8 +1090,8 @@ describe('durable upload management', () => {
       for (let index = 0; index < 10; index++)
         await ready(`guest-${index}`, UPLOAD_MAX_FILE_BYTES, now, guest);
       expect((await first.usage(guest, now)).usedBytes).toBe(UPLOAD_USER_WINDOW_BYTES);
-      expect((await first.usage(user, now)).usedBytes).toBe(0);
-      expect((await first.usage({ ...guest, userId: other.userId }, now)).usedBytes).toBe(0);
+      expect((await first.usage({ ...user, userId: guest.userId }, now)).usedBytes).toBe(0);
+      expect((await first.usage(stranger, now)).usedBytes).toBe(0);
       await expect(second.reserve(guest, request('guest-over', 1), now)).rejects.toMatchObject({
         code: 'quota_exceeded',
       });
@@ -1108,7 +1122,6 @@ describe('durable upload management', () => {
   );
 
   it('does not classify missing or malformed tenant snapshots as guest migrations', async () => {
-    const guest = { tenantId: null, userId: user.userId, authentication: 'guest' } as const;
     await first.reserve(guest, request('malformed-guest'), now);
     await a.connection
       .db!.collection<StoredUpload>(a.models.UploadOperation.collection.name)

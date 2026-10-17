@@ -447,6 +447,11 @@ const startServer = async () => {
   } else {
     app.use('/api/uploads', (_req, res) => res.status(503).json({ code: 'unavailable' }));
   }
+  app.use(
+    '/api/workspaces',
+    requireJwtAuth,
+    require('./routes/workspaces').createWorkspaceRouter(),
+  );
   // Enforce the code-request cap on incoming bytes before the general JSON parser.
   app.use(
     '/api/auth/email-code',
