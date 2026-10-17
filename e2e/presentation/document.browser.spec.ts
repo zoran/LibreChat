@@ -1,6 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { expect, test } from '@playwright/test';
-import type { SourceCoverage, TFilePreview } from 'librechat-data-provider';
+import { FileContext, FileSources } from 'librechat-data-provider';
+import type {
+  FileLibraryItem,
+  FileLibraryPage,
+  SourceCoverage,
+  TFilePreview,
+} from 'librechat-data-provider';
 import { seedConversations, seedMessages, withMongo } from '../specs/mock/db';
 import { getAccessToken } from '../specs/mock/helpers';
 
@@ -52,23 +58,30 @@ test('native file library inspects sources and discards a revoked preview', asyn
       quality: { status: 'partial', warnings: ['visual_content_not_extracted'] },
     },
   };
-  await page.route(/\/api\/files(?:\?.*)?$/, (route) =>
+  await page.route(/\/api\/files\/library(?:\?.*)?$/, (route) =>
     route.fulfill({
-      json: [
-        {
-          file_id: id,
-          filename,
-          type: 'application/pdf',
-          bytes: 512,
-          source: 's3',
-          filepath: `/api/files/managed/${id}`,
-          embedded: true,
-          llmDeliveryPath: 'text',
-          status: 'ready',
-          context: 'message_attachment',
-          updatedAt: '2026-10-17T00:00:00.000Z',
-        },
-      ],
+      json: {
+        files: [
+          {
+            file_id: id,
+            filename,
+            type: 'application/pdf',
+            bytes: 512,
+            source: FileSources.s3,
+            filepath: `/api/files/managed/${id}`,
+            embedded: true,
+            user: 'synthetic-source-owner',
+            object: 'file',
+            usage: 0,
+            llmDeliveryPath: 'text',
+            status: 'ready',
+            context: FileContext.message_attachment,
+            updatedAt: '2026-10-17T00:00:00.000Z',
+            library: { tags: [], archivedAt: null, revision: 0 },
+          },
+        ],
+        nextCursor: null,
+      } satisfies FileLibraryPage,
     }),
   );
   let revoked = false;
@@ -80,7 +93,7 @@ test('native file library inspects sources and discards a revoked preview', asyn
     );
   });
   const email = `source-${randomUUID()}@example.invalid`;
-  const password = 'Synthetic-local-only-42!';
+  const password = `Presentation-${randomUUID()}!`;
   const registered = await page.request.post('/api/auth/register', {
     data: { name: 'Source Test', email, password, confirm_password: password },
   });
@@ -145,7 +158,7 @@ test('native answers keep prepared source coverage local across reload and remov
   });
   await context.addInitScript(() => localStorage.setItem('color-theme', 'light'));
   const email = `coverage-${randomUUID()}@example.invalid`;
-  const password = 'Synthetic-local-only-42!';
+  const password = `Presentation-${randomUUID()}!`;
   expect(
     (
       await page.request.post('/api/auth/register', {
@@ -329,29 +342,36 @@ test('native project sources and picker preview exact files without attaching', 
   const attachedIds = [randomUUID(), randomUUID()];
   const pickerIds = [randomUUID(), randomUUID()];
   const unavailableId = randomUUID();
-  await page.route(/\/api\/projects\/[^/]+\/files(?:\/[^/?]+)?(?:\?.*)?$/, (route) => {
-    if (route.request().method() !== 'GET') {
-      mutations.push(`${route.request().method()} ${new URL(route.request().url()).pathname}`);
-      return route.abort();
-    }
-    if (new URL(route.request().url()).pathname.endsWith('/available')) {
-      return route.fulfill({
-        json: {
-          files: pickerIds.map((file_id) => ({
+  await page.route(/\/api\/files\/library(?:\?.*)?$/, (route) =>
+    route.fulfill({
+      json: {
+        files: pickerIds.map(
+          (file_id): FileLibraryItem => ({
             file_id,
             filename,
             type: 'text/plain',
             bytes: 128,
-            source: 's3',
+            source: FileSources.s3,
             embedded: true,
-            context: 'message_attachment',
+            filepath: `/api/files/managed/${file_id}`,
+            user: 'synthetic-project-source-owner',
+            object: 'file',
+            usage: 0,
+            context: FileContext.message_attachment,
             llmDeliveryPath: 'text',
             status: 'ready',
             updatedAt: '2026-10-17T00:00:00.000Z',
-          })),
-          nextCursor: null,
-        },
-      });
+            library: { tags: [], archivedAt: null, revision: 0 },
+          }),
+        ),
+        nextCursor: null,
+      } satisfies FileLibraryPage,
+    }),
+  );
+  await page.route(/\/api\/projects\/[^/]+\/files(?:\/[^/?]+)?(?:\?.*)?$/, (route) => {
+    if (route.request().method() !== 'GET') {
+      mutations.push(`${route.request().method()} ${new URL(route.request().url()).pathname}`);
+      return route.abort();
     }
     return route.fulfill({
       json: [
@@ -385,7 +405,7 @@ test('native project sources and picker preview exact files without attaching', 
     });
   }
   const email = `project-source-${randomUUID()}@example.invalid`;
-  const password = 'Synthetic-local-only-42!';
+  const password = `Presentation-${randomUUID()}!`;
   expect(
     (
       await page.request.post('/api/auth/register', {
