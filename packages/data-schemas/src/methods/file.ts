@@ -42,6 +42,7 @@ export type AvailableProjectFileRecord = {
   context?: string;
   user: string;
   tenantId?: string;
+  llmDeliveryPath?: TFile['llmDeliveryPath'];
 };
 
 type AvailableProjectFileRecordSource = Pick<
@@ -58,7 +59,16 @@ type AvailableProjectFileRecordSource = Pick<
   | 'context'
   | 'user'
   | 'tenantId'
+  | 'llmDeliveryPath'
 >;
+
+function projectDeliveryMetadata(
+  value: IMongoFile['llmDeliveryPath'],
+): Pick<TFile, 'llmDeliveryPath'> {
+  return value === 'provider' || value === 'text' || value === 'none'
+    ? { llmDeliveryPath: value }
+    : {};
+}
 
 function normalizeAvailableProjectFileRecord(
   file: AvailableProjectFileRecordSource,
@@ -76,6 +86,7 @@ function normalizeAvailableProjectFileRecord(
     ...(file.context !== undefined ? { context: file.context } : {}),
     user: file.user.toString(),
     ...(file.tenantId !== undefined ? { tenantId: file.tenantId } : {}),
+    ...projectDeliveryMetadata(file.llmDeliveryPath),
   };
 }
 
@@ -111,6 +122,7 @@ export type ProjectFileRecord = {
   previewRevision?: string;
   status?: 'pending' | 'ready' | 'failed';
   text?: string;
+  llmDeliveryPath?: TFile['llmDeliveryPath'];
 };
 
 type ProjectFileRecordSource = Pick<
@@ -133,6 +145,7 @@ type ProjectFileRecordSource = Pick<
   | 'previewRevision'
   | 'status'
   | 'text'
+  | 'llmDeliveryPath'
 >;
 
 function normalizeProjectFileRecord(file: ProjectFileRecordSource): ProjectFileRecord {
@@ -155,6 +168,7 @@ function normalizeProjectFileRecord(file: ProjectFileRecordSource): ProjectFileR
     ...(file.previewRevision !== undefined ? { previewRevision: file.previewRevision } : {}),
     ...(file.status !== undefined ? { status: file.status } : {}),
     ...(file.text !== undefined ? { text: file.text } : {}),
+    ...projectDeliveryMetadata(file.llmDeliveryPath),
   };
 }
 
@@ -599,6 +613,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
         updatedAt: 1,
         previewRevision: 1,
         status: 1,
+        llmDeliveryPath: 1,
       });
     }
     const files = (await query.lean<ProjectFileRecordSource[]>()) ?? [];
@@ -658,6 +673,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
         context: 1,
         user: 1,
         tenantId: 1,
+        llmDeliveryPath: 1,
       })
       .sort({ _id: -1 })
       .limit(limit + 1)

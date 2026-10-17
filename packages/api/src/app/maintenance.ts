@@ -590,6 +590,8 @@ export async function initializeMaintenanceGeneration(deps: {
     cancelUndispatchedGenerationAdmission: deps.methods.cancelUndispatchedGenerationAdmission,
     findGenerationAdmissionByEpoch: deps.methods.findGenerationAdmissionByEpoch,
     countUnsettledGenerationAdmissions: deps.methods.countUnsettledGenerationAdmissions,
+    recoverGenerationAdmission: deps.methods.recoverGenerationAdmission,
+    writeGenerationCheckpoint: deps.methods.writeGenerationCheckpoint,
   };
   if (deps.required) {
     if (Object.values(methods).some((method) => typeof method !== 'function')) {

@@ -1,5 +1,6 @@
 import React from 'react';
 import { RecoilRoot } from 'recoil';
+import userEvent from '@testing-library/user-event';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import type { TFile } from 'librechat-data-provider';
 import FileGrid from '../Files';
@@ -18,11 +19,25 @@ let mockFiles: TFile[] | undefined = [];
 let mockQueryState = { isLoading: false, isError: false };
 const mockRefetch = jest.fn();
 const mockFetchPreview = jest.fn();
+const mockTextPreview = jest.fn();
 
 jest.mock('~/data-provider', () => ({
   useGetFiles: () => ({ data: mockFiles, refetch: mockRefetch, ...mockQueryState }),
   useFilePreviewBlob: () => ({ refetch: mockFetchPreview }),
-  useFilePreview: () => ({ refetch: jest.fn() }),
+  useFilePreview: (...args: unknown[]) => {
+    mockTextPreview(...args);
+    return {
+      data: {
+        file_id: args[0],
+        status: 'ready',
+        textFormat: 'text',
+        text: `Approved source ${args[0]}`,
+      },
+      isFetching: false,
+      isError: false,
+      refetch: jest.fn(),
+    };
+  },
   useFileDownload: () => ({ refetch: jest.fn() }),
   useSharedFileDownload: () => ({ refetch: jest.fn() }),
 }));
@@ -32,6 +47,9 @@ jest.mock('@librechat/client', () => ({
   ...jest.requireActual('@librechat/client'),
   useToastContext: () => ({ showToast: mockShowToast }),
 }));
+
+jest.mock('~/Providers', () => ({ useShareContext: () => ({}), useFileMapContext: () => ({}) }));
+jest.mock('~/components/Messages/Content/CopyButton', () => () => null);
 
 jest.mock('~/hooks', () => ({
   useLocalize: () => (key: string, options?: Record<string, string | number>) =>
@@ -68,7 +86,7 @@ describe('FileGrid', () => {
     expect(cards[1]).toHaveTextContent('PDF · 2.0 KB');
   });
 
-  it('offers a preview for images and PDFs only', () => {
+  it('preserves image/PDF previews and leaves text without a native delivery path unpreviewable', () => {
     renderGrid();
     expect(
       screen.getByRole('button', { name: 'com_ui_composer_preview_file:photo.png' }),
@@ -79,6 +97,31 @@ describe('FileGrid', () => {
     expect(
       screen.queryByRole('button', { name: 'com_ui_composer_preview_file:notes.txt' }),
     ).not.toBeInTheDocument();
+  });
+
+  it('previews native extracted text by exact ID without attaching, then restores picker focus', async () => {
+    const user = userEvent.setup();
+    const filename = `${'Long native source '.repeat(8)}.txt`;
+    mockFiles = [
+      file({ file_id: 'text-one', filename, llmDeliveryPath: 'text' }),
+      file({ file_id: 'text-two', filename, llmDeliveryPath: 'text' }),
+    ];
+    const { onAttach } = renderGrid();
+    const previews = screen.getAllByRole('button', {
+      name: `com_ui_composer_preview_file:${filename}`,
+    });
+    await user.click(previews[1]);
+    expect(await screen.findByRole('dialog', { name: filename })).toBeInTheDocument();
+    expect(screen.getByText('Approved source text-two')).toBeInTheDocument();
+    expect(screen.queryByText('Approved source text-one')).not.toBeInTheDocument();
+    expect(mockTextPreview).toHaveBeenCalledWith('text-two', { enabled: true }, undefined);
+    expect(mockFetchPreview).not.toHaveBeenCalled();
+    expect(onAttach).not.toHaveBeenCalled();
+    await user.keyboard('{Escape}');
+    await waitFor(() => expect(previews[1]).toHaveFocus());
+    expect(screen.queryByRole('dialog', { name: filename })).not.toBeInTheDocument();
+    await user.click(within(screen.getAllByRole('listitem')[0]).getAllByRole('button')[0]);
+    expect(onAttach).toHaveBeenCalledWith(expect.objectContaining({ file_id: 'text-one' }));
   });
 
   it('filters by kind and by name', () => {

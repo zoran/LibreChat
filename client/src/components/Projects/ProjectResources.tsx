@@ -44,6 +44,7 @@ import {
   useUploadFileMutation,
 } from '~/data-provider';
 import { useAgentCapabilities, useGetAgentsConfig, useHasAccess, useLocalize } from '~/hooks';
+import FileSourceButton from '~/components/Chat/Input/Files/Table/FileSourceButton';
 import FileGrid, { FILE_VIEWS } from '~/components/Chat/Input/Composer/Files';
 import { CatalogContent } from '~/components/Chat/Input/Composer/Catalog';
 import { NotificationSeverity, type LocalizeFunction } from '~/common';
@@ -538,14 +539,21 @@ export default function ProjectResources({ project }: ProjectResourcesProps) {
                 className="border-border-light bg-surface-secondary flex items-center gap-3 rounded-xl border px-3.5 py-3"
               >
                 <Paperclip className="text-text-secondary size-4 shrink-0" aria-hidden="true" />
-                <TooltipAnchor
-                  description={file.filename ?? file.file_id}
-                  render={
-                    <span className="text-text-primary min-w-0 flex-1 truncate text-sm">
-                      {file.filename ?? file.file_id}
-                    </span>
-                  }
-                />
+                {file.availability === 'ready' ? (
+                  <FileSourceButton
+                    file={{ ...file, filename: file.filename ?? file.file_id }}
+                    className="text-text-primary flex-1 py-1.5 text-sm"
+                  />
+                ) : (
+                  <TooltipAnchor
+                    description={file.filename ?? file.file_id}
+                    render={
+                      <span className="text-text-primary min-w-0 flex-1 truncate text-sm">
+                        {file.filename ?? file.file_id}
+                      </span>
+                    }
+                  />
+                )}
                 <span
                   className={
                     file.availability === 'ready'

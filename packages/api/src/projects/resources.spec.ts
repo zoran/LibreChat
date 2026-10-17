@@ -7,6 +7,8 @@ import {
   getChatProjectFileAvailability,
   listChatProjectFileViews,
   resolveChatProjectFiles,
+  resolveChatProjectResources,
+  toRuntimeFile,
 } from './resources';
 import { getChatProjectContextKey, resolveChatProjectContext } from './context';
 
@@ -101,6 +103,86 @@ const getProjectFiles = async ({
 };
 
 describe('ChatProject resource hydration', () => {
+  it('carries native delivery hints only into ready UI views while keeping runtime retrieval-only', async () => {
+    const owner = new mongoose.Types.ObjectId().toString();
+    const tenantId = 'source-tenant';
+    const methods = createMethods(mongoose);
+    await File.create([
+      file('provider-source', owner, { tenantId, llmDeliveryPath: 'provider' }),
+      file('text-source', owner, { tenantId, llmDeliveryPath: 'text' }),
+      file('no-delivery', owner, { tenantId, llmDeliveryPath: 'none' }),
+      file('expired-source', owner, {
+        tenantId,
+        llmDeliveryPath: 'provider',
+        expiredAt: new Date(Date.now() - 1),
+      }),
+      file('foreign-source', new mongoose.Types.ObjectId().toString(), {
+        tenantId,
+        llmDeliveryPath: 'provider',
+      }),
+    ]);
+    const getNativeFiles = jest.fn(methods.getProjectFiles);
+    const params = {
+      userId: owner,
+      tenantId,
+      project: {
+        file_ids: [
+          'provider-source',
+          'text-source',
+          'no-delivery',
+          'expired-source',
+          'foreign-source',
+        ],
+      },
+      getProjectFiles: getNativeFiles,
+    };
+    const views = await listChatProjectFileViews(params);
+    expect(views.slice(0, 3).map((view) => view.llmDeliveryPath)).toEqual([
+      'provider',
+      'text',
+      'none',
+    ]);
+    expect(views[3]).toEqual({
+      file_id: 'expired-source',
+      filename: 'expired-source.txt',
+      type: 'text/plain',
+      bytes: 12,
+      availability: 'unavailable',
+    });
+    expect(views[4]).toEqual({ file_id: 'foreign-source', availability: 'unavailable' });
+    expect(JSON.stringify(views)).not.toContain('must never be loaded');
+    const runtime = await resolveChatProjectFiles(params);
+    expect(runtime.map((row) => row.file_id)).toEqual([
+      'provider-source',
+      'text-source',
+      'no-delivery',
+    ]);
+    for (const row of runtime) {
+      expect(row.embedded).toBe(true);
+      for (const field of ['llmDeliveryPath', 'text', 'securityApproval', 'documentStructure'])
+        expect(row).not.toHaveProperty(field);
+    }
+    expect(getNativeFiles).toHaveBeenCalledWith(
+      expect.objectContaining({ includeContent: false, userId: owner, tenantId }),
+    );
+
+    const records = await methods.getProjectFiles({
+      userId: owner,
+      tenantId,
+      fileIds: ['provider-source'],
+    });
+    expect(toRuntimeFile(records[0])).not.toHaveProperty('llmDeliveryPath');
+    const before = await resolveChatProjectResources(params);
+    await File.collection.updateOne(
+      { file_id: 'provider-source' },
+      { $set: { llmDeliveryPath: 'text' } },
+    );
+    const after = await resolveChatProjectResources(params);
+    expect(after).toEqual(before);
+    expect(await resolveChatProjectFiles(params)).toEqual(runtime);
+    expect((await listChatProjectFileViews(params))[0]).toHaveProperty('llmDeliveryPath', 'text');
+  });
+
   it('preserves Project compatibility when signed file URLs are refreshed', async () => {
     const owner = new mongoose.Types.ObjectId().toString();
     const methods = { ...createMethods(mongoose), getProjectFiles };

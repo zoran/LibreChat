@@ -8,7 +8,10 @@ import FilePreviewDialog, {
   formatBytes,
   getDisplayType,
 } from '~/components/Chat/Messages/Content/FilePreviewDialog';
-import { getPreviewKind } from '~/components/Chat/Messages/Content/preview';
+import {
+  getPreviewKind,
+  shouldUseExtractedTextPreview,
+} from '~/components/Chat/Messages/Content/preview';
 import { getFileType, toAbsoluteFilePath, triggerDownload } from '~/utils';
 import DialogImage from '~/components/Chat/Messages/Content/DialogImage';
 import FilePreview from '~/components/Chat/Input/Files/FilePreview';
@@ -33,9 +36,11 @@ const isDocument = (file: TFile) =>
   file.type?.startsWith('audio/') !== true &&
   file.type?.startsWith('video/') !== true;
 
-/** What a card's preview button opens, if anything: images in the message
- *  image viewer, PDFs in the message file preview. */
-function previewOf(file: TFile): 'image' | 'pdf' | null {
+/** Use the existing source view for extracted text; preserve native image/PDF previews. */
+function previewOf(file: TFile): 'image' | 'pdf' | 'text' | null {
+  if (shouldUseExtractedTextPreview(file.llmDeliveryPath)) {
+    return 'text';
+  }
   if (isImage(file)) {
     return 'image';
   }
@@ -350,7 +355,7 @@ export default function FileGrid({
         }}
       />
       <FilePreviewDialog
-        open={previewKind === 'pdf'}
+        open={previewKind === 'pdf' || previewKind === 'text'}
         onOpenChange={closePreview}
         fileName={previewing?.filename ?? ''}
         fileId={previewing?.file_id}

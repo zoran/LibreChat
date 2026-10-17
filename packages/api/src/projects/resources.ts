@@ -211,6 +211,7 @@ export async function listChatProjectFileViews(params: {
   const { fileIds, byId } = await loadProjectFiles(params);
   return fileIds.map((file_id) => {
     const file = byId.get(file_id);
+    const availability = getChatProjectFileAvailability(file);
     return {
       file_id,
       ...(file
@@ -220,7 +221,10 @@ export async function listChatProjectFileViews(params: {
             ...(typeof file.bytes === 'number' ? { bytes: file.bytes } : {}),
           }
         : {}),
-      availability: getChatProjectFileAvailability(file),
+      availability,
+      ...(availability === 'ready' && file?.llmDeliveryPath !== undefined
+        ? { llmDeliveryPath: file.llmDeliveryPath }
+        : {}),
     };
   });
 }

@@ -187,7 +187,7 @@ describe('ChatProject handlers', () => {
     expect(deps.getProjectFiles).not.toHaveBeenCalled();
   });
 
-  it('excludes extracted text from available-file metadata', async () => {
+  it('includes a delivery hint only in available HTTP metadata without source bodies or approval', async () => {
     const file = {
       file_id: 'candidate',
       filename: 'candidate.txt',
@@ -201,6 +201,9 @@ describe('ChatProject handlers', () => {
       user: 'owner',
       tenantId: 'tenant-a',
       text: 'must not be returned',
+      llmDeliveryPath: 'provider',
+      securityApproval: { privateProof: 'not a scanner fixture' },
+      documentStructure: { privateSource: 'must not be returned' },
     };
     const { handlers } = setup({
       getChatProject: jest.fn().mockResolvedValue({
@@ -224,8 +227,71 @@ describe('ChatProject handlers', () => {
     );
 
     expect(result.statusCode).toBe(200);
-    expect(result.body).toMatchObject({ files: [{ file_id: 'candidate' }] });
+    expect(result.body).toMatchObject({
+      files: [{ file_id: 'candidate', llmDeliveryPath: 'provider' }],
+      nextCursor: 'next',
+    });
     expect(result.body).not.toHaveProperty('files.0.text');
+    expect(result.body).not.toHaveProperty('files.0.securityApproval');
+    expect(result.body).not.toHaveProperty('files.0.documentStructure');
+  });
+
+  it('renders attached delivery metadata only for ready references without private source fields', async () => {
+    const shared = {
+      user: 'owner',
+      tenantId: 'tenant-a',
+      type: 'text/plain',
+      bytes: 12,
+      embedded: true,
+      context: 'message_attachment',
+      llmDeliveryPath: 'text',
+      text: 'private body',
+      securityApproval: { privateProof: true },
+      documentStructure: { privateSource: true },
+    };
+    const { handlers, deps } = setup({
+      getChatProject: jest.fn().mockResolvedValue({
+        _id: projectId,
+        tenantId: 'tenant-a',
+        file_ids: ['ready', 'expired', 'missing'],
+      }),
+      getProjectFiles: jest.fn().mockResolvedValue([
+        { ...shared, file_id: 'ready', filename: 'ready.txt' },
+        {
+          ...shared,
+          file_id: 'expired',
+          filename: 'expired.txt',
+          expiredAt: new Date(Date.now() - 1),
+        },
+      ]),
+    });
+    const { res, result } = response();
+    await handlers.listProjectFiles(request({ params: { projectId } }), res);
+    expect(result.statusCode).toBe(200);
+    expect(result.body).toEqual([
+      {
+        file_id: 'ready',
+        filename: 'ready.txt',
+        type: 'text/plain',
+        bytes: 12,
+        availability: 'ready',
+        llmDeliveryPath: 'text',
+      },
+      {
+        file_id: 'expired',
+        filename: 'expired.txt',
+        type: 'text/plain',
+        bytes: 12,
+        availability: 'unavailable',
+      },
+      { file_id: 'missing', availability: 'unavailable' },
+    ]);
+    expect(deps.getProjectFiles).toHaveBeenCalledWith({
+      fileIds: ['ready', 'expired', 'missing'],
+      userId: 'owner',
+      tenantId: 'tenant-a',
+      includeContent: false,
+    });
   });
 
   it.each([{ limit: '0' }, { limit: '51' }, { limit: '1.5' }, { limit: 'nope' }])(

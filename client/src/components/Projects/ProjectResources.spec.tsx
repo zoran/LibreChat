@@ -15,6 +15,8 @@ const mockAddMutateAsync = jest.fn();
 const mockRemoveMutateAsync = jest.fn();
 const mockRefetch = jest.fn();
 const mockShowToast = jest.fn();
+const mockPreview = jest.fn();
+const mockPreviewBlob = jest.fn().mockResolvedValue({ data: undefined });
 
 let projectFilesState: TChatProjectFile[] = [];
 let mockProjectQueryState = {
@@ -57,16 +59,6 @@ jest.mock('@librechat/client', () => {
         }),
       ),
     ),
-    OGDialog: ({ open, children }: { open: boolean; children: ReactNode }) =>
-      open ? React.createElement(React.Fragment, null, children) : null,
-    OGDialogContent: ({ children }: { children: ReactNode }) =>
-      React.createElement('div', null, children),
-    OGDialogHeader: ({ children }: { children: ReactNode }) =>
-      React.createElement('div', null, children),
-    OGDialogTitle: ({ children }: { children: ReactNode }) =>
-      React.createElement('h2', null, children),
-    OGDialogDescription: ({ children }: { children: ReactNode }) =>
-      React.createElement('p', null, children),
     TooltipAnchor: ({ render }: { render: ReactNode }) => render,
     useToastContext: () => ({ showToast: mockShowToast }),
   };
@@ -80,7 +72,27 @@ jest.mock('~/data-provider', () => ({
   useAddProjectFileMutation: () => ({ mutateAsync: mockAddMutateAsync, isLoading: false }),
   useRemoveProjectFileMutation: () => ({ mutateAsync: mockRemoveMutateAsync, isLoading: false }),
   useGetStartupConfig: () => ({ data: undefined }),
+  useFilePreview: (...args: unknown[]) => {
+    mockPreview(...args);
+    return {
+      data: {
+        file_id: args[0],
+        status: 'ready',
+        textFormat: 'text',
+        text: `Approved source ${args[0]}`,
+      },
+      isFetching: false,
+      isError: false,
+      refetch: jest.fn(),
+    };
+  },
+  useFilePreviewBlob: () => ({ refetch: mockPreviewBlob }),
+  useFileDownload: () => ({ refetch: jest.fn() }),
+  useSharedFileDownload: () => ({ refetch: jest.fn() }),
 }));
+
+jest.mock('~/Providers', () => ({ useShareContext: () => ({}), useFileMapContext: () => ({}) }));
+jest.mock('~/components/Messages/Content/CopyButton', () => () => null);
 
 jest.mock('~/hooks', () => ({
   useAgentCapabilities: () => ({ fileSearchEnabled: true }),
@@ -88,11 +100,12 @@ jest.mock('~/hooks', () => ({
   useHasAccess: () => mockCanUseFileSearch(),
   useAuthContext: () => ({ user: { id: 'user-1' } }),
   useToolFavorites: () => ({ favoriteKeys: new Set(), toggle: jest.fn() }),
-  useLocalize: () => (key: string, options?: { count?: number; name?: string }) => {
+  useLocalize: () => (key: string, options?: { count?: number; name?: string; 0?: string }) => {
     const translations: Record<string, string> = {
       com_error_files_upload: 'An error occurred while uploading the file.',
       com_error_files_upload_canceled: 'The file upload was canceled.',
       com_ui_project_add_files: 'Add files',
+      com_ui_composer_preview_file: `Preview ${options?.[0] ?? ''}`,
       com_ui_project_files: 'Reference files',
       com_ui_project_files_help: 'Files are searched',
       com_ui_project_files_retrieval_only: 'Retrieval only',
@@ -167,6 +180,57 @@ describe('ProjectResources', () => {
     mockCanUseFileSearch.mockReturnValue(true);
     mockAddMutateAsync.mockResolvedValue({});
     mockRemoveMutateAsync.mockResolvedValue({});
+  });
+
+  it('opens a ready source by exact ID without attaching/removing it and restores focus on Escape', async () => {
+    const user = userEvent.setup();
+    const filename = `${'Long project reference '.repeat(8)}.txt`;
+    mockProjectQueryState.data = [
+      {
+        file_id: 'source-one',
+        filename,
+        availability: 'ready',
+        type: 'text/plain',
+        bytes: 128,
+        llmDeliveryPath: 'text',
+      },
+      {
+        file_id: 'source-two',
+        filename,
+        availability: 'ready',
+        type: 'text/plain',
+        bytes: 128,
+        llmDeliveryPath: 'text',
+      },
+      {
+        file_id: 'unavailable-source',
+        filename: 'Unavailable source.txt',
+        availability: 'unavailable',
+      },
+    ];
+    renderResources();
+    expect(
+      screen.queryByRole('button', { name: 'Preview Unavailable source.txt' }),
+    ).not.toBeInTheDocument();
+    const triggers = screen.getAllByRole('button', { name: `Preview ${filename}` });
+    expect(triggers).toHaveLength(2);
+    expect(triggers[1]).toHaveAttribute('title', filename);
+    triggers[1].focus();
+    await user.keyboard('{Enter}');
+    expect(await screen.findByRole('dialog', { name: filename })).toBeInTheDocument();
+    expect(screen.getByText('Approved source source-two')).toBeInTheDocument();
+    expect(screen.queryByText('Approved source source-one')).not.toBeInTheDocument();
+    expect(mockPreview).toHaveBeenCalledWith('source-two', { enabled: true }, undefined);
+    expect(mockAddMutateAsync).not.toHaveBeenCalled();
+    expect(mockRemoveMutateAsync).not.toHaveBeenCalled();
+    await user.keyboard('{Escape}');
+    await waitFor(() => expect(triggers[1]).toHaveFocus());
+    expect(screen.queryByRole('dialog', { name: filename })).not.toBeInTheDocument();
+    await user.click(screen.getAllByRole('button', { name: `Remove ${filename} from project` })[0]);
+    expect(mockRemoveMutateAsync).toHaveBeenCalledWith({
+      projectId: 'project-1',
+      file_id: 'source-one',
+    });
   });
 
   it('renders loading, error, and empty states with recovery controls', () => {

@@ -352,7 +352,10 @@ export function createProjectHandlers(deps: ProjectHandlerDependencies): {
         search: queryString(req.query.search),
       });
       return res.status(200).json({
-        files: result.files.map(toRuntimeFile),
+        files: result.files.map((file) => ({
+          ...toRuntimeFile(file),
+          ...(file.llmDeliveryPath !== undefined ? { llmDeliveryPath: file.llmDeliveryPath } : {}),
+        })),
         nextCursor: result.nextCursor,
       });
     } catch (error) {

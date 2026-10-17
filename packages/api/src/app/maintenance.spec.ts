@@ -295,16 +295,9 @@ it('blocks new mutating API admission while preserving exact abort and reads', (
   }
   expect(next).toHaveBeenCalledTimes(2);
 });
-it('awaits exact durable indexes before configuring required generation admission', async () => {
-  let finish!: () => void;
-  const configure = jest.fn();
-  const methods = {
-    ensureGenerationAdmissionIndexes: jest.fn(
-      () =>
-        new Promise<void>((resolve) => {
-          finish = resolve;
-        }),
-    ),
+function generationAdmissionMethods() {
+  return {
+    ensureGenerationAdmissionIndexes: jest.fn(async () => {}),
     acquireGenerationAdmission: jest.fn(),
     getGenerationAdmission: jest.fn(),
     dispatchGenerationAdmission: jest.fn(),
@@ -313,6 +306,22 @@ it('awaits exact durable indexes before configuring required generation admissio
     cancelUndispatchedGenerationAdmission: jest.fn(),
     findGenerationAdmissionByEpoch: jest.fn(),
     countUnsettledGenerationAdmissions: jest.fn(),
+    recoverGenerationAdmission: jest.fn(),
+    writeGenerationCheckpoint: jest.fn(),
+  };
+}
+
+it('awaits exact durable indexes before configuring required generation admission', async () => {
+  let finish!: () => void;
+  const configure = jest.fn();
+  const methods = {
+    ...generationAdmissionMethods(),
+    ensureGenerationAdmissionIndexes: jest.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    ),
   };
   const identity = fixture().app.identity;
   const initializing = initializeMaintenanceGeneration({
@@ -327,6 +336,43 @@ it('awaits exact durable indexes before configuring required generation admissio
   expect(configure).toHaveBeenCalledWith({
     required: true,
     methods,
+    ownerInstanceId: identity.podUid,
+    processBootId: identity.incarnation,
+    externalCensus: undefined,
+  });
+});
+
+it.each(['recoverGenerationAdmission', 'writeGenerationCheckpoint'])(
+  'rejects a missing checkpoint port %s before configuring required admission',
+  async (port) => {
+    const methods = generationAdmissionMethods();
+    Object.assign(methods, { [port]: undefined });
+    const configure = jest.fn();
+    await expect(
+      initializeMaintenanceGeneration({
+        required: true,
+        methods,
+        identity: fixture().app.identity,
+        configure,
+      }),
+    ).rejects.toThrow('Generation admission methods unavailable');
+    expect(methods.ensureGenerationAdmissionIndexes).not.toHaveBeenCalled();
+    expect(configure).not.toHaveBeenCalled();
+  },
+);
+
+it('preserves optional generation admission without methods or indexes', async () => {
+  const configure = jest.fn();
+  const identity = fixture().app.identity;
+  await initializeMaintenanceGeneration({
+    required: false,
+    methods: {} as never,
+    identity,
+    configure,
+  });
+  expect(configure).toHaveBeenCalledWith({
+    required: false,
+    methods: undefined,
     ownerInstanceId: identity.podUid,
     processBootId: identity.incarnation,
     externalCensus: undefined,

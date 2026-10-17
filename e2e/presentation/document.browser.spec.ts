@@ -296,3 +296,173 @@ test('native answers keep prepared source coverage local across reload and remov
   await expect(summary).toHaveCount(0);
   expect(previewRequests).toBe(0);
 });
+
+// Real native project/auth/picker UI; file metadata and approved-source responses below
+// are synthetic backend fixtures, not uploads or claims about scanner/RAG authorization.
+test('native project sources and picker preview exact files without attaching', async ({
+  page,
+  context,
+  baseURL,
+}, testInfo) => {
+  if (!baseURL) throw new Error('An isolated presentation origin is required');
+  const origin = new URL(baseURL).origin;
+  const externalRequests: string[] = [];
+  const mutations: string[] = [];
+  const previews: string[] = [];
+  await context.route('**/*', (route) => {
+    const url = new URL(route.request().url());
+    if (url.origin === origin || ['data:', 'blob:'].includes(url.protocol)) {
+      return route.continue();
+    }
+    externalRequests.push(url.href);
+    return route.abort();
+  });
+  await context.addInitScript(() => localStorage.setItem('color-theme', 'light'));
+  await page.route(
+    (url) => url.pathname === '/api/config',
+    async (route) => {
+      const response = await route.fetch();
+      await route.fulfill({ response, json: { ...(await response.json()), ragEnabled: true } });
+    },
+  );
+  const filename = `${'Synthetischer langer Quellenname '.repeat(6)}.txt`;
+  const attachedIds = [randomUUID(), randomUUID()];
+  const pickerIds = [randomUUID(), randomUUID()];
+  const unavailableId = randomUUID();
+  await page.route(/\/api\/projects\/[^/]+\/files(?:\/[^/?]+)?(?:\?.*)?$/, (route) => {
+    if (route.request().method() !== 'GET') {
+      mutations.push(`${route.request().method()} ${new URL(route.request().url()).pathname}`);
+      return route.abort();
+    }
+    if (new URL(route.request().url()).pathname.endsWith('/available')) {
+      return route.fulfill({
+        json: {
+          files: pickerIds.map((file_id) => ({
+            file_id,
+            filename,
+            type: 'text/plain',
+            bytes: 128,
+            source: 's3',
+            embedded: true,
+            context: 'message_attachment',
+            llmDeliveryPath: 'text',
+            status: 'ready',
+            updatedAt: '2026-10-17T00:00:00.000Z',
+          })),
+          nextCursor: null,
+        },
+      });
+    }
+    return route.fulfill({
+      json: [
+        ...attachedIds.map((file_id) => ({
+          file_id,
+          filename,
+          availability: 'ready',
+          type: 'text/plain',
+          bytes: 128,
+          llmDeliveryPath: 'text',
+        })),
+        {
+          file_id: unavailableId,
+          filename: 'Nicht verfügbare Quelle.txt',
+          availability: 'unavailable',
+        },
+      ],
+    });
+  });
+  for (const fileId of [...attachedIds, ...pickerIds]) {
+    await page.route(`**/api/files/${fileId}/preview`, (route) => {
+      previews.push(fileId);
+      return route.fulfill({
+        json: {
+          file_id: fileId,
+          status: 'ready',
+          textFormat: 'text',
+          text: `Synthetischer freigegebener Quelltext ${fileId}`,
+        } satisfies TFilePreview,
+      });
+    });
+  }
+  const email = `project-source-${randomUUID()}@example.invalid`;
+  const password = 'Synthetic-local-only-42!';
+  expect(
+    (
+      await page.request.post('/api/auth/register', {
+        data: { name: 'Project Source Test', email, password, confirm_password: password },
+      })
+    ).ok(),
+  ).toBeTruthy();
+  expect(
+    (await page.request.post('/api/auth/login', { data: { email, password } })).ok(),
+  ).toBeTruthy();
+  await page.goto('/projects');
+  await page.getByRole('button', { name: 'Neues Projekt', exact: true }).first().click();
+  const create = page.getByRole('dialog');
+  await create
+    .getByRole('textbox', { name: 'Projektname', exact: true })
+    .fill('Synthetische Projektquellen');
+  await create.getByRole('button', { name: 'Projekt erstellen', exact: true }).click();
+  const resources = page.getByRole('region', { name: 'Dateien', exact: true });
+  await expect(resources).toBeVisible();
+  await expect(
+    resources.getByRole('button', { name: 'Vorschau von Nicht verfügbare Quelle.txt' }),
+  ).toHaveCount(0);
+  const projectOpen = resources
+    .getByRole('button', { name: `Vorschau von ${filename}`, exact: true })
+    .nth(1);
+  await expect(projectOpen).toHaveAttribute('title', filename);
+  await projectOpen.focus();
+  await projectOpen.press('Enter');
+  const preview = page.getByRole('dialog', { name: filename, exact: true });
+  await expect(
+    preview.getByText(`Synthetischer freigegebener Quelltext ${attachedIds[1]}`, { exact: true }),
+  ).toBeVisible();
+  expect(previews).toEqual([attachedIds[1]]);
+  expect(mutations).toEqual([]);
+  expect(
+    await page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
+  ).toBeLessThanOrEqual(1);
+  await page.screenshot({ path: testInfo.outputPath('native-project-source.png') });
+  await page.keyboard.press('Escape');
+  await expect(preview).toHaveCount(0);
+  await expect(projectOpen).toBeFocused();
+  await page.screenshot({ path: testInfo.outputPath('native-project-resources.png') });
+  const addFiles = resources.getByRole('button', { name: 'Dateien hinzufügen', exact: true });
+  await addFiles.click();
+  await page.getByRole('menuitem', { name: 'Aus deinen Dateien auswählen', exact: true }).click();
+  const picker = page.getByRole('dialog', { name: 'Aus deinen Dateien auswählen', exact: true });
+  await expect(picker).toBeVisible();
+  const pickerOpen = picker
+    .getByRole('button', { name: `Vorschau von ${filename}`, exact: true })
+    .nth(1);
+  await pickerOpen.focus();
+  await pickerOpen.press('Enter');
+  await expect(
+    preview.getByText(`Synthetischer freigegebener Quelltext ${pickerIds[1]}`, { exact: true }),
+  ).toBeVisible();
+  expect(previews).toEqual([attachedIds[1], pickerIds[1]]);
+  expect(mutations).toEqual([]);
+  expect(
+    await page.evaluate(() => document.documentElement.scrollWidth - innerWidth),
+  ).toBeLessThanOrEqual(1);
+  await page.screenshot({ path: testInfo.outputPath('native-project-picker-source.png') });
+  await page.keyboard.press('Escape');
+  await expect(preview).toHaveCount(0);
+  await expect(picker).toBeVisible();
+  await expect(pickerOpen).toBeFocused();
+  await page.keyboard.press('Escape');
+  await expect(picker).toHaveCount(0);
+  await expect(addFiles).toBeFocused();
+  expect(mutations).toEqual([]);
+  expect(externalRequests).toEqual([]);
+  await testInfo.attach('synthetic-backend-boundary', {
+    body: JSON.stringify({
+      previews,
+      mutations,
+      externalRequests,
+      backend: 'synthetic file responses; actual native auth/project/UI',
+    }),
+    contentType: 'application/json',
+  });
+});

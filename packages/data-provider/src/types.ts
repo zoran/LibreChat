@@ -30,6 +30,7 @@ import type { TMinimalFeedback } from './feedback';
 import type { ContentTypes } from './types/runs';
 import type { ProviderId } from './providers';
 import type { Agent } from './types/agents';
+import type { TFile } from './types/files';
 
 export * from './schemas';
 export * from './types/subagents';
@@ -439,6 +440,7 @@ export type TChatProjectFile = {
   filename?: string;
   type?: string;
   bytes?: number;
+  llmDeliveryPath?: TFile['llmDeliveryPath'];
   availability: 'ready' | 'unavailable';
 };
 
