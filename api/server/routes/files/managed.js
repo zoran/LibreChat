@@ -1,4 +1,9 @@
-const { isUploadPrincipal } = require('librechat-data-provider');
+const {
+  isUploadPrincipal,
+  isUploadOriginalIntegrity,
+  readManagedDocumentResult,
+  matchesUploadSecurityApproval,
+} = require('librechat-data-provider');
 const { once } = require('node:events');
 const { performance } = require('node:perf_hooks');
 const {
@@ -122,7 +127,7 @@ function createManagedFileHandlers(options = {}) {
             uploadOperationId: id,
           },
           null,
-          `${FILE_FIELDS}${text ? ' text textFormat' : ''}`,
+          `${FILE_FIELDS}${text ? ' text textFormat +documentStructure +securityApproval' : ''}`,
           1,
         ),
       )) ?? [];
@@ -146,8 +151,15 @@ function createManagedFileHandlers(options = {}) {
     ) {
       throw unavailable();
     }
+    // These private fields are deliberately selected only for an authorized preview. A present
+    // malformed representation must never downgrade to a legacy text-only success.
+    let document;
+    if (text && Object.prototype.hasOwnProperty.call(file, 'documentStructure')) {
+      document = readManagedDocumentResult({ text: file.text, structure: file.documentStructure });
+      if (!document) throw unavailable();
+    }
     let receipt;
-    if (original) {
+    if (original || document) {
       const task = await system(() => owner.repository.cleanupForFile(user, id));
       receipt = task?.original;
       if (
@@ -164,6 +176,30 @@ function createManagedFileHandlers(options = {}) {
         operation.actualBytes !== file.bytes
       )
         throw unavailable();
+      if (document) {
+        const source = document.structure.source;
+        if (
+          !isUploadOriginalIntegrity(receipt.integrity, receipt.bytes) ||
+          source.sha256 !== receipt.integrity.sha256 ||
+          source.bytes !== file.bytes ||
+          source.mediaType !== file.type ||
+          !matchesUploadSecurityApproval(
+            file.securityApproval,
+            {
+              tenantId: user.tenantId,
+              userId: user.userId,
+              operationId: id,
+              transferGeneration: task.attemptGeneration,
+              mediaType: file.type,
+              bytes: file.bytes,
+              sha256: source.sha256,
+            },
+            process.env.UPLOAD_SECURITY_POLICY_SHA256,
+            now(),
+          )
+        )
+          throw unavailable();
+      }
     }
     return {
       owner,
@@ -171,6 +207,7 @@ function createManagedFileHandlers(options = {}) {
       operation,
       file,
       receipt,
+      document,
       expiresAt: Math.min(operationExpiry, fileExpiry),
     };
   }
@@ -262,8 +299,9 @@ function createManagedFileHandlers(options = {}) {
       res.json({
         file_id: access.file.file_id,
         status: 'ready',
-        text: access.file.text,
+        text: access.document?.text ?? access.file.text,
         textFormat: 'text',
+        ...(access.document ? { documentStructure: access.document.structure } : {}),
       });
     } catch (error) {
       sendFailure(res, error);

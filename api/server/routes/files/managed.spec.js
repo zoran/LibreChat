@@ -207,6 +207,225 @@ function storedOriginal(f, original, returned = original) {
   return { body, send };
 }
 
+function structuredFixture() {
+  const f = fixture();
+  f.receipt.integrity = integrityFor(Buffer.from('hello'));
+  f.task.attemptGeneration = 1;
+  const source = { sha256: f.receipt.integrity.sha256, bytes: 5, mediaType: 'text/plain' };
+  f.file.securityApproval = {
+    version: 1,
+    decision: 'approved',
+    policySha256: 'a'.repeat(64),
+    subject: {
+      ...source,
+      tenantId: user.tenantId,
+      userId: user.userId,
+      operationId: 'operation',
+      transferGeneration: 1,
+    },
+    scannerVersion: 'test/1',
+    checkedAt: new Date(epoch - 1000).toISOString(),
+    coverage: { complete: true, pages: 1, parts: 1 },
+  };
+  f.file.documentStructure = {
+    version: 1,
+    source,
+    extractor: { name: 'librechat-managed', version: '1' },
+    pages: [],
+    elements: [
+      {
+        id: 'e1',
+        kind: 'paragraph',
+        start: 0,
+        end: f.file.text.length,
+        page: null,
+        parentId: null,
+      },
+    ],
+    quality: { status: 'complete', warnings: [] },
+  };
+  return f;
+}
+
+describe('authorized managed source preview', () => {
+  const previousPolicy = process.env.UPLOAD_SECURITY_POLICY_SHA256;
+  beforeAll(() => {
+    process.env.UPLOAD_SECURITY_POLICY_SHA256 = 'a'.repeat(64);
+  });
+  afterAll(() => {
+    if (previousPolicy === undefined) delete process.env.UPLOAD_SECURITY_POLICY_SHA256;
+    else process.env.UPLOAD_SECURITY_POLICY_SHA256 = previousPolicy;
+  });
+  it('returns validated original-bound structure only from the explicit private preview projection', async () => {
+    const f = structuredFixture();
+    await f.handlers.preview(f.req, f.res);
+    expect(f.res.body).toEqual({
+      file_id: 'operation',
+      status: 'ready',
+      text: f.file.text,
+      textFormat: 'text',
+      documentStructure: f.file.documentStructure,
+    });
+    expect(f.res.body.documentStructure).not.toBe(f.file.documentStructure);
+    expect(f.getFiles.mock.calls[0][2].split(' ').slice(-4)).toEqual([
+      'text',
+      'textFormat',
+      '+documentStructure',
+      '+securityApproval',
+    ]);
+    expect(f.owner.repository.cleanupForFile).toHaveBeenCalledWith(user, 'operation');
+    expect(f.owner.principal).toHaveBeenCalledTimes(2);
+    expect(f.owner.management.get).toHaveBeenCalledTimes(2);
+    expect(f.res.headers['cache-control']).toBe('private, no-store');
+    expect(f.res.body).not.toHaveProperty('securityApproval');
+    expect(f.owner.storage.read).not.toHaveBeenCalled();
+  });
+  test.each([
+    [
+      'malformed',
+      (f) => {
+        f.file.documentStructure = null;
+      },
+    ],
+    [
+      'present undefined',
+      (f) => {
+        f.file.documentStructure = undefined;
+      },
+    ],
+    [
+      'out-of-range element',
+      (f) => {
+        f.file.documentStructure.elements[0].end = 999;
+      },
+    ],
+    [
+      'source hash',
+      (f) => {
+        f.file.documentStructure.source.sha256 = '0'.repeat(64);
+      },
+    ],
+    [
+      'source bytes',
+      (f) => {
+        f.file.documentStructure.source.bytes = 6;
+      },
+    ],
+    [
+      'File MIME',
+      (f) => {
+        f.file.type = 'application/pdf';
+      },
+    ],
+    [
+      'missing original integrity',
+      (f) => {
+        delete f.receipt.integrity;
+      },
+    ],
+    [
+      'missing approval',
+      (f) => {
+        delete f.file.securityApproval;
+      },
+    ],
+    [
+      'foreign approval',
+      (f) => {
+        f.file.securityApproval.subject.userId = 'other';
+      },
+    ],
+    [
+      'stale transfer',
+      (f) => {
+        f.task.attemptGeneration = 2;
+      },
+    ],
+    [
+      'stale policy',
+      (f) => {
+        f.file.securityApproval.policySha256 = 'b'.repeat(64);
+      },
+    ],
+    [
+      'future approval',
+      (f) => {
+        f.file.securityApproval.checkedAt = new Date(epoch + 1).toISOString();
+      },
+    ],
+    [
+      'original binding',
+      (f) => {
+        f.receipt.storageKey = 'foreign-original';
+      },
+    ],
+    [
+      'foreign File',
+      (f) => {
+        f.file.user = 'other';
+      },
+    ],
+    [
+      'revoked File',
+      (f) => {
+        f.getFiles.mockResolvedValue([]);
+      },
+    ],
+  ])('fails closed for %s without exposing private contents', async (_name, change) => {
+    const f = structuredFixture();
+    change(f);
+    await f.handlers.preview(f.req, f.res);
+    expect(f.res.statusCode).toBe(404);
+    expect(f.res.body).toEqual({ code: 'not_found' });
+    expect(f.res.headers['cache-control']).toBe('private, no-store');
+    expect(f.owner.storage.read).not.toHaveBeenCalled();
+  });
+  test.each(['principal', 'operation'])(
+    'revalidates final %s before disclosing sources',
+    async (stage) => {
+      const f = structuredFixture();
+      if (stage === 'principal')
+        f.owner.principal
+          .mockResolvedValueOnce(user)
+          .mockRejectedValueOnce(Object.assign(new Error('revoked'), { code: 'unauthorized' }));
+      else
+        f.owner.management.get
+          .mockResolvedValueOnce({ ...f.operation })
+          .mockResolvedValueOnce({ ...f.operation, canUseInComposer: false });
+      await f.handlers.preview(f.req, f.res);
+      expect(f.res.statusCode).toBe(stage === 'principal' ? 401 : 404);
+      expect(Object.keys(f.res.body)).toEqual(['code']);
+    },
+  );
+  it('keeps a detached valid representation while the final native revalidation awaits', async () => {
+    const f = structuredFixture();
+    const expected = JSON.parse(JSON.stringify(f.file.documentStructure));
+    f.owner.principal.mockResolvedValueOnce(user).mockImplementationOnce(async () => {
+      f.file.documentStructure.elements[0].end = 999;
+      f.file.text = 'changed';
+      return user;
+    });
+    await f.handlers.preview(f.req, f.res);
+    expect(f.res.body.documentStructure).toEqual(expected);
+    expect(f.res.body.text).toBe('useful text');
+  });
+  test.each(['list', 'download', 'downloadURL'])(
+    'keeps private fields out of %s projections and metadata',
+    async (method) => {
+      const f = structuredFixture();
+      await f.handlers[method](f.req, f.res);
+      expect(f.getFiles.mock.calls[0][2]).not.toMatch(/documentStructure|securityApproval/);
+      const publicValue =
+        method === 'download'
+          ? JSON.parse(decodeURIComponent(f.res.headers['x-file-metadata']))
+          : f.res.body;
+      expect(JSON.stringify(publicValue)).not.toMatch(
+        /documentStructure|securityApproval|scannerVersion|sha256/,
+      );
+    },
+  );
+});
+
 describe('managed personal File consumers', () => {
   it('requires explicit guest File ownership on download, including each revalidation', async () => {
     const f = fixture();

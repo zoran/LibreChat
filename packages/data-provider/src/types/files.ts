@@ -1,4 +1,5 @@
 import type { TDefaultLLMDeliveryPathConfig } from '../file-config';
+import type { DocumentStructure } from '../document-structure';
 import type { CodeEnvRef, CodeEnvRefMap } from '../codeEnvRef';
 import { EToolResources } from './tools';
 
@@ -251,6 +252,8 @@ export type TFilePreview = {
   text?: string;
   textFormat?: 'html' | 'text' | null;
   previewError?: string;
+  /** Only the authorized native preview may return this original-bound representation. */
+  documentStructure?: DocumentStructure;
 };
 
 export type AvatarUploadResponse = {

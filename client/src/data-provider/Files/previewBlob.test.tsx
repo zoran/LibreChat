@@ -1,16 +1,16 @@
 import React from 'react';
+import { RecoilRoot } from 'recoil';
 import { dataService } from 'librechat-data-provider';
 import { act, renderHook } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import type { TUser } from 'librechat-data-provider';
+import store from '~/store';
 import { useFilePreviewBlob } from './queries';
 
 jest.mock('librechat-data-provider', () => ({
   ...jest.requireActual('librechat-data-provider'),
   dataService: { getFileDownload: jest.fn(), getSharedFileDownload: jest.fn() },
 }));
-jest.mock('~/store', () => ({}));
-jest.mock('~/utils', () => ({}));
-jest.mock('~/common', () => ({}));
 
 describe('preview blob ownership', () => {
   afterEach(() => jest.clearAllMocks());
@@ -28,7 +28,14 @@ describe('preview blob ownership', () => {
         .mockReturnValue(pending as never);
       const client = new QueryClient();
       const wrapper = ({ children }: React.PropsWithChildren) => (
-        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        <RecoilRoot
+          initializeState={({ set }) => {
+            set(store.user, { id: 'owner', tenantId: 'tenant-a' } as TUser);
+            set(store.queriesEnabled, true);
+          }}
+        >
+          <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        </RecoilRoot>
       );
       const first = renderHook(() => useFilePreviewBlob('owner', 'f1', shareId), { wrapper });
       const second = renderHook(() => useFilePreviewBlob('owner', 'f1', shareId), { wrapper });

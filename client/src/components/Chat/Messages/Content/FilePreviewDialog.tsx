@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import copy from 'copy-to-clipboard';
 import { Download } from 'lucide-react';
 import { useRecoilValue } from 'recoil';
+import { readManagedDocumentResult } from 'librechat-data-provider';
 import {
   Button,
   OGDialog,
@@ -28,6 +29,7 @@ import CopyButton from '~/components/Messages/Content/CopyButton';
 import { useFileMapContext, useShareContext } from '~/Providers';
 import { useLocalize } from '~/hooks';
 import store from '~/store';
+import DocumentSourceView from './DocumentSourceView';
 
 interface FilePreviewDialogProps {
   open: boolean;
@@ -42,6 +44,7 @@ interface FilePreviewDialogProps {
   fileSource?: string;
   fileSize?: number;
   deliveryPath?: TFile['llmDeliveryPath'];
+  sourceElementId?: string;
   /** Where focus returns on close when the dialog is opened without a trigger. */
   triggerRef?: React.RefObject<HTMLElement | null>;
 }
@@ -106,6 +109,7 @@ export default function FilePreviewDialog({
   fileSource,
   fileSize,
   deliveryPath,
+  sourceElementId,
   triggerRef,
 }: FilePreviewDialogProps) {
   const localize = useLocalize();
@@ -145,19 +149,39 @@ export default function FilePreviewDialog({
 
   const previewKind = showExtractedText ? false : getPreviewKind(fileName, fileType, fileSource);
   const downloadFilename = getDownloadFilename(fileName, fileId, fileSource);
-  const displayedText = showExtractedText ? (extractedPreview?.text ?? null) : fileContent;
+  const hasStructure = extractedPreview?.documentStructure !== undefined;
+  const source = useMemo(
+    () =>
+      extractedPreview?.textFormat === 'text' && hasStructure
+        ? readManagedDocumentResult({
+            text: extractedPreview.text,
+            structure: extractedPreview.documentStructure,
+          })
+        : null,
+    [extractedPreview, hasStructure],
+  );
+  let displayedText = fileContent;
+  if (showExtractedText) {
+    displayedText =
+      !extractedTextFetching && !extractedTextError && extractedPreview?.file_id === fileId
+        ? (extractedPreview?.text ?? null)
+        : null;
+  }
   const isLoading =
     (!showExtractedText && loading) ||
     (showExtractedText &&
-      isExtractedTextPreviewLoading(
-        extractedPreview?.status,
-        extractedTextLoading,
-        extractedTextError,
-      ));
+      (extractedTextFetching ||
+        isExtractedTextPreviewLoading(
+          extractedPreview?.status,
+          extractedTextLoading,
+          extractedTextError,
+        )));
   const hasPreviewError =
     (!showExtractedText && previewError) ||
     (showExtractedText &&
       (extractedTextError ||
+        (extractedPreview !== undefined && extractedPreview.file_id !== fileId) ||
+        (hasStructure && !source) ||
         extractedPreview?.status === 'failed' ||
         (extractedPreview?.status === 'ready' && extractedPreview.text == null)));
 
@@ -175,8 +199,9 @@ export default function FilePreviewDialog({
     setLoading(true);
     const load = async () => {
       try {
-        const { data: blob } = await previewFile();
-        if (!blob) {
+        const result = await previewFile();
+        const blob = result.data;
+        if (result.isError || !blob) {
           throw new Error('Preview download unavailable');
         }
         if (cancelled) {
@@ -216,7 +241,7 @@ export default function FilePreviewDialog({
     }
     try {
       const result = await downloadFile();
-      if (!result.data) {
+      if (result.isError || !result.data) {
         return;
       }
       triggerDownload(result.data, downloadFilename);
@@ -331,9 +356,19 @@ export default function FilePreviewDialog({
                 />
               </div>
               <div className="bg-surface-secondary -mt-8 rounded-lg p-4">
-                <pre className="text-text-primary pr-8 font-mono text-sm leading-6 break-words whitespace-pre-wrap">
-                  {displayedText}
-                </pre>
+                {source && showExtractedText ? (
+                  <DocumentSourceView
+                    key={`${fileId}:${source.structure.source.sha256}`}
+                    text={source.text}
+                    structure={source.structure}
+                    initialPage={sortedPages?.[0]}
+                    initialElementId={sourceElementId}
+                  />
+                ) : (
+                  <pre className="text-text-primary pr-8 font-mono text-sm leading-6 break-words whitespace-pre-wrap">
+                    {displayedText}
+                  </pre>
+                )}
               </div>
             </>
           )}

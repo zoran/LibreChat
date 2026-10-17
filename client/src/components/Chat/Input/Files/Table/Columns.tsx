@@ -15,6 +15,7 @@ import ImagePreview from '~/components/Chat/Input/Files/ImagePreview';
 import FilePreview from '~/components/Chat/Input/Files/FilePreview';
 import { TranslationKeys, useLocalize } from '~/hooks';
 import { SortFilterHeader } from './SortFilterHeader';
+import FileSourceButton from './FileSourceButton';
 import { formatDate, getFileType } from '~/utils';
 
 const contextMap: Record<any, TranslationKeys> = {
@@ -114,7 +115,7 @@ export const columns: ColumnDef<TFile>[] = [
               className="relative h-10 w-10 shrink-0 overflow-visible rounded-md"
               source={file.source}
             />
-            <span className="self-center truncate">{file.filename}</span>
+            <FileSourceButton file={file} />
           </div>
         );
       }
@@ -123,7 +124,7 @@ export const columns: ColumnDef<TFile>[] = [
       return (
         <div className="flex gap-2">
           {fileType && <FilePreview fileType={fileType} className="relative" file={file} />}
-          <span className="self-center truncate">{file.filename}</span>
+          <FileSourceButton file={file} />
         </div>
       );
     },

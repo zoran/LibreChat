@@ -1,10 +1,61 @@
 import { useCallback, useRef } from 'react';
 import { FileSources, FileContext } from 'librechat-data-provider';
-import { OGDialog, OGDialogContent, OGDialogHeader, OGDialogTitle } from '@librechat/client';
+import {
+  Button,
+  OGDialog,
+  OGDialogContent,
+  OGDialogHeader,
+  OGDialogTitle,
+} from '@librechat/client';
 import type { TFile } from 'librechat-data-provider';
 import { useGetFiles } from '~/data-provider';
 import { DataTable, columns } from './Table';
 import { useLocalize } from '~/hooks';
+
+function FileList() {
+  const localize = useLocalize();
+  const {
+    data: files = [],
+    isFetching,
+    isLoading,
+    isError,
+    isFetchedAfterMount,
+    refetch,
+  } = useGetFiles<TFile[]>({
+    refetchOnMount: 'always',
+    staleTime: 0,
+    select: (files) =>
+      files.map((file) => ({
+        ...file,
+        context: file.context ?? FileContext.unknown,
+        filterSource: file.source === FileSources.firebase ? FileSources.local : file.source,
+      })),
+  });
+
+  const loading = isFetching || isLoading || !isFetchedAfterMount;
+  const unavailable = loading || isError;
+  return (
+    <>
+      {loading && (
+        <p role="status" className="py-6">
+          {localize('com_ui_loading')}
+        </p>
+      )}
+      {!loading && isError && (
+        <div className="space-y-3 py-6">
+          <p role="alert">{localize('com_ui_table_error_description')}</p>
+          <Button variant="outline" onClick={() => void refetch()}>
+            {localize('com_ui_retry')}
+          </Button>
+        </div>
+      )}
+      {/* Keep native sort/filter/selection state across refreshes, without rendering cached rows. */}
+      <div hidden={unavailable}>
+        <DataTable columns={columns} data={unavailable ? [] : files} />
+      </div>
+    </>
+  );
+}
 
 export function MyFilesModal({
   open,
@@ -31,15 +82,6 @@ export function MyFilesModal({
       : (triggerRef?.current ?? null);
   }, [triggerRef]);
 
-  const { data: files = [] } = useGetFiles<TFile[]>({
-    select: (files) =>
-      files.map((file) => {
-        file.context = file.context ?? FileContext.unknown;
-        file.filterSource = file.source === FileSources.firebase ? FileSources.local : file.source;
-        return file;
-      }),
-  });
-
   return (
     <OGDialog open={open} onOpenChange={onOpenChange} triggerRef={returnFocusRef}>
       <OGDialogContent
@@ -50,7 +92,7 @@ export function MyFilesModal({
         <OGDialogHeader>
           <OGDialogTitle>{localize('com_nav_my_files')}</OGDialogTitle>
         </OGDialogHeader>
-        <DataTable columns={columns} data={files} />
+        {open && <FileList />}
       </OGDialogContent>
     </OGDialog>
   );

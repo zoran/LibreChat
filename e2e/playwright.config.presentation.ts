@@ -30,6 +30,10 @@ if (process.env.E2E_MODEL_FIXTURES === 'record') {
 const runtimePath = path.resolve(__dirname, 'presentation/.runtime/runtime-env.json');
 process.env.E2E_RUNTIME_ENV_PATH = runtimePath;
 const channel = process.env.E2E_CHROMIUM_CHANNEL || undefined;
+const executablePath = process.env.E2E_CHROMIUM_EXECUTABLE || undefined;
+if (executablePath && !path.isAbsolute(executablePath)) {
+  throw new Error('The configured presentation browser must use an absolute executable path.');
+}
 
 export default defineConfig({
   ...mockConfig,
@@ -53,6 +57,7 @@ export default defineConfig({
     video: 'off',
     actionTimeout: 15_000,
     navigationTimeout: 30_000,
+    ...(executablePath ? { launchOptions: { executablePath } } : {}),
   },
   projects: [
     {

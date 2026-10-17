@@ -2,6 +2,7 @@ import { FileSources } from 'librechat-data-provider';
 import type { TFilePreview } from 'librechat-data-provider';
 
 const mockGetFilePreview = jest.fn();
+const mockGetSharedFilePreview = jest.fn();
 jest.mock('librechat-data-provider', () => {
   const actual = jest.requireActual('librechat-data-provider');
   return {
@@ -9,6 +10,7 @@ jest.mock('librechat-data-provider', () => {
     dataService: {
       ...actual.dataService,
       getFilePreview: (...args: unknown[]) => mockGetFilePreview(...args),
+      getSharedFilePreview: (...args: unknown[]) => mockGetSharedFilePreview(...args),
     },
   };
 });
@@ -17,6 +19,7 @@ import {
   PREVIEW_MAX_CONSECUTIVE_ERRORS,
   _resetPreviewErrorCounter,
   fetchFilePreview,
+  fetchSharedFilePreview,
   isDirectDownloadSource,
   previewRefetchInterval,
   revokeDownloadURL,
@@ -28,6 +31,7 @@ const FID = 'fid-test';
 beforeEach(() => {
   _resetPreviewErrorCounter();
   mockGetFilePreview.mockReset();
+  mockGetSharedFilePreview.mockReset();
 });
 
 describe('previewRefetchInterval', () => {
@@ -96,6 +100,21 @@ describe('previewRefetchInterval', () => {
     }
     expect(previewRefetchInterval(undefined, q('fid-broken'))).toBe(false);
     expect(previewRefetchInterval(undefined, q('fid-healthy'))).toBe(2500);
+  });
+
+  it('keeps the polling budget separate for owners, tenants and shared authorization', async () => {
+    const owner = ['filePreview', FID, 'owner', 'tenant-a', 'alice'];
+    const otherOwner = ['filePreview', FID, 'owner', 'tenant-b', 'alice'];
+    const shared = ['filePreview', FID, 'share', 'share-a'];
+    mockGetFilePreview.mockRejectedValue(new Error('403'));
+    for (let i = 0; i < PREVIEW_MAX_CONSECUTIVE_ERRORS; i++) {
+      await expect(fetchFilePreview(FID, owner)).rejects.toThrow('403');
+    }
+    mockGetSharedFilePreview.mockResolvedValue({ file_id: FID, status: 'pending' });
+    await fetchSharedFilePreview('share-a', FID, shared);
+    expect(previewRefetchInterval(undefined, { queryKey: owner })).toBe(false);
+    expect(previewRefetchInterval(undefined, { queryKey: otherOwner })).toBe(2500);
+    expect(previewRefetchInterval(undefined, { queryKey: shared })).toBe(2500);
   });
 });
 

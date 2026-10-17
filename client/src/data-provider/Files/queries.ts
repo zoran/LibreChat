@@ -189,11 +189,31 @@ export const useFilePreviewBlob = (
   userId?: string,
   fileId?: string,
   shareId?: string,
-): QueryObserverResult<Blob> =>
-  useQuery(
-    [QueryKeys.fileDownload, 'previewBlob', shareId ? 'share' : 'owner', shareId ?? userId, fileId],
+): QueryObserverResult<Blob> => {
+  const user = useRecoilValue(store.user);
+  const queriesEnabled = useRecoilValue(store.queriesEnabled);
+  const previewUser = queriesEnabled && userId === user?.id ? user : undefined;
+  return useQuery(
+    shareId
+      ? [
+          QueryKeys.fileDownload,
+          'previewBlob',
+          'share',
+          shareId,
+          fileId,
+          user?.tenantId ?? '',
+          user?.id,
+        ]
+      : [
+          QueryKeys.fileDownload,
+          'previewBlob',
+          'owner',
+          previewUser?.tenantId ?? '',
+          previewUser?.id,
+          fileId,
+        ],
     async () => {
-      if (!fileId || (!shareId && !userId)) {
+      if (!fileId || (!shareId && (!queriesEnabled || !user?.id || userId !== user.id))) {
         throw new Error('Preview identity unavailable');
       }
       const response = shareId
@@ -203,6 +223,7 @@ export const useFilePreviewBlob = (
     },
     { enabled: false, retry: false, cacheTime: 0 },
   );
+};
 
 export const useCodeOutputDownload = (url = ''): QueryObserverResult<string> => {
   return useQuery(
@@ -225,20 +246,25 @@ export const useCodeOutputDownload = (url = ''): QueryObserverResult<string> => 
 };
 
 /* Stop on terminal success or after 5 consecutive errors. The cap is
- * tracked in a module-level Map keyed by file_id because React Query
+ * tracked in a module-level Map keyed by the scoped query key because React Query
  * v4 resets `state.fetchFailureCount` to 0 on every fetch dispatch
  * (the `'fetch'` action in the reducer), so it can't be used to count
  * errors *across* polls. */
 export const PREVIEW_MAX_CONSECUTIVE_ERRORS = 5;
 const consecutivePreviewErrors = new Map<string, number>();
+const previewErrorKey = (queryKey: readonly unknown[]): string => JSON.stringify(queryKey);
 
-export const fetchFilePreview = async (fileId: string): Promise<t.TFilePreview> => {
+export const fetchFilePreview = async (
+  fileId: string,
+  queryKey: readonly unknown[] = [QueryKeys.filePreview, fileId],
+): Promise<t.TFilePreview> => {
+  const key = previewErrorKey(queryKey);
   try {
     const data = await dataService.getFilePreview(fileId);
-    consecutivePreviewErrors.delete(fileId);
+    consecutivePreviewErrors.delete(key);
     return data;
   } catch (err) {
-    consecutivePreviewErrors.set(fileId, (consecutivePreviewErrors.get(fileId) ?? 0) + 1);
+    consecutivePreviewErrors.set(key, (consecutivePreviewErrors.get(key) ?? 0) + 1);
     throw err;
   }
 };
@@ -247,13 +273,15 @@ export const fetchFilePreview = async (fileId: string): Promise<t.TFilePreview> 
 export const fetchSharedFilePreview = async (
   shareId: string,
   fileId: string,
+  queryKey: readonly unknown[] = [QueryKeys.filePreview, fileId, 'share', shareId],
 ): Promise<t.TFilePreview> => {
+  const key = previewErrorKey(queryKey);
   try {
     const data = await dataService.getSharedFilePreview(shareId, fileId);
-    consecutivePreviewErrors.delete(fileId);
+    consecutivePreviewErrors.delete(key);
     return data;
   } catch (err) {
-    consecutivePreviewErrors.set(fileId, (consecutivePreviewErrors.get(fileId) ?? 0) + 1);
+    consecutivePreviewErrors.set(key, (consecutivePreviewErrors.get(key) ?? 0) + 1);
     throw err;
   }
 };
@@ -262,13 +290,13 @@ export const previewRefetchInterval = (
   data: t.TFilePreview | undefined,
   query: { queryKey: readonly unknown[] },
 ): number | false => {
-  const fileId = String(query.queryKey[1] ?? '');
+  const key = previewErrorKey(query.queryKey);
   if (data?.status === 'ready' || data?.status === 'failed') {
-    consecutivePreviewErrors.delete(fileId);
+    consecutivePreviewErrors.delete(key);
     return false;
   }
-  if ((consecutivePreviewErrors.get(fileId) ?? 0) >= PREVIEW_MAX_CONSECUTIVE_ERRORS) {
-    consecutivePreviewErrors.delete(fileId);
+  if ((consecutivePreviewErrors.get(key) ?? 0) >= PREVIEW_MAX_CONSECUTIVE_ERRORS) {
+    consecutivePreviewErrors.delete(key);
     return false;
   }
   return 2500;
@@ -276,8 +304,13 @@ export const previewRefetchInterval = (
 
 /** Test-only: clear the consecutive-error counter. */
 export const _resetPreviewErrorCounter = (fileId?: string): void => {
-  if (fileId) consecutivePreviewErrors.delete(fileId);
-  else consecutivePreviewErrors.clear();
+  if (!fileId) {
+    consecutivePreviewErrors.clear();
+    return;
+  }
+  for (const key of consecutivePreviewErrors.keys()) {
+    if (JSON.parse(key)[1] === fileId) consecutivePreviewErrors.delete(key);
+  }
 };
 
 /**
@@ -287,36 +320,55 @@ export const _resetPreviewErrorCounter = (fileId?: string): void => {
  * Caller wires `enabled` to `attachment.status === 'pending'` so the
  * query is dormant for terminal-status records. Once enabled, React
  * Query's `refetchInterval` runs at 2.5s; see `previewRefetchInterval`
- * for the auto-stop rules. Idle by default.
+ * for the auto-stop rules. Dialogs instead enable the query while open.
  *
- * Cache key: `[QueryKeys.filePreview, file_id]`. Sibling components
- * watching the same `file_id` get a single shared poller.
+ * The native `[QueryKeys.filePreview, file_id]` prefix remains invalidatable.
+ * Its suffix separates actual private identities from shared-link authorization.
+ * Sibling observers within that scope share a poller. Private content is discarded
+ * after the last observer leaves; reopening an enabled observer revalidates first.
  */
 export const useFilePreview = (
   file_id: string | undefined,
   config?: UseQueryOptions<t.TFilePreview, unknown, t.TFilePreview>,
   shareId?: string,
 ): QueryObserverResult<t.TFilePreview, unknown> => {
+  const user = useRecoilValue(store.user);
+  const queriesEnabled = useRecoilValue(store.queriesEnabled);
+  const previewUser = queriesEnabled ? user : undefined;
+  const queryKey = shareId
+    ? [QueryKeys.filePreview, file_id, 'share', shareId, user?.tenantId ?? '', user?.id]
+    : [QueryKeys.filePreview, file_id, 'owner', previewUser?.tenantId ?? '', previewUser?.id];
   return useQuery<t.TFilePreview, unknown, t.TFilePreview>(
-    shareId ? [QueryKeys.filePreview, file_id, shareId] : [QueryKeys.filePreview, file_id],
-    () =>
-      shareId ? fetchSharedFilePreview(shareId, file_id ?? '') : fetchFilePreview(file_id ?? ''),
+    queryKey,
+    () => {
+      // `refetch()` bypasses enabled, so identity must also guard the actual fetch.
+      if (!file_id || (!shareId && (!queriesEnabled || !user?.id))) {
+        throw new Error('Preview identity unavailable');
+      }
+      return shareId
+        ? fetchSharedFilePreview(shareId, file_id, queryKey)
+        : fetchFilePreview(file_id, queryKey);
+    },
     {
       refetchOnWindowFocus: false,
       refetchOnReconnect: false,
-      /* Note: `refetchOnMount` left at the React Query default (`true`)
-       * so a freshly-mounted observer with stale cached data refetches.
-       * Cross-turn filename reuse keeps the same `file_id`; the cache
-       * may hold a prior turn's `'ready'` payload. `useAttachmentHandler`
-       * removes the entry on every new attachment for safety, but this
-       * default is the second line of defense — without it, an observer
-       * that mounts before the handler runs would read the stale cache
-       * and `refetchInterval` would never start polling. (Codex P1
-       * round-3 review on PR #12957.) */
+      // Shared snapshots keep native defaults. Private previews must revalidate
+      // on opening and focus even when another observer retains ready content.
       retry: false,
       refetchInterval: previewRefetchInterval,
       ...config,
-      enabled: !!file_id && (config?.enabled ?? true),
+      ...(!shareId && {
+        cacheTime: 0,
+        staleTime: 0,
+        keepPreviousData: false,
+        initialData: undefined,
+        placeholderData: undefined,
+        refetchOnMount: 'always' as const,
+        refetchOnWindowFocus: 'always' as const,
+        refetchOnReconnect: 'always' as const,
+      }),
+      enabled:
+        !!file_id && (!!shareId || (queriesEnabled && !!user?.id)) && (config?.enabled ?? true),
     },
   );
 };
