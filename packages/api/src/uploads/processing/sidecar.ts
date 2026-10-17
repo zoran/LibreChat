@@ -1,3 +1,4 @@
+import { MANAGED_DOCUMENT_WIRE_MAX_BYTES } from 'librechat-data-provider';
 import path from 'node:path';
 import { createServer } from 'node:http';
 import { spawn } from 'node:child_process';
@@ -216,7 +217,7 @@ export async function startDocumentSidecar(
       let errorCode = '';
       child.stdout.on('data', (chunk: Buffer) => {
         bytes += chunk.length;
-        if (bytes > MANAGED_DOCUMENT_LIMITS.outputBytes) stop('resource_limit');
+        if (bytes > MANAGED_DOCUMENT_WIRE_MAX_BYTES) stop('resource_limit');
         else if (record.state === 'running') output.push(chunk);
       });
       child.stderr.on('data', (chunk: Buffer) => {
@@ -239,7 +240,7 @@ export async function startDocumentSidecar(
           true,
         );
       response.writeHead(200, {
-        'content-type': 'application/octet-stream',
+        'content-type': 'application/vnd.librechat.document-frame',
         'content-length': bytes,
         'x-parser-joined': '1',
         'cache-control': 'no-store',

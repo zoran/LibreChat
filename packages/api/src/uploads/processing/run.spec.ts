@@ -1,3 +1,4 @@
+import { documentResultFixture } from './result.helper';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { createHash } from 'node:crypto';
@@ -101,7 +102,7 @@ describe('one managed processing claim', () => {
     if (root) await rm(root, { recursive: true, force: true });
   });
   function fixture(
-    extract = jest.fn(async () => ({ text: 'useful content', writerStopped: true as const })),
+    extract = jest.fn(async () => ({ ...documentResultFixture(), writerStopped: true as const })),
   ) {
     const management = {
       claimProcessing: jest.fn(async () => lease),
@@ -186,7 +187,7 @@ describe('one managed processing claim', () => {
     deps.documents.extract.mockImplementationOnce(async () => {
       expect(await readFile(path.join(root, 'op.2', 'original'))).toEqual(original);
       expect(deps.body.readableEnded).toBe(true);
-      return { text: 'useful content', writerStopped: true as const };
+      return { ...documentResultFixture(), writerStopped: true as const };
     });
     await processNextManagedUpload(deps as never, new AbortController().signal);
     expect(deps.send).toHaveBeenCalledTimes(1);
@@ -195,7 +196,7 @@ describe('one managed processing claim', () => {
       VersionId: 'recorded-version',
     });
     expect(deps.management.publish).toHaveBeenCalledWith(lease, {
-      text: 'useful content',
+      ...documentResultFixture(),
       writerStopped: true,
     });
     expect(deps.management.fail).not.toHaveBeenCalled();
@@ -275,7 +276,7 @@ describe('one managed processing claim', () => {
       deps.documents.extract.mock.invocationCallOrder[0],
     );
     expect(deps.management.publish).toHaveBeenCalledWith(lease, {
-      text: 'useful content',
+      ...documentResultFixture(),
       writerStopped: true,
     });
     expect(deps.management.confirmCleanup).toHaveBeenCalledWith(

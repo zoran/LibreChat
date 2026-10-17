@@ -13,6 +13,7 @@ export * from './upload-management';
 export * from './upload-intake';
 export * from './upload-intake-recovery';
 export * from './upload-security';
+export * from './document-structure';
 export * from './upload-view';
 export * from './email-code';
 export * from './resolve-llm-delivery-path';

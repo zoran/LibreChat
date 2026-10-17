@@ -1112,7 +1112,8 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
     if (Object.keys(data).some((key) => key.startsWith('$')))
       throw new FileSourceUnavailableError();
     const File = mongoose.models.File as Model<IMongoFile>;
-    const fileData: (Partial<IMongoFile> | CodeFileCommitData) & {
+    const fileData: Omit<Partial<IMongoFile> | CodeFileCommitData, 'tenantId'> & {
+      tenantId?: string | null;
       expiresAt?: Date;
       retentionAcceptedAt?: Date;
       retentionRevision?: number;
@@ -1132,6 +1133,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
       'deletionCompletedAt',
       'uploadOperationId',
       'securityApproval',
+      'documentStructure',
       'retainedDerivativeBytes',
       'retainedDerivativeReservations',
     ]) {
@@ -1223,6 +1225,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
       'deletionCompletedAt',
       'uploadOperationId',
       'securityApproval',
+      'documentStructure',
       'retainedDerivativeBytes',
       'retainedDerivativeReservations',
     ]) {

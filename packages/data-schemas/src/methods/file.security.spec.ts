@@ -95,7 +95,26 @@ describe('native File security boundary', () => {
         input.principal,
         input.operationId,
         7,
-        `private content for ${input.operationId}`,
+        {
+          text: `private content for ${input.operationId}`,
+          structure: {
+            version: 1,
+            source: { sha256, bytes: bytes.length, mediaType: 'text/plain' },
+            extractor: { name: 'fixture', version: '1' },
+            pages: [],
+            elements: [
+              {
+                id: 'e1',
+                kind: 'paragraph',
+                start: 0,
+                end: `private content for ${input.operationId}`.length,
+                page: null,
+                parentId: null,
+              },
+            ],
+            quality: { status: 'complete', warnings: [] },
+          },
+        },
         now,
         session,
       );

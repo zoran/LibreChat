@@ -2,7 +2,16 @@ import path from 'node:path';
 import { JSDOM } from 'jsdom';
 import { TextDecoder } from 'node:util';
 import { readFile, stat } from 'node:fs/promises';
+import { readManagedDocumentResult } from 'librechat-data-provider';
+import type { ManagedDocumentResult } from 'librechat-data-provider';
 import type { TextItem } from 'pdfjs-dist/types/src/display/api';
+import {
+  ManagedStructure,
+  plainParagraphs,
+  wordStructure,
+  slideStructure,
+  wordNS,
+} from './managedStructure';
 import { readSafeZipEntries, ZipBombError } from './zipSafety';
 
 type Limits = {
@@ -52,9 +61,7 @@ export class DocumentProcessingError extends Error {
   }
 }
 
-const wordNS = 'http://schemas.openxmlformats.org/wordprocessingml/2006/main';
 const presentationNS = 'http://schemas.openxmlformats.org/presentationml/2006/main';
-const drawingNS = 'http://schemas.openxmlformats.org/drawingml/2006/main';
 const officeRelNS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
 const packageRelNS = 'http://schemas.openxmlformats.org/package/2006/relationships';
 
@@ -89,13 +96,18 @@ function xml(data: Buffer | undefined): JSDOM {
 function textCollector(maxBytes: number) {
   const chunks: string[] = [];
   let bytes = 0;
+  let length = 0;
   return {
+    get length() {
+      return length;
+    },
     add(value: string) {
       bytes += Buffer.byteLength(value, 'utf8');
       if (bytes > maxBytes) {
         fail('resource_limit');
       }
       chunks.push(value);
+      length += value.length;
     },
     finish() {
       const text = chunks.join('');
@@ -107,12 +119,12 @@ function textCollector(maxBytes: number) {
   };
 }
 
-/** Run only in the isolated parser child. Limits can only be lowered for fixtures. */
+/** Isolated extraction only, never security approval. Limits can only be lowered for fixtures. */
 export async function extractManagedDocument(input: {
   filePath: string;
   mediaType: string;
   limits?: Partial<Limits>;
-}): Promise<{ text: string; bytes: number }> {
+}): Promise<ManagedDocumentResult & { bytes: number }> {
   const limits = { ...MANAGED_DOCUMENT_LIMITS, ...input.limits };
   for (const key of Object.keys(limits) as Array<keyof Limits>) {
     if (
@@ -135,11 +147,23 @@ export async function extractManagedDocument(input: {
     fail('resource_limit');
   }
   const output = textCollector(limits.outputBytes);
+  const structure = new ManagedStructure(data, input.mediaType, () => fail('resource_limit'));
+  const finish = () => {
+    const result = output.finish();
+    const value = structure.finish();
+    if (!readManagedDocumentResult({ text: result.text, structure: value }))
+      fail('invalid_document');
+    return { ...result, structure: value };
+  };
   if (input.mediaType === 'text/plain') {
     output.add(decode(data));
-    return output.finish();
+    plainParagraphs(output.finish().text, structure);
+    return finish();
   }
   if (input.mediaType === 'application/pdf') {
+    structure.warn('layout_unavailable');
+    structure.warn('visual_content_not_extracted');
+    structure.warn('table_structure_unavailable');
     const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs');
     const loading = getDocument({
       data: new Uint8Array(data),
@@ -156,16 +180,21 @@ export async function extractManagedDocument(input: {
         fail('resource_limit');
       }
       for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber++) {
+        structure.value.pages.push({ number: pageNumber, kind: 'page' });
         const page = await pdf.getPage(pageNumber);
         try {
           const content = await page.getTextContent();
+          const start = output.length;
+          let hasText = false;
           for (const item of content.items) {
             if ('str' in item) {
               const text = item as TextItem;
               output.add(text.str);
+              hasText ||= text.str.trim().length > 0;
               output.add(text.hasEOL ? '\n' : ' ');
             }
           }
+          if (hasText) structure.add('paragraph', start, output.length, pageNumber);
           output.add('\n');
         } finally {
           page.cleanup();
@@ -174,7 +203,7 @@ export async function extractManagedDocument(input: {
     } finally {
       await loading.destroy();
     }
-    return output.finish();
+    return finish();
   }
 
   let parts: Map<string, Buffer>;
@@ -188,10 +217,11 @@ export async function extractManagedDocument(input: {
   } catch (error) {
     return fail(error instanceof ZipBombError ? 'resource_limit' : 'invalid_document');
   }
-  // All relationships are inert; explicitly refuse external relationships in extraction inputs.
-  // Ordinary hyperlinks may be present: their visible text is extracted without following them.
+  // Relationships are inert. Visible hyperlinks are text only; external slide targets are refused.
+  structure.warn('layout_unavailable');
   if (input.mediaType === MANAGED_DOCUMENT_TYPES[2]) {
     const document = xml(parts.get('word/document.xml'));
+    let styles: JSDOM | undefined;
     try {
       // DOCX has no trustworthy rendered page count. Bound explicit page boundaries;
       // ZIP/output/wall/cgroup bounds also apply to unpaginated documents.
@@ -202,13 +232,24 @@ export async function extractManagedDocument(input: {
       if (explicitBreaks + 1 > limits.pages) {
         fail('resource_limit');
       }
+      if (parts.has('word/styles.xml')) styles = xml(parts.get('word/styles.xml'));
+      const { extractRawText } = await import('mammoth');
+      const result = await extractRawText({ buffer: data });
+      output.add(result.value);
+      if (
+        result.messages.length ||
+        Array.from(parts.keys()).some((name) =>
+          /^word\/(?:header|footer|footnotes|endnotes|comments).*\.xml$/.test(name),
+        )
+      ) {
+        structure.warn('unsupported_content');
+      }
+      wordStructure(doc, styles?.window.document, result.value, structure);
     } finally {
       document.window.close();
+      styles?.window.close();
     }
-    const { extractRawText } = await import('mammoth');
-    const result = await extractRawText({ buffer: data });
-    output.add(result.value);
-    return output.finish();
+    return finish();
   }
 
   const presentation = xml(parts.get('ppt/presentation.xml'));
@@ -251,16 +292,11 @@ export async function extractManagedDocument(input: {
         fail('invalid_document');
       }
       used.add(target);
+      const page = used.size;
+      structure.value.pages.push({ number: page, kind: 'slide' });
       const slide = xml(parts.get(target));
       try {
-        for (const paragraph of Array.from(
-          slide.window.document.getElementsByTagNameNS(drawingNS, 'p'),
-        )) {
-          for (const run of Array.from(paragraph.getElementsByTagNameNS(drawingNS, 't'))) {
-            output.add(run.textContent ?? '');
-          }
-          output.add('\n');
-        }
+        slideStructure(slide.window.document, page, structure, output);
         output.add('\n');
       } finally {
         slide.window.close();
@@ -270,5 +306,8 @@ export async function extractManagedDocument(input: {
     presentation.window.close();
     relationships.window.close();
   }
-  return output.finish();
+  if (Array.from(parts.keys()).some((name) => /^ppt\/(?:notesSlides|slideMasters)\//.test(name))) {
+    structure.warn('unsupported_content');
+  }
+  return finish();
 }

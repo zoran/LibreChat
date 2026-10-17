@@ -1,3 +1,4 @@
+import { documentResultFixture } from './processing/result.helper';
 /** Public authorization and retry boundaries; persistence has its own real Mongo suite. */
 import { UPLOAD_MAX_FILE_BYTES } from 'librechat-data-provider';
 import type {
@@ -313,7 +314,10 @@ describe('managed upload public boundary', () => {
         expiresAt: new Date(46_000).toISOString(),
       };
       await expect(
-        f.management.publish(lease, { text: 'ready content', writerStopped: true }),
+        f.management.publish(lease, {
+          ...documentResultFixture('ready content'),
+          writerStopped: true,
+        }),
       ).resolves.toMatchObject({ state: 'ready' });
       const failure = new UploadManagementError('quota_exceeded');
       f.reserve.mockRejectedValueOnce(failure);

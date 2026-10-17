@@ -85,6 +85,18 @@ describe('built managed document flow', () => {
     const execution = await documents.prepare({ attemptId, mediaType, signal });
     const result = await documents.extract({ execution, signal });
     expect(result.writerStopped).toBe(true);
+    const original = await readFile(path.join(stagingRoot, attemptId, 'original'));
+    expect(result.structure.source).toEqual({
+      sha256: createHash('sha256').update(original).digest('hex'),
+      bytes: original.length,
+      mediaType,
+    });
+    for (const element of result.structure.elements) {
+      expect(element.end).toBeLessThanOrEqual(result.text.length);
+      expect(element.start).toBeLessThanOrEqual(element.end);
+    }
+    if (mediaType === 'application/pdf') expect(result.structure.pages[0]?.kind).toBe('page');
+    if (mediaType.includes('presentationml')) expect(result.structure.pages[0]?.kind).toBe('slide');
     // A terminal receipt also acknowledges cancellation without relaunching the child.
     await expect(documents.cancel({ execution, signal })).resolves.toEqual({ writerStopped: true });
     return result.text;

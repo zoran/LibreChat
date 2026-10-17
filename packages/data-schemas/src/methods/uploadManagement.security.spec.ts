@@ -61,6 +61,27 @@ describe('durable upload security approval', () => {
     checkedAt: new Date(now).toISOString(),
     coverage: { complete: true, pages: 1, parts: 1 },
   });
+  const documentResult = (text: string, bytes = 8) => ({
+    text,
+    writerStopped: true as const,
+    structure: {
+      version: 1 as const,
+      source: { sha256: 'a'.repeat(64), bytes, mediaType: 'text/plain' },
+      extractor: { name: 'fixture', version: '1' },
+      pages: [],
+      elements: [
+        {
+          id: 'e1',
+          kind: 'paragraph' as const,
+          start: 0,
+          end: text.length,
+          page: null,
+          parentId: null,
+        },
+      ],
+      quality: { status: 'complete' as const, warnings: [] },
+    },
+  });
   const localGone = (lease: UploadLease) => ({
     operationId: lease.operationId,
     generation: lease.generation,
@@ -287,8 +308,8 @@ describe('durable upload security approval', () => {
     const input = await first.getProcessingInput(retry, now);
     expect(input.securityApproval).toEqual(proof);
     expect(input.attemptGeneration).toBe(original.generation);
-    await first.publish(retry, { text: 'approved text', writerStopped: true }, now);
-    await second.publish(retry, { text: 'approved text', writerStopped: true }, now);
+    await first.publish(retry, documentResult('approved text'), now);
+    await second.publish(retry, documentResult('approved text'), now);
     expect(await first.usage(user, now)).toMatchObject({ usedBytes: 8 });
   });
 
@@ -314,9 +335,9 @@ describe('durable upload security approval', () => {
       await expect(changed.getProcessingInput(lease, now)).rejects.toMatchObject({
         code: 'security_uninspectable',
       });
-      await expect(
-        changed.publish(lease, { text: 'blocked', writerStopped: true }, now),
-      ).rejects.toMatchObject({ code: 'security_uninspectable' });
+      await expect(changed.publish(lease, documentResult('blocked'), now)).rejects.toMatchObject({
+        code: 'security_uninspectable',
+      });
       await expect(changed.retryProcessing(user, original.operationId, now)).rejects.toMatchObject({
         code: 'security_uninspectable',
       });
@@ -355,9 +376,9 @@ describe('durable upload security approval', () => {
     await expect(second.getProcessingInput(lease, now)).rejects.toMatchObject({
       code: 'security_uninspectable',
     });
-    await expect(
-      second.publish(lease, { text: 'blocked', writerStopped: true }, now),
-    ).rejects.toMatchObject({ code: 'security_uninspectable' });
+    await expect(second.publish(lease, documentResult('blocked'), now)).rejects.toMatchObject({
+      code: 'security_uninspectable',
+    });
     await first.delete(user, original.operationId, now);
     await first.confirmCleanup(
       { ...localGone(lease), originalAbsent: true, textAndHistoryRemoved: true },
@@ -372,7 +393,7 @@ describe('durable upload security approval', () => {
   it('rechecks policy even when replaying an already published result', async () => {
     await accepted();
     const lease = await processing();
-    const result = { text: 'approved text', writerStopped: true as const };
+    const result = documentResult('approved text');
     await first.publish(lease, result, now);
     const changed = createUploadManagementRepository(b, { securityPolicySha256: 'd'.repeat(64) });
     await expect(changed.publish(lease, result, now)).rejects.toMatchObject({

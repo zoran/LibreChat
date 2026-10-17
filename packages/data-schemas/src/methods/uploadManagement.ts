@@ -13,6 +13,7 @@ import {
   readUploadSecuritySettlement,
   matchesUploadSecurityExecution,
   readUploadAcceptedMetadata,
+  readManagedDocumentResult,
 } from 'librechat-data-provider';
 import type {
   UploadPrincipal,
@@ -34,6 +35,7 @@ import type {
   UploadSecurityExecution,
   UploadSecuritySettlement,
   UploadAcceptedMetadata,
+  ManagedDocumentResult,
 } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
 import type {
@@ -123,7 +125,7 @@ export type UploadManagementRepository = UploadControlMethods &
     ): Promise<UploadOperation>;
     publish(
       lease: UploadLease,
-      result: { text: string; writerStopped: true },
+      result: ManagedDocumentResult & { writerStopped: true },
       now: number,
     ): Promise<UploadOperation>;
     cancel(principal: UploadPrincipal, id: string, now: number): Promise<UploadOperation>;
@@ -774,17 +776,38 @@ export function createUploadManagementRepository(
       });
     },
     async publish(lease, result, now) {
+      if (!result || ![Object.prototype, null].includes(Object.getPrototypeOf(result)))
+        reject('processing_failed');
+      const fields = Object.getOwnPropertyDescriptors(result);
       if (
-        result.writerStopped !== true ||
-        !result.text ||
-        Buffer.byteLength(result.text, 'utf8') > UPLOAD_MAX_TEXT_BYTES
+        Reflect.ownKeys(result).length !== 3 ||
+        !['text', 'structure', 'writerStopped'].every(
+          (key) => fields[key] && 'value' in fields[key],
+        ) ||
+        fields.writerStopped.value !== true
       )
         reject('processing_failed');
+      const document = readManagedDocumentResult({
+        text: fields.text.value,
+        structure: fields.structure.value,
+      });
+      const actual = document
+        ? Buffer.byteLength(document.text, 'utf8') +
+          Buffer.byteLength(JSON.stringify(document.structure), 'utf8')
+        : 0;
+      if (!document || actual > UPLOAD_MAX_TEXT_BYTES) reject('processing_failed');
+      const digest = uploadDigest(JSON.stringify(document));
       return store.transaction(async (session, global) => {
         const row = await store.Operation.findById(lease.operationId)
           .session(session)
           .lean<StoredUpload>();
-        const digest = uploadDigest(result.text);
+        if (
+          row &&
+          (document.structure.source.sha256 !== row.original?.integrity?.sha256 ||
+            document.structure.source.bytes !== row.actualBytes ||
+            document.structure.source.mediaType !== row.mediaType)
+        )
+          reject('processing_failed');
         if (
           row?.state === 'ready' &&
           row.generation === lease.generation &&
@@ -810,11 +833,10 @@ export function createUploadManagementRepository(
           principalOf(row),
           row._id,
           row.generation,
-          result.text,
+          document,
           now,
           session,
         );
-        const actual = Buffer.byteLength(result.text, 'utf8');
         global.textBytes -= row.textBytes - actual;
         row.textBytes = actual;
         row.state = 'ready';

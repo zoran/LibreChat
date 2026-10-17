@@ -48,7 +48,7 @@ export function captureManagedFileApproval(
 /** Used in the query itself, before counts, names, text or references can leave Mongo. */
 export function approvedFileFilter(
   policy: unknown = process.env.UPLOAD_SECURITY_POLICY_SHA256,
-  now = Date.now(),
+  now: number = Date.now(),
 ): FilterQuery<IMongoFile> {
   const policySha256 = uploadSecurityPolicySha256(policy);
   if (!policySha256) return { _id: { $exists: false } };

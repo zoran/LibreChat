@@ -77,6 +77,8 @@ const file: Schema<IMongoFile> = new Schema(
     text: {
       type: String,
     },
+    /** Private original-bound derivation; only the managed File lifecycle publishes it. */
+    documentStructure: { type: Schema.Types.Mixed, select: false },
     textFormat: {
       /* 'html' when the backend produced a sanitized HTML preview
        * (office-type CDN/mammoth output), 'text' for plain-text
@@ -241,6 +243,7 @@ const file: Schema<IMongoFile> = new Schema(
         delete value.retainedDerivativeBytes;
         delete value.retainedDerivativeReservations;
         delete value.securityApproval;
+        delete value.documentStructure;
         return value;
       },
     },
@@ -249,6 +252,7 @@ const file: Schema<IMongoFile> = new Schema(
         delete value.retainedDerivativeBytes;
         delete value.retainedDerivativeReservations;
         delete value.securityApproval;
+        delete value.documentStructure;
         return value;
       },
     },

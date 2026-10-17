@@ -8,6 +8,7 @@ import type {
   UploadSecurityApproval,
   UploadPrincipal,
   UploadStorageReceipt,
+  DocumentStructure,
 } from 'librechat-data-provider';
 
 export type RunArtifactRunScope = {
@@ -108,6 +109,8 @@ export interface IMongoFile extends Omit<Document, 'model'> {
   uploadOperationId?: string;
   /** Private immutable upload-owner proof; never part of TFile or client projections. */
   securityApproval?: UploadSecurityApproval;
+  /** Private derived structure, bound to the immutable accepted original and File lifecycle. */
+  documentStructure?: DocumentStructure;
   deletionRequestedAt?: Date;
   deletionCompletedAt?: Date;
   user: Types.ObjectId;

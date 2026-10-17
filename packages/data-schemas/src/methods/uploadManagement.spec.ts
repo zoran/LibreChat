@@ -61,6 +61,27 @@ describe('durable upload management', () => {
       chunkSha256: Array.from({ length: Math.ceil(bytes / 262144) }, () => 'b'.repeat(64)),
     },
   });
+  const documentResult = (text: string, bytes = 8) => ({
+    text,
+    writerStopped: true as const,
+    structure: {
+      version: 1 as const,
+      source: { sha256: 'a'.repeat(64), bytes, mediaType: 'text/plain' },
+      extractor: { name: 'fixture', version: '1' },
+      pages: [],
+      elements: [
+        {
+          id: 'e1',
+          kind: 'paragraph' as const,
+          start: 0,
+          end: text.length,
+          page: null,
+          parentId: null,
+        },
+      ],
+      quality: { status: 'complete' as const, warnings: [] },
+    },
+  });
   const localGone = (lease: UploadLease) => ({
     operationId: lease.operationId,
     generation: lease.generation,
@@ -188,7 +209,7 @@ describe('durable upload management', () => {
   async function ready(id: string, bytes = 8, at = now, principal = user) {
     const result = await accepted(id, bytes, at, principal);
     const lease = await processing(result.operation.id, at);
-    await first.publish(lease, { text: 'document', writerStopped: true }, at);
+    await first.publish(lease, documentResult('document', bytes), at);
     await second.confirmCleanup(localGone(lease), at);
     return result;
   }
@@ -1326,7 +1347,7 @@ describe('durable upload management', () => {
       ).acceptedAt,
     ).toBe(new Date(now).toISOString());
     const parser = await processing('replay');
-    const result = { text: 'document', writerStopped: true as const };
+    const result = documentResult('document');
     const published = await first.publish(parser, result, now);
     expect((await second.publish(parser, result, now + 1)).revision).toBe(published.revision);
     expect(
@@ -1334,9 +1355,9 @@ describe('durable upload management', () => {
         ?.instanceId,
     ).toBe('parser-a');
     expect((await first.usage(user, now)).usedBytes).toBe(8);
-    await expect(
-      first.publish(parser, { ...result, text: 'changed' }, now + 1),
-    ).rejects.toMatchObject({ code: 'lease_lost' });
+    await expect(first.publish(parser, documentResult('changed'), now + 1)).rejects.toMatchObject({
+      code: 'lease_lost',
+    });
   });
 
   it('binds exactly one inert parser receipt to the held processing generation', async () => {
@@ -1354,9 +1375,9 @@ describe('durable upload management', () => {
       ),
     ).rejects.toMatchObject({ code: 'lease_lost' });
     await first.delete(user, 'parser', now);
-    await expect(
-      second.publish(lease, { text: 'late', writerStopped: true }, now),
-    ).rejects.toMatchObject({ code: 'lease_lost' });
+    await expect(second.publish(lease, documentResult('late'), now)).rejects.toMatchObject({
+      code: 'lease_lost',
+    });
     expect((await first.get(user, 'parser', now)).canUseInComposer).toBe(false);
   });
 
@@ -1461,7 +1482,7 @@ describe('durable upload management', () => {
     const lease = await processing('revoke');
     const lifecycle = createFileRetentionMethods(b);
     await Promise.allSettled([
-      first.publish(lease, { text: 'late', writerStopped: true }, now),
+      first.publish(lease, documentResult('late'), now),
       lifecycle.revokeFileSources(user, ['revoke']),
     ]);
     expect((await first.get(user, 'revoke', now)).canUseInComposer).toBe(false);

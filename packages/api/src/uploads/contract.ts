@@ -1,5 +1,6 @@
 /** Upload domain ports. Adapters own credentials, storage engines, processes and transports. */
 import type {
+  ManagedDocumentResult,
   UploadPrincipal,
   UploadScope,
   UploadReserveInput,
@@ -103,7 +104,7 @@ export interface DocumentPort {
   extract(input: {
     execution: UploadParserExecution;
     signal: AbortSignal;
-  }): Promise<{ text: string; writerStopped: true }>;
+  }): Promise<ManagedDocumentResult & { writerStopped: true }>;
   cancel(input: {
     execution: UploadParserExecution;
     signal: AbortSignal;
@@ -204,7 +205,7 @@ export interface UploadRepository {
   ): Promise<UploadOperation>;
   publish(
     lease: UploadLease,
-    result: { text: string; writerStopped: true },
+    result: ManagedDocumentResult & { writerStopped: true },
     now: number,
   ): Promise<UploadOperation>;
   cancel(principal: UploadPrincipal, id: string, now: number): Promise<UploadOperation>;

@@ -30,6 +30,27 @@ describe('durable scanner execution', () => {
   };
   const worker = { hostId: 'host-a', instanceId: 'app-a' };
   const sha256 = createHash('sha256').update('document').digest('hex');
+  const documentResult = (text: string, bytes = 8) => ({
+    text,
+    writerStopped: true as const,
+    structure: {
+      version: 1 as const,
+      source: { sha256: sha256, bytes, mediaType: 'text/plain' },
+      extractor: { name: 'fixture', version: '1' },
+      pages: [],
+      elements: [
+        {
+          id: 'e1',
+          kind: 'paragraph' as const,
+          start: 0,
+          end: text.length,
+          page: null,
+          parentId: null,
+        },
+      ],
+      quality: { status: 'complete' as const, warnings: [] },
+    },
+  });
   const execution = (lease: UploadLease): UploadSecurityExecution => ({
     version: 1,
     attemptId: `${lease.operationId}.${lease.generation}`,
@@ -309,14 +330,14 @@ describe('durable scanner execution', () => {
       },
       time,
     );
-    await first.publish(parser, { text: 'document', writerStopped: true }, time);
+    await first.publish(parser, documentResult('document'), time);
     await a.models.UploadOperation.updateOne(
       { _id: 'scan' },
       { $unset: { securitySettlement: 1 } },
     );
-    await expect(
-      second.publish(parser, { text: 'document', writerStopped: true }, time),
-    ).rejects.toMatchObject({ code: 'security_uninspectable' });
+    await expect(second.publish(parser, documentResult('document'), time)).rejects.toMatchObject({
+      code: 'security_uninspectable',
+    });
     await expect(second.retryProcessing(user, 'scan', time)).rejects.toMatchObject({
       code: 'security_uninspectable',
     });

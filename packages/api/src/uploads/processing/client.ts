@@ -1,3 +1,6 @@
+import { MANAGED_DOCUMENT_WIRE_MAX_BYTES } from 'librechat-data-provider';
+import type { ManagedDocumentResult } from 'librechat-data-provider';
+import { decodeDocumentResult } from './result';
 import { request } from 'node:http';
 import { TextDecoder } from 'node:util';
 import type { UploadParserExecution } from 'librechat-data-provider';
@@ -69,7 +72,7 @@ export function createUnixDocumentPort(options: {
         (res) => {
           let bytes = 0;
           const chunks: Buffer[] = [];
-          const cap = binary && res.statusCode === 200 ? MANAGED_DOCUMENT_LIMITS.outputBytes : 1024;
+          const cap = binary && res.statusCode === 200 ? MANAGED_DOCUMENT_WIRE_MAX_BYTES : 1024;
           res.on('data', (chunk: Buffer) => {
             bytes += chunk.length;
             if (bytes > cap) {
@@ -81,15 +84,17 @@ export function createUnixDocumentPort(options: {
           res.once('end', () => {
             if (settled) return;
             try {
-              const text = new TextDecoder('utf-8', { fatal: true }).decode(
-                Buffer.concat(chunks, bytes),
-              );
+              const payload = Buffer.concat(chunks, bytes);
               if (binary && res.statusCode === 200) {
-                if (res.headers['x-parser-joined'] !== '1' || !text.trim())
+                if (
+                  res.headers['x-parser-joined'] !== '1' ||
+                  res.headers['content-type'] !== 'application/vnd.librechat.document-frame'
+                )
                   throw new Error('Invalid parser reply');
-                finish(undefined, { text, writerStopped: true });
+                finish(undefined, { ...decodeDocumentResult(payload), writerStopped: true });
                 return;
               }
+              const text = new TextDecoder('utf-8', { fatal: true }).decode(payload);
               const value = JSON.parse(text) as Record<string, unknown>;
               if (res.statusCode === 200) finish(undefined, value);
               else
@@ -147,8 +152,7 @@ export function createUnixDocumentPort(options: {
     },
     async extract({ execution, signal }) {
       validateExecution(execution);
-      return (await rpc('/extract', execution, signal, true)) as {
-        text: string;
+      return (await rpc('/extract', execution, signal, true)) as ManagedDocumentResult & {
         writerStopped: true;
       };
     },

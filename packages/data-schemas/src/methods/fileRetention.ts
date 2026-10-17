@@ -3,7 +3,9 @@ import {
   UPLOAD_MAX_TEXT_BYTES,
   UPLOAD_RETENTION_MS,
   isUploadPrincipal,
+  readManagedDocumentResult,
 } from 'librechat-data-provider';
+import type { ManagedDocumentResult } from 'librechat-data-provider';
 import type { ClientSession, FilterQuery, Model } from 'mongoose';
 import type {
   FileOwnerScope,
@@ -234,7 +236,7 @@ export function createFileRetentionMethods(
     owner: FileOwnerScope,
     operationId: string,
     generation: number,
-    text: string,
+    result: ManagedDocumentResult,
     now: number,
     session: ClientSession,
   ): Promise<void>;
@@ -520,22 +522,39 @@ export function createFileRetentionMethods(
     owner: FileOwnerScope,
     operationId: string,
     generation: number,
-    text: string,
+    input: ManagedDocumentResult,
     now: number,
     session: ClientSession,
   ): Promise<void> {
+    const document = readManagedDocumentResult(input);
     if (
       !session.inTransaction() ||
-      !text.length ||
-      Buffer.byteLength(text, 'utf8') > UPLOAD_MAX_TEXT_BYTES
+      !document ||
+      Buffer.byteLength(document.text, 'utf8') +
+        Buffer.byteLength(JSON.stringify(document.structure), 'utf8') >
+        UPLOAD_MAX_TEXT_BYTES
     ) {
       throw new FileSourceUnavailableError();
     }
     const File = mongoose.models.File as Model<IMongoFile>;
     const result = await File.updateOne(
-      { ...managedFilter(owner, operationId, now), previewRevision: String(generation) },
       {
-        $set: { text, textFormat: 'text', status: 'ready', embedded: true },
+        ...managedFilter(owner, operationId, now),
+        previewRevision: String(generation),
+        'securityApproval.subject.sha256': document.structure.source.sha256,
+        'securityApproval.subject.bytes': document.structure.source.bytes,
+        'securityApproval.subject.mediaType': document.structure.source.mediaType,
+        bytes: document.structure.source.bytes,
+        type: document.structure.source.mediaType,
+      },
+      {
+        $set: {
+          text: document.text,
+          documentStructure: document.structure,
+          textFormat: 'text',
+          status: 'ready',
+          embedded: true,
+        },
         $inc: { retentionRevision: 1 },
       },
       { session, timestamps: false },
@@ -661,7 +680,9 @@ export function createFileRetentionMethods(
         await session.withTransaction(
           async () => {
             const current = await File.findOne({ ...managedFileScope(owner), _id: row._id })
-              .select('+retainedDerivativeBytes +retainedDerivativeReservations')
+              .select(
+                '+retainedDerivativeBytes +retainedDerivativeReservations +documentStructure +securityApproval',
+              )
               .session(session)
               .lean<IMongoFile>();
             if (!current?.deletionRequestedAt) throw new FileSourceUnavailableError();

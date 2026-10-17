@@ -121,21 +121,66 @@ describe('managed document derivative storage', () => {
     }));
   it('publishes usable embedded text atomically through the existing File lifecycle', async () =>
     run(async () => {
+      const managedFiles = createFileRetentionMethods(mongoose, {
+        securityPolicySha256: 'c'.repeat(64),
+      });
       const context = await source();
       const operationId = context.sourceFileIds[0];
       await mongoose.models.File.updateOne(
         { file_id: operationId },
-        { $set: { uploadOperationId: operationId, embedded: false, status: 'pending' } },
+        {
+          $set: {
+            uploadOperationId: operationId,
+            embedded: false,
+            status: 'pending',
+            source: 's3',
+            storageKey: `t/${owner.tenantId}/managed-uploads/${owner.userId}/${operationId}.1__original`,
+            securityApproval: {
+              version: 1,
+              decision: 'approved',
+              policySha256: 'c'.repeat(64),
+              subject: {
+                ...owner,
+                operationId,
+                transferGeneration: 1,
+                bytes: 10,
+                mediaType: 'text/plain',
+                sha256: 'a'.repeat(64),
+              },
+              scannerVersion: 'fixture-v1',
+              checkedAt: new Date().toISOString(),
+              coverage: { complete: true, pages: 1, parts: 1 },
+            },
+          },
+        },
       );
       const session = await mongoose.startSession();
       try {
         await session.withTransaction(async () => {
-          await files.claimManagedUploadProcessing(owner, operationId, 3, Date.now(), session);
-          await files.publishManagedUpload(
+          await managedFiles.claimManagedUploadProcessing(
             owner,
             operationId,
             3,
-            'usable parsed text',
+            Date.now(),
+            session,
+          );
+          await managedFiles.publishManagedUpload(
+            owner,
+            operationId,
+            3,
+            {
+              text: 'usable parsed text',
+              structure: {
+                version: 1,
+                source: { sha256: 'a'.repeat(64), bytes: 10, mediaType: 'text/plain' },
+                extractor: { name: 'fixture', version: '1' },
+                pages: [],
+                elements: [
+                  { id: 'e1', kind: 'paragraph', start: 0, end: 18, page: null, parentId: null },
+                ],
+                quality: { status: 'complete', warnings: [] },
+              },
+            },
             Date.now(),
             session,
           );

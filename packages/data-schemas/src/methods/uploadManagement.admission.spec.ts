@@ -74,6 +74,27 @@ describe('durable upload admission pause', () => {
     checkedAt: new Date(now).toISOString(),
     coverage: { complete: true, pages: 1, parts: 1 },
   });
+  const documentResult = (text: string, bytes = 8) => ({
+    text,
+    writerStopped: true as const,
+    structure: {
+      version: 1 as const,
+      source: { sha256: originalSha256, bytes, mediaType: 'text/plain' },
+      extractor: { name: 'fixture', version: '1' },
+      pages: [],
+      elements: [
+        {
+          id: 'e1',
+          kind: 'paragraph' as const,
+          start: 0,
+          end: text.length,
+          page: null,
+          parentId: null,
+        },
+      ],
+      quality: { status: 'complete' as const, warnings: [] },
+    },
+  });
   const localGone = (lease: UploadLease) => ({
     operationId: lease.operationId,
     generation: lease.generation,
@@ -458,9 +479,9 @@ describe('durable upload admission pause', () => {
       },
       now + 1,
     );
-    expect(
-      await first.publish(parser, { text: 'document', writerStopped: true }, now + 1),
-    ).toMatchObject({ state: 'ready' });
+    expect(await first.publish(parser, documentResult('document'), now + 1)).toMatchObject({
+      state: 'ready',
+    });
     await second.confirmCleanup(localGone(parser), now + 1);
     expect(await first.get(user, 'continuing', now + 1)).toMatchObject({ state: 'ready' });
     expect((await first.metrics(now + 1)).staging.count).toBe(0);

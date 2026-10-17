@@ -1,6 +1,7 @@
 import { once } from 'node:events';
 import { extractManagedDocument, DocumentProcessingError } from '../../files/documents/managed';
 import { existingAttemptOriginal } from './paths';
+import { encodeDocumentResult } from './result';
 
 /** Dedicated entry: no credentials, storage, HTTP, DB or lifecycle imports. */
 async function main(): Promise<void> {
@@ -9,7 +10,7 @@ async function main(): Promise<void> {
   const [stagingRoot, attemptId, mediaType] = process.argv.slice(2);
   const filePath = await existingAttemptOriginal(stagingRoot, attemptId);
   const result = await extractManagedDocument({ filePath, mediaType });
-  if (!process.stdout.write(result.text, 'utf8')) {
+  if (!process.stdout.write(encodeDocumentResult(result))) {
     await once(process.stdout, 'drain');
   }
 }

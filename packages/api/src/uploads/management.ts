@@ -5,6 +5,7 @@ import {
   readUploadAcceptedMetadata,
 } from 'librechat-data-provider';
 import type {
+  ManagedDocumentResult,
   UploadPrincipal,
   UploadRequest,
   UploadOperation,
@@ -94,7 +95,7 @@ export interface UploadManagement {
   ): ReturnType<UploadRepository['bindProcessingExecution']>;
   publish(
     lease: UploadLease,
-    result: { text: string; writerStopped: true },
+    result: ManagedDocumentResult & { writerStopped: true },
   ): Promise<UploadOperation>;
   fail(lease: UploadLease, code: UploadErrorCode): Promise<UploadOperation>;
   confirmCleanup(proof: UploadCleanupProof): Promise<UploadOperation>;
@@ -273,7 +274,7 @@ export function createUploadManagement(deps: UploadManagementDependencies): Uplo
     getProcessingInput: (lease: UploadLease) => repository.getProcessingInput(lease, now()),
     bindProcessingExecution: (lease: UploadLease, execution: UploadParserExecution) =>
       repository.bindProcessingExecution(lease, execution, now()),
-    publish: (lease: UploadLease, result: { text: string; writerStopped: true }) =>
+    publish: (lease: UploadLease, result: ManagedDocumentResult & { writerStopped: true }) =>
       emit(repository.publish(lease, result, now())),
     fail: (lease: UploadLease, code: UploadErrorCode) => emit(repository.fail(lease, code, now())),
     confirmCleanup: (proof: UploadCleanupProof) => emit(repository.confirmCleanup(proof, now())),
