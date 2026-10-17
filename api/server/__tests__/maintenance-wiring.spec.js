@@ -3,6 +3,19 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../index.js'), 'utf8');
+test('gives uploads the same process identity as native application maintenance', async () => {
+  const identity = Object.freeze({ incarnation: 'native-process' });
+  const initializeUploads = jest.fn();
+  const statement = source.match(/const uploads = await initializeUploads\([^;]+;/)?.[0];
+  expect(statement).toBeDefined();
+  await vm.runInNewContext(`(async () => {${statement}})()`, {
+    registry: 'registry',
+    maintenance: { identity },
+    initializeUploads,
+  });
+  expect(initializeUploads).toHaveBeenCalledWith({ registry: 'registry', identity });
+});
+
 test('wires all actual work facades, late browser load, and the same external census', async () => {
   const facade = () => ({
     pauseAdmissions: jest.fn(),
@@ -46,6 +59,7 @@ test('wires all actual work facades, late browser load, and the same external ce
     'queuedTurns',
     'skillSync',
     'fileRetention',
+    'uploads',
     'auth',
   ]);
   expect(deps.workOwners.skillSync).toBe(context.skillSyncMaintenance);

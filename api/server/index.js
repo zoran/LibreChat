@@ -310,7 +310,7 @@ const startServer = async () => {
   configureAgentEventRuntime(appConfig?.endpoints?.agents?.eventDriven);
   warnOnUnreachableDeliveryPaths(appConfig);
   initializeFileStorage(appConfig);
-  const uploads = await initializeUploads({ registry });
+  const uploads = await initializeUploads({ registry, identity: maintenance.identity });
   if (uploads) {
     registerShutdownTask(
       'managed upload workers',

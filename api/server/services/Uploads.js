@@ -327,16 +327,27 @@ async function createUploadComposition({
 }
 
 /** Called once after database/storage initialization. Disabled means no adapter, timer or watch. */
-async function initializeUploads({ registry }) {
+async function initializeUploads({ registry, identity }) {
   if (process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED !== 'true') return undefined;
   if (current) return current;
+  if (
+    !identity ||
+    !/^[a-f0-9]{40}$/.test(identity.source) ||
+    identity.source !== process.env.BUILD_COMMIT ||
+    !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(identity.podUid) ||
+    identity.podUid !== process.env.POD_UID ||
+    !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+      identity.incarnation,
+    )
+  )
+    throw new Error('Upload process identity unavailable');
   const intakeConfig = await managedIntakeControlConfig();
   const security = await managedSecurityClient();
   const client = managedStorageClient();
   const mongoose = require('mongoose');
   const models = require('~/models');
   const { createUploadPlatform } = require('./UploadPlatform');
-  const worker = { hostId: process.env.POD_NODE_NAME, instanceId: process.env.POD_UID };
+  const worker = { hostId: process.env.POD_NODE_NAME, instanceId: identity.incarnation };
   const stagingRoot = '/var/lib/cortex/uploads/staging';
   await mkdir(stagingRoot, { recursive: true, mode: 0o700 });
   const directory = await lstat(stagingRoot);

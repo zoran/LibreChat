@@ -2,10 +2,12 @@
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { createHttpUploadSecurityPort } from '../security/transport';
+import { createMaintenanceIdentity } from '../../app/identity';
 import { createIntakeChannel } from './channel';
 import { startIntakeService } from './service';
 
 async function main(): Promise<void> {
+  const identity = createMaintenanceIdentity(process.env, true);
   if (
     Object.keys(process.env).some((name) =>
       /^(?:JWT_SECRET|JWT_REFRESH_SECRET|MONGO_URI|DATABASE_URL|AWS_ACCESS_KEY_ID|AWS_SECRET_ACCESS_KEY|OPENAI_API_KEY)$/.test(
@@ -45,7 +47,7 @@ async function main(): Promise<void> {
   const service = await startIntakeService({
     channel,
     security,
-    worker: { hostId: process.env.POD_NODE_NAME ?? '', instanceId: process.env.POD_UID ?? '' },
+    worker: { hostId: process.env.POD_NODE_NAME ?? '', instanceId: identity.incarnation },
     stagingRoot: process.env.UPLOAD_INTAKE_ROOT ?? '/var/run/cortex-intake',
     allowedOrigins: (process.env.UPLOAD_INTAKE_ALLOWED_ORIGINS ?? '').split(',').filter(Boolean),
   });

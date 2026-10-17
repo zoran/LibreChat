@@ -18,9 +18,11 @@ import type {
 } from 'librechat-data-provider';
 import type { SecurityMarkingPolicy } from './markings';
 import type { UploadSecurityPort } from '../contract';
+import type { ApplicationWorkPort } from '~/app';
 import { inspectSecurityMarkings } from './markings';
 
 export type SecurityWorker = UploadSecurityPort & {
+  maintenance: ApplicationWorkPort;
   close(signal: AbortSignal): Promise<{ complete: boolean }>;
 };
 
@@ -39,6 +41,7 @@ type RecordState = {
   state: 'prepared' | 'running' | 'finished';
   controller: AbortController;
   done: Promise<void>;
+  active: boolean;
   inputStopped: boolean;
   threadStopped: boolean;
   bytesRemoved: boolean;
@@ -91,6 +94,7 @@ export function createSecurityWorker(options: Options): SecurityWorker {
   const policy: SecurityMarkingPolicy = JSON.parse(JSON.stringify(options.policy));
   const records = new Map<string, RecordState>();
   let closed = false;
+  let pausedBy: string | null = null;
   function snapshot(record: RecordState) {
     return { ...record.execution };
   }
@@ -117,10 +121,51 @@ export function createSecurityWorker(options: Options): SecurityWorker {
     };
   }
   function stop(record: RecordState) {
+    if (record.controller.signal.aborted) return;
     record.controller.abort();
     if (record.state === 'prepared') record.state = 'finished';
     if (record.thread) void record.thread.terminate().catch(() => {});
   }
+  function census() {
+    let queuedContinuations = 0;
+    let pendingWrites = 0;
+    for (const record of records.values()) {
+      if (record.state === 'prepared' && now() >= Date.parse(record.execution.expiresAt))
+        stop(record);
+      if (record.state === 'prepared') queuedContinuations++;
+      else if (record.active || !settlement(record.execution, record).transientDataRemoved)
+        pendingWrites++;
+    }
+    return { queuedContinuations, pendingWrites };
+  }
+  const maintenance: ApplicationWorkPort = {
+    pauseAdmissions(requestId) {
+      if (
+        closed ||
+        typeof requestId !== 'string' ||
+        !requestId ||
+        (pausedBy !== null && pausedBy !== requestId)
+      )
+        return false;
+      pausedBy = requestId;
+      return true;
+    },
+    resumeAdmissions(requestId) {
+      if (closed || pausedBy === null || pausedBy !== requestId) return false;
+      const counts = census();
+      if (counts.queuedContinuations || counts.pendingWrites) return false;
+      pausedBy = null;
+      return true;
+    },
+    async getMaintenanceCensus(requestId) {
+      const counts = census();
+      return {
+        admissionClosed: requestId !== null && pausedBy === requestId,
+        ...counts,
+        complete: (pausedBy === null || pausedBy === requestId) && counts.pendingWrites === 0,
+      };
+    },
+  };
   function live(record: RecordState) {
     if (record.controller.signal.aborted || now() >= Date.parse(record.execution.expiresAt)) {
       stop(record);
@@ -275,12 +320,13 @@ export function createSecurityWorker(options: Options): SecurityWorker {
   }
   return {
     policySha256,
+    maintenance,
     async prepare(input: {
       attemptId: string;
       subject: UploadSecuritySubject;
       signal: AbortSignal;
     }) {
-      if (closed || input.signal.aborted) throw unavailable();
+      if (closed || pausedBy !== null || input.signal.aborted) throw unavailable();
       const subject = readUploadSecuritySubject(input.subject);
       if (!subject || input.attemptId !== `${subject.operationId}.${subject.transferGeneration}`)
         throw unavailable();
@@ -319,6 +365,7 @@ export function createSecurityWorker(options: Options): SecurityWorker {
         state: 'prepared',
         controller: new AbortController(),
         done: Promise.resolve(),
+        active: false,
         inputStopped: true,
         threadStopped: true,
         bytesRemoved: true,
@@ -346,6 +393,7 @@ export function createSecurityWorker(options: Options): SecurityWorker {
         throw unavailable();
       live(record);
       record.state = 'running';
+      record.active = true;
       record.inputStopped = false;
       const abort = () => stop(record);
       input.signal.addEventListener('abort', abort, { once: true });
@@ -355,7 +403,10 @@ export function createSecurityWorker(options: Options): SecurityWorker {
           () => {},
           () => {},
         )
-        .finally(() => input.signal.removeEventListener('abort', abort));
+        .finally(() => {
+          record.active = false;
+          input.signal.removeEventListener('abort', abort);
+        });
       return wait(task, record.controller.signal);
     },
     async cancel(input: { execution: UploadSecurityExecution; signal: AbortSignal }) {
@@ -371,8 +422,10 @@ export function createSecurityWorker(options: Options): SecurityWorker {
       return settlement(execution, record);
     },
     async close(signal: AbortSignal): Promise<{ complete: boolean }> {
-      closed = true;
-      for (const record of records.values()) stop(record);
+      if (!closed) {
+        closed = true;
+        for (const record of records.values()) stop(record);
+      }
       try {
         await wait(Promise.all([...records.values()].map((record) => record.done)), signal);
       } catch {

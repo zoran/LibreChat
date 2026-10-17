@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:https';
 import type { AddressInfo } from 'node:net';
+import type { ApplicationWorkPort } from '~/app';
 import { createSecurityRequestHandler } from './transport';
 import { waitForSecurityResponse } from './cancellation';
 import { inspectSecurityMarkings } from './markings';
@@ -17,6 +18,7 @@ export async function startSecurityService(options: {
   port?: number;
 }): Promise<{
   address: AddressInfo;
+  maintenance: ApplicationWorkPort;
   close(signal?: AbortSignal): Promise<{ complete: boolean }>;
 }> {
   if (
@@ -45,6 +47,26 @@ export async function startSecurityService(options: {
     policySha256: options.policySha256,
     threadPath: options.threadPath,
   });
+  const active = new Set<Promise<void>>();
+  let stopped = false;
+  let closed: Promise<void> | undefined;
+  const maintenance: ApplicationWorkPort = {
+    pauseAdmissions(requestId) {
+      return !stopped && worker.maintenance.pauseAdmissions(requestId);
+    },
+    resumeAdmissions(requestId) {
+      return !stopped && active.size === 0 && worker.maintenance.resumeAdmissions(requestId);
+    },
+    async getMaintenanceCensus(requestId) {
+      const census = await worker.maintenance.getMaintenanceCensus(requestId);
+      return {
+        ...census,
+        // Handler and worker are distinct obligations, even for the same inspection.
+        pendingWrites: census.pendingWrites + active.size,
+        complete: census.complete && active.size === 0,
+      };
+    },
+  };
   const server = createServer(
     {
       ...options.tls,
@@ -56,7 +78,12 @@ export async function startSecurityService(options: {
       headersTimeout: 5000,
       keepAliveTimeout: 1000,
     },
-    createSecurityRequestHandler(worker),
+    createSecurityRequestHandler(worker, {
+      track(work) {
+        active.add(work);
+        void work.finally(() => active.delete(work)).catch(() => undefined);
+      },
+    }),
   );
   server.maxConnections = 8;
   server.maxRequestsPerSocket = 2;
@@ -70,13 +97,21 @@ export async function startSecurityService(options: {
   });
   return {
     address: server.address() as AddressInfo,
+    maintenance,
     async close(signal = AbortSignal.timeout(10000)): Promise<{ complete: boolean }> {
-      const stopped = new Promise<void>((resolve) => server.close(() => resolve()));
+      if (!stopped) {
+        stopped = true;
+        closed = new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+      const drained = worker.close(signal);
       server.closeAllConnections();
-      const drained = await worker.close(signal);
       try {
-        await waitForSecurityResponse(() => stopped, signal);
-        return { complete: drained.complete };
+        return await waitForSecurityResponse(async () => {
+          const result = await drained;
+          await closed;
+          while (active.size) await Promise.allSettled([...active]);
+          return { complete: result.complete };
+        }, signal);
       } catch {
         return { complete: false };
       }

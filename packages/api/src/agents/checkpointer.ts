@@ -13,7 +13,22 @@ import type { BaseMessage } from '@librechat/agents/langchain/messages';
 import type { TCheckpointerConfig } from 'librechat-data-provider';
 import type { IndexBuildOptions } from '@librechat/data-schemas';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { DurableAgentCheckpointScope } from './checkpoints/durable';
 import type { ResolvedCheckpointerConfig } from './checkpoints/config';
+import {
+  LIBRECHAT_CHECKPOINT_NAMESPACE_KEY,
+  LIBRECHAT_EVENT_ACTOR_INVOCATION_KEY,
+  toStorageCheckpointConfig,
+  fromStorageCheckpointConfig,
+  fromStorageCheckpointTuple,
+  generationNamespaceFilter,
+} from './checkpoints/namespace';
+import {
+  DurableMongoSaver,
+  CHECKPOINT_HARD_LIMIT_BYTES,
+  CHECKPOINT_WARN_BYTES,
+  CheckpointTooLargeError,
+} from './checkpoints/durable';
 import {
   OwnedMongoSaver,
   LIBRECHAT_CHECKPOINT_OWNER_KEY,
@@ -21,6 +36,18 @@ import {
 } from './checkpoints/saver';
 import { checkpointOwnerNamespacePrefix } from '../stream/checkpoints';
 import { resolveCheckpointerConfig } from './checkpoints/config';
+
+export {
+  DurableMongoSaver,
+  CHECKPOINT_HARD_LIMIT_BYTES,
+  CHECKPOINT_WARN_BYTES,
+  CheckpointTooLargeError,
+} from './checkpoints/durable';
+export type { DurableAgentCheckpointScope } from './checkpoints/durable';
+export {
+  LIBRECHAT_CHECKPOINT_NAMESPACE_KEY,
+  LIBRECHAT_EVENT_ACTOR_INVOCATION_KEY,
+} from './checkpoints/namespace';
 
 export {
   LIBRECHAT_CHECKPOINT_OWNER_KEY,
@@ -36,108 +63,9 @@ export {
 export type { ResolvedCheckpointerConfig } from './checkpoints/config';
 export { DEFAULT_CHECKPOINT_TTL_SECONDS } from '../stream/checkpoints';
 
-/**
- * LangGraph reserves `checkpoint_ns` for nested graph namespaces and forcibly
- * resets a non-empty value to `''` for every root invocation. Carry LibreChat's
- * immutable generation scope on a private configurable key instead; the saver
- * adapter below maps it into Mongo's storage namespace without changing the
- * graph-visible conversation `thread_id`.
- */
-export const LIBRECHAT_CHECKPOINT_NAMESPACE_KEY = '__librechat_checkpoint_ns';
-/** Marks a checkpoint write as belonging to an isolated event-actor attempt.
- * Unlike ordinary clean chat exits, these exits are durable candidate heads. */
-export const LIBRECHAT_EVENT_ACTOR_INVOCATION_KEY = '__librechat_event_actor_invocation_id';
-
-const CHECKPOINT_NAMESPACE_SEPARATOR = '|';
-
-function generationCheckpointNamespace(config: RunnableConfig): string | undefined {
-  const value = config.configurable?.[LIBRECHAT_CHECKPOINT_NAMESPACE_KEY];
-  return typeof value === 'string' && value.length > 0 ? value : undefined;
-}
-
 function isEventActorInvocation(config: RunnableConfig): boolean {
   const value = config.configurable?.[LIBRECHAT_EVENT_ACTOR_INVOCATION_KEY];
   return typeof value === 'string' && value.length > 0;
-}
-
-/** Prefix every root/subgraph storage namespace with the immutable generation. */
-function toStorageCheckpointConfig(config: RunnableConfig): RunnableConfig {
-  const generationNamespace = generationCheckpointNamespace(config);
-  if (!generationNamespace) {
-    return config;
-  }
-  const graphNamespace =
-    typeof config.configurable?.checkpoint_ns === 'string' ? config.configurable.checkpoint_ns : '';
-  return {
-    ...config,
-    configurable: {
-      ...config.configurable,
-      checkpoint_ns:
-        graphNamespace === ''
-          ? generationNamespace
-          : `${generationNamespace}${CHECKPOINT_NAMESPACE_SEPARATOR}${graphNamespace}`,
-    },
-  };
-}
-
-/** Restore the namespace LangGraph supplied while retaining the private scope. */
-function fromStorageCheckpointConfig(
-  storedConfig: RunnableConfig,
-  requestedConfig: RunnableConfig,
-): RunnableConfig {
-  const generationNamespace = generationCheckpointNamespace(requestedConfig);
-  if (!generationNamespace) {
-    return storedConfig;
-  }
-  const graphNamespace =
-    typeof requestedConfig.configurable?.checkpoint_ns === 'string'
-      ? requestedConfig.configurable.checkpoint_ns
-      : '';
-  return {
-    ...storedConfig,
-    configurable: {
-      ...storedConfig.configurable,
-      ...(requestedConfig.configurable?.[LIBRECHAT_CHECKPOINT_OWNER_KEY] && {
-        [LIBRECHAT_CHECKPOINT_OWNER_KEY]:
-          requestedConfig.configurable[LIBRECHAT_CHECKPOINT_OWNER_KEY],
-      }),
-      ...(requestedConfig.configurable?.[LIBRECHAT_LEGACY_CHECKPOINT_KEY] && {
-        [LIBRECHAT_LEGACY_CHECKPOINT_KEY]:
-          storedConfig.configurable?.[LIBRECHAT_LEGACY_CHECKPOINT_KEY] ??
-          requestedConfig.configurable[LIBRECHAT_LEGACY_CHECKPOINT_KEY],
-      }),
-      thread_id: requestedConfig.configurable?.thread_id ?? storedConfig.configurable?.thread_id,
-      checkpoint_ns: graphNamespace,
-      [LIBRECHAT_CHECKPOINT_NAMESPACE_KEY]: generationNamespace,
-    },
-  };
-}
-
-function fromStorageCheckpointTuple(
-  tuple: CheckpointTuple,
-  requestedConfig: RunnableConfig,
-): CheckpointTuple {
-  return {
-    ...tuple,
-    config: fromStorageCheckpointConfig(tuple.config, requestedConfig),
-    ...(tuple.parentConfig && {
-      parentConfig: fromStorageCheckpointConfig(tuple.parentConfig, requestedConfig),
-    }),
-  };
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-/** Mongo filter matching a generation's root and every nested graph namespace. */
-function generationNamespaceFilter(checkpointNamespace: string): string | { $regex: string } {
-  if (checkpointNamespace === '') {
-    return '';
-  }
-  return {
-    $regex: `^${escapeRegExp(checkpointNamespace)}(?:\\${CHECKPOINT_NAMESPACE_SEPARATOR}|$)`,
-  };
 }
 
 /**
@@ -258,57 +186,6 @@ function hasResumableWrite(writes: PendingWrite[]): boolean {
 interface BufferedWriteBatch {
   at: number;
   batches: Array<{ config: RunnableConfig; writes: PendingWrite[]; taskId: string }>;
-}
-
-/**
- * MongoDB's hard per-document ceiling. A checkpoint whose serialized state pushes its
- * document past this cannot be stored — the driver throws `BSONObjectTooLarge` (code 10334).
- */
-const MAX_BSON_DOCUMENT_BYTES = 16 * 1024 * 1024;
-
-/**
- * Headroom reserved below {@link MAX_BSON_DOCUMENT_BYTES} for a checkpoint document's
- * non-state fields (ids, metadata, `metadata_search`, BSON framing). The serialized
- * `checkpoint` blob dominates the document; this margin covers everything else so the guard
- * rejects before Mongo does — with a legible error instead of a raw driver failure.
- */
-const CHECKPOINT_SIZE_HEADROOM_BYTES = 1024 * 1024;
-
-/**
- * Reject a checkpoint whose serialized state exceeds this. The pause is unrecoverable either
- * way (the document can't be written), so failing here as a typed {@link CheckpointTooLargeError}
- * turns an opaque `BSONObjectTooLarge` crash into an actionable one.
- */
-export const CHECKPOINT_HARD_LIMIT_BYTES: number =
-  MAX_BSON_DOCUMENT_BYTES - CHECKPOINT_SIZE_HEADROOM_BYTES;
-
-/**
- * Warn once a persisted checkpoint crosses this soft threshold (~50% of the ceiling), so a
- * conversation's checkpoint growth is visible in logs well before it reaches the hard limit.
- */
-export const CHECKPOINT_WARN_BYTES: number = 8 * 1024 * 1024;
-
-/**
- * A durable checkpoint whose serialized state exceeds {@link CHECKPOINT_HARD_LIMIT_BYTES} — more
- * than MongoDB can hold in a single document. Thrown BEFORE the doomed write so the run fails
- * with a clear, typed message instead of a raw driver `BSONObjectTooLarge`. The checkpoint cannot
- * be persisted regardless of how it is handled upstream, so a durable resume is impossible.
- */
-export class CheckpointTooLargeError extends Error {
-  readonly code = 'CHECKPOINT_TOO_LARGE';
-  constructor(
-    readonly bytes: number,
-    readonly limit: number,
-    readonly threadId?: string,
-  ) {
-    const mb = (n: number): string => (n / 1024 / 1024).toFixed(1);
-    super(
-      `Checkpoint state is ${mb(bytes)} MB, over the ${mb(limit)} MB durable limit. ` +
-        'This conversation carries too much state to resume — large tool outputs or inlined ' +
-        'media are the usual cause. Start a new conversation or reduce context.',
-    );
-    this.name = 'CheckpointTooLargeError';
-  }
 }
 
 /**
@@ -689,6 +566,55 @@ export async function getAgentCheckpointer(
     saverPromise = buildMongoSaver(resolved);
   }
   return saverPromise;
+}
+
+/** Scope-bound native persistence; missing Mongo or required indexes is fatal. */
+export async function getDurableAgentCheckpointer(
+  scope: DurableAgentCheckpointScope,
+  cfg?: TCheckpointerConfig,
+): Promise<DurableMongoSaver> {
+  const resolved = resolveCheckpointerConfig(cfg);
+  const names = [resolved.checkpointCollectionName, resolved.checkpointWritesCollectionName];
+  if (
+    resolved.type !== 'mongo' ||
+    !Number.isSafeInteger(resolved.ttlSeconds) ||
+    resolved.ttlSeconds <= 0 ||
+    resolved.ttlSeconds > 2147483647 ||
+    names[0] === names[1] ||
+    names.some(
+      (name) => !/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,119}$/.test(name) || name.startsWith('system.'),
+    )
+  ) {
+    throw new Error('Durable checkpoints require valid Mongo storage and retention settings');
+  }
+  const db = mongoose.connection.db;
+  if (mongoose.connection.readyState !== 1 || db == null) {
+    throw new Error('Mongo is unavailable for durable checkpoints');
+  }
+  // Construction snapshots the scope synchronously, before setup can yield.
+  const saver = new DurableMongoSaver({
+    scope,
+    client: mongoose.connection.getClient() as unknown as ConstructorParameters<
+      typeof MongoDBSaver
+    >[0]['client'],
+    dbName: db.databaseName,
+    checkpointCollectionName: resolved.checkpointCollectionName,
+    checkpointWritesCollectionName: resolved.checkpointWritesCollectionName,
+    ttl: resolved.ttlSeconds,
+  });
+  const errors = await setupCheckpointIndexes(saver);
+  if (errors.length > 0) throw errors[0];
+  for (const name of names) {
+    await buildIndexWithRetry(
+      () => db.collection(name).createIndex({ checkpoint_ns: 1 }),
+      `${name}.checkpoint_ns`,
+    );
+    await buildIndexWithRetry(
+      () => db.collection(name).createIndex({ lc_owner: 1, thread_id: 1 }),
+      `${name}.lc_owner`,
+    );
+  }
+  return saver;
 }
 
 export interface AgentEventCheckpointReference {

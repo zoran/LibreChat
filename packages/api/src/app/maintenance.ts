@@ -1,9 +1,13 @@
 import { createServer } from 'node:http';
 import { setTimeout, clearTimeout } from 'node:timers';
-import { randomUUID, timingSafeEqual, createHash } from 'node:crypto';
+import { timingSafeEqual, createHash } from 'node:crypto';
 import type { GenerationAdmissionMethods } from '@librechat/data-schemas';
 import type { IncomingMessage, ServerResponse, Server } from 'node:http';
 import type { RequestHandler } from 'express';
+import type { MaintenanceIdentity } from './identity';
+import { createMaintenanceIdentity } from './identity';
+
+export type { MaintenanceIdentity } from './identity';
 
 /** Existing application owners report their own admitted work; no provider registry here. */
 export interface ApplicationWorkCensus {
@@ -38,11 +42,6 @@ export interface GenerationMaintenancePort {
   reopenGenerationAdmission(requestId: string): boolean;
   getGenerationAdmissionCensus(): Promise<GenerationMaintenanceCensus>;
   getGenerationRuntimeHealth(): Promise<boolean>;
-}
-export interface MaintenanceIdentity {
-  podUid: string;
-  source: string;
-  incarnation: string;
 }
 export interface MaintenanceDependencies {
   env: Record<string, string | undefined>;
@@ -143,16 +142,8 @@ async function readRequest(req: IncomingMessage): Promise<unknown> {
 export function createAppMaintenance(deps: MaintenanceDependencies): AppMaintenance {
   const token = deps.env.LIBRECHAT_MAINTENANCE_TOKEN;
   const controlEnabled = token !== undefined;
-  const source = deps.env.BUILD_COMMIT ?? '';
-  const podUid = deps.env.POD_UID ?? '';
   const port = Number(deps.env.LIBRECHAT_MAINTENANCE_PORT ?? '3091');
-  if (
-    (controlEnabled || deps.requiredSharedState) &&
-    (!/^[a-f0-9]{40}$/.test(source) ||
-      !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(podUid))
-  ) {
-    throw new Error('Invalid application runtime identity');
-  }
+  const identity = createMaintenanceIdentity(deps.env, controlEnabled || deps.requiredSharedState);
   if (
     controlEnabled &&
     (!token ||
@@ -163,11 +154,6 @@ export function createAppMaintenance(deps: MaintenanceDependencies): AppMaintena
   ) {
     throw new Error('Invalid private maintenance configuration');
   }
-  const identity: MaintenanceIdentity = Object.freeze({
-    podUid,
-    source,
-    incarnation: randomUUID(),
-  });
   const tokenHash = hash(token ?? '');
   let requestId: string | null = null;
   let revision = 0;

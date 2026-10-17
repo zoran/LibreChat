@@ -332,7 +332,10 @@ function reply(res: ServerResponse, status: number, value: unknown) {
 }
 
 /** Composition must also configure HTTPS requestCert and rejectUnauthorized. */
-export function createSecurityRequestHandler(worker: UploadSecurityPort): RequestListener {
+export function createSecurityRequestHandler(
+  worker: UploadSecurityPort,
+  options: { track?: (work: Promise<void>) => void } = {},
+): RequestListener {
   return (req, res) => {
     if (!(req.socket instanceof TLSSocket) || req.socket.authorized !== true) {
       reply(res, 403, { code: 'security_uninspectable' });
@@ -344,76 +347,81 @@ export function createSecurityRequestHandler(worker: UploadSecurityPort): Reques
     };
     req.once('aborted', clock.abort);
     res.once('close', disconnect);
-    void bounded(async () => {
-      if (req.url === '/healthz' && req.method === 'GET') {
-        reply(res, 200, { version: 1 });
-        return;
-      }
-      if (req.url === '/v1/inspect' && req.method === 'PUT') {
-        profile(req, 'application/octet-stream');
-        const context = header(req, 'x-upload-security-context');
-        if (
-          !context ||
-          context.length > CONTEXT_LIMIT ||
-          Buffer.from(context, 'base64').toString('base64') !== context
-        )
+    void bounded(() => {
+      const work = (async () => {
+        if (req.url === '/healthz' && req.method === 'GET') {
+          reply(res, 200, { version: 1 });
+          return;
+        }
+        if (req.url === '/v1/inspect' && req.method === 'PUT') {
+          profile(req, 'application/octet-stream');
+          const context = header(req, 'x-upload-security-context');
+          if (
+            !context ||
+            context.length > CONTEXT_LIMIT ||
+            Buffer.from(context, 'base64').toString('base64') !== context
+          )
+            throw failure();
+          const record = closed(json(Buffer.from(context, 'base64')), ['execution', 'subject']);
+          const execution = readUploadSecurityExecution(record.execution);
+          if (!execution) throw failure();
+          const subject = boundSubject(record.subject, execution.attemptId);
+          if (
+            header(req, 'content-length') !== String(subject.bytes) ||
+            header(req, 'transfer-encoding') !== undefined
+          )
+            throw failure();
+          let complete = false;
+          const body = (async function* () {
+            let bytes = 0;
+            for await (const chunk of req) {
+              clock.signal.throwIfAborted();
+              bytes += chunk.length;
+              if (bytes > subject.bytes) throw failure();
+              yield chunk as Buffer;
+            }
+            if (bytes !== subject.bytes) throw failure();
+            complete = true;
+          })();
+          const inspection = readUploadSecurityInspection(
+            await worker.inspect({ execution, subject, body, signal: clock.signal }),
+          );
+          if (!inspection || (inspection.decision.decision === 'approved' && !complete))
+            throw failure();
+          reply(res, 200, { version: 1, execution, inspection });
+          return;
+        }
+        if (req.method !== 'POST' || (req.url !== '/v1/prepare' && req.url !== '/v1/cancel'))
           throw failure();
-        const record = closed(json(Buffer.from(context, 'base64')), ['execution', 'subject']);
-        const execution = readUploadSecurityExecution(record.execution);
-        if (!execution) throw failure();
-        const subject = boundSubject(record.subject, execution.attemptId);
-        if (
-          header(req, 'content-length') !== String(subject.bytes) ||
-          header(req, 'transfer-encoding') !== undefined
-        )
-          throw failure();
-        let complete = false;
-        const body = (async function* () {
-          let bytes = 0;
-          for await (const chunk of req) {
-            clock.signal.throwIfAborted();
-            bytes += chunk.length;
-            if (bytes > subject.bytes) throw failure();
-            yield chunk as Buffer;
-          }
-          if (bytes !== subject.bytes) throw failure();
-          complete = true;
-        })();
-        const inspection = readUploadSecurityInspection(
-          await worker.inspect({ execution, subject, body, signal: clock.signal }),
-        );
-        if (!inspection || (inspection.decision.decision === 'approved' && !complete))
-          throw failure();
-        reply(res, 200, { version: 1, execution, inspection });
-        return;
-      }
-      if (req.method !== 'POST' || (req.url !== '/v1/prepare' && req.url !== '/v1/cancel'))
-        throw failure();
-      profile(req, 'application/json');
-      const value = await readJson(req, clock.signal);
-      if (req.url === '/v1/prepare') {
-        const record = closed(value, ['attemptId', 'subject']);
-        const subject = boundSubject(record.subject, record.attemptId);
-        const execution = readUploadSecurityExecution(
-          await worker.prepare({
-            attemptId: record.attemptId as string,
-            subject,
-            signal: clock.signal,
-          }),
-        );
-        if (!execution || execution.attemptId !== record.attemptId) throw failure();
-        reply(res, 200, { version: 1, execution });
-      } else {
-        const record = closed(value, ['execution']);
-        const execution = readUploadSecurityExecution(record.execution);
-        if (!execution) throw failure();
-        const settlement = readUploadSecuritySettlement(
-          await worker.cancel({ execution, signal: clock.signal }),
-        );
-        if (!settlement || !matchesUploadSecurityExecution(settlement.execution, execution))
-          throw failure();
-        reply(res, 200, { version: 1, execution, settlement });
-      }
+        profile(req, 'application/json');
+        const value = await readJson(req, clock.signal);
+        if (req.url === '/v1/prepare') {
+          const record = closed(value, ['attemptId', 'subject']);
+          const subject = boundSubject(record.subject, record.attemptId);
+          const execution = readUploadSecurityExecution(
+            await worker.prepare({
+              attemptId: record.attemptId as string,
+              subject,
+              signal: clock.signal,
+            }),
+          );
+          if (!execution || execution.attemptId !== record.attemptId) throw failure();
+          reply(res, 200, { version: 1, execution });
+        } else {
+          const record = closed(value, ['execution']);
+          const execution = readUploadSecurityExecution(record.execution);
+          if (!execution) throw failure();
+          const settlement = readUploadSecuritySettlement(
+            await worker.cancel({ execution, signal: clock.signal }),
+          );
+          if (!settlement || !matchesUploadSecurityExecution(settlement.execution, execution))
+            throw failure();
+          reply(res, 200, { version: 1, execution, settlement });
+        }
+      })();
+      // Track the actual handler, not the deadline race or HTTP response lifetime.
+      options.track?.(work);
+      return work;
     }, clock.signal)
       .catch(() => reply(res, 400, { code: 'security_uninspectable' }))
       .finally(() => {

@@ -1,9 +1,14 @@
 /** Standalone intake process: no application bootstrap, database or ordinary storage credentials. */
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
+import { createMaintenanceIdentity } from '../../app/identity';
 import { startSecurityService } from './service';
 
 async function main() {
+  const identity = createMaintenanceIdentity(process.env, true);
+  const port = Number(process.env.UPLOAD_SECURITY_PORT ?? '8443');
+  if (!Number.isInteger(port) || port < 1 || port > 65535)
+    throw new Error('Security configuration unavailable');
   const material = async (name: string) => {
     const file = process.env[name];
     if (!file || !path.isAbsolute(file)) throw new Error('Security configuration unavailable');
@@ -19,7 +24,8 @@ async function main() {
     material('UPLOAD_SECURITY_POLICY_FILE'),
   ]);
   const service = await startSecurityService({
-    instanceId: process.env.POD_UID ?? '',
+    instanceId: identity.incarnation,
+    port,
     policySha256: process.env.UPLOAD_SECURITY_POLICY_SHA256 ?? '',
     policyBytes,
     tls: { ca, cert, key },

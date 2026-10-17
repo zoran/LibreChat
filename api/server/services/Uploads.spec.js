@@ -2,6 +2,7 @@ const jwt = require('jsonwebtoken');
 const { Registry } = require('prom-client');
 jest.mock('node:fs/promises', () => ({ mkdir: jest.fn(), lstat: jest.fn(), readFile: jest.fn() }));
 jest.mock('~/models', () => ({}));
+jest.mock('./UploadPlatform', () => ({ createUploadPlatform: jest.fn() }));
 jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
   createUploadManagementRepository: jest.fn(),
@@ -205,9 +206,35 @@ describe('Cortex upload adapter trust boundaries', () => {
     expect(require('node:fs/promises').mkdir).not.toHaveBeenCalled();
   });
 
+  it.each([
+    undefined,
+    { podUid: 'other-pod', source: 'a'.repeat(40), incarnation: 'c'.repeat(36) },
+    {
+      podUid: '12345678-1234-4234-8234-123456789012',
+      source: 'b'.repeat(40),
+      incarnation: '52345678-1234-4234-8234-123456789012',
+    },
+  ])(
+    'requires the actual application process identity before opening upload dependencies',
+    async (identity) => {
+      process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = 'true';
+      process.env.POD_UID = '12345678-1234-4234-8234-123456789012';
+      process.env.BUILD_COMMIT = 'a'.repeat(40);
+      await expect(initializeUploads({ identity })).rejects.toThrow(
+        'Upload process identity unavailable',
+      );
+      expect(initializeS3).not.toHaveBeenCalled();
+      expect(require('node:fs/promises').readFile).not.toHaveBeenCalled();
+      expect(require('node:fs/promises').mkdir).not.toHaveBeenCalled();
+    },
+  );
+
   it('binds the native durable owner to the validated scanner policy', async () => {
     Object.assign(process.env, {
       CORTEX_UPLOAD_MANAGEMENT_ENABLED: 'true',
+      POD_NODE_NAME: 'cpu-2',
+      POD_UID: '12345678-1234-4234-8234-123456789012',
+      BUILD_COMMIT: 'a'.repeat(40),
       UPLOAD_SECURITY_ENDPOINT: 'https://scanner.example.test:8443',
       UPLOAD_SECURITY_ALLOWED_HOSTS: 'scanner.example.test',
       UPLOAD_SECURITY_POLICY_SHA256: 'a'.repeat(64),
@@ -235,12 +262,23 @@ describe('Cortex upload adapter trust boundaries', () => {
     const security = { policySha256: 'b'.repeat(64) };
     createHttpUploadSecurityPort.mockReturnValue(security);
     const { createUploadManagementRepository } = require('@librechat/data-schemas');
-    createUploadManagementRepository.mockImplementation(() => {
-      throw new Error('fixture-constructor-stop');
+    const repository = { initialize: jest.fn(async () => {}) };
+    createUploadManagementRepository.mockReturnValue(repository);
+    const { createUploadPlatform } = require('./UploadPlatform');
+    createUploadPlatform.mockRejectedValue(new Error('fixture-platform-stop'));
+    const identity = Object.freeze({
+      podUid: process.env.POD_UID,
+      source: process.env.BUILD_COMMIT,
+      incarnation: '52345678-1234-4234-8234-123456789012',
     });
-    await expect(initializeUploads({})).rejects.toThrow('fixture-constructor-stop');
+    await expect(initializeUploads({ identity })).rejects.toThrow('fixture-platform-stop');
     expect(createUploadManagementRepository).toHaveBeenCalledWith(require('mongoose'), {
       securityPolicySha256: security.policySha256,
+    });
+    expect(createUploadPlatform).toHaveBeenCalledWith({
+      repository,
+      worker: { hostId: 'cpu-2', instanceId: identity.incarnation },
+      stagingRoot: '/var/lib/cortex/uploads/staging',
     });
   });
 

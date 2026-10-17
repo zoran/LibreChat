@@ -112,6 +112,53 @@ describe('bounded authenticated scanner transport', () => {
   }
   const client = (endpoint: string, tls = { ca, cert, key }) =>
     createHttpUploadSecurityPort({ endpoint, allowedHosts: ['127.0.0.1'], policySha256, tls });
+  it('tracks the actual handler after disconnect until an abort-ignoring scanner call settles', async () => {
+    const scanner = worker();
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const remaining = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    scanner.inspect.mockImplementation(async (input) => {
+      for await (const _chunk of input.body) {
+        /* actual complete HTTP body */
+      }
+      entered();
+      await remaining;
+      return inspection();
+    });
+    const active = new Set<Promise<void>>();
+    const endpoint = await serve(
+      createSecurityRequestHandler(scanner, {
+        track(work) {
+          active.add(work);
+          void work.finally(() => active.delete(work)).catch(() => undefined);
+        },
+      }),
+    );
+    const controller = new AbortController();
+    const result = client(endpoint).inspect({
+      execution,
+      subject,
+      body: body(),
+      signal: controller.signal,
+    });
+    const failed = result.catch((error: unknown) => error);
+    try {
+      await started;
+      expect(active.size).toBe(1);
+      controller.abort();
+      expect(await failed).toBeInstanceOf(Error);
+      expect(active.size).toBe(1);
+    } finally {
+      release();
+      await Promise.allSettled([...active]);
+    }
+    expect(active.size).toBe(0);
+  });
   async function raw(
     endpoint: string,
     route: string,
