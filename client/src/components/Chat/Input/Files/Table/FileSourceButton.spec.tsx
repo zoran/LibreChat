@@ -18,6 +18,7 @@ jest.mock('~/hooks', () => ({
     values ? `${key}: ${values[0]}` : key,
 }));
 jest.mock('~/utils', () => ({
+  cn: jest.requireActual('~/utils/cn').default,
   getDownloadFilename: (name: string) => name,
   logger: { error: jest.fn() },
   sortPagesByRelevance: () => [],
