@@ -35,9 +35,9 @@ const TRUNCATION_SAFETY_BUFFER = 0.98;
  * @returns Promise resolving to object with processed text, token count, and truncation status
  *
  * @remarks
- * This function uses a ratio-based estimation algorithm instead of binary search.
- * Binary search would require O(log n) tokenCountFn calls (~17 for 100k chars),
- * while this approach typically requires only 2-3 calls for a 90%+ reduction in CPU usage.
+ * Ratios estimate positions only: every returned result has a validated measured count.
+ * Refinement is bounded; a measured empty fallback is used if it cannot converge.
+ * Invalid limits/counts or an empty result still over the limit throw instead of succeeding.
  */
 export async function processTextWithTokenLimit({
   text,
@@ -50,7 +50,17 @@ export async function processTextWithTokenLimit({
   tokenCountFn: TokenCountFn;
   preserve?: 'start' | 'end';
 }): Promise<{ text: string; tokenCount: number; wasTruncated: boolean }> {
-  const originalTokenCount = await tokenCountFn(text);
+  if (!Number.isSafeInteger(tokenLimit) || tokenLimit < 0) {
+    throw new RangeError('tokenLimit must be a non-negative safe integer');
+  }
+  const measure = async (value: string): Promise<number> => {
+    const count = await tokenCountFn(value);
+    if (!Number.isSafeInteger(count) || count < 0) {
+      throw new RangeError('Token counter must return a non-negative safe integer');
+    }
+    return count;
+  };
+  const originalTokenCount = await measure(text);
 
   if (originalTokenCount <= tokenLimit) {
     return {
@@ -71,11 +81,18 @@ export async function processTextWithTokenLimit({
     if (position <= 0) {
       return '';
     }
-    return preserve === 'end' ? text.slice(-position) : text.substring(0, position);
+    let boundary = preserve === 'end' ? text.length - position : position;
+    const before = text.charCodeAt(boundary - 1);
+    const after = text.charCodeAt(boundary);
+    if (before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff) {
+      // Shrink inward rather than separating a UTF-16 surrogate pair at either edge.
+      boundary += preserve === 'end' ? 1 : -1;
+    }
+    return preserve === 'end' ? text.slice(boundary) : text.slice(0, boundary);
   };
 
   let truncatedText = sliceText(charPosition);
-  let tokenCount = await tokenCountFn(truncatedText);
+  let tokenCount = await measure(truncatedText);
 
   const maxIterations = 5;
   let iterations = 0;
@@ -84,8 +101,16 @@ export async function processTextWithTokenLimit({
     const overageRatio = tokenLimit / tokenCount;
     charPosition = Math.floor(charPosition * overageRatio * TRUNCATION_SAFETY_BUFFER);
     truncatedText = sliceText(charPosition);
-    tokenCount = await tokenCountFn(truncatedText);
+    tokenCount = await measure(truncatedText);
     iterations++;
+  }
+
+  if (tokenCount > tokenLimit && truncatedText !== '') {
+    truncatedText = '';
+    tokenCount = await measure(truncatedText);
+  }
+  if (tokenCount > tokenLimit) {
+    throw new RangeError('Token count exceeds the limit even for empty text');
   }
 
   logger.warn(

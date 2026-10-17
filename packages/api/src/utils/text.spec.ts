@@ -18,6 +18,158 @@ describe('normalizeString', () => {
   });
 });
 
+describe('measured token-limit safety', () => {
+  const invalidNumbers: unknown[] = [
+    -1,
+    NaN,
+    Infinity,
+    -Infinity,
+    0.5,
+    Number.MAX_SAFE_INTEGER + 1,
+    '3',
+    null,
+    undefined,
+  ];
+
+  it.each(invalidNumbers)(
+    'rejects an invalid limit before invoking the counter %#',
+    async (limit) => {
+      const tokenCountFn = jest.fn(() => 1);
+      await expect(
+        processTextWithTokenLimit({
+          text: 'source',
+          tokenLimit: limit as number,
+          tokenCountFn,
+        }),
+      ).rejects.toThrow(RangeError);
+      expect(tokenCountFn).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(invalidNumbers)('rejects an invalid original count %#', async (count) => {
+    await expect(
+      processTextWithTokenLimit({
+        text: 'source',
+        tokenLimit: 3,
+        tokenCountFn: () => count as number,
+      }),
+    ).rejects.toThrow(RangeError);
+  });
+
+  it.each(invalidNumbers)(
+    'rejects an invalid asynchronously measured candidate %#',
+    async (count) => {
+      const tokenCountFn = jest.fn().mockResolvedValueOnce(100).mockResolvedValue(count);
+      await expect(
+        processTextWithTokenLimit({
+          text: 'x'.repeat(100),
+          tokenLimit: 10,
+          tokenCountFn,
+        }),
+      ).rejects.toThrow(RangeError);
+    },
+  );
+
+  it('returns only a measured safe empty fallback when ratio refinement cannot converge', async () => {
+    const tokenCountFn = jest.fn((text: string) => (text.length ? 101 : 0));
+    const result = await processTextWithTokenLimit({
+      text: 'x'.repeat(10_000),
+      tokenLimit: 100,
+      tokenCountFn,
+    });
+    expect(result).toEqual({ text: '', tokenCount: 0, wasTruncated: true });
+    expect(tokenCountFn).toHaveBeenLastCalledWith('');
+    expect(tokenCountFn.mock.calls.length).toBeLessThanOrEqual(8);
+  });
+
+  it('throws when even the measured empty fallback exceeds the limit', async () => {
+    const tokenCountFn = jest.fn(() => 101);
+    await expect(
+      processTextWithTokenLimit({
+        text: 'x'.repeat(10_000),
+        tokenLimit: 100,
+        tokenCountFn,
+      }),
+    ).rejects.toThrow(RangeError);
+    expect(tokenCountFn).toHaveBeenLastCalledWith('');
+    expect(tokenCountFn.mock.calls.length).toBeLessThanOrEqual(8);
+  });
+
+  it('measures zero-limit results and keeps already empty input unchanged', async () => {
+    const tokenCountFn = jest.fn((text: string) => text.length);
+    expect(
+      await processTextWithTokenLimit({ text: 'source', tokenLimit: 0, tokenCountFn }),
+    ).toEqual({ text: '', tokenCount: 0, wasTruncated: true });
+    expect(tokenCountFn).toHaveBeenLastCalledWith('');
+    expect(await processTextWithTokenLimit({ text: '', tokenLimit: 0, tokenCountFn })).toEqual({
+      text: '',
+      tokenCount: 0,
+      wasTruncated: false,
+    });
+    await expect(
+      processTextWithTokenLimit({ text: '', tokenLimit: 0, tokenCountFn: () => 1 }),
+    ).rejects.toThrow(RangeError);
+  });
+
+  it.each(['start', 'end'] as const)(
+    'keeps surrogate pairs intact in every %s candidate',
+    async (preserve) => {
+      const text = '🧭'.repeat(100);
+      const tokenCountFn = jest.fn((value: string) => Array.from(value).length);
+      const result = await processTextWithTokenLimit({
+        text,
+        tokenLimit: 51,
+        tokenCountFn,
+        preserve,
+      });
+      expect(result.text.length).toBeGreaterThan(0);
+      expect(result.tokenCount).toBeLessThanOrEqual(51);
+      expect(result.tokenCount).toBe(Array.from(result.text).length);
+      for (const [candidate] of tokenCountFn.mock.calls) {
+        expect(candidate).not.toMatch(
+          /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u,
+        );
+      }
+    },
+  );
+
+  it('propagates a tokenizer rejection instead of returning an unmeasured result', async () => {
+    const failure = new Error('Tokenizer unavailable');
+    const tokenCountFn = jest.fn().mockResolvedValueOnce(100).mockRejectedValue(failure);
+    await expect(
+      processTextWithTokenLimit({
+        text: 'x'.repeat(100),
+        tokenLimit: 10,
+        tokenCountFn,
+      }),
+    ).rejects.toBe(failure);
+  });
+
+  it.each(['start', 'end'] as const)(
+    'honors an initialized real tokenizer at the %s boundary',
+    async (preserve) => {
+      const tokenCountFn = await Tokenizer.createExactTokenCounter('o200k_base');
+      const text = '🧭 Köln 東京 — vollständiger Dokumenttext.\n'.repeat(40);
+      const result = await processTextWithTokenLimit({
+        text,
+        tokenLimit: 73,
+        tokenCountFn,
+        preserve,
+      });
+      expect(result.wasTruncated).toBe(true);
+      expect(result.text.length).toBeGreaterThan(0);
+      expect(result.tokenCount).toBe(tokenCountFn(result.text));
+      expect(result.tokenCount).toBeLessThanOrEqual(73);
+      expect(preserve === 'start' ? text.startsWith(result.text) : text.endsWith(result.text)).toBe(
+        true,
+      );
+      expect(result.text).not.toMatch(
+        /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u,
+      );
+    },
+  );
+});
+
 /**
  * OLD IMPLEMENTATION (Binary Search) - kept for comparison testing
  * This is the original algorithm that caused CPU spikes
