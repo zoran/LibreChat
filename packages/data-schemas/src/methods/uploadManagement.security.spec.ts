@@ -62,6 +62,22 @@ describe('durable upload security approval', () => {
     originalAbsent: false,
     textAndHistoryRemoved: false,
   });
+  async function completeScanner(lease: UploadLease, at: number) {
+    const execution = {
+      version: 1 as const,
+      attemptId: `${lease.operationId}.${lease.generation}`,
+      instanceId: '11111111-1111-4111-8111-111111111111',
+      executionId: '22222222-2222-4222-8222-222222222222',
+      expiresAt: new Date(at + 60_000).toISOString(),
+    };
+    await first.bindSecurityExecution(lease, execution, at);
+    await second.settleSecurityExecution(
+      lease,
+      { execution, writerStopped: true, transientDataRemoved: true },
+      at,
+    );
+  }
+
   beforeAll(async () => {
     mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
     await Promise.all([
@@ -105,13 +121,15 @@ describe('durable upload security approval', () => {
       },
       now,
     );
-    return (await first.claim({
+    const lease = (await first.claim({
       kind: 'transfer',
       principal: user,
       operationId: id,
       worker,
       now,
     }))!;
+    await completeScanner(lease, now);
+    return lease;
   }
   async function accepted() {
     const lease = await transfer();

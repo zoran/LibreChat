@@ -1,5 +1,10 @@
 /** Exercises the private receipt boundary; a well-shaped receipt is never scanner authentication. */
-import type { UploadSecuritySubject, UploadSecurityApproval } from './upload-security';
+import type {
+  UploadSecuritySubject,
+  UploadSecurityApproval,
+  UploadSecurityExecution,
+  UploadSecuritySettlement,
+} from './upload-security';
 import {
   isUploadSecuritySubject,
   isUploadSecurityApproval,
@@ -7,6 +12,11 @@ import {
   isUploadSecurityInspection,
   readUploadSecurityInspection,
   matchesUploadSecurityApproval,
+  readUploadSecuritySubject,
+  readUploadSecurityExecution,
+  readUploadSecuritySettlement,
+  matchesUploadSecurityExecution,
+  isCompleteUploadSecuritySettlement,
 } from './upload-security';
 import { UPLOAD_MAX_FILE_BYTES } from './upload-management';
 
@@ -34,6 +44,242 @@ const approval = (): UploadSecurityApproval => ({
 function accessor(value: object, key: string, get: () => unknown): object {
   return Object.defineProperty({ ...value }, key, { enumerable: true, get });
 }
+
+const execution = (): UploadSecurityExecution => ({
+  version: 1,
+  attemptId: 'operation-1.1',
+  instanceId: '12345678-9abc-4def-8123-456789abcdef',
+  executionId: 'abcdef01-2345-4678-9abc-def012345678',
+  expiresAt: '2026-10-17T03:00:00.000Z',
+});
+const settlement = (): UploadSecuritySettlement => ({
+  execution: execution(),
+  writerStopped: true,
+  transientDataRemoved: true,
+});
+
+describe('scanner execution contract', () => {
+  it('returns detached plain records from frozen or null-prototype input without a clock policy', () => {
+    for (const attemptId of ['a.1', `${'a'.repeat(128)}.999999999999999`]) {
+      const input = Object.freeze(Object.assign(Object.create(null), execution(), { attemptId }));
+      const result = readUploadSecurityExecution(input)!;
+      expect(result).toEqual(input);
+      expect(result).not.toBe(input);
+      expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+    }
+    expect(
+      readUploadSecurityExecution({ ...execution(), expiresAt: '1970-01-01T00:00:00.000Z' }),
+    ).not.toBeNull();
+  });
+
+  it.each([
+    ['future version', { version: 2 }],
+    ['coerced version', { version: '1' }],
+    ['empty attempt', { attemptId: '' }],
+    ['missing generation', { attemptId: 'operation-1' }],
+    ['zero generation', { attemptId: 'op.0' }],
+    ['leading zero', { attemptId: 'op.01' }],
+    ['fractional generation', { attemptId: 'op.1.5' }],
+    ['oversized generation', { attemptId: 'op.1000000000000000' }],
+    ['oversized operation', { attemptId: `${'a'.repeat(129)}.1` }],
+    ['path attempt', { attemptId: '../op.1' }],
+    ['newline attempt', { attemptId: 'op.1\n' }],
+    ['control attempt', { attemptId: 'op.1\u0000' }],
+    ['uppercase UUID', { instanceId: execution().instanceId.toUpperCase() }],
+    ['wrong UUID version', { instanceId: '12345678-9abc-1def-8123-456789abcdef' }],
+    ['wrong UUID variant', { executionId: 'abcdef01-2345-4678-0abc-def012345678' }],
+    ['UUID suffix', { executionId: `${execution().executionId}\n` }],
+    ['null UUID', { instanceId: null }],
+    ['nonfinite UUID', { executionId: Infinity }],
+    ['private filename', { filename: 'private.txt' }],
+    ['private hash', { sha256: 'b'.repeat(64) }],
+  ])('rejects %s', (_name, change) => {
+    const value = { ...execution(), ...change };
+    expect(readUploadSecurityExecution(value)).toBeNull();
+    expect(matchesUploadSecurityExecution(value, execution())).toBe(false);
+    expect(matchesUploadSecurityExecution(execution(), value)).toBe(false);
+  });
+
+  it.each([
+    undefined,
+    NaN,
+    new Date(now),
+    '2026-02-30T03:00:00.000Z',
+    '2026-10-17T24:00:00.000Z',
+    '2026-10-17T03:00:60.000Z',
+    '2026-10-17T03:00:00Z',
+    '2026-10-17T03:00:00.000+00:00',
+    '2026-10-17T03:00:00.000Z\n',
+    '+010000-10-17T03:00:00.000Z',
+  ])('rejects noncanonical expiry %s', (expiresAt) => {
+    expect(readUploadSecurityExecution({ ...execution(), expiresAt })).toBeNull();
+  });
+
+  it('requires every own enumerable field and rejects symbols and inherited records', () => {
+    for (const key of Object.keys(execution())) {
+      const value: Record<string, unknown> = { ...execution() };
+      delete value[key];
+      expect(readUploadSecurityExecution(value)).toBeNull();
+      expect(
+        readUploadSecurityExecution(Object.defineProperty(execution(), key, { enumerable: false })),
+      ).toBeNull();
+    }
+    for (const value of [
+      null,
+      undefined,
+      [],
+      true,
+      'execution',
+      Object.create(execution()),
+      Object.setPrototypeOf(execution(), { extra: true }),
+      { ...execution(), [Symbol('hidden')]: true },
+      Object.defineProperty(execution(), 'extra', { value: true }),
+    ]) {
+      expect(readUploadSecurityExecution(value)).toBeNull();
+      expect(matchesUploadSecurityExecution(value, value)).toBe(false);
+    }
+  });
+
+  it('rejects accessors and failed reflection on either side without evaluating them', () => {
+    const get = jest.fn(() => {
+      throw new Error('Untrusted getter');
+    });
+    const reflectionFailure = () => {
+      throw new Error('Untrusted reflection');
+    };
+    const revoked = Proxy.revocable(execution(), {});
+    revoked.revoke();
+    for (const value of [
+      ...Object.keys(execution()).map((key) => accessor(execution(), key, get)),
+      Object.defineProperty(execution(), 'attemptId', { set: get }),
+      revoked.proxy,
+      new Proxy(execution(), { getPrototypeOf: reflectionFailure }),
+      new Proxy(execution(), { ownKeys: reflectionFailure }),
+      new Proxy(execution(), { getOwnPropertyDescriptor: reflectionFailure }),
+    ]) {
+      expect(readUploadSecurityExecution(value)).toBeNull();
+      expect(matchesUploadSecurityExecution(value, execution())).toBe(false);
+      expect(matchesUploadSecurityExecution(execution(), value)).toBe(false);
+    }
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it('binds all five fields and never uses ordinary property access on supplied records', () => {
+    const get = jest.fn(() => {
+      throw new Error('Do not reread data');
+    });
+    const value = new Proxy(execution(), { get });
+    expect(readUploadSecurityExecution(value)).toEqual(execution());
+    expect(matchesUploadSecurityExecution(value, execution())).toBe(true);
+    for (const change of [
+      { version: 2 },
+      { attemptId: 'operation-1.2' },
+      { attemptId: 'operation-2.1' },
+      { instanceId: execution().executionId },
+      { executionId: execution().instanceId },
+      { expiresAt: '2026-10-17T03:00:00.001Z' },
+    ]) {
+      expect(matchesUploadSecurityExecution(value, { ...execution(), ...change })).toBe(false);
+    }
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it('exports the existing subject reader as a detached descriptor-based snapshot', () => {
+    const input = subject();
+    const get = jest.fn(() => {
+      throw new Error('Do not reread subject');
+    });
+    const result = readUploadSecuritySubject(new Proxy(input, { get }));
+    expect(result).toEqual(subject());
+    expect(result).not.toBe(input);
+    input.sha256 = 'c'.repeat(64);
+    expect(result).toEqual(subject());
+    expect(readUploadSecuritySubject(accessor(input, 'sha256', get))).toBeNull();
+    expect(get).not.toHaveBeenCalled();
+  });
+});
+
+describe('scanner settlement contract', () => {
+  it.each([
+    [false, false],
+    [false, true],
+    [true, false],
+    [true, true],
+  ])(
+    'retains explicit stop=%s/removal=%s without inferring completion',
+    (writerStopped, transientDataRemoved) => {
+      const value = { ...settlement(), writerStopped, transientDataRemoved };
+      expect(readUploadSecuritySettlement(value)).toEqual(value);
+      expect(isCompleteUploadSecuritySettlement(value, execution())).toBe(
+        writerStopped && transientDataRemoved,
+      );
+    },
+  );
+
+  it('snapshots nested execution and refuses a mismatched expected receipt', () => {
+    const input = settlement();
+    const result = readUploadSecuritySettlement(input)!;
+    expect(result).toEqual(input);
+    expect(result).not.toBe(input);
+    expect(result.execution).not.toBe(input.execution);
+    input.writerStopped = false;
+    input.execution.attemptId = 'operation-1.2';
+    expect(result).toEqual(settlement());
+    expect(isCompleteUploadSecuritySettlement(result, input.execution)).toBe(false);
+    expect(isCompleteUploadSecuritySettlement(result, { ...execution(), extra: true })).toBe(false);
+    expect(isCompleteUploadSecuritySettlement(result, null)).toBe(false);
+  });
+
+  it('rejects missing, nonboolean, additional or malformed settlement data', () => {
+    const values: unknown[] = [
+      null,
+      undefined,
+      [],
+      Object.create(settlement()),
+      { ...settlement(), execution: null },
+      { ...settlement(), extra: true },
+      { ...settlement(), [Symbol('extra')]: true },
+    ];
+    for (const key of Object.keys(settlement())) {
+      const missing: Record<string, unknown> = { ...settlement() };
+      delete missing[key];
+      values.push(missing, Object.defineProperty(settlement(), key, { enumerable: false }));
+    }
+    for (const value of [undefined, null, 0, 1, 'true', 'false', NaN, Infinity]) {
+      values.push(
+        { ...settlement(), writerStopped: value },
+        { ...settlement(), transientDataRemoved: value },
+      );
+    }
+    for (const value of values) {
+      expect(readUploadSecuritySettlement(value)).toBeNull();
+      expect(isCompleteUploadSecuritySettlement(value, execution())).toBe(false);
+    }
+  });
+
+  it('handles nested hostile descriptors and revoked proxies without a false cleanup receipt', () => {
+    const get = jest.fn(() => {
+      throw new Error('Untrusted cleanup');
+    });
+    const revoked = Proxy.revocable(settlement(), {});
+    revoked.revoke();
+    for (const value of [
+      revoked.proxy,
+      ...Object.keys(settlement()).map((key) => accessor(settlement(), key, get)),
+      { ...settlement(), execution: accessor(execution(), 'instanceId', get) },
+    ]) {
+      expect(readUploadSecuritySettlement(value)).toBeNull();
+      expect(isCompleteUploadSecuritySettlement(value, execution())).toBe(false);
+    }
+    const input = new Proxy(
+      { ...settlement(), execution: new Proxy(execution(), { get }) },
+      { get },
+    );
+    expect(readUploadSecuritySettlement(input)).toEqual(settlement());
+    expect(isCompleteUploadSecuritySettlement(input, new Proxy(execution(), { get }))).toBe(true);
+    expect(get).not.toHaveBeenCalled();
+  });
+});
 
 describe('upload security subject', () => {
   it('accepts exact bounded bytes and explicit null tenant without mutating input', () => {

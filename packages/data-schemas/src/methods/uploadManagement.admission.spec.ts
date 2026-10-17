@@ -78,6 +78,22 @@ describe('durable upload admission pause', () => {
     textAndHistoryRemoved: false,
   });
 
+  async function completeScanner(lease: UploadLease, at: number) {
+    const execution = {
+      version: 1 as const,
+      attemptId: `${lease.operationId}.${lease.generation}`,
+      instanceId: '11111111-1111-4111-8111-111111111111',
+      executionId: '22222222-2222-4222-8222-222222222222',
+      expiresAt: new Date(at + 60_000).toISOString(),
+    };
+    await first.bindSecurityExecution(lease, execution, at);
+    await second.settleSecurityExecution(
+      lease,
+      { execution, writerStopped: true, transientDataRemoved: true },
+      at,
+    );
+  }
+
   beforeAll(async () => {
     mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
     await Promise.all([
@@ -404,6 +420,7 @@ describe('durable upload admission pause', () => {
     const grant = await first.claimWorkBytes({ lease: transfer, requestedBytes: 8, now });
     expect(grant?.bytes).toBe(8);
     await second.completeWorkBytes({ lease: transfer, generation: grant!.generation, now });
+    await completeScanner(transfer, now);
     await first.accept(user, transfer, receipt(transfer), approval(transfer, now), now);
     await second.confirmCleanup(localGone(transfer), now);
     const prior = (await first.claim({ kind: 'processing', worker, now }))!;

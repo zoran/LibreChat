@@ -11,6 +11,8 @@ import type {
   UploadErrorCode,
   UploadParserExecution,
   UploadSecurityApproval,
+  UploadSecurityExecution,
+  UploadSecuritySettlement,
 } from 'librechat-data-provider';
 import type { UploadRepository, IdentityPort, ResourcePort, TelemetryPort } from './contract';
 import { UploadManagementError, isUploadManagementError } from './errors';
@@ -53,6 +55,8 @@ export interface UploadManagement {
   retryProcessing(principal: UploadPrincipal, id: string): Promise<UploadOperation>;
   claimProcessing(worker: UploadWorker): Promise<UploadLease | null>;
   renew(lease: UploadLease): Promise<UploadLease>;
+  bindSecurityExecution(lease: UploadLease, execution: UploadSecurityExecution): Promise<void>;
+  settleSecurityExecution(lease: UploadLease, settlement: UploadSecuritySettlement): Promise<void>;
   claimWorkBytes(
     lease: UploadLease,
     requestedBytes: number,
@@ -216,6 +220,10 @@ export function createUploadManagement(deps: UploadManagementDependencies): Uplo
     },
     claimWorkBytes: (lease: UploadLease, requestedBytes: number) =>
       repository.claimWorkBytes({ lease, requestedBytes, now: now() }),
+    bindSecurityExecution: (lease, execution) =>
+      repository.bindSecurityExecution(lease, execution, now()),
+    settleSecurityExecution: (lease, settlement) =>
+      repository.settleSecurityExecution(lease, settlement, now()),
     completeWorkBytes: (lease: UploadLease, generation: number) =>
       repository.completeWorkBytes({ lease, generation, now: now() }),
     getProcessingInput: (lease: UploadLease) => repository.getProcessingInput(lease, now()),

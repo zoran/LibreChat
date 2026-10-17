@@ -321,16 +321,28 @@ gewöhnlichem Storage an die tatsächlichen Bytes, den Besitzer, die ursprüngli
 und die aktuelle Policy gebunden sein. Der Nachweis bleibt privat; normale Datei-Updates können ihn
 nicht erteilen. Fehlende, veraltete oder beschädigte Nachweise schließen nachgelagerte Zugriffe.
 
-`UploadSecurityPort` liefert ausschließlich den aktuellen `UploadSecurityInspection`-Vertrag mit
-Entscheidung und ausdrücklich bestätigtem Prozessende sowie bereinigten Scannerkopien. Eine beendete
-RPC-Promise oder lokal entfernte Eingabedatei belegt keine beendete entfernte Ausführung. Solche
-ungeklärten Fälle bleiben gesperrt und beim vorhandenen Cleanup-Owner. `UPLOAD_SECURITY_POLICY_SHA256`
-bindet die aktive Policy; ohne gültige Policy gibt es keine Freigabe.
+`UploadSecurityPort` reserviert zunächst eine inerte Execution. Erst nach deren dauerhafter Bindung
+an den ursprünglichen Upload darf der begrenzte Scanstream beginnen. Die vollständige
+`UploadSecurityInspection` bestätigt Entscheidung, Threadende und bereinigte Scannerkopien;
+der bestehende Upload-Owner speichert den passenden Abschluss vor gewöhnlichem Storage. Nach
+Verbindungsfehlern kann derselbe Cleanup-Owner über die gespeicherte Execution erneut abbrechen und
+den Abschluss prüfen. Lokale Kopien, Scanner und S3-Schreiber benötigen jeweils eigene Nachweise.
+
+Der eigenständige Einstieg ist `packages/api/dist/uploads/security/security-entry.cjs`. Er benötigt
+`POD_UID`, `UPLOAD_SECURITY_POLICY_FILE`, `UPLOAD_SECURITY_POLICY_SHA256` und die absoluten
+Zertifikatspfade `UPLOAD_SECURITY_TLS_CA_FILE`, `UPLOAD_SECURITY_TLS_CERT_FILE`,
+`UPLOAD_SECURITY_TLS_KEY_FILE`. Die Policy-Datei enthält `SecurityMarkingPolicy`-JSON; ihr tatsächlicher
+Bytehash muss passen und alle vier deutschen VS-Einstufungen einschließlich Vollform müssen gesperrt
+werden. Zusätzliche interne Regeln bleiben konfigurierbar. Der Dienst lauscht auf HTTPS-Port8443
+mit verpflichtendem Clientzertifikat; er startet keine Chat-, Datenbank- oder Storage-Anbindung.
+Die App benötigt dieselbe Policyrevision, eine eigene Clientidentität sowie den festen
+`UPLOAD_SECURITY_ENDPOINT` und `UPLOAD_SECURITY_ALLOWED_HOSTS`. Fehlende Konfiguration bleibt geschlossen.
 
 `UPLOAD_TEST_TMPDIR=/absoluter/privater/testpfad npm run test:upload-security` prüft diese Verträge,
 Raw-Transport, echte Mongo-Transaktionen,
-File-Verbraucher und UI-Meldungen nach dem gewöhnlichen Paketbuild. Der normale CI-Owner führt diese
-Regressionskarte auch bei späteren Updates aus. Erkennungsregeln und der begrenzte TXT-Prüfkern sind
-keine Sandbox und keine vollständige Sicherheitsabnahme. Ein realer isolierter Scanner, vollständige
-Format-/Eingangspfadabdeckung und dauerhafte Abbruch-/Bereinigungsnachweise müssen vor Aktivierung
-integriert und qualifiziert sein; diese Änderung aktiviert keine neue Dateifunktion.
+File-Verbraucher und UI-Meldungen nach dem gewöhnlichen Paketbuild. Lokales OpenSSL erzeugt ausschließlich
+temporäre Testzertifikate; Mongo-Tests verwenden eine lokale Replica-Set-Fixture. Der normale CI-Owner
+führt diese Regressionskarte auch bei späteren Updates aus. Der reale TXT-Worker prüft höchstens64KiB
+UTF-8 und besitzt keinen Plattenspeicher. Threadlimits sind keine Prozess-, RSS- oder Netzwerkisolation.
+Native Abschottung, vollständige Format-/Eingangspfadabdeckung und Ressourcen-/Bereinigungsnachweise
+müssen vor Aktivierung qualifiziert sein; diese Änderung aktiviert keine neue Dateifunktion.

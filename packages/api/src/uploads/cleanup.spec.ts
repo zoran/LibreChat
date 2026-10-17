@@ -5,6 +5,18 @@ import { createManagedUploadCleanup } from './cleanup';
 
 const worker = { hostId: 'host', instanceId: 'instance' };
 const principal = { tenantId: 'tenant', userId: 'user', authentication: 'verified-email' as const };
+const securityExecution = {
+  version: 1 as const,
+  attemptId: 'op.1',
+  instanceId: '11111111-1111-4111-8111-111111111111',
+  executionId: '22222222-2222-4222-8222-222222222222',
+  expiresAt: '2026-10-17T02:01:00.000Z',
+};
+const securitySettlement = {
+  execution: securityExecution,
+  writerStopped: true,
+  transientDataRemoved: true,
+};
 const base: UploadCleanupTask = {
   operationId: 'op',
   generation: 2,
@@ -55,17 +67,116 @@ describe('sole File owner managed cleanup adapter', () => {
       stopAndJoin: jest.fn().mockResolvedValue({ writerStopped: false, localCopiesAbsent: false }),
       recordCleanup: jest.fn(),
     };
+    const security = { cancel: jest.fn().mockRejectedValue(new Error('unavailable')) };
     const cleanup = createManagedUploadCleanup({
       repository,
       storage,
       documents,
       attempts,
+      security,
       worker,
       stagingRoot: root,
       now: () => 1234,
     } as never);
-    return { cleanup, repository, storage, documents, attempts };
+    return { cleanup, repository, storage, documents, attempts, security };
   }
+
+  it.each(['unavailable', 'foreign receipt', 'partial settlement'])(
+    'retains cleanup obligations when the scanner returns %s',
+    async (reason) => {
+      const task = { ...base, state: 'failed' as const, fileId: undefined, securityExecution };
+      const test = fixture(task);
+      test.attempts.stopAndJoin.mockResolvedValue({
+        writerStopped: true,
+        localCopiesAbsent: true,
+        securityPending: true,
+      });
+      if (reason === 'foreign receipt')
+        test.security.cancel.mockResolvedValue({
+          ...securitySettlement,
+          execution: { ...securityExecution, executionId: '33333333-3333-4333-8333-333333333333' },
+        });
+      if (reason === 'partial settlement')
+        test.security.cancel.mockResolvedValue({
+          ...securitySettlement,
+          transientDataRemoved: false,
+        });
+      expect(await test.cleanup.sweep({ deleteAcceptedFile: jest.fn() })).toMatchObject({
+        pending: 1,
+      });
+      expect(test.storage.remove).not.toHaveBeenCalled();
+      expect(test.repository.confirmCleanup).not.toHaveBeenCalled();
+      expect(test.attempts.recordCleanup).toHaveBeenCalledWith(
+        task,
+        expect.objectContaining({ securityPending: true }),
+      );
+    },
+  );
+
+  it('retries the exact remote join and combines it only with known local completion', async () => {
+    const task = { ...base, state: 'failed' as const, fileId: undefined, securityExecution };
+    const test = fixture(task);
+    test.attempts.stopAndJoin.mockResolvedValue({
+      writerStopped: true,
+      localCopiesAbsent: true,
+      securityPending: true,
+    });
+    test.security.cancel.mockResolvedValue(securitySettlement);
+    expect(await test.cleanup.sweep({ deleteAcceptedFile: jest.fn() })).toMatchObject({
+      cleaned: 1,
+    });
+    expect(test.security.cancel).toHaveBeenCalledWith({
+      execution: securityExecution,
+      signal: expect.anything(),
+    });
+    expect(test.repository.confirmCleanup).toHaveBeenCalledWith(
+      expect.objectContaining({
+        writerStopped: true,
+        originalAbsent: true,
+        securitySettlement,
+      }),
+      1234,
+    );
+    expect(test.attempts.recordCleanup).toHaveBeenCalledWith(
+      task,
+      expect.objectContaining({ securityPending: false }),
+    );
+  });
+
+  it.each(['missing local receipt', 'uncertain storage'])(
+    'a positive scanner join cannot replace %s',
+    async (reason) => {
+      const task = { ...base, state: 'failed' as const, fileId: undefined, securityExecution };
+      const test = fixture(task);
+      test.security.cancel.mockResolvedValue(securitySettlement);
+      if (reason === 'uncertain storage')
+        test.attempts.stopAndJoin.mockResolvedValue({
+          writerStopped: true,
+          localCopiesAbsent: true,
+          storageOutcome: 'unknown',
+        });
+      expect(await test.cleanup.sweep({ deleteAcceptedFile: jest.fn() })).toMatchObject({
+        pending: 1,
+      });
+      expect(test.storage.remove).not.toHaveBeenCalled();
+      expect(test.repository.confirmCleanup).not.toHaveBeenCalled();
+    },
+  );
+
+  it('reuses durable scanner completion without restarting or contacting the scanner', async () => {
+    const task = {
+      ...base,
+      writerStopped: true,
+      localCopiesAbsent: true,
+      securityExecution,
+      securitySettlement,
+    };
+    const test = fixture(task);
+    const proof = await test.cleanup.removeFileOriginal(task);
+    expect(proof.securitySettlement).toEqual(securitySettlement);
+    expect(test.security.cancel).not.toHaveBeenCalled();
+    expect(proof.originalAbsent).toBe(true);
+  });
 
   it('fences the exact managed file then reloads durable cleanup facts', async () => {
     const test = fixture();

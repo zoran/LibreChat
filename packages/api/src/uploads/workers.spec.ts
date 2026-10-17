@@ -133,6 +133,22 @@ describe('managed upload work ownership', () => {
     await workers.close();
   });
 
+  it('retains the independent scanner obligation after local and storage writers finish', async () => {
+    const workers = fixture();
+    const ticket = workers.attempts.begin(jest.fn());
+    ticket.bind(lease);
+    ticket.settle({ ...stopped, securityPending: true });
+    expect(await workers.attempts.stopAndJoin(task, new AbortController().signal)).toMatchObject({
+      writerStopped: true,
+      securityPending: true,
+    });
+    workers.attempts.recordCleanup(task, stopped);
+    expect((await workers.maintenance.getMaintenanceCensus(null)).complete).toBe(false);
+    workers.attempts.recordCleanup(task, { ...stopped, securityPending: false });
+    expect((await workers.maintenance.getMaintenanceCensus(null)).complete).toBe(true);
+    await expect(workers.close()).resolves.toEqual({ complete: true });
+  });
+
   it('a bounded join timeout leaves the active attempt in the maintenance census', async () => {
     const workers = fixture();
     const ticket = workers.attempts.begin(jest.fn());

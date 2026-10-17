@@ -81,6 +81,22 @@ describe('durable managed original integrity', () => {
     coverage: { complete: true as const, pages: 1, parts: 1 },
   });
 
+  async function completeScanner(lease: UploadLease, at: number) {
+    const execution = {
+      version: 1 as const,
+      attemptId: `${lease.operationId}.${lease.generation}`,
+      instanceId: '11111111-1111-4111-8111-111111111111',
+      executionId: '22222222-2222-4222-8222-222222222222',
+      expiresAt: new Date(at + 60_000).toISOString(),
+    };
+    await first.bindSecurityExecution(lease, execution, at);
+    await second.settleSecurityExecution(
+      lease,
+      { execution, writerStopped: true, transientDataRemoved: true },
+      at,
+    );
+  }
+
   beforeAll(async () => {
     mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
     await Promise.all([
@@ -122,6 +138,7 @@ describe('durable managed original integrity', () => {
       now,
     });
     expect(lease).not.toBeNull();
+    await completeScanner(lease!, now);
     return lease!;
   }
   async function accepted(id = 'identity') {
@@ -328,7 +345,14 @@ describe('durable managed original integrity', () => {
     );
     await a.models.UploadOperation.updateOne(
       { _id: lease.operationId },
-      { $unset: { 'original.integrity': 1, securityApproval: 1 } },
+      {
+        $unset: {
+          'original.integrity': 1,
+          securityApproval: 1,
+          securityExecution: 1,
+          securitySettlement: 1,
+        },
+      },
     );
     const page = await first.exportSnapshot({ epoch: 'removed' });
     await target.importSnapshot(page);
@@ -339,6 +363,8 @@ describe('durable managed original integrity', () => {
     ).lean<StoredUpload>();
     expect(stored!.original).not.toHaveProperty('integrity');
     expect(stored).not.toHaveProperty('securityApproval');
+    expect(stored).not.toHaveProperty('securityExecution');
+    expect(stored).not.toHaveProperty('securitySettlement');
     expect(stored).toMatchObject({ originalBytes: 0, originalRemoved: true, actualBytes: 8 });
     expect(await target.usage(user, now + 1)).toMatchObject({
       usedBytes: 8,
@@ -370,6 +396,7 @@ describe('durable managed original integrity', () => {
       etag: 'é'.repeat(512),
       versionId: 'é'.repeat(512),
     };
+    await completeScanner(lease, now);
     await first.accept(owner, lease, original, approval(lease, original), now);
     const row = (await b.models.UploadOperation.findById(id).lean<StoredUpload>())!;
     const largest: StoredUpload = {

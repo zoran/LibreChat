@@ -9,6 +9,9 @@ import {
   UPLOAD_RECORD_BYTES,
   isUploadOriginalIntegrity,
   isUploadStorageReceipt,
+  readUploadSecurityExecution,
+  readUploadSecuritySettlement,
+  matchesUploadSecurityExecution,
 } from 'librechat-data-provider';
 import type {
   UploadPrincipal,
@@ -27,6 +30,8 @@ import type {
   UploadWorker,
   UploadLocalReservations,
   UploadSecurityApproval,
+  UploadSecurityExecution,
+  UploadSecuritySettlement,
 } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
 import type {
@@ -58,6 +63,8 @@ import {
   captureUploadSecurityApproval,
   hasCurrentUploadSecurityApproval,
   requireUploadSecurityApproval,
+  hasCompleteUploadSecurityExecution,
+  recordUploadSecuritySettlement,
 } from './uploadManagement.security';
 import { createUploadAdmissionMethods, readUploadAdmission } from './uploadManagementAdmission';
 import { createUploadMigrationMethods } from './uploadManagementMigration';
@@ -85,6 +92,16 @@ export type UploadManagementRepository = UploadControlMethods &
     usage(principal: UploadPrincipal, now: number): Promise<UploadUsage>;
     claim(input: UploadClaimInput): Promise<UploadLease | null>;
     renew(lease: UploadLease, now: number): Promise<UploadLease>;
+    bindSecurityExecution(
+      lease: UploadLease,
+      execution: UploadSecurityExecution,
+      now: number,
+    ): Promise<void>;
+    settleSecurityExecution(
+      lease: UploadLease,
+      settlement: UploadSecuritySettlement,
+      now: number,
+    ): Promise<void>;
     accept(
       principal: UploadPrincipal,
       lease: UploadLease,
@@ -145,6 +162,8 @@ export function createUploadManagementRepository(
     fileId: row.fileId,
     state: row.state,
     parserExecution: row.parserExecution,
+    securityExecution: row.securityExecution,
+    securitySettlement: row.securitySettlement,
     writerStopped: row.writerStopped === true,
     localCopiesAbsent: row.stagingHeld === false,
   });
@@ -473,7 +492,11 @@ export function createUploadManagementRepository(
       return project(row, now);
     },
     async get(principal, id, now) {
-      const result = project(await owned(principal, id), now);
+      const row = await owned(principal, id);
+      const result = project(row, now);
+      const approved = hasCurrentUploadSecurityApproval(row, securityPolicySha256, now);
+      result.canUseInComposer = result.canUseInComposer && approved;
+      result.canRetryProcessing = result.canRetryProcessing && approved;
       if (result.canUseInComposer || result.canRetryProcessing) {
         const [file] = await lifecycle.getManagedUploadAvailability(principal, [id], now);
         result.canUseInComposer = result.canUseInComposer && file?.ready === true;
@@ -497,10 +520,12 @@ export function createUploadManagementRepository(
       );
       return rows.map((row) => {
         const result = project(row, now);
+        const approved = hasCurrentUploadSecurityApproval(row, securityPolicySha256, now);
         return {
           ...result,
-          canUseInComposer: result.canUseInComposer && available.get(row._id)?.ready === true,
-          canRetryProcessing: result.canRetryProcessing && available.has(row._id),
+          canUseInComposer:
+            result.canUseInComposer && approved && available.get(row._id)?.ready === true,
+          canRetryProcessing: result.canRetryProcessing && approved && available.has(row._id),
         };
       });
     },
@@ -519,6 +544,42 @@ export function createUploadManagementRepository(
         row.leaseExpiresAt = now + LEASE_MS;
         await store.save(row, session);
         return leaseFor(row);
+      });
+    },
+    async bindSecurityExecution(lease, value, now) {
+      const execution = readUploadSecurityExecution(value);
+      if (
+        !execution ||
+        execution.attemptId !== `${lease.operationId}.${lease.generation}` ||
+        Date.parse(execution.expiresAt) <= now
+      )
+        reject('invalid_request');
+      await store.transaction(async (session) => {
+        const row = await store.Operation.findById(lease.operationId)
+          .session(session)
+          .lean<StoredUpload>();
+        assertLease(row, lease, now);
+        if (row.state !== 'transferring' || row.slot !== 'transfer') reject('lease_lost');
+        if (row.securityExecution) {
+          if (!matchesUploadSecurityExecution(row.securityExecution, execution))
+            reject('lease_lost');
+          return;
+        }
+        row.securityExecution = execution;
+        await store.save(row, session);
+      });
+    },
+    async settleSecurityExecution(lease, value, now) {
+      const settlement = readUploadSecuritySettlement(value);
+      if (!settlement) reject('invalid_request');
+      await store.transaction(async (session) => {
+        const row = await store.Operation.findById(lease.operationId)
+          .session(session)
+          .lean<StoredUpload>();
+        assertLease(row, lease, now);
+        if (row.state !== 'transferring' || row.slot !== 'transfer') reject('lease_lost');
+        recordUploadSecuritySettlement(row, settlement);
+        await store.save(row, session);
       });
     },
     async accept(principal, lease, receipt, securityApproval, now) {
@@ -709,12 +770,19 @@ export function createUploadManagementRepository(
     },
     fail,
     async confirmCleanup(proof, now) {
+      const settlement =
+        proof.securitySettlement === undefined
+          ? undefined
+          : readUploadSecuritySettlement(proof.securitySettlement);
+      if (settlement === null) reject('invalid_request');
       return store.transaction(async (session, global) => {
         const row = await store.Operation.findById(proof.operationId)
           .session(session)
           .lean<StoredUpload>();
         if (!row || (row.workerGeneration ?? row.generation) !== proof.generation)
           reject('lease_lost');
+        if (settlement) recordUploadSecuritySettlement(row, settlement);
+        if (row.securityExecution && !hasCompleteUploadSecurityExecution(row)) reject('not_ready');
         if (!proof.writerStopped) reject('not_ready');
         row.writerStopped = true;
         if (row.slot && ['transferring', 'processing'].includes(row.state))

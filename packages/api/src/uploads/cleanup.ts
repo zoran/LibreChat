@@ -1,8 +1,19 @@
 import path from 'node:path';
 import { lstat, realpath, rm } from 'node:fs/promises';
+import {
+  readUploadSecuritySettlement,
+  isCompleteUploadSecuritySettlement,
+} from 'librechat-data-provider';
 import type { UploadCleanupTask, UploadCleanupProof, UploadWorker } from 'librechat-data-provider';
-import type { UploadRepository, DocumentPort, StoragePort, UploadAttemptPort } from './contract';
+import type {
+  UploadRepository,
+  DocumentPort,
+  StoragePort,
+  UploadAttemptPort,
+  UploadSecurityPort,
+} from './contract';
 import { attemptOriginalPath, uploadAttemptId } from './processing/paths';
+import { cancelSecurityExecution } from './security/cancellation';
 
 type FileOwner = { tenantId?: string | null; userId?: string };
 type CleanupRepository = Pick<
@@ -24,6 +35,7 @@ export function createManagedUploadCleanup(options: {
   repository: CleanupRepository;
   storage: StoragePort;
   documents: DocumentPort;
+  security?: UploadSecurityPort;
   attempts: UploadAttemptPort;
   worker: UploadWorker;
   stagingRoot: string;
@@ -67,13 +79,20 @@ export function createManagedUploadCleanup(options: {
       originalAbsent: false,
       textAndHistoryRemoved: false,
     };
+    let securityPending = false;
     if (local(task) && (!proof.writerStopped || !proof.localCopiesAbsent)) {
       const joined = await options.attempts.stopAndJoin(task, signal);
       proof.writerStopped ||= joined.writerStopped && joined.storageOutcome !== 'unknown';
       proof.localCopiesAbsent ||= joined.localCopiesAbsent;
+      securityPending = joined.securityPending === true;
       // Only a bound exact parser receipt can supplement the local journal.
       // An old worker incarnation cannot use this Pod's socket as stop evidence.
-      if (!proof.writerStopped && task.parserExecution && !signal.aborted) {
+      if (
+        !proof.writerStopped &&
+        task.parserExecution &&
+        joined.storageOutcome !== 'unknown' &&
+        !signal.aborted
+      ) {
         const stopped = await options.documents
           .cancel({ execution: task.parserExecution, signal })
           .catch(() => ({ writerStopped: false }));
@@ -83,7 +102,17 @@ export function createManagedUploadCleanup(options: {
     if (proof.writerStopped && !proof.localCopiesAbsent && !signal.aborted) {
       proof.localCopiesAbsent = await removeLocal(task);
     }
-    options.attempts.recordCleanup(task, proof);
+    if (task.securityExecution) {
+      const stored = readUploadSecuritySettlement(task.securitySettlement);
+      const settled = isCompleteUploadSecuritySettlement(stored, task.securityExecution)
+        ? stored
+        : await cancelSecurityExecution(options.security, task.securityExecution, signal);
+      securityPending = !settled;
+      if (settled) proof.securitySettlement = settled;
+    }
+    // Preserve local stop evidence separately; a remote join cannot attest local or S3 writers.
+    options.attempts.recordCleanup(task, { ...proof, securityPending });
+    proof.writerStopped &&= !securityPending;
     return proof;
   }
 

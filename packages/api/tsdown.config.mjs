@@ -14,6 +14,8 @@ export default defineConfig({
     'src/agents/files/edit-worker.ts',
     'src/uploads/processing/sidecar-entry.ts',
     'src/uploads/processing/parser-child.ts',
+    'src/uploads/security/worker-thread.ts',
+    'src/uploads/security/security-entry.ts',
   ],
   format: ['cjs'],
   platform: 'node',

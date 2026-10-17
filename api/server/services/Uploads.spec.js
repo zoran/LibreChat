@@ -1,9 +1,10 @@
 const jwt = require('jsonwebtoken');
 const { Registry } = require('prom-client');
-jest.mock('node:fs/promises', () => ({ mkdir: jest.fn(), lstat: jest.fn() }));
+jest.mock('node:fs/promises', () => ({ mkdir: jest.fn(), lstat: jest.fn(), readFile: jest.fn() }));
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
   initializeS3: jest.fn(),
+  createHttpUploadSecurityPort: jest.fn(),
   validateEmailCodeBearer: jest.fn(),
   createRawUploadBodyHandler: jest.fn(
     jest.requireActual('@librechat/api').createRawUploadBodyHandler,
@@ -19,10 +20,12 @@ const {
   createUploadWorkers,
   createUploadLiveHub,
   createUploadRuntime,
+  createHttpUploadSecurityPort,
   UploadManagementError,
 } = require('@librechat/api');
 const {
   managedStorageClient,
+  managedSecurityClient,
   uploadPrincipal,
   attachmentProjection,
   initializeUploads,
@@ -39,6 +42,37 @@ describe('Cortex upload adapter trust boundaries', () => {
   });
   afterEach(() => {
     process.env = previous;
+  });
+
+  it('requires operator-owned scanner identity and policy before enabling uploads', async () => {
+    delete process.env.UPLOAD_SECURITY_ENDPOINT;
+    await expect(managedSecurityClient()).rejects.toThrow(
+      'Upload security configuration unavailable',
+    );
+    const { readFile } = require('node:fs/promises');
+    expect(readFile).not.toHaveBeenCalled();
+    expect(createHttpUploadSecurityPort).not.toHaveBeenCalled();
+  });
+
+  it('binds the fixed scanner endpoint to mounted mTLS credentials', async () => {
+    process.env.UPLOAD_SECURITY_ENDPOINT = 'https://intake.internal:8443';
+    process.env.UPLOAD_SECURITY_ALLOWED_HOSTS = 'intake.internal';
+    process.env.UPLOAD_SECURITY_POLICY_SHA256 = 'a'.repeat(64);
+    for (const name of ['CA', 'CERT', 'KEY'])
+      process.env[`UPLOAD_SECURITY_TLS_${name}_FILE`] = `/run/intake/${name.toLowerCase()}.pem`;
+    const { readFile } = require('node:fs/promises');
+    readFile.mockResolvedValue(Buffer.from('isolated-test-material'));
+    await managedSecurityClient();
+    expect(createHttpUploadSecurityPort).toHaveBeenCalledWith({
+      endpoint: 'https://intake.internal:8443',
+      allowedHosts: ['intake.internal'],
+      policySha256: 'a'.repeat(64),
+      tls: {
+        ca: Buffer.from('isolated-test-material'),
+        cert: Buffer.from('isolated-test-material'),
+        key: Buffer.from('isolated-test-material'),
+      },
+    });
   });
 
   it('uses the validated durable identity, ignoring browser owner fields', async () => {
@@ -275,6 +309,7 @@ describe('Cortex upload adapter trust boundaries', () => {
       platform,
       storage: {},
       documents: {},
+      security: { prepare: jest.fn(), inspect: jest.fn(), cancel: jest.fn() },
       stagingRoot: '/fixture/uploads',
       allowedOrigins: ['https://cortex.example'],
       principal: async () => owner,

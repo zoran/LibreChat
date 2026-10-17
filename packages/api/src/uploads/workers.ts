@@ -90,7 +90,11 @@ export function createUploadWorkers(options: {
           if (receipts.size >= 256) {
             const oldest = [...receipts].find(([, value]) => !value.active);
             if (!oldest) throw new UploadManagementError('queue_full');
-            if (!oldest[1].proof?.writerStopped || !oldest[1].proof?.localCopiesAbsent)
+            if (
+              !oldest[1].proof?.writerStopped ||
+              !oldest[1].proof?.localCopiesAbsent ||
+              oldest[1].proof.securityPending
+            )
               uncertain = true;
             receipts.delete(oldest[0]);
           }
@@ -126,6 +130,7 @@ export function createUploadWorkers(options: {
         writerStopped: record.proof?.writerStopped === true || normalized.writerStopped,
         localCopiesAbsent: record.proof?.localCopiesAbsent === true || normalized.localCopiesAbsent,
         storageOutcome: record.proof?.storageOutcome,
+        securityPending: normalized.securityPending ?? record.proof?.securityPending,
       };
     },
   };
@@ -136,7 +141,9 @@ export function createUploadWorkers(options: {
       [...receipts.values()].every(
         (record) =>
           record.active ||
-          (record.proof?.writerStopped === true && record.proof.localCopiesAbsent === true),
+          (record.proof?.writerStopped === true &&
+            record.proof.localCopiesAbsent === true &&
+            !record.proof.securityPending),
       )
     );
   }

@@ -19,6 +19,8 @@ import type {
   UploadReconciliationSnapshot,
   UploadActivationProof,
   UploadSecurityApproval,
+  UploadSecurityExecution,
+  UploadSecuritySettlement,
 } from 'librechat-data-provider';
 import type { ClientSession, Model } from 'mongoose';
 import { tenantStorage, SYSTEM_TENANT_ID, runAsSystem } from '~/config/tenantContext';
@@ -104,6 +106,8 @@ export type StoredUpload = {
   original?: UploadStorageReceipt;
   /** Trusted scanner receipt, private to the original transfer rather than processing attempts. */
   securityApproval?: UploadSecurityApproval;
+  securityExecution?: UploadSecurityExecution;
+  securitySettlement?: UploadSecuritySettlement;
   originalBytes: number;
   textBytes: number;
   recordBytes: number;
@@ -380,6 +384,8 @@ export function createUploadStore(
       attemptGeneration: Number,
       original: S.Types.Mixed,
       securityApproval: S.Types.Mixed,
+      securityExecution: S.Types.Mixed,
+      securitySettlement: S.Types.Mixed,
       originalBytes: Number,
       textBytes: Number,
       recordBytes: Number,

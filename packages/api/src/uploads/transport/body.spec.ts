@@ -29,6 +29,13 @@ const lease = {
 };
 const policySha256 = 'a'.repeat(64);
 const now = Date.parse('2026-10-17T02:00:00.000Z');
+const execution = {
+  version: 1 as const,
+  attemptId: 'operation.1',
+  instanceId: '11111111-1111-4111-8111-111111111111',
+  executionId: '22222222-2222-4222-8222-222222222222',
+  expiresAt: '2026-10-17T02:01:00.000Z',
+};
 
 function approval(subject: UploadSecuritySubject): UploadSecurityApproval {
   return {
@@ -149,6 +156,8 @@ describe('raw upload body admission and streaming', () => {
       }),
       claimTransfer: jest.fn(async (): Promise<UploadLease> => lease),
       renew: jest.fn(async (): Promise<UploadLease> => lease),
+      bindSecurityExecution: jest.fn(async () => undefined),
+      settleSecurityExecution: jest.fn(async () => undefined),
       accept: jest.fn(async () => ({ id: 'operation', state: 'queued_processing' })),
       fail: jest.fn(async () => ({})),
       cancel: jest.fn(async () => ({})),
@@ -184,6 +193,12 @@ describe('raw upload body admission and streaming', () => {
     }));
     const security = {
       policySha256,
+      prepare: jest.fn(async () => ({ ...execution })),
+      cancel: jest.fn(async () => ({
+        execution: { ...execution },
+        writerStopped: false,
+        transientDataRemoved: false,
+      })),
       inspect: jest.fn(
         async ({ subject, body, signal }: Parameters<UploadSecurityPort['inspect']>[0]) => {
           const hash = createHash('sha256');
@@ -230,6 +245,81 @@ describe('raw upload body admission and streaming', () => {
     await expect(readFile(test.ordinaryPath)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await readdir(root)).toEqual([]);
   }
+  it('commits the scanner binding before bytes and settlement before ordinary storage', async () => {
+    const test = fixture();
+    const done = test.run();
+    test.req.end('hello');
+    await done;
+    expect(test.response.statusCode).toBe(202);
+    expect(test.management.bindSecurityExecution).toHaveBeenCalledWith(lease, execution);
+    expect(test.management.bindSecurityExecution.mock.invocationCallOrder[0]).toBeLessThan(
+      test.security.inspect.mock.invocationCallOrder[0],
+    );
+    expect(test.management.settleSecurityExecution).toHaveBeenCalledWith(lease, {
+      execution,
+      writerStopped: true,
+      transientDataRemoved: true,
+    });
+    expect(test.management.settleSecurityExecution.mock.invocationCallOrder[0]).toBeLessThan(
+      test.storage.put.mock.invocationCallOrder[0],
+    );
+    expect(test.claimBytes).toHaveBeenCalledTimes(3);
+  });
+  it.each(['binding', 'settlement'])(
+    'does not publish when the scanner %s commit fails',
+    async (step) => {
+      const test = fixture();
+      const commit =
+        step === 'binding'
+          ? test.management.bindSecurityExecution
+          : test.management.settleSecurityExecution;
+      commit.mockRejectedValueOnce(new Error('unknown commit outcome'));
+      const done = test.run();
+      test.req.end('hello');
+      await done;
+      await expectNoOrdinaryStorage(test);
+      if (step === 'binding') expect(test.security.inspect).not.toHaveBeenCalled();
+      expect(test.response.value).toEqual({ code: 'security_uninspectable' });
+    },
+  );
+  it('can prove scanner cleanup through an independent matching cancellation after disconnect', async () => {
+    const test = fixture();
+    test.security.inspect.mockRejectedValueOnce(new Error('lost connection'));
+    test.security.cancel.mockResolvedValueOnce({
+      execution,
+      writerStopped: true,
+      transientDataRemoved: true,
+    });
+    const done = test.run();
+    test.req.end('hello');
+    await done;
+    await expectNoOrdinaryStorage(test);
+    expect(test.security.cancel).toHaveBeenCalledWith({ execution, signal: expect.anything() });
+    expect(test.security.cancel.mock.calls[0][0].signal.aborted).toBe(false);
+    expect(test.management.confirmCleanup).toHaveBeenCalledWith(
+      expect.objectContaining({
+        writerStopped: true,
+        securitySettlement: { execution, writerStopped: true, transientDataRemoved: true },
+      }),
+    );
+    expect(test.response.value).toEqual({ code: 'security_uninspectable' });
+  });
+  it.each(['foreign attempt', 'expired', 'malformed'])(
+    'does not dispatch bytes with a %s prepared execution',
+    async (reason) => {
+      const test = fixture();
+      let prepared: unknown = { ...execution, extra: 'untrusted' };
+      if (reason === 'foreign attempt') prepared = { ...execution, attemptId: 'other.1' };
+      if (reason === 'expired') prepared = { ...execution, expiresAt: '2026-10-17T01:00:00.000Z' };
+      test.security.prepare.mockResolvedValueOnce(prepared as never);
+      const done = test.run();
+      test.req.end('hello');
+      await done;
+      await expectNoOrdinaryStorage(test);
+      expect(test.management.bindSecurityExecution).not.toHaveBeenCalled();
+      expect(test.security.inspect).not.toHaveBeenCalled();
+    },
+  );
   it('blocks security rejection before ordinary storage and confirms only owned local cleanup', async () => {
     const test = fixture();
     test.security.inspect.mockResolvedValueOnce(
@@ -371,9 +461,10 @@ describe('raw upload body admission and streaming', () => {
         expect(test.management.confirmCleanup).not.toHaveBeenCalled();
       }
       expect(ticket.settle).toHaveBeenCalledWith({
-        writerStopped: cleaned,
+        writerStopped: true,
         localCopiesAbsent: true,
         storageOutcome: 'not_started',
+        securityPending: !cleaned,
       });
     },
   );
@@ -420,9 +511,10 @@ describe('raw upload body admission and streaming', () => {
     expect(test.response.value).toEqual({ code: 'security_uninspectable' });
     expect(test.management.confirmCleanup).not.toHaveBeenCalled();
     expect(ticket.settle).toHaveBeenCalledWith({
-      writerStopped: false,
+      writerStopped: true,
       localCopiesAbsent: true,
       storageOutcome: 'not_started',
+      securityPending: true,
     });
   });
   it('does not invoke cleanup or decision getters to derive a trusted result', async () => {
@@ -443,9 +535,10 @@ describe('raw upload body admission and streaming', () => {
       expect(test.response.value).toEqual({ code: 'security_uninspectable' });
       expect(test.management.confirmCleanup).not.toHaveBeenCalled();
       expect(ticket.settle).toHaveBeenCalledWith({
-        writerStopped: false,
+        writerStopped: true,
         localCopiesAbsent: true,
         storageOutcome: 'not_started',
+        securityPending: true,
       });
     }
     expect(get).not.toHaveBeenCalled();
@@ -503,9 +596,10 @@ describe('raw upload body admission and streaming', () => {
     expect(test.management.fail).toHaveBeenCalledWith(lease, 'security_uninspectable');
     expect(test.management.confirmCleanup).not.toHaveBeenCalled();
     expect(ticket.settle).toHaveBeenCalledWith({
-      writerStopped: false,
+      writerStopped: true,
       localCopiesAbsent: true,
       storageOutcome: 'not_started',
+      securityPending: true,
     });
   });
   it('does not reuse an approval when the active policy changes during inspection', async () => {
@@ -657,9 +751,10 @@ describe('raw upload body admission and streaming', () => {
       expect(test.response.value).toEqual({ code: 'security_uninspectable' });
       expect(test.management.confirmCleanup).not.toHaveBeenCalled();
       expect(ticket.settle).toHaveBeenCalledWith({
-        writerStopped: false,
+        writerStopped: true,
         localCopiesAbsent: true,
         storageOutcome: 'not_started',
+        securityPending: true,
       });
       finish();
       await release;
@@ -697,12 +792,13 @@ describe('raw upload body admission and streaming', () => {
     await expectNoOrdinaryStorage(test);
     expect(test.management.confirmCleanup).not.toHaveBeenCalled();
     expect(ticket.settle).toHaveBeenCalledWith({
-      writerStopped: false,
+      writerStopped: true,
       localCopiesAbsent: true,
       storageOutcome: 'not_started',
+      securityPending: true,
     });
   });
-  it('accepts only counted, staged and durable bytes and awaits both traffic grant completions', async () => {
+  it('accepts only counted, staged and durable bytes and awaits all three traffic grant completions', async () => {
     const observe = jest.fn();
     const test = fixture('hello', { observe });
     const done = test.run();
@@ -713,7 +809,7 @@ describe('raw upload body admission and streaming', () => {
     expect(await readFile(test.ordinaryPath, 'utf8')).toBe('hello');
     expect(test.security.inspect).toHaveBeenCalledTimes(1);
     const inspected = test.security.inspect.mock.calls[0][0];
-    expect(Object.keys(inspected).sort()).toEqual(['body', 'signal', 'subject']);
+    expect(Object.keys(inspected).sort()).toEqual(['body', 'execution', 'signal', 'subject']);
     expect(inspected.subject).toEqual({
       tenantId: 'tenant',
       userId: 'user',
@@ -730,7 +826,7 @@ describe('raw upload body admission and streaming', () => {
       expect.objectContaining({ outcome: 'durable' }),
       approval(inspected.subject),
     );
-    expect(test.completeBytes).toHaveBeenCalledTimes(2);
+    expect(test.completeBytes).toHaveBeenCalledTimes(3);
     expect(test.management.confirmCleanup).toHaveBeenCalledWith(
       expect.objectContaining({
         writerStopped: true,
@@ -1041,6 +1137,7 @@ describe('raw upload body admission and streaming', () => {
       writerStopped: false,
       localCopiesAbsent: true,
       storageOutcome: 'unknown',
+      securityPending: false,
     });
   });
   it('never deletes a pre-existing attempt owned by another invocation', async () => {
@@ -1094,6 +1191,7 @@ describe('raw upload body admission and streaming', () => {
       writerStopped: true,
       localCopiesAbsent: true,
       storageOutcome: 'not_started',
+      securityPending: false,
     });
     expect(await readdir(root)).toEqual([]);
   });

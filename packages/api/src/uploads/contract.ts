@@ -30,6 +30,8 @@ import type {
   UploadSecuritySubject,
   UploadSecurityApproval,
   UploadSecurityInspection,
+  UploadSecurityExecution,
+  UploadSecuritySettlement,
 } from 'librechat-data-provider';
 
 export interface IdentityPort {
@@ -71,11 +73,22 @@ export interface StoragePort {
 /** Isolated intake only. A normal parser or successful storage write cannot grant this approval. */
 export interface UploadSecurityPort {
   readonly policySha256: string;
+  /** Inert reservation; persist its receipt before sending any input bytes. */
+  prepare(input: {
+    attemptId: string;
+    subject: UploadSecuritySubject;
+    signal: AbortSignal;
+  }): Promise<UploadSecurityExecution>;
   inspect(input: {
+    execution: UploadSecurityExecution;
     subject: UploadSecuritySubject;
     body: AsyncIterable<Uint8Array>;
     signal: AbortSignal;
   }): Promise<UploadSecurityInspection>;
+  cancel(input: {
+    execution: UploadSecurityExecution;
+    signal: AbortSignal;
+  }): Promise<UploadSecuritySettlement>;
 }
 export interface DocumentPort {
   prepare(input: {
@@ -97,6 +110,8 @@ export type UploadAttemptSettlement = {
   writerStopped: boolean;
   localCopiesAbsent: boolean;
   storageOutcome?: 'not_started' | 'absent' | 'durable' | 'unknown';
+  /** Independent scanner obligation; local/S3 completion cannot settle it. */
+  securityPending?: boolean;
 };
 export type UploadAttemptRegistration = {
   bind(lease: UploadLease): void;
@@ -137,6 +152,16 @@ export interface UploadRepository {
   usage(principal: UploadPrincipal, now: number): Promise<UploadUsage>;
   claim(input: UploadClaimInput): Promise<UploadLease | null>;
   renew(lease: UploadLease, now: number): Promise<UploadLease>;
+  bindSecurityExecution(
+    lease: UploadLease,
+    execution: UploadSecurityExecution,
+    now: number,
+  ): Promise<void>;
+  settleSecurityExecution(
+    lease: UploadLease,
+    settlement: UploadSecuritySettlement,
+    now: number,
+  ): Promise<void>;
   accept(
     principal: UploadPrincipal,
     lease: UploadLease,

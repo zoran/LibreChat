@@ -80,6 +80,22 @@ describe('durable upload management', () => {
     coverage: { complete: true as const, pages: 1, parts: 1 },
   });
 
+  async function completeScanner(lease: UploadLease, at: number) {
+    const execution = {
+      version: 1 as const,
+      attemptId: `${lease.operationId}.${lease.generation}`,
+      instanceId: '11111111-1111-4111-8111-111111111111',
+      executionId: '22222222-2222-4222-8222-222222222222',
+      expiresAt: new Date(at + 60_000).toISOString(),
+    };
+    await first.bindSecurityExecution(lease, execution, at);
+    await second.settleSecurityExecution(
+      lease,
+      { execution, writerStopped: true, transientDataRemoved: true },
+      at,
+    );
+  }
+
   beforeAll(async () => {
     mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
     await Promise.all([
@@ -121,6 +137,7 @@ describe('durable upload management', () => {
       now: at,
     });
     expect(lease).not.toBeNull();
+    await completeScanner(lease!, at);
     const operation = await second.accept(
       principal,
       lease!,
@@ -1131,6 +1148,7 @@ describe('durable upload management', () => {
       worker,
       now,
     }))!;
+    await completeScanner(transfer, now);
     await second.accept(user, transfer, receipt(transfer), approval(transfer), now);
     expect(await first.cleanupForFile(other, 'cleanup-proof')).toBeNull();
     expect(

@@ -1,5 +1,9 @@
 /** Versioned plain-data contract for managed uploads; no persistence or HTTP dependencies. */
-import type { UploadSecurityApproval } from './upload-security';
+import type {
+  UploadSecurityApproval,
+  UploadSecurityExecution,
+  UploadSecuritySettlement,
+} from './upload-security';
 
 export const UPLOAD_CONTRACT_VERSION = 1;
 export const UPLOAD_MAX_FILE_BYTES = 31_457_280;
@@ -257,6 +261,8 @@ export type UploadCleanupTask = {
   fileId?: string;
   state: UploadState;
   parserExecution?: UploadParserExecution;
+  securityExecution?: UploadSecurityExecution;
+  securitySettlement?: UploadSecuritySettlement;
   /** Explicit durable facts; missing historical journal values remain false/unknown. */
   writerStopped: boolean;
   localCopiesAbsent: boolean;
@@ -269,6 +275,7 @@ export type UploadCleanupProof = {
   originalAbsent: boolean;
   localCopiesAbsent: boolean;
   textAndHistoryRemoved: boolean;
+  securitySettlement?: UploadSecuritySettlement;
 };
 export type UploadReserveInput = UploadRequest & { operationId: string; fingerprint: string };
 export type UploadClaimInput = {

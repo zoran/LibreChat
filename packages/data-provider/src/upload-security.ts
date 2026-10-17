@@ -44,6 +44,24 @@ export type UploadSecurityInspection = {
   cleanup: { writerStopped: true; transientDataRemoved: true };
 };
 
+/** Inert execution identity; issuer authentication and lease expiry belong to the server owner. */
+export type UploadSecurityExecution = {
+  version: 1;
+  attemptId: string;
+  instanceId: string;
+  executionId: string;
+  expiresAt: string;
+};
+
+/** False means unconfirmed, never a successful cancellation or proof that copies were removed. */
+export type UploadSecuritySettlement = {
+  execution: UploadSecurityExecution;
+  writerStopped: boolean;
+  transientDataRemoved: boolean;
+};
+
+const EXECUTION_KEYS = ['version', 'attemptId', 'instanceId', 'executionId', 'expiresAt'] as const;
+const SETTLEMENT_KEYS = ['execution', 'writerStopped', 'transientDataRemoved'] as const;
 const NEGATIVE_DECISION_KEYS = ['version', 'decision', 'reason'] as const;
 const INSPECTION_KEYS = ['decision', 'cleanup'] as const;
 const CLEANUP_KEYS = ['writerStopped', 'transientDataRemoved'] as const;
@@ -141,7 +159,8 @@ function checkedAt(value: unknown): value is string {
   return Number.isFinite(time) && new Date(time).toISOString() === value;
 }
 
-function readSubject(value: unknown): UploadSecuritySubject | null {
+/** Detached subject data for trusted server consumers; no accessor or inherited field is read. */
+export function readUploadSecuritySubject(value: unknown): UploadSecuritySubject | null {
   const record = readClosedRecord(value, SUBJECT_KEYS);
   if (
     !record ||
@@ -177,7 +196,7 @@ function readApproval(value: unknown): UploadSecurityApproval | null {
     !checkedAt(record.checkedAt)
   )
     return null;
-  const subject = readSubject(record.subject);
+  const subject = readUploadSecuritySubject(record.subject);
   const coverage = readClosedRecord(record.coverage, COVERAGE_KEYS);
   // Existing isolated inspection bounds: at most 500 pages/slides and 2,048 archive parts.
   if (
@@ -235,7 +254,7 @@ export function isUploadSecurityInspection(value: unknown): value is UploadSecur
 }
 
 export function isUploadSecuritySubject(value: unknown): value is UploadSecuritySubject {
-  return readSubject(value) !== null;
+  return readUploadSecuritySubject(value) !== null;
 }
 
 /** Shape only, without a wall-clock dependency or any assertion about the receipt's issuer. */
@@ -253,12 +272,85 @@ export function matchesUploadSecurityApproval(
   if (!hash(policySha256) || !Number.isSafeInteger(now) || now < 0 || now > 8_640_000_000_000_000)
     return false;
   const approval = readApproval(value);
-  const expected = readSubject(subject);
+  const expected = readUploadSecuritySubject(subject);
   return (
     approval !== null &&
     expected !== null &&
     approval.policySha256 === policySha256 &&
     Date.parse(approval.checkedAt) <= now &&
     SUBJECT_KEYS.every((key) => approval.subject[key] === expected[key])
+  );
+}
+
+function executionAttemptId(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length > 144) return false;
+  const match = /^[a-zA-Z0-9_-]{1,128}\.[1-9][0-9]{0,14}$/.exec(value);
+  return match?.[0] === value;
+}
+
+function uuidV4(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length === 36 &&
+    /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value)
+  );
+}
+
+/** Shape and snapshot only; callers must authenticate the issuer and enforce their lease clock. */
+export function readUploadSecurityExecution(value: unknown): UploadSecurityExecution | null {
+  const record = readClosedRecord(value, EXECUTION_KEYS);
+  if (
+    !record ||
+    record.version !== 1 ||
+    !executionAttemptId(record.attemptId) ||
+    !uuidV4(record.instanceId) ||
+    !uuidV4(record.executionId) ||
+    !checkedAt(record.expiresAt)
+  )
+    return null;
+  return {
+    version: 1,
+    attemptId: record.attemptId,
+    instanceId: record.instanceId,
+    executionId: record.executionId,
+    expiresAt: record.expiresAt,
+  };
+}
+
+/** Preserve unknown outcomes explicitly and detach the nested identity before consumers await. */
+export function readUploadSecuritySettlement(value: unknown): UploadSecuritySettlement | null {
+  const record = readClosedRecord(value, SETTLEMENT_KEYS);
+  if (
+    !record ||
+    typeof record.writerStopped !== 'boolean' ||
+    typeof record.transientDataRemoved !== 'boolean'
+  )
+    return null;
+  const execution = readUploadSecurityExecution(record.execution);
+  if (!execution) return null;
+  return {
+    execution,
+    writerStopped: record.writerStopped,
+    transientDataRemoved: record.transientDataRemoved,
+  };
+}
+
+export function matchesUploadSecurityExecution(value: unknown, expected: unknown): boolean {
+  const execution = readUploadSecurityExecution(value);
+  const identity = readUploadSecurityExecution(expected);
+  return (
+    execution !== null &&
+    identity !== null &&
+    EXECUTION_KEYS.every((key) => execution[key] === identity[key])
+  );
+}
+
+export function isCompleteUploadSecuritySettlement(value: unknown, execution: unknown): boolean {
+  const settlement = readUploadSecuritySettlement(value);
+  return (
+    settlement !== null &&
+    settlement.writerStopped &&
+    settlement.transientDataRemoved &&
+    matchesUploadSecurityExecution(settlement.execution, execution)
   );
 }

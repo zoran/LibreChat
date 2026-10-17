@@ -1,5 +1,6 @@
 const jwt = require('jsonwebtoken');
-const { mkdir, lstat } = require('node:fs/promises');
+const { mkdir, lstat, readFile } = require('node:fs/promises');
+const { isAbsolute } = require('node:path');
 const {
   createUploadManagement,
   createUploadRuntime,
@@ -9,6 +10,7 @@ const {
   createRawUploadBodyHandler,
   createUploadWorkers,
   createManagedUploadCleanup,
+  createHttpUploadSecurityPort,
   createUnixDocumentPort,
   createManagedS3Storage,
   createUploadMetrics,
@@ -27,6 +29,41 @@ const {
 
 let current;
 const getUploadRuntime = () => current;
+
+/** Operator-owned mTLS identity; no request can choose hosts, credentials or policy. */
+async function managedSecurityClient() {
+  const endpoint = process.env.UPLOAD_SECURITY_ENDPOINT;
+  const policySha256 = process.env.UPLOAD_SECURITY_POLICY_SHA256;
+  const allowedHosts = (process.env.UPLOAD_SECURITY_ALLOWED_HOSTS ?? '').split(',').filter(Boolean);
+  const paths = ['CA', 'CERT', 'KEY'].map(
+    (name) => process.env[`UPLOAD_SECURITY_TLS_${name}_FILE`],
+  );
+  if (
+    !endpoint ||
+    !/^[a-f0-9]{64}$/.test(policySha256 ?? '') ||
+    !allowedHosts.length ||
+    paths.some((value) => !value || !isAbsolute(value))
+  ) {
+    throw new Error('Upload security configuration unavailable');
+  }
+  try {
+    const [ca, cert, key] = await Promise.all(
+      paths.map(async (file) => {
+        const value = await readFile(file);
+        if (value.length < 1 || value.length > 65536) throw new Error('Invalid TLS material');
+        return value;
+      }),
+    );
+    return createHttpUploadSecurityPort({
+      endpoint,
+      allowedHosts,
+      policySha256,
+      tls: { ca, cert, key },
+    });
+  } catch {
+    throw new Error('Upload security configuration unavailable');
+  }
+}
 
 /** Bind after the generation store is configured; File remains the only quota owner. */
 function configureUploadSourceReplay({ manager, models, metrics }) {
@@ -156,6 +193,7 @@ async function createUploadComposition({
   platform,
   storage,
   documents,
+  security,
   stagingRoot,
   allowedOrigins,
   principal = uploadPrincipal(models),
@@ -165,7 +203,10 @@ async function createUploadComposition({
     !worker.instanceId ||
     !platform?.resources ||
     !platform.snapshots ||
-    typeof platform.hardGuards !== 'function'
+    typeof platform.hardGuards !== 'function' ||
+    typeof security?.prepare !== 'function' ||
+    typeof security.inspect !== 'function' ||
+    typeof security.cancel !== 'function'
   )
     throw new Error('Invalid upload composition');
   const metrics = createUploadMetrics(registry, [worker.hostId]).bind(worker.hostId);
@@ -205,6 +246,7 @@ async function createUploadComposition({
     repository,
     storage,
     documents,
+    security,
     attempts: workers.attempts,
     worker,
     stagingRoot,
@@ -238,6 +280,7 @@ async function createUploadComposition({
     management,
     principal,
     storage,
+    security,
     worker,
     stagingRoot,
     attempts: workers.attempts,
@@ -298,6 +341,7 @@ async function createUploadComposition({
 async function initializeUploads({ registry }) {
   if (process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED !== 'true') return undefined;
   if (current) return current;
+  const security = await managedSecurityClient();
   const client = managedStorageClient();
   const mongoose = require('mongoose');
   const models = require('~/models');
@@ -342,6 +386,7 @@ async function initializeUploads({ registry }) {
     platform,
     storage,
     documents,
+    security,
     stagingRoot,
     allowedOrigins: [origin],
   });
@@ -355,5 +400,6 @@ module.exports = {
   uploadPrincipal,
   attachmentProjection,
   managedStorageClient,
+  managedSecurityClient,
   configureUploadSourceReplay,
 };

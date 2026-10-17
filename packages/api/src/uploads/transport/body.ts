@@ -7,6 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import {
   isUploadPrincipal,
   readUploadSecurityInspection,
+  readUploadSecurityExecution,
   matchesUploadSecurityApproval,
 } from 'librechat-data-provider';
 import type {
@@ -17,6 +18,8 @@ import type {
   UploadErrorCode,
   UploadSecurityApproval,
   UploadSecuritySubject,
+  UploadSecurityExecution,
+  UploadSecuritySettlement,
 } from 'librechat-data-provider';
 import type { Request, RequestHandler } from 'express';
 import type {
@@ -26,6 +29,7 @@ import type {
   UploadSecurityPort,
 } from '../contract';
 import type { UploadManagement } from '../management';
+import { cancelSecurityExecution, waitForSecurityResponse } from '../security/cancellation';
 import { UploadManagementError, isUploadManagementError } from '../errors';
 import { attemptOriginalPath, uploadAttemptId } from '../processing/paths';
 import { createOriginalIntegrity } from '../storage/integrity';
@@ -46,7 +50,15 @@ export type RawUploadObservation =
 export type RawUploadBodyDependencies = {
   management: Pick<
     UploadManagement,
-    'get' | 'claimTransfer' | 'renew' | 'accept' | 'fail' | 'cancel' | 'confirmCleanup'
+    | 'get'
+    | 'claimTransfer'
+    | 'renew'
+    | 'accept'
+    | 'fail'
+    | 'cancel'
+    | 'confirmCleanup'
+    | 'bindSecurityExecution'
+    | 'settleSecurityExecution'
   >;
   principal(request: Request): Promise<UploadPrincipal>;
   storage: StoragePort;
@@ -134,6 +146,8 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
     let inspectionPending = false;
     // No scanner work exists before dispatch; afterward only its validated attestation can settle it.
     let scannerSettled = true;
+    let securityExecution: UploadSecurityExecution | undefined;
+    let securitySettlement: UploadSecuritySettlement | undefined;
     let storageOutcome: 'not_started' | 'durable' | 'unknown' | 'absent' = 'not_started';
     let errorCode: UploadErrorCode = 'unavailable';
     let admittedPrincipal: UploadPrincipal | undefined;
@@ -321,8 +335,28 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
       errorCode = 'security_uninspectable';
       let securityRejected = false;
       try {
-        if (typeof deps.security?.inspect !== 'function')
+        if (
+          typeof deps.security?.inspect !== 'function' ||
+          typeof deps.security.prepare !== 'function'
+        )
           throw new UploadManagementError('security_uninspectable');
+        inspectionPending = true;
+        const prepared = readUploadSecurityExecution(
+          await waitForSecurityResponse(
+            () => deps.security.prepare({ attemptId, subject, signal }),
+            signal,
+          ),
+        );
+        if (
+          !prepared ||
+          prepared.attemptId !== attemptId ||
+          Date.parse(prepared.expiresAt) <= now()
+        )
+          throw new UploadManagementError('security_uninspectable');
+        securityExecution = Object.freeze(prepared);
+        scannerSettled = false;
+        await deps.management.bindSecurityExecution(lease, securityExecution);
+        signal.throwIfAborted();
         // The extra byte detects an appended file while keeping this independent read bounded.
         const scan = createReadStream(filePath, {
           start: 0,
@@ -334,7 +368,7 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
         const scanIntegrity = createOriginalIntegrity(bytes);
         let scanComplete = false;
         const scanBody = (async function* () {
-          for await (const chunk of scan) {
+          for await (const chunk of budgeted(scan)) {
             signal.throwIfAborted();
             scanIntegrity.update(chunk);
             yield chunk;
@@ -356,7 +390,12 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
             .then(() => {
               signal.throwIfAborted();
               scannerSettled = false;
-              return deps.security.inspect({ subject, body: scanBody, signal });
+              return deps.security.inspect({
+                execution: securityExecution!,
+                subject,
+                body: scanBody,
+                signal,
+              });
             })
             .finally(() => {
               inspectionPending = false;
@@ -366,6 +405,12 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
           const inspected = readUploadSecurityInspection(result);
           if (!inspected) throw new UploadManagementError('security_uninspectable');
           scannerSettled = true;
+          securitySettlement = {
+            execution: securityExecution,
+            writerStopped: true,
+            transientDataRemoved: true,
+          };
+          await deps.management.settleSecurityExecution(lease, securitySettlement);
           const { decision } = inspected;
           if (decision.decision !== 'approved') {
             securityRejected = decision.decision === 'rejected';
@@ -393,6 +438,7 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
           signal.removeEventListener('abort', abortInspection);
           scan.destroy();
           await scanClosed;
+          clearTimeout(idleTimer);
         }
       } catch {
         if (signal.aborted) signal.throwIfAborted();
@@ -472,6 +518,17 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
       await heartbeat;
       req.off('aborted', disconnected);
       res.off('close', disconnected);
+      if (securityExecution && !scannerSettled) {
+        const settlement = await cancelSecurityExecution(
+          deps.security,
+          securityExecution,
+          AbortSignal.timeout(5_000),
+        );
+        if (settlement) {
+          securitySettlement = settlement;
+          scannerSettled = true;
+        }
+      }
       // Do not release shared reservations here: unknown storage/DB outcomes need
       // the existing durable cleanup owner. Scanner promise settlement or local input
       // removal cannot establish that its execution and transient copies are gone.
@@ -493,6 +550,7 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
             localCopiesAbsent: true,
             originalAbsent: storageOutcome === 'not_started' || storageOutcome === 'absent',
             textAndHistoryRemoved: false,
+            ...(securitySettlement ? { securitySettlement } : {}),
           })
           .catch(() => undefined);
       }
@@ -500,12 +558,10 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
       // writer identity stays unknown; recovery must not adopt and remove it.
       registration?.settle({
         writerStopped:
-          storageOutcome !== 'unknown' &&
-          scannerSettled &&
-          !claimUncertain &&
-          !(stagingAttempted && !directory),
+          storageOutcome !== 'unknown' && !claimUncertain && !(stagingAttempted && !directory),
         localCopiesAbsent,
         storageOutcome,
+        securityPending: !scannerSettled,
       });
       observe({
         kind: 'stage',

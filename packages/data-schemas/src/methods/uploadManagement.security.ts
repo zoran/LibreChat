@@ -3,8 +3,15 @@ import {
   isUploadOriginalIntegrity,
   isUploadSecurityApproval,
   matchesUploadSecurityApproval,
+  readUploadSecurityExecution,
+  matchesUploadSecurityExecution,
+  isCompleteUploadSecuritySettlement,
 } from 'librechat-data-provider';
-import type { UploadSecurityApproval, UploadStorageReceipt } from 'librechat-data-provider';
+import type {
+  UploadSecurityApproval,
+  UploadSecuritySettlement,
+  UploadStorageReceipt,
+} from 'librechat-data-provider';
 import type { StoredUpload } from './uploadManagementStore';
 import { reject } from './uploadManagementStore';
 
@@ -14,7 +21,27 @@ export function captureUploadSecurityApproval(value: unknown): UploadSecurityApp
   return { ...value, subject: { ...value.subject }, coverage: { ...value.coverage } };
 }
 
-export function hasCurrentUploadSecurityApproval(
+export function hasCompleteUploadSecurityExecution(row: StoredUpload): boolean {
+  const execution = readUploadSecurityExecution(row.securityExecution);
+  return (
+    execution !== null &&
+    execution.attemptId === `${row._id}.${row.attemptGeneration}` &&
+    isCompleteUploadSecuritySettlement(row.securitySettlement, execution)
+  );
+}
+
+/** A complete acknowledgement is monotone; separate incomplete observations never combine. */
+export function recordUploadSecuritySettlement(
+  row: StoredUpload,
+  settlement: UploadSecuritySettlement,
+): void {
+  if (!matchesUploadSecurityExecution(row.securityExecution, settlement.execution))
+    reject('lease_lost');
+  if (isCompleteUploadSecuritySettlement(settlement, row.securityExecution!))
+    row.securitySettlement = settlement;
+}
+
+function hasBoundUploadSecurityApproval(
   row: StoredUpload,
   policySha256: string | undefined,
   now: number,
@@ -50,6 +77,19 @@ export function hasCurrentUploadSecurityApproval(
   );
 }
 
+export function hasCurrentUploadSecurityApproval(
+  row: StoredUpload,
+  policySha256: string | undefined,
+  now: number,
+  approval: unknown = row.securityApproval,
+  original: UploadStorageReceipt | undefined = row.original,
+): approval is UploadSecurityApproval {
+  return (
+    hasCompleteUploadSecurityExecution(row) &&
+    hasBoundUploadSecurityApproval(row, policySha256, now, approval, original)
+  );
+}
+
 export function requireUploadSecurityApproval(
   row: StoredUpload,
   policySha256: string | undefined,
@@ -68,13 +108,24 @@ export function validateUploadMigrationSecurity(
   policySha256: string | undefined,
   now: number,
 ): void {
+  if (row.securityExecution !== undefined) {
+    const execution = readUploadSecurityExecution(row.securityExecution);
+    if (
+      !execution ||
+      execution.attemptId !== `${row._id}.${row.attemptGeneration}` ||
+      (!hasCompleteUploadSecurityExecution(row) && !row.cleanupPending)
+    )
+      reject('migration_conflict');
+  }
+  if (row.securitySettlement !== undefined && !hasCompleteUploadSecurityExecution(row))
+    reject('migration_conflict');
   if (row.securityApproval !== undefined) {
     if (!isUploadSecurityApproval(row.securityApproval) || row.acceptedAt == null)
       reject('migration_conflict');
     // Retained historical proofs still bind their original; a policy change does not erase them.
     if (
       row.original?.integrity &&
-      !hasCurrentUploadSecurityApproval(row, row.securityApproval.policySha256, now)
+      !hasBoundUploadSecurityApproval(row, row.securityApproval.policySha256, now)
     )
       reject('migration_conflict');
   }
