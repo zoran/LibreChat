@@ -8,7 +8,7 @@ const policy: SecurityMarkingPolicy = {
   labels: ['Einstufung'],
   prose: [{ before: 'Die Kennzeichnung', after: 'wird hier als Beispiel erläutert.' }],
 };
-const clear = { decision: 'clear' };
+const clear = { decision: 'clear', coverage: { complete: true, pages: 1, parts: 1 } };
 const rejected = { decision: 'rejected', reason: 'classification_marking' };
 const ambiguous = { decision: 'uninspectable', reason: 'ambiguous_marking' };
 const invalid = { decision: 'uninspectable', reason: 'invalid_content' };

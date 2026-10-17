@@ -1,7 +1,8 @@
 /** Pure text byte inspection. Execution isolation, byte binding and approval belong to the caller. */
 import { TextDecoder } from 'node:util';
-import type { SecurityMarkingPolicy, SecurityMarkingResult } from './markings';
-import { inspectSecurityMarkings } from './markings';
+import type { SecurityMarkingPolicy } from './markings';
+import type { SecurityInspectionResult } from './inspection';
+import { inspectCompleteSecurityEvidence } from './inspection';
 import { MANAGED_CSV_LIMITS, parseManagedCsv } from '../../files/documents/csv';
 
 // One complete context unit: never split a literal or prose frame across artificial boundaries.
@@ -19,7 +20,7 @@ type TextSecurityInput = {
  * Known foreign-format prefixes are refused, not parsed; this is no general MIME detector.
  * `clear` is only classification evidence, never UploadSecurityApproval or a sandbox/cleanup proof.
  */
-export function inspectPlainTextSecurity(input: TextSecurityInput): SecurityMarkingResult {
+export function inspectPlainTextSecurity(input: TextSecurityInput): SecurityInspectionResult {
   try {
     const { bytes, mediaType, policy } = input;
     if (
@@ -38,7 +39,7 @@ export function inspectPlainTextSecurity(input: TextSecurityInput): SecurityMark
     if (/^\s*(?:%PDF-|%!PS|\{\\rtf\d|<[\w!?/])/iu.test(text)) {
       return { decision: 'uninspectable', reason: 'invalid_content' };
     }
-    return inspectSecurityMarkings(policy, {
+    return inspectCompleteSecurityEvidence(policy, {
       version: 1,
       coverage: { complete: true, pages: 1, parts: 1 },
       units: [{ part: 1, page: 1, placement: 'body', text }],
@@ -54,7 +55,7 @@ export function inspectPlainTextSecurity(input: TextSecurityInput): SecurityMark
  * formulae. Inspect the entire raw source and decoded field stream as well as every complete cell;
  * a prose exception for one cell can never exempt the rest of the document.
  */
-export function inspectTextSecurity(input: TextSecurityInput): SecurityMarkingResult {
+export function inspectTextSecurity(input: TextSecurityInput): SecurityInspectionResult {
   try {
     if (input.mediaType === 'text/plain') return inspectPlainTextSecurity(input);
     const { bytes, mediaType, policy } = input;
@@ -85,7 +86,7 @@ export function inspectTextSecurity(input: TextSecurityInput): SecurityMarkingRe
       }
     }
     const coverage = { complete: true, pages: 1, parts: 1 };
-    return inspectSecurityMarkings(policy, {
+    return inspectCompleteSecurityEvidence(policy, {
       version: 1,
       coverage,
       // A cell is not a heading. Only a real two-field row supplies a label/value context;

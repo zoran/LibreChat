@@ -339,7 +339,7 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         expect(received.put).toHaveBeenCalledTimes(1);
         expect(await readFile(path.join(ordinaryRoot, derived.id))).toEqual(bytes);
         expect(stored?.securityApproval).toMatchObject({
-          scannerVersion: 'txt-csv-worker-v2',
+          scannerVersion: 'complete-content-v3',
           subject: {
             operationId: derived.id,
             sha256: createHash('sha256').update(bytes).digest('hex'),
@@ -595,7 +595,7 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         expect(approved).toMatchObject({
           decision: 'approved',
           policySha256,
-          scannerVersion: 'txt-csv-worker-v2',
+          scannerVersion: 'complete-content-v3',
           subject: {
             tenantId: principal.tenantId,
             userId: principal.userId,

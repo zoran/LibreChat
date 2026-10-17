@@ -634,7 +634,7 @@ describe('isolated Intake through native authority, scanner and App promotion', 
         promotion: { state: 'settled', writerStopped: true },
         securityApproval: {
           decision: 'approved',
-          scannerVersion: 'txt-csv-worker-v2',
+          scannerVersion: 'complete-content-v3',
           subject: { mediaType: 'text/csv', bytes: bytes.length, sha256: digest(bytes) },
         },
       });
@@ -724,7 +724,7 @@ describe('isolated Intake through native authority, scanner and App promotion', 
     const row = await stored(issued.operationId);
     expect(row).toMatchObject({
       promotion: { state: 'settled', writerStopped: true, worker: appWorker },
-      securityApproval: { scannerVersion: 'txt-csv-worker-v2' },
+      securityApproval: { scannerVersion: 'complete-content-v3' },
     });
     expect(
       await observer.models.File.findOne({ file_id: issued.operationId })

@@ -20,6 +20,7 @@ import type { SecurityMarkingPolicy } from './markings';
 import type { UploadSecurityPort } from '../contract';
 import type { ApplicationWorkPort } from '~/app';
 import { inspectSecurityMarkings } from './markings';
+import { SECURITY_INSPECTION_VERSION } from './inspection';
 
 export type SecurityWorker = UploadSecurityPort & {
   maintenance: ApplicationWorkPort;
@@ -276,19 +277,24 @@ export function createSecurityWorker(options: Options): SecurityWorker {
       if (
         result &&
         typeof result === 'object' &&
-        Object.keys(result).length === 1 &&
+        Object.keys(result).length === 2 &&
         'decision' in result &&
-        result.decision === 'clear'
+        result.decision === 'clear' &&
+        'coverage' in result
       ) {
-        decision = {
-          version: 1,
-          decision: 'approved',
-          subject: { ...record.subject },
-          policySha256,
-          scannerVersion: 'txt-csv-worker-v2',
-          checkedAt: new Date(now()).toISOString(),
-          coverage: { complete: true, pages: 1, parts: 1 },
-        };
+        const inspection = readUploadSecurityInspection({
+          decision: {
+            version: 1,
+            decision: 'approved',
+            subject: { ...record.subject },
+            policySha256,
+            scannerVersion: SECURITY_INSPECTION_VERSION,
+            checkedAt: new Date(now()).toISOString(),
+            coverage: result.coverage,
+          },
+          cleanup: { writerStopped: true, transientDataRemoved: true },
+        });
+        if (inspection?.decision.decision === 'approved') decision = inspection.decision;
       } else {
         const parsed = readUploadSecurityInspection({
           decision: result && typeof result === 'object' ? { version: 1, ...result } : null,

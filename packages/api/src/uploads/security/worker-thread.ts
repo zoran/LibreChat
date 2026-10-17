@@ -1,4 +1,4 @@
-/** Trusted text/CSV thread: no I/O/model. Process/network isolation is the deployment owner. */
+/** Trusted text/CSV evidence thread: no I/O/model. Process/network isolation is the deployment owner. */
 import { parentPort, workerData } from 'node:worker_threads';
 import { inspectTextSecurity } from './text';
 

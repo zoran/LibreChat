@@ -5,9 +5,11 @@ import { createHash, randomUUID } from 'node:crypto';
 import { mkdtemp, stat, writeFile, rm } from 'node:fs/promises';
 import { matchesUploadSecurityApproval } from 'librechat-data-provider';
 import { createSecurityWorker } from './worker';
+import { SECURITY_INSPECTION_VERSION } from './inspection';
 
 const policy = { version: 1 as const, markings: ['GEHEIM'], labels: ['Einstufung'] };
 const policySha256 = 'a'.repeat(64);
+const complete = { decision: 'clear', coverage: { complete: true, pages: 1, parts: 1 } };
 const signal = () => AbortSignal.timeout(3000);
 const subject = (text = 'Harmloser Text') => ({
   tenantId: 'tenant',
@@ -42,11 +44,11 @@ beforeAll(async () => {
   // Controlled failure fixture: posts a claimed result but deliberately never exits.
   await writeFile(
     join(directory, 'no-exit.js'),
-    `require('node:worker_threads').parentPort.postMessage(JSON.stringify({decision:'clear'})); require('node:fs').writeFileSync(${JSON.stringify(join(directory, 'thread-started'))}, 'started'); setInterval(()=>{},1000);`,
+    `require('node:worker_threads').parentPort.postMessage(${JSON.stringify(JSON.stringify(complete))}); require('node:fs').writeFileSync(${JSON.stringify(join(directory, 'thread-started'))}, 'started'); setInterval(()=>{},1000);`,
   );
   await writeFile(
     join(directory, 'bad-exit.js'),
-    "require('node:worker_threads').parentPort.postMessage(JSON.stringify({decision:'clear'})); process.exit(1);",
+    `require('node:worker_threads').parentPort.postMessage(${JSON.stringify(JSON.stringify(complete))}); process.exit(1);`,
   );
 });
 afterEach(async () => {
@@ -59,6 +61,57 @@ afterAll(async () => {
 });
 
 describe('bounded security worker', () => {
+  async function inspectThreadResult(result: unknown) {
+    const threadPath = join(directory, `${randomUUID()}.js`);
+    await writeFile(
+      threadPath,
+      `require('node:worker_threads').parentPort.postMessage(${JSON.stringify(JSON.stringify(result))});`,
+    );
+    const instance = worker({ threadPath });
+    const execution = await instance.prepare({
+      attemptId: 'upload.1',
+      subject: subject(),
+      signal: signal(),
+    });
+    return instance.inspect({ execution, subject: subject(), body: body(), signal: signal() });
+  }
+
+  it('binds actual multi-page coverage from a joined controlled thread through the public approval reader', async () => {
+    const result = await inspectThreadResult({
+      decision: 'clear',
+      coverage: { complete: true, pages: 3, parts: 2 },
+    });
+    expect(result.decision).toMatchObject({
+      decision: 'approved',
+      subject: subject(),
+      policySha256,
+      scannerVersion: SECURITY_INSPECTION_VERSION,
+      coverage: { complete: true, pages: 3, parts: 2 },
+    });
+    expect(
+      matchesUploadSecurityApproval(result.decision, subject(), policySha256, Date.now()),
+    ).toBe(true);
+    expect(result.cleanup).toEqual({ writerStopped: true, transientDataRemoved: true });
+  });
+
+  it.each([
+    { decision: 'clear' },
+    { decision: 'clear', coverage: { complete: false, pages: 1, parts: 1 } },
+    { decision: 'clear', coverage: { complete: true, pages: 0, parts: 1 } },
+    { decision: 'clear', coverage: { complete: true, pages: 501, parts: 1 } },
+    { decision: 'clear', coverage: { complete: true, pages: 1, parts: 2049 } },
+    { decision: 'clear', coverage: { complete: true, pages: 1, parts: 1, untrusted: true } },
+    { ...complete, untrusted: true },
+  ])('refuses legacy or malformed positive thread evidence %#', async (claimed) => {
+    const result = await inspectThreadResult(claimed);
+    expect(result.decision).toEqual({
+      version: 1,
+      decision: 'uninspectable',
+      reason: 'scanner_unavailable',
+    });
+    expect(result.cleanup).toEqual({ writerStopped: true, transientDataRemoved: true });
+  });
+
   it('approves original CSV bytes/MIME with the new scanner version only after real thread exit', async () => {
     const source = '\ufeffName,Wert\r\nNotiz,-1.25\r\n';
     const input = { ...subject(source), mediaType: 'text/csv' };
@@ -77,7 +130,11 @@ describe('bounded security worker', () => {
     expect(matchesUploadSecurityApproval(result.decision, input, policySha256, Date.now())).toBe(
       true,
     );
-    expect(result.decision).toMatchObject({ scannerVersion: 'txt-csv-worker-v2', subject: input });
+    expect(result.decision).toMatchObject({
+      scannerVersion: SECURITY_INSPECTION_VERSION,
+      subject: input,
+      coverage: { complete: true, pages: 1, parts: 1 },
+    });
     expect(
       matchesUploadSecurityApproval(
         result.decision,

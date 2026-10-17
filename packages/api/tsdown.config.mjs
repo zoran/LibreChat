@@ -15,6 +15,7 @@ export default defineConfig({
     'src/uploads/processing/sidecar-entry.ts',
     'src/uploads/processing/parser-child.ts',
     'src/uploads/security/worker-thread.ts',
+    'src/uploads/security/pdf-child.ts',
     'src/uploads/security/security-entry.ts',
     'src/uploads/intake/intake-entry.ts',
   ],
