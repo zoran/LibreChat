@@ -36,7 +36,7 @@ const mockMutate = jest.fn((vars: MutationVars) => {
   mockMutationHandlers.onMutate?.(vars);
 });
 
-jest.mock('@monaco-editor/react', () => ({
+jest.mock('./monaco', () => ({
   __esModule: true,
   default: (props: MonacoEditorProps) => {
     Object.assign(mockEditorProps, props);
@@ -74,6 +74,8 @@ jest.mock('~/Providers/EditorContext', () => {
         },
         [],
       );
+      const artifactConflicts = ReactModule.useRef({});
+      const setArtifactConflict = jest.fn();
       const codeSession = ReactModule.useRef(0);
       const savedContent = ReactModule.useRef({});
       const endCodeSession = ReactModule.useCallback(() => {
@@ -89,6 +91,8 @@ jest.mock('~/Providers/EditorContext', () => {
         codeSession,
         endCodeSession,
         savedContent,
+        artifactConflicts,
+        setArtifactConflict,
       };
     },
   };
@@ -99,6 +103,12 @@ jest.mock('~/Providers', () => ({
 }));
 
 jest.mock('~/data-provider', () => ({
+  useRefreshArtifact: () => ({
+    load: jest.fn(),
+    readCurrent: () => null,
+    source: { header: 'artifact', source: 'text' },
+    version: 1,
+  }),
   useEditArtifact: (handlers: MutationHandlers) => {
     mockMutationHandlers.onMutate = handlers.onMutate;
     mockMutationHandlers.onSuccess = handlers.onSuccess;
@@ -181,12 +191,10 @@ const createMonacoMock = () => {
   const defineTheme = jest.fn();
   const monaco = {
     editor: { defineTheme },
-    languages: {
-      typescript: {
-        typescriptDefaults: defaults,
-        javascriptDefaults: defaults,
-        JsxEmit: { React: 1 },
-      },
+    typescript: {
+      typescriptDefaults: defaults,
+      javascriptDefaults: defaults,
+      JsxEmit: { React: 1 },
     },
   } as unknown as Monaco;
 
@@ -342,11 +350,14 @@ describe('ArtifactCodeEditor', () => {
     expect(mockMutate).toHaveBeenCalledTimes(2);
 
     act(() => {
-      mockMutationHandlers.onSuccess?.(undefined, {
-        updated: 'DIFFERENT',
-        messageId: 'msg-1',
-        index: 0,
-      });
+      mockMutationHandlers.onSuccess?.(
+        { __v: 1 },
+        {
+          updated: 'DIFFERENT',
+          messageId: 'msg-1',
+          index: 0,
+        },
+      );
     });
     fireEdit('EDITED');
     expect(mockMutate).toHaveBeenCalledTimes(3);

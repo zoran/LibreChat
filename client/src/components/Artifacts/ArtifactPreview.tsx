@@ -7,6 +7,7 @@ import type {
 import type { SandpackStartupConfig } from '~/utils/artifacts';
 import type { ArtifactFiles } from '~/common';
 import { sharedFiles, buildSandpackOptions } from '~/utils/artifacts';
+import { useLocalize } from '~/hooks';
 
 export const ArtifactPreview = memo(function ({
   files,
@@ -25,6 +26,7 @@ export const ArtifactPreview = memo(function ({
   currentCode?: string;
   startupConfig?: SandpackStartupConfig;
 }) {
+  const localize = useLocalize();
   const artifactFiles = useMemo(() => {
     if (Object.keys(files).length === 0) {
       return files;
@@ -48,11 +50,23 @@ export const ArtifactPreview = memo(function ({
     return null;
   }
 
+  // Mounting without a selected endpoint lets Sandpack contact its public default service.
+  if (typeof options?.bundlerURL !== 'string' || options.bundlerURL.trim() === '') {
+    return (
+      <div
+        className="text-text-secondary flex h-full items-center justify-center p-4 text-sm"
+        role="status"
+      >
+        {localize('com_ui_preview_unavailable')}
+      </div>
+    );
+  }
+
   return (
     <SandpackProvider
       files={{ ...artifactFiles, ...sharedFiles }}
-      options={options}
       {...sharedProps}
+      options={options}
       template={template}
     >
       <SandpackPreview

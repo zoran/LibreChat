@@ -167,4 +167,22 @@ describe('message mutation policy for durable subagent threads', () => {
     expect(mockIsSubagentThreadWriteBlocked).not.toHaveBeenCalled();
     expect(db.updateMessage).not.toHaveBeenCalled();
   });
+
+  it('keeps the child-thread restriction ahead of artifact version disclosure', async () => {
+    db.getMessage.mockResolvedValue({
+      messageId: 'message-1',
+      conversationId: 'child-conversation',
+      text: 'private artifact',
+      __v: 8,
+    });
+    const response = await request(app).post('/api/messages/artifact/message-1').send({
+      index: 0,
+      original: 'before',
+      updated: 'after',
+      expectedVersion: 7,
+    });
+    expect(response.status).toBe(409);
+    expect(response.body).toEqual({ error: 'This subagent thread is view-only.' });
+    expect(db.saveMessage).not.toHaveBeenCalled();
+  });
 });

@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useMemo, useCallback, useRef } from 'react';
 import { useIsMutating } from '@tanstack/react-query';
 import { MutationKeys } from 'librechat-data-provider';
+import type { ArtifactSourceIdentity } from '~/common/artifacts';
 
 /**
  * Mutation state context - for components that need to know about save/edit status
@@ -50,6 +51,12 @@ interface MutationContextType {
  * It outlives a session: the server's content does not change when the pane
  * closes.
  */
+export type ArtifactConflictTarget = {
+  messageId: string;
+  index: number;
+  source: ArtifactSourceIdentity | null;
+};
+
 interface CodeContextType {
   currentCode?: string;
   codeArtifactId?: string;
@@ -61,6 +68,13 @@ interface CodeContextType {
   codeSession: { current: number };
   endCodeSession: () => void;
   savedContent: SavedContentLedger;
+  conflictRevision: number;
+  artifactConflicts: { current: Record<string, ArtifactConflictTarget> };
+  setArtifactConflict: (
+    artifactId: string,
+    target: ArtifactConflictTarget | undefined,
+    fallbackCode?: string,
+  ) => void;
 }
 
 /**
@@ -71,7 +85,13 @@ interface CodeContextType {
  * made elsewhere, which wins. `savedBuffer` is the buffer text that save wrote
  * until the buffer changes again: only that copy is known to be saved.
  */
-type SavedContent = { base: string; pending: string[]; savedBuffer: string | null };
+type SavedContent = {
+  base: string;
+  pending: string[];
+  savedBuffer: string | null;
+  version?: number | null;
+  source?: ArtifactSourceIdentity | null;
+};
 export type SavedContentLedger = { current: Record<string, SavedContent> };
 
 export function recordSave(
@@ -79,12 +99,15 @@ export function recordSave(
   artifactId: string,
   original: string,
   updated: string,
+  version?: number | null,
 ): void {
   const previous = ledger.current[artifactId];
   ledger.current[artifactId] = {
     base: updated,
     pending: [...(previous?.pending ?? []), original],
     savedBuffer: updated,
+    version,
+    source: previous?.source,
   };
 }
 
@@ -139,6 +162,29 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
   }>({ buffer: {}, retained: {} });
   const [rejectedCode, setRejectedState] = useState<Record<string, string>>({});
   const codeSession = useRef(0);
+  const artifactConflicts = useRef<Record<string, ArtifactConflictTarget>>({});
+  const [conflictRevision, setConflictRevision] = useState(0);
+  const setArtifactConflict = useCallback(
+    (artifactId: string, target: ArtifactConflictTarget | undefined, fallbackCode?: string) => {
+      if (target == null) {
+        delete artifactConflicts.current[artifactId];
+      } else {
+        artifactConflicts.current[artifactId] = target;
+        if (fallbackCode != null) {
+          setCodeState((previous) =>
+            previous.buffer.artifactId === artifactId || previous.retained[artifactId] != null
+              ? previous
+              : {
+                  ...previous,
+                  retained: { ...previous.retained, [artifactId]: fallbackCode },
+                },
+          );
+        }
+      }
+      setConflictRevision((value) => value + 1);
+    },
+    [],
+  );
   const savedContent = useRef<Record<string, SavedContent>>({});
 
   const setCurrentCode = useCallback((code: string | undefined, artifactId?: string) => {
@@ -196,7 +242,17 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
 
   const endCodeSession = useCallback(() => {
     codeSession.current += 1;
-    setCodeState({ buffer: {}, retained: {} });
+    // Closing a pane is not permission to discard a conflicted draft or retry it.
+    setCodeState((previous) => {
+      const retained = Object.fromEntries(
+        Object.entries(previous.retained).filter(([id]) => artifactConflicts.current[id] != null),
+      );
+      const { artifactId, code } = previous.buffer;
+      if (artifactId != null && code != null && artifactConflicts.current[artifactId] != null) {
+        retained[artifactId] = code;
+      }
+      return { buffer: {}, retained };
+    });
     setRejectedState({});
     /* With the buffers gone, an entry only matters while the registry may
      * still lag behind a save. */
@@ -218,8 +274,20 @@ export function EditorProvider({ children }: { children: React.ReactNode }) {
       codeSession,
       endCodeSession,
       savedContent,
+      artifactConflicts,
+      conflictRevision,
+      setArtifactConflict,
     }),
-    [clearCode, codeState, endCodeSession, rejectedCode, setCurrentCode, setRejectedCode],
+    [
+      clearCode,
+      codeState,
+      conflictRevision,
+      endCodeSession,
+      rejectedCode,
+      setCurrentCode,
+      setRejectedCode,
+      setArtifactConflict,
+    ],
   );
 
   return (

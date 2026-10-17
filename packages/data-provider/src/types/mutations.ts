@@ -478,9 +478,14 @@ export type TEditArtifactRequest = {
   messageId: string;
   original: string;
   updated: string;
+  /** Omission supports older clients; null names an existing versionless native message. */
+  expectedVersion?: number | null;
 };
 
-export type TEditArtifactResponse = Pick<types.TMessage, 'content' | 'text' | 'conversationId'>;
+export type TEditArtifactResponse = Pick<types.TMessage, 'content' | 'text' | 'conversationId'> & {
+  /** Actual saved native message revision, never inferred by the client. */
+  __v: number;
+};
 
 export type EditArtifactOptions = MutationOptions<
   TEditArtifactResponse,

@@ -1,6 +1,5 @@
 import React, { useMemo, useState, useEffect, useRef, useCallback, useContext } from 'react';
 import debounce from 'lodash/debounce';
-import MonacoEditor from '@monaco-editor/react';
 import {
   ThemeContext,
   highContrastDarkTheme,
@@ -10,6 +9,7 @@ import {
 import type { Monaco } from '@monaco-editor/react';
 import type { IThemeRGB } from '@librechat/client';
 import type { editor } from 'monaco-editor';
+import type { ArtifactRevision, ArtifactSourceIdentity } from '~/common/artifacts';
 import type { Artifact } from '~/common';
 import {
   isSavedText,
@@ -18,9 +18,11 @@ import {
   useMutationState,
   resolveServerContent,
 } from '~/Providers/EditorContext';
+import { useEditArtifact, useRefreshArtifact } from '~/data-provider';
+import { ArtifactConflict } from './ArtifactConflict';
 import { getResponseStatus } from '~/utils/errors';
 import { useArtifactsContext } from '~/Providers';
-import { useEditArtifact } from '~/data-provider';
+import MonacoEditor from './monaco';
 
 /** Monaco's font size, in baseline pixels. */
 const EDITOR_FONT_SIZE = 13;
@@ -245,7 +247,7 @@ export const ArtifactCodeEditor = function ArtifactCodeEditor({
   readOnly?: boolean;
 }) {
   const { resolvedMode, highContrast } = useContext(ThemeContext);
-  const { isSubmitting } = useArtifactsContext();
+  const { isSubmitting, conversationId } = useArtifactsContext();
   const readOnly = (externalReadOnly ?? false) || isSubmitting;
   const {
     currentCode,
@@ -257,7 +259,17 @@ export const ArtifactCodeEditor = function ArtifactCodeEditor({
     clearCode,
     codeSession,
     savedContent,
+    artifactConflicts,
+    setArtifactConflict,
   } = useCodeState();
+  const {
+    load: refreshArtifact,
+    source: artifactSource,
+    version: artifactVersion,
+    readCurrent: readCurrentRevision,
+  } = useRefreshArtifact(artifact, conversationId, artifactConflicts.current[artifact.id]?.source);
+  const mutationSourceRef = useRef<ArtifactSourceIdentity | null>(null);
+
   /* The pane is remounted when it changes hosts (side panel, mobile sheet,
    * undocked window). The buffer outlives that remount, so unsaved text is
    * restored here instead of falling back to the persisted content. An edit
@@ -301,7 +313,7 @@ export const ArtifactCodeEditor = function ArtifactCodeEditor({
       currentUpdateRef.current = vars.updated;
       setCurrentUpdate(vars.updated);
     },
-    onSuccess: (_data, vars) => {
+    onSuccess: (data, vars) => {
       currentUpdateRef.current = null;
       /* What the server now holds is true whoever is editing, so it is
        * recorded before the session check below. */
@@ -310,6 +322,7 @@ export const ArtifactCodeEditor = function ArtifactCodeEditor({
         mutationArtifactIdRef.current ?? artifactRef.current.id,
         vars.original,
         vars.updated,
+        data.__v,
       );
       /* A save that outlived its session reports to nobody: the buffer and any
        * queued edit belong to whoever is editing now. */
@@ -338,16 +351,31 @@ export const ArtifactCodeEditor = function ArtifactCodeEditor({
         runMutationRef.current(pending.code, original);
       }
     },
-    onError: (error) => {
+    onError: (error, vars) => {
       const attempted = currentUpdateRef.current;
       currentUpdateRef.current = null;
+      const status = getResponseStatus(error);
+      if (status === 409) {
+        const artifactId = mutationArtifactIdRef.current ?? artifactRef.current.id;
+        const pending = pendingUpdateRef.current;
+        const draft =
+          pending?.artifactId === artifactId ? pending.code : (attempted ?? vars.updated);
+        pendingUpdateRef.current = pending?.artifactId === artifactId ? null : pending;
+        if (artifactRef.current.id === artifactId) debouncedMutation.cancel();
+        setArtifactConflict(
+          artifactId,
+          { messageId: vars.messageId, index: vars.index, source: mutationSourceRef.current },
+          draft,
+        );
+        if (!isStaleSession()) setCurrentUpdate(null);
+        return;
+      }
       if (isStaleSession()) {
         return;
       }
       const pending = pendingUpdateRef.current;
       pendingUpdateRef.current = null;
 
-      const status = getResponseStatus(error);
       if (status === 400 && attempted != null) {
         setRejectedCode(attempted, mutationArtifactIdRef.current ?? artifactRef.current.id);
       }
@@ -382,11 +410,65 @@ export const ArtifactCodeEditor = function ArtifactCodeEditor({
   rejectedCodeRef.current = rejectedCode;
   restoredCodeRef.current = restoredCode;
 
+  const pinRevision = useCallback(() => {
+    const art = artifactRef.current;
+    const held = savedContent.current[art.id];
+    const buffer = restoredCodeRef.current;
+    const dirty = buffer != null && !isSavedText(savedContent, art.id, buffer);
+    const current = readCurrentRevision();
+    const source = held?.source ?? artifactSource;
+    if (
+      !dirty &&
+      !isMutatingRef.current &&
+      pendingUpdateRef.current == null &&
+      artifactConflicts.current[art.id] == null &&
+      current != null &&
+      source != null &&
+      current.header === source.header &&
+      current.source === source.source &&
+      current.partIndex === source.partIndex &&
+      (held?.version == null || (current.version != null && current.version > held.version)) &&
+      (current.content === art.content || current.content === `${art.content ?? ''}\n`)
+    ) {
+      savedContent.current[art.id] = {
+        base: art.content ?? '',
+        pending: [],
+        savedBuffer: held?.savedBuffer ?? null,
+        version: current.version,
+        source,
+      };
+      return;
+    }
+    if (
+      savedContent.current[art.id]?.version === undefined &&
+      artifactVersion !== undefined &&
+      artifactSource != null
+    ) {
+      savedContent.current[art.id] = {
+        base: art.content ?? '',
+        pending: [],
+        savedBuffer: null,
+        version: artifactVersion,
+        source: artifactSource,
+      };
+    }
+  }, [artifactSource, artifactVersion, savedContent, readCurrentRevision, artifactConflicts]);
+
   const runMutation = useCallback(
     (code: string, originalOverride?: string) => {
       const art = artifactRef.current;
       const target = getArtifactEditTarget(art);
-      if (readOnly || target == null) {
+      if (readOnly || target == null || artifactConflicts.current[art.id] != null) {
+        return;
+      }
+
+      pinRevision();
+      if (savedContent.current[art.id]?.version === undefined) {
+        setArtifactConflict(
+          art.id,
+          { messageId: target.messageId, index: target.index, source: artifactSource },
+          code,
+        );
         return;
       }
 
@@ -442,15 +524,25 @@ export const ArtifactCodeEditor = function ArtifactCodeEditor({
 
       mutationSessionRef.current = codeSession.current;
       mutationArtifactIdRef.current = target.artifactId;
+      mutationSourceRef.current = savedContent.current[art.id]?.source ?? artifactSource;
       setCurrentCodeRef.current(code, art.id);
       editArtifactRef.current.mutate({
         index: target.index,
         messageId: target.messageId,
         original,
         updated: code,
+        expectedVersion: savedContent.current[art.id]?.version,
       });
     },
-    [codeSession, readOnly, savedContent],
+    [
+      codeSession,
+      readOnly,
+      savedContent,
+      artifactConflicts,
+      artifactSource,
+      pinRevision,
+      setArtifactConflict,
+    ],
   );
 
   runMutationRef.current = runMutation;
@@ -509,7 +601,7 @@ export const ArtifactCodeEditor = function ArtifactCodeEditor({
    * A read-only editor cannot save, so nothing is drained while a response is
    * generating: the buffer stays in play and goes out once editing returns. */
   useEffect(() => {
-    if (isMutating || readOnly) {
+    if (isMutating || readOnly || artifactConflicts.current[artifactRef.current.id] != null) {
       return;
     }
 
@@ -575,7 +667,15 @@ export const ArtifactCodeEditor = function ArtifactCodeEditor({
       return;
     }
     runMutationRef.current(inherited, inheritedOriginal);
-  }, [isMutating, readOnly, savedContent, clearCode, monacoRef, writeModelValue]);
+  }, [
+    isMutating,
+    readOnly,
+    savedContent,
+    clearCode,
+    monacoRef,
+    writeModelValue,
+    artifactConflicts,
+  ]);
 
   /* The registry reaching this tab's last save ends the lag, so a later
    * change elsewhere (even back to an earlier value) is read as the truth. */
@@ -687,50 +787,24 @@ export const ArtifactCodeEditor = function ArtifactCodeEditor({
       if (programmatic != null && value === programmatic) {
         return;
       }
+      pinRevision();
       setCurrentCode(value, artifactRef.current.id);
-      if (value.length > 0) {
+      if (value.length > 0 && artifactConflicts.current[artifactRef.current.id] == null) {
         debouncedMutation(value);
       }
     },
-    [readOnly, debouncedMutation, setCurrentCode],
+    [readOnly, debouncedMutation, setCurrentCode, artifactConflicts, pinRevision],
   );
 
   /**
    * Disable all validation — this is an artifact viewer/editor, not an IDE.
    * Note: these are global Monaco settings that affect all editor instances on the page.
-   * The `as unknown` cast is required because monaco-editor v0.55 types `.languages.typescript`
-   * as `{ deprecated: true }` while the runtime API is fully functional.
    */
   const handleBeforeMount = useCallback((monaco: Monaco) => {
     monaco.editor.defineTheme(HIGH_CONTRAST_LIGHT_EDITOR_THEME, highContrastLightEditorTheme);
     monaco.editor.defineTheme(HIGH_CONTRAST_DARK_EDITOR_THEME, highContrastDarkEditorTheme);
 
-    const { typescriptDefaults, javascriptDefaults, JsxEmit } = monaco.languages
-      .typescript as unknown as {
-      typescriptDefaults: {
-        setDiagnosticsOptions: (o: {
-          noSemanticValidation: boolean;
-          noSyntaxValidation: boolean;
-        }) => void;
-        setCompilerOptions: (o: {
-          allowNonTsExtensions: boolean;
-          allowJs: boolean;
-          jsx: number;
-        }) => void;
-      };
-      javascriptDefaults: {
-        setDiagnosticsOptions: (o: {
-          noSemanticValidation: boolean;
-          noSyntaxValidation: boolean;
-        }) => void;
-        setCompilerOptions: (o: {
-          allowNonTsExtensions: boolean;
-          allowJs: boolean;
-          jsx: number;
-        }) => void;
-      };
-      JsxEmit: { React: number };
-    };
+    const { typescriptDefaults, javascriptDefaults, JsxEmit } = monaco.typescript;
     const diagnosticsOff = { noSemanticValidation: true, noSyntaxValidation: true };
     const compilerBase = { allowNonTsExtensions: true, allowJs: true, jsx: JsxEmit.React };
     typescriptDefaults.setDiagnosticsOptions(diagnosticsOff);
@@ -806,22 +880,68 @@ export const ArtifactCodeEditor = function ArtifactCodeEditor({
     [readOnly, remScale],
   );
 
+  const conflict = artifactConflicts.current[artifact.id];
+  const reconcile = (snapshot: ArtifactRevision, applyDraft: boolean) => {
+    const current = artifactRef.current;
+    if (
+      readOnly ||
+      isMutatingRef.current ||
+      artifactConflicts.current[current.id] !== conflict ||
+      current.id !== artifact.id ||
+      current.messageId !== snapshot.messageId ||
+      current.index !== snapshot.index ||
+      conflict?.messageId !== snapshot.messageId ||
+      conflict.index !== snapshot.index
+    )
+      return;
+    const draft =
+      restoredCodeRef.current ?? monacoRef.current?.getModel()?.getValue() ?? current.content ?? '';
+    debouncedMutation.cancel();
+    pendingUpdateRef.current = null;
+    inheritedBufferRef.current = null;
+    recordSave(savedContent, current.id, current.content ?? '', snapshot.content, snapshot.version);
+    setRejectedCode(undefined, current.id);
+    setArtifactConflict(current.id, undefined);
+    const next = applyDraft ? draft : snapshot.content;
+    setCurrentCode(next, current.id);
+    prevContentRef.current = next;
+    if (monacoRef.current) writeModelValue(monacoRef.current, next);
+    if (applyDraft) runMutationRef.current(draft, snapshot.content);
+    monacoRef.current?.focus();
+  };
+
   if (!artifact.content) {
     return null;
   }
 
   return (
-    <div className="h-full w-full" style={{ backgroundColor: editorAppearance.background }}>
-      <MonacoEditor
-        height="100%"
-        language={readOnly ? 'plaintext' : language}
-        theme={editorAppearance.theme}
-        defaultValue={restoredCode ?? artifact.content}
-        onChange={handleChange}
-        beforeMount={handleBeforeMount}
-        onMount={handleMount}
-        options={editorOptions}
-      />
+    <div
+      className="flex h-full w-full min-w-0 flex-col"
+      style={{ backgroundColor: editorAppearance.background }}
+    >
+      {conflict != null && (
+        <ArtifactConflict
+          key={`${artifact.id}/${conflict.messageId}/${conflict.index}`}
+          draft={restoredCode ?? artifact.content}
+          language={language}
+          theme={editorAppearance.theme}
+          disabled={readOnly || isMutating}
+          load={refreshArtifact}
+          onResolve={reconcile}
+        />
+      )}
+      <div className="min-h-0 flex-1">
+        <MonacoEditor
+          height="100%"
+          language={readOnly ? 'plaintext' : language}
+          theme={editorAppearance.theme}
+          defaultValue={restoredCode ?? artifact.content}
+          onChange={handleChange}
+          beforeMount={handleBeforeMount}
+          onMount={handleMount}
+          options={editorOptions}
+        />
+      </div>
     </div>
   );
 };

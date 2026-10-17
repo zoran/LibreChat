@@ -420,12 +420,30 @@ router.post('/branch', configMiddleware, async (req, res) => {
   }
 });
 
+const ARTIFACT_VERSION_CONFLICT = {
+  code: 'MESSAGE_VERSION_CONFLICT',
+  error:
+    'Die Nachricht wurde zwischenzeitlich geändert. Lade die aktuelle Fassung und prüfe deine Änderungen.',
+};
+
 router.post('/artifact/:messageId', configMiddleware, async (req, res) => {
   try {
     const { messageId } = req.params;
-    const { index, original, updated } = req.body;
+    const { index, original, updated, expectedVersion } = req.body ?? {};
+    const hasExpectedVersion = Object.prototype.hasOwnProperty.call(
+      req.body ?? {},
+      'expectedVersion',
+    );
 
-    if (typeof index !== 'number' || index < 0 || original == null || updated == null) {
+    if (
+      !Number.isSafeInteger(index) ||
+      index < 0 ||
+      typeof original !== 'string' ||
+      typeof updated !== 'string' ||
+      (hasExpectedVersion &&
+        expectedVersion !== null &&
+        (!Number.isSafeInteger(expectedVersion) || expectedVersion < 0))
+    ) {
       return res.status(400).json({ error: 'Invalid request parameters' });
     }
 
@@ -443,6 +461,10 @@ router.post('/artifact/:messageId', configMiddleware, async (req, res) => {
     const artifacts = findAllArtifacts(message);
     if (index >= artifacts.length) {
       return res.status(400).json({ error: 'Artifact index out of bounds' });
+    }
+    const loadedVersion = message.__v ?? null;
+    if (hasExpectedVersion && expectedVersion !== loadedVersion) {
+      return res.status(409).json(ARTIFACT_VERSION_CONFLICT);
     }
 
     // Unescape LaTeX preprocessing done by the frontend
@@ -477,7 +499,7 @@ router.post('/artifact/:messageId', configMiddleware, async (req, res) => {
     }
 
     if (!updatedText) {
-      return res.status(400).json({ error: 'Original content not found in target artifact' });
+      return res.status(409).json(ARTIFACT_VERSION_CONFLICT);
     }
 
     const filteredArtifact =
@@ -506,7 +528,11 @@ router.post('/artifact/:messageId', configMiddleware, async (req, res) => {
         ),
         user: req.user.id,
       },
-      { context: 'POST /api/messages/artifact/:messageId' },
+      {
+        context: 'POST /api/messages/artifact/:messageId',
+        // Older clients omit a version; the loaded native snapshot still fences the actual write.
+        expectedVersion: loadedVersion,
+      },
     );
 
     await applyForcedRetention(db, {
@@ -523,11 +549,15 @@ router.post('/artifact/:messageId', configMiddleware, async (req, res) => {
         conversationId: savedMessage.conversationId,
         content: savedMessage.content,
         text: savedMessage.text,
+        __v: savedMessage.__v,
       }),
     );
   } catch (error) {
     if (isContentFilterError(error)) {
       return res.status(error.statusCode).json(error.body);
+    }
+    if (error?.code === ARTIFACT_VERSION_CONFLICT.code) {
+      return res.status(409).json(ARTIFACT_VERSION_CONFLICT);
     }
     logger.error('Error editing artifact:', error);
     res.status(500).json({ error: 'Internal server error' });

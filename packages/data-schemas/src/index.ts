@@ -20,6 +20,7 @@ export {
   CLIENT_MESSAGE_SELECT,
   SUBAGENT_TRANSCRIPT_SOURCE_BYTE_LIMIT,
   RoleConflictError,
+  MessageVersionConflictError,
   DEFAULT_REFRESH_TOKEN_EXPIRY,
   DEFAULT_SESSION_EXPIRY,
   tokenValues,

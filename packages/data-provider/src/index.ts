@@ -29,6 +29,7 @@ export * from './parts';
 export * from './toolTiming';
 /* artifacts  */
 export * from './artifacts';
+export * from './artifact-source';
 /* schema helpers  */
 export * from './parsers';
 /* custom/dynamic configurations  */

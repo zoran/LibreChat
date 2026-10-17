@@ -1,7 +1,16 @@
+import { useCallback, useRef } from 'react';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
-import { dataService, QueryKeys, MutationKeys, Constants } from 'librechat-data-provider';
+import {
+  dataService,
+  QueryKeys,
+  MutationKeys,
+  Constants,
+  readArtifactSource,
+} from 'librechat-data-provider';
 import type { UseMutationResult, UseMutationOptions } from '@tanstack/react-query';
 import type * as t from 'librechat-data-provider';
+import type { Artifact, ArtifactRevision, ArtifactSourceIdentity } from '~/common/artifacts';
+import { fetchConversationMessages } from './queries';
 
 type EditArtifactContext = {
   previousMessages: Record<string, t.TMessage[] | undefined>;
@@ -74,10 +83,18 @@ export const useEditArtifact = (
             return prev;
           }
 
+          const previous = newArray[targetIndex];
+          const previousVersion = (previous as t.TMessage & { __v?: number }).__v;
+          // A refresh that already observed a newer revision must not be rolled back by a late save reply.
+          if (typeof previousVersion === 'number' && previousVersion > data.__v) return prev;
+          const metadata = { ...previous.metadata };
+          delete metadata.sourceCoverage;
           newArray[targetIndex] = {
             ...newArray[targetIndex],
             content: data.content,
             text: data.text,
+            __v: data.__v,
+            metadata: previous.metadata == null ? previous.metadata : metadata,
           };
 
           return newArray;
@@ -94,10 +111,128 @@ export const useEditArtifact = (
       onSuccess?.(data, vars, context);
     },
     ...options,
+    // A stale revision needs a user decision; mutation defaults must never retry it.
+    retry: false,
   };
 
   return useMutation(mutationOptions);
 };
+
+/** Refresh only through the native authenticated messages query; never infer an artifact from its title. */
+export function useRefreshArtifact(
+  artifact: Artifact,
+  conversationId: string | null | undefined,
+  expectedSource?: ArtifactSourceIdentity | null,
+) {
+  const queryClient = useQueryClient();
+  const key = `${conversationId ?? ''}/${artifact.id}/${artifact.messageId ?? ''}/${artifact.index ?? ''}`;
+  const initial = useRef<{
+    key: string;
+    source: ArtifactSourceIdentity | null;
+    version?: number | null;
+  } | null>(null);
+  if (initial.current?.key !== key) {
+    const message = queryClient
+      .getQueryData<t.TMessage[]>([QueryKeys.messages, conversationId])
+      ?.find((item) => item.messageId === artifact.messageId);
+    const captured =
+      message && artifact.index != null ? readArtifactSource(message, artifact.index) : null;
+    const version = (message as (t.TMessage & { __v?: unknown }) | undefined)?.__v;
+    initial.current = {
+      key,
+      version:
+        message != null &&
+        captured != null &&
+        (version == null ||
+          (typeof version === 'number' && Number.isSafeInteger(version) && version >= 0))
+          ? (version ?? null)
+          : undefined,
+      source:
+        captured == null
+          ? null
+          : { header: captured.header, source: captured.source, partIndex: captured.partIndex },
+    };
+  }
+  const found = initial.current.source;
+  const source = expectedSource === undefined ? found : expectedSource;
+  const load = useCallback(async (): Promise<ArtifactRevision> => {
+    if (
+      source == null ||
+      !conversationId ||
+      conversationId === Constants.NEW_CONVO ||
+      artifact.index == null ||
+      !artifact.messageId
+    ) {
+      throw new Error('Artifact revision unavailable');
+    }
+    let refreshed: t.TMessage[] | undefined;
+    const queryKey = [QueryKeys.messages, conversationId];
+    await queryClient.fetchQuery<t.TMessage[]>(
+      queryKey,
+      async () => {
+        const before = queryClient.getQueryData<t.TMessage[]>(queryKey);
+        const result = await fetchConversationMessages(conversationId);
+        refreshed = result;
+        const current = queryClient.getQueryData<t.TMessage[]>(queryKey);
+        // Match the native messages query: an overlapping stream/update owns its newer cache.
+        return current != null && current !== before ? current : result;
+      },
+      { staleTime: 0 },
+    );
+    // A deduplicated unrelated query is not this explicit comparison's authenticated snapshot.
+    if (refreshed == null) throw new Error('Artifact revision unavailable');
+    const message = refreshed.find((item) => item.messageId === artifact.messageId);
+    const fresh = message == null ? null : readArtifactSource(message, artifact.index);
+    const version = (message as (t.TMessage & { __v?: unknown }) | undefined)?.__v;
+    if (
+      !fresh ||
+      fresh.header !== source.header ||
+      fresh.source !== source.source ||
+      fresh.partIndex !== source.partIndex ||
+      !(
+        version === undefined ||
+        version === null ||
+        (typeof version === 'number' && Number.isSafeInteger(version) && version >= 0)
+      )
+    ) {
+      throw new Error('Artifact revision unavailable');
+    }
+    return {
+      messageId: artifact.messageId,
+      index: artifact.index,
+      content: fresh.content,
+      version: version ?? null,
+    };
+  }, [artifact.index, artifact.messageId, conversationId, queryClient, source]);
+  const readCurrent = useCallback(() => {
+    const message = queryClient
+      .getQueryData<t.TMessage[]>([QueryKeys.messages, conversationId])
+      ?.find((item) => item.messageId === artifact.messageId);
+    const current =
+      message != null && artifact.index != null
+        ? readArtifactSource(message, artifact.index)
+        : null;
+    const version = (message as (t.TMessage & { __v?: unknown }) | undefined)?.__v;
+    if (
+      current == null ||
+      !(
+        version == null ||
+        (typeof version === 'number' && Number.isSafeInteger(version) && version >= 0)
+      )
+    )
+      return null;
+    return { ...current, version: version ?? null };
+  }, [artifact.index, artifact.messageId, conversationId, queryClient]);
+  return {
+    load,
+    readCurrent,
+    version: initial.current.version,
+    source:
+      source == null
+        ? null
+        : { header: source.header, source: source.source, partIndex: source.partIndex },
+  };
+}
 
 type BranchMessageContext = {
   previousMessages: t.TMessage[] | undefined;

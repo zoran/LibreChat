@@ -1,17 +1,26 @@
 import React, { useEffect } from 'react';
 import { ThemeContext } from '@librechat/client';
-import { render, act } from '@testing-library/react';
+import { QueryKeys } from 'librechat-data-provider';
+import { render, act, fireEvent, screen } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import type { editor } from 'monaco-editor';
 import type { Artifact } from '~/common';
 import { EditorProvider, useCodeState } from '~/Providers/EditorContext';
 import { ArtifactCodeEditor } from '../ArtifactCodeEditor';
+import en from '~/locales/en/translation.json';
 
 interface MonacoEditorProps {
   onChange?: (value: string | undefined) => void;
 }
 
 const editorProps: MonacoEditorProps = {};
+const mockGetMessages = jest.fn();
+const savedMessage = (content: string, version: number) => ({
+  messageId: 'msg-a',
+  conversationId: 'conversation',
+  __v: version,
+  text: `:::artifact{identifier="example" type="text/plain" title="Example"}\n${content}\n:::`,
+});
 
 /** One save at a time, settled by the test the way the server would. */
 let inFlight: { resolve: (value: unknown) => void; reject: (error: unknown) => void } | null = null;
@@ -19,15 +28,23 @@ const mockEditArtifact = jest.fn(
   (vars: unknown) =>
     new Promise((resolve, reject) => {
       inFlight = {
-        resolve: () =>
-          resolve({ ...(vars as object), content: '', text: '', conversationId: null }),
+        resolve: (value: unknown) =>
+          resolve({
+            ...(vars as object),
+            content: '',
+            text: '',
+            conversationId: null,
+            __v: 2,
+            ...(value as object),
+          }),
         reject,
       };
     }),
 );
 
-jest.mock('@monaco-editor/react', () => ({
+jest.mock('../monaco', () => ({
   __esModule: true,
+  DiffEditor: () => null,
   default: (props: MonacoEditorProps) => {
     Object.assign(editorProps, props);
     return null;
@@ -35,12 +52,15 @@ jest.mock('@monaco-editor/react', () => ({
 }));
 
 jest.mock('~/Providers', () => ({
-  useArtifactsContext: () => ({ isSubmitting: false }),
+  useArtifactsContext: () => ({ isSubmitting: false, conversationId: 'conversation' }),
 }));
 
 jest.mock('librechat-data-provider', () => ({
   ...jest.requireActual('librechat-data-provider'),
-  dataService: { editArtifact: (vars: unknown) => mockEditArtifact(vars) },
+  dataService: {
+    editArtifact: (vars: unknown) => mockEditArtifact(vars),
+    getMessagesByConvoId: (...args: unknown[]) => mockGetMessages(...args),
+  },
 }));
 
 const artifactA: Artifact = {
@@ -81,6 +101,7 @@ const createModel = (initial: string) => {
   const ed = {
     getModel: () => model,
     revealLine: jest.fn(),
+    focus: jest.fn(),
   } as unknown as editor.IStandaloneCodeEditor;
   return { ed, read: () => value };
 };
@@ -113,6 +134,17 @@ const renderEditor = (initial: Artifact, monacoRef: React.MutableRefObject<any>)
   const client = new QueryClient({
     defaultOptions: { mutations: { retry: false }, queries: { retry: false } },
   });
+  client.setQueryData(
+    [QueryKeys.messages, 'conversation'],
+    [
+      savedMessage('CONTENT-A', 1),
+      {
+        ...savedMessage('CONTENT-B', 1),
+        messageId: 'msg-b',
+        text: savedMessage('IGNORED', 1).text + '\n' + savedMessage('CONTENT-B', 1).text,
+      },
+    ],
+  );
   const tree = () => (
     <QueryClientProvider client={client}>
       <ThemeContext.Provider
@@ -136,6 +168,7 @@ const renderEditor = (initial: Artifact, monacoRef: React.MutableRefObject<any>)
     });
   return {
     ...utils,
+    client,
     select: (next: Artifact) => {
       current = next;
       rerender();
@@ -181,6 +214,7 @@ describe('ArtifactCodeEditor unsaved text across a selection change', () => {
   beforeEach(() => {
     jest.useFakeTimers();
     mockEditArtifact.mockClear();
+    mockGetMessages.mockReset();
     inFlight = null;
     editorProps.onChange = undefined;
   });
@@ -188,6 +222,214 @@ describe('ArtifactCodeEditor unsaved text across a selection change', () => {
   afterEach(() => {
     jest.runOnlyPendingTimers();
     jest.useRealTimers();
+  });
+
+  it.each([true, false])(
+    'reconciles only an explicitly viewed revision (apply draft: %s)',
+    async (applyDraft) => {
+      const { ed, read } = createModel('CONTENT-A');
+      const view = renderEditor(artifactA, { current: ed });
+      type('LOCAL');
+      settleDebounce();
+      await flush();
+      await act(async () =>
+        inFlight?.reject({
+          isAxiosError: true,
+          response: { status: 409, data: { code: 'MESSAGE_VERSION_CONFLICT' } },
+        }),
+      );
+      await flush();
+      mockGetMessages.mockResolvedValue([savedMessage('REMOTE', 7)]);
+      fireEvent.click(screen.getByRole('button', { name: en.com_ui_artifact_conflict_compare }));
+      await flush();
+      type('LATEST');
+      settleDebounce();
+      expect(mockEditArtifact).toHaveBeenCalledTimes(1);
+      fireEvent.click(
+        screen.getByRole('button', {
+          name: applyDraft ? en.com_ui_artifact_conflict_apply : en.com_ui_artifact_conflict_adopt,
+        }),
+      );
+      await flush();
+      if (applyDraft) {
+        expect(mockEditArtifact).toHaveBeenCalledTimes(2);
+        expect(mockEditArtifact).toHaveBeenLastCalledWith(
+          expect.objectContaining({ original: 'REMOTE\n', updated: 'LATEST', expectedVersion: 7 }),
+        );
+      } else {
+        expect(mockEditArtifact).toHaveBeenCalledTimes(1);
+        expect(read()).toBe('REMOTE\n');
+        expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+        view.closePane();
+        view.reopenPane();
+        await flush();
+        settleDebounce();
+        expect(mockEditArtifact).toHaveBeenCalledTimes(1);
+      }
+    },
+  );
+
+  it('fences a late conflict to the artifact that was saved while another artifact is selected', async () => {
+    const { ed } = createModel('CONTENT-A');
+    const view = renderEditor(artifactA, { current: ed });
+    type('DRAFT-A');
+    settleDebounce();
+    await flush();
+    view.select(artifactB);
+    type('DRAFT-B');
+    settleDebounce();
+    await act(async () =>
+      inFlight?.reject({
+        isAxiosError: true,
+        response: { status: 409, data: { code: 'MESSAGE_VERSION_CONFLICT' } },
+      }),
+    );
+    await flush();
+    expect(mockEditArtifact).toHaveBeenCalledTimes(2);
+    expect(mockEditArtifact).toHaveBeenLastCalledWith(
+      expect.objectContaining({ messageId: 'msg-b', updated: 'DRAFT-B' }),
+    );
+    view.select(artifactA);
+    expect(screen.getByRole('alert')).toHaveTextContent('Automatic saving is paused');
+    type('NEW-A');
+    settleDebounce();
+    expect(mockEditArtifact).toHaveBeenCalledTimes(2);
+  });
+
+  it('uses a freshly authorized revision after a clean saved artifact is revisited', async () => {
+    const { ed } = createModel('CONTENT-A');
+    const view = renderEditor(artifactA, { current: ed });
+    type('LOCAL-SAVED');
+    settleDebounce();
+    await flush();
+    await act(async () => inFlight?.resolve({ __v: 2 }));
+    await flush();
+    view.client.setQueryData(
+      [QueryKeys.messages, 'conversation'],
+      [savedMessage('OTHER-SESSION', 3)],
+    );
+    view.select(artifactB);
+    view.select({ ...artifactA, content: 'OTHER-SESSION' });
+    type('AFTER-FRESH-READ');
+    settleDebounce();
+    await flush();
+    expect(mockEditArtifact).toHaveBeenCalledTimes(2);
+    expect(mockEditArtifact).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        original: 'OTHER-SESSION',
+        updated: 'AFTER-FRESH-READ',
+        expectedVersion: 3,
+      }),
+    );
+  });
+
+  it('normalizes only the native terminal LF when deciding whether a clean revision was viewed', async () => {
+    const { ed } = createModel('CONTENT-A');
+    const view = renderEditor(artifactA, { current: ed });
+    type('LOCAL-SAVED');
+    settleDebounce();
+    await flush();
+    await act(async () => inFlight?.resolve({ __v: 2 }));
+    await flush();
+    view.select({ ...artifactA, content: 'LOCAL-SAVED' });
+    view.client.setQueryData(
+      [QueryKeys.messages, 'conversation'],
+      [savedMessage('LOCAL-SAVED ', 3)],
+    );
+    type('NEXT-DRAFT');
+    settleDebounce();
+    await flush();
+    expect(mockEditArtifact).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        original: 'LOCAL-SAVED',
+        updated: 'NEXT-DRAFT',
+        expectedVersion: 2,
+      }),
+    );
+  });
+
+  it('pins the first edit to its authorized revision across a stale append and host remount', async () => {
+    const { ed } = createModel('CONTENT-A');
+    const view = renderEditor(artifactA, { current: ed });
+    type('LOCAL-DRAFT');
+    view.closePane();
+    view.client.setQueryData(
+      [QueryKeys.messages, 'conversation'],
+      [savedMessage('CONTENT-A appended elsewhere', 2)],
+    );
+    view.reopenPane();
+    await flush();
+    settleDebounce();
+    await flush();
+    expect(mockEditArtifact).toHaveBeenCalledTimes(1);
+    expect(mockEditArtifact).toHaveBeenCalledWith(
+      expect.objectContaining({
+        original: 'CONTENT-A',
+        updated: 'LOCAL-DRAFT',
+        expectedVersion: 1,
+      }),
+    );
+    await act(async () =>
+      inFlight?.reject({
+        isAxiosError: true,
+        response: { status: 409, data: { code: 'MESSAGE_VERSION_CONFLICT' } },
+      }),
+    );
+    await flush();
+    type('LATEST-DRAFT');
+    settleDebounce();
+    expect(mockEditArtifact).toHaveBeenCalledTimes(1);
+  });
+
+  it('blocks a conflict through further typing, a host remount and a session close', async () => {
+    const { ed } = createModel('CONTENT-A');
+    const view = renderEditor(artifactA, { current: ed });
+    type('FIRST-DRAFT');
+    settleDebounce();
+    await flush();
+    type('LATEST-DRAFT');
+    settleDebounce();
+    await act(async () => {
+      inFlight?.reject({
+        isAxiosError: true,
+        response: { status: 409, data: { code: 'MESSAGE_VERSION_CONFLICT' } },
+      });
+    });
+    await flush();
+    type('AFTER-CONFLICT');
+    settleDebounce();
+    view.closePane();
+    view.reopenPane();
+    await flush();
+    expect(mockEditArtifact).toHaveBeenCalledTimes(1);
+    expect(session.buffer.code).toBe('AFTER-CONFLICT');
+    act(() => session.endCodeSession());
+    view.closePane();
+    view.reopenPane();
+    await flush();
+    settleDebounce();
+    expect(mockEditArtifact).toHaveBeenCalledTimes(1);
+    expect(editorProps).toMatchObject({ defaultValue: 'AFTER-CONFLICT' });
+  });
+
+  it('binds a later save to the actual acknowledged message version', async () => {
+    const { ed } = createModel('CONTENT-A');
+    renderEditor(artifactA, { current: ed });
+    type('FIRST-DRAFT');
+    settleDebounce();
+    await flush();
+    await act(async () => inFlight?.resolve({ __v: 7 }));
+    await flush();
+    type('SECOND-DRAFT');
+    settleDebounce();
+    await flush();
+    expect(mockEditArtifact).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        original: 'FIRST-DRAFT',
+        updated: 'SECOND-DRAFT',
+        expectedVersion: 7,
+      }),
+    );
   });
 
   it('keeps the unsaved text of the artifact the user left', () => {

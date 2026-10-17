@@ -123,6 +123,9 @@ export default defineConfig(({ command }) => ({
           'assets/rum.*.js',
           'assets/locale-*.js',
           'assets/query-devtools*.js',
+          // Local Monaco is loaded on demand; do not prefetch its editor and language workers.
+          'assets/code-editor.*.js',
+          'assets/*.worker-*.js',
           // Deployment mounts replace these after the image build. A build-time
           // revision would pin stale artwork across configuration-only rollouts.
           'assets/favicon*.png',
@@ -226,6 +229,7 @@ export default defineConfig(({ command }) => ({
   },
   publicDir: command === 'serve' ? './public' : false,
   build: {
+    license: { fileName: 'assets/dependency-licenses.txt' },
     sourcemap: buildSourceMap,
     outDir: './dist',
     minify: 'oxc',

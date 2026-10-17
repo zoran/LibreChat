@@ -82,7 +82,8 @@ jest.mock('~/server/middleware', () => ({
 describe('message writes that bypass conversation retention', () => {
   let app;
   const { configMiddleware } = require('~/server/middleware');
-  const { getMessage, saveMessage, stampForcedRetention } = require('~/models');
+  const db = require('~/models');
+  const { getMessage, saveMessage } = db;
   const { applyForcedRetention } = require('@librechat/api');
   const {
     findAllArtifacts,
@@ -122,7 +123,12 @@ describe('message writes that bypass conversation retention', () => {
       });
       findAllArtifacts.mockReturnValue([{ source: 'text', partIndex: 0 }]);
       replaceArtifactContent.mockReturnValue('updated artifact');
-      saveMessage.mockResolvedValue({ messageId, conversationId, text: 'updated artifact' });
+      saveMessage.mockResolvedValue({
+        messageId,
+        conversationId,
+        text: 'updated artifact',
+        __v: 1,
+      });
     });
 
     it('re-stamps the parent conversation of the edited message', async () => {
@@ -134,15 +140,12 @@ describe('message writes that bypass conversation retention', () => {
       expect(saveMessage).toHaveBeenCalledWith(
         expect.objectContaining({ userId, interfaceConfig }),
         expect.objectContaining({ messageId, conversationId, user: userId }),
-        { context: 'POST /api/messages/artifact/:messageId' },
+        { context: 'POST /api/messages/artifact/:messageId', expectedVersion: null },
       );
-      expect(applyForcedRetention).toHaveBeenCalledWith(
-        { stampForcedRetention },
-        {
-          ctx: expect.objectContaining({ userId, interfaceConfig }),
-          conversationId,
-        },
-      );
+      expect(applyForcedRetention).toHaveBeenCalledWith(db, {
+        ctx: expect.objectContaining({ userId, interfaceConfig }),
+        conversationId,
+      });
     });
 
     it('does not touch the conversation when the artifact edit fails to match', async () => {
@@ -152,7 +155,8 @@ describe('message writes that bypass conversation retention', () => {
         .post(`/api/messages/artifact/${messageId}`)
         .send({ index: 0, original: 'missing', updated: 'updated artifact' });
 
-      expect(response.status).toBe(400);
+      expect(response.status).toBe(409);
+      expect(response.body.code).toBe('MESSAGE_VERSION_CONFLICT');
       expect(saveMessage).not.toHaveBeenCalled();
       expect(applyForcedRetention).not.toHaveBeenCalled();
     });
@@ -174,14 +178,11 @@ describe('message writes that bypass conversation retention', () => {
         .send({ feedback: { rating: 'thumbsDown', tag: 'inaccurate' } });
 
       expect(response.status).toBe(200);
-      expect(applyForcedRetention).toHaveBeenCalledWith(
-        { stampForcedRetention },
-        {
-          ctx: expect.objectContaining({ userId, interfaceConfig }),
-          conversationId,
-          messageId,
-        },
-      );
+      expect(applyForcedRetention).toHaveBeenCalledWith(db, {
+        ctx: expect.objectContaining({ userId, interfaceConfig }),
+        conversationId,
+        messageId,
+      });
     });
 
     it('re-stamps the stored conversation, not the one named in the route', async () => {
@@ -198,7 +199,7 @@ describe('message writes that bypass conversation retention', () => {
 
       expect(response.status).toBe(200);
       expect(applyForcedRetention).toHaveBeenCalledWith(
-        { stampForcedRetention },
+        db,
         expect.objectContaining({ conversationId: 'conversation-2', messageId }),
       );
     });
@@ -226,13 +227,10 @@ describe('message writes that bypass conversation retention', () => {
       const response = await request(app).post('/api/messages/branch').send({ messageId, agentId });
 
       expect(response.status).toBe(201);
-      expect(applyForcedRetention).toHaveBeenCalledWith(
-        { stampForcedRetention },
-        {
-          ctx: expect.objectContaining({ userId, interfaceConfig }),
-          conversationId,
-        },
-      );
+      expect(applyForcedRetention).toHaveBeenCalledWith(db, {
+        ctx: expect.objectContaining({ userId, interfaceConfig }),
+        conversationId,
+      });
     });
 
     it('does not re-stamp when the branch message cannot be saved', async () => {

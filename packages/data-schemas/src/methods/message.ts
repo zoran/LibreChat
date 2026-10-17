@@ -51,6 +51,24 @@ const MAX_SUBAGENT_CONTROL_MESSAGE_LENGTH = 4 * 1024;
 const MAX_SUBAGENT_CONTROL_RECEIPT_CAS_ATTEMPTS = 64;
 const HITL_MESSAGE_FILTER_FIELD_SET = new Set<string>(HITL_MESSAGE_FILTER_FIELDS);
 
+/** An expected existing revision no longer identifies a writable message. */
+export class MessageVersionConflictError extends Error {
+  readonly code = 'MESSAGE_VERSION_CONFLICT';
+
+  constructor() {
+    super('The message version has changed.');
+    this.name = 'MessageVersionConflictError';
+  }
+}
+
+/** Null denotes a legacy row without a native version, never a missing row. */
+function expectedMessageVersionFilter(
+  expectedVersion: number | null | undefined,
+): FilterQuery<IMessage> {
+  if (expectedVersion === undefined) return {};
+  return { __v: expectedVersion === null ? { $exists: false } : expectedVersion };
+}
+
 function normalizeUserSubmittedPaths(paths: unknown): string[] {
   if (!Array.isArray(paths)) {
     return [];
@@ -395,6 +413,7 @@ async function findOneAndMergeMessageProvenance(
   userSubmittedMessageFieldPaths: readonly UserSubmittedMessageFieldPath[],
   options: {
     upsert: boolean;
+    expectedVersion?: number | null;
     stampModelOutputOnInsert?: boolean;
     unsetContextMeta?: boolean;
     unsetPrivateText?: boolean;
@@ -418,7 +437,8 @@ async function findOneAndMergeMessageProvenance(
   );
 
   /** A small optimistic loop keeps the merge atomic while using only classic update operators. */
-  for (let attempt = 0; attempt < MAX_PROVENANCE_CAS_ATTEMPTS; attempt += 1) {
+  const attempts = options.expectedVersion === undefined ? MAX_PROVENANCE_CAS_ATTEMPTS : 1;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
     const current = await Message.findOne(identity)
       .session(options.session ?? null)
       .select(
@@ -441,6 +461,7 @@ async function findOneAndMergeMessageProvenance(
         | null
       >();
     if (current == null && !options.upsert) {
+      if (options.expectedVersion !== undefined) throw new MessageVersionConflictError();
       return null;
     }
 
@@ -462,6 +483,7 @@ async function findOneAndMergeMessageProvenance(
               __v: current.__v ?? null,
             }
           : { _id: new Message.base.Types.ObjectId() })),
+      ...expectedMessageVersionFilter(options.expectedVersion),
     };
     const admittedUpdate = options.prepareAppUpdate
       ? await options.prepareAppUpdate(current, { ...safeUpdate, ...provenance })
@@ -501,12 +523,16 @@ async function findOneAndMergeMessageProvenance(
         return message;
       }
     } catch (err) {
+      if (options.expectedVersion !== undefined && isDuplicateKeyError(err)) {
+        throw new MessageVersionConflictError();
+      }
       if (options.session || !isDuplicateKeyError(err) || !options.upsert) {
         throw err;
       }
     }
   }
 
+  if (options.expectedVersion !== undefined) throw new MessageVersionConflictError();
   throw new Error('Message provenance write contention exceeded its retry bound.');
 }
 
@@ -592,7 +618,6 @@ const SERVER_AUTHORED_SAMPLED_RESPONSE = {
 
 export const CLIENT_MESSAGE_SELECT: string = [
   '-_id',
-  '-__v',
   '-user',
   '-clientId',
   '-invocationId',
@@ -855,6 +880,8 @@ export interface MessageMethods {
     },
     metadata?: {
       context?: string;
+      /** Existing-row CAS only; null binds a legacy row with no native __v. */
+      expectedVersion?: number | null;
       privateText?: PrivateTextWrite;
       insertOnly?: boolean;
       sourceRetention?: SourceRetentionContext;
@@ -1441,6 +1468,9 @@ export function createMessageMethods(
             .session(session)
             .select(privateMessagePaths())
             .lean<IMessage & { isEdited?: boolean }>();
+          if (options.expectedVersion !== undefined && current == null) {
+            throw new MessageVersionConflictError();
+          }
           if (current?.sourceContentRemovedAt) throw new FileSourceUnavailableError();
           if (
             options.sourceCoverage &&
@@ -1920,6 +1950,7 @@ export function createMessageMethods(
     input: Record<string, unknown>,
     options: {
       upsert: boolean;
+      expectedVersion?: number | null;
       stampModelOutputOnInsert?: boolean;
       unsetContextMeta?: boolean;
       retentionOnInsert?: { expiredAt: Date; isTemporary: false };
@@ -1937,6 +1968,10 @@ export function createMessageMethods(
     },
   ): Promise<IMessage | null> {
     const Message = mongoose.models.Message as Model<IMessage>;
+    if (options.expectedVersion !== undefined) {
+      identity = { ...identity, ...expectedMessageVersionFilter(options.expectedVersion) };
+      options = { ...options, upsert: false };
+    }
     const update = sanitizeMessageUpdate(input, options.session != null, options.sourceCoverage);
     options = {
       ...options,
@@ -2029,6 +2064,9 @@ export function createMessageMethods(
           return fast.value;
         }
       } catch (error) {
+        if (options.expectedVersion !== undefined && isDuplicateKeyError(error)) {
+          throw new MessageVersionConflictError();
+        }
         if (options.session || !isDuplicateKeyError(error)) throw error;
       }
     }
@@ -2099,6 +2137,7 @@ export function createMessageMethods(
     },
     metadata?: {
       context?: string;
+      expectedVersion?: number | null;
       privateText?: PrivateTextWrite;
       insertOnly?: boolean;
       sourceRetention?: SourceRetentionContext;
@@ -2108,6 +2147,29 @@ export function createMessageMethods(
   ) {
     if (!userId) {
       throw new Error('User not authenticated');
+    }
+
+    const hasExpectedVersion = Object.prototype.hasOwnProperty.call(
+      metadata ?? {},
+      'expectedVersion',
+    );
+    const expectedVersion = metadata?.expectedVersion;
+    if (hasExpectedVersion) {
+      if (
+        expectedVersion !== null &&
+        (typeof expectedVersion !== 'number' ||
+          !Number.isSafeInteger(expectedVersion) ||
+          expectedVersion < 0)
+      ) {
+        throw new TypeError('Invalid expected message version.');
+      }
+      if (
+        params.newMessageId !== undefined ||
+        Object.prototype.hasOwnProperty.call(params, 'newMessageId') ||
+        metadata?.insertOnly === true
+      ) {
+        throw new TypeError('Expected message versions require an existing-row update.');
+      }
     }
 
     const conversationId = params.conversationId as string | undefined;
@@ -2306,7 +2368,8 @@ export function createMessageMethods(
         { messageId: params.messageId, user: userId },
         { ...update, userSubmittedPaths, userSubmittedMessageFieldPaths },
         {
-          upsert: true,
+          upsert: !hasExpectedVersion,
+          ...(hasExpectedVersion && { expectedVersion }),
           sourceRetention: metadata?.sourceRetention,
           sourceCoverage: sourceCoverage ?? undefined,
           quoteRetention: metadata?.quoteRetention,
@@ -2333,6 +2396,7 @@ export function createMessageMethods(
         const result = await Message.updateOne(
           {
             _id: message._id,
+            ...(hasExpectedVersion && { __v: message.__v }),
             expiredAt: null,
             isTemporary: message.isTemporary === true ? true : { $ne: true },
           },
@@ -2351,7 +2415,11 @@ export function createMessageMethods(
           (message.isTemporary === false && message.$isDefault('isTemporary')))
       ) {
         await Message.updateOne(
-          { _id: message._id, isTemporary: { $ne: false } },
+          {
+            _id: message._id,
+            ...(hasExpectedVersion && { __v: message.__v }),
+            isTemporary: { $ne: false },
+          },
           { $set: { isTemporary: false } },
         );
         message.isTemporary = false;
@@ -2359,6 +2427,8 @@ export function createMessageMethods(
 
       return message.toObject();
     } catch (err: unknown) {
+      if (err instanceof MessageVersionConflictError) throw err;
+      if (hasExpectedVersion && isDuplicateKeyError(err)) throw new MessageVersionConflictError();
       logger.error('Error saving message:', err);
       logger.info(`---\`saveMessage\` context: ${metadata?.context}`);
 

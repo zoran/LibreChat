@@ -45,3 +45,18 @@ export type ArtifactFiles =
   | Partial<{
       [x: string]: string | undefined;
     }>;
+
+/** Authenticated saved source, tied to one concrete message revision and artifact slot. */
+export type ArtifactRevision = {
+  messageId: string;
+  index: number;
+  content: string;
+  version: number | null;
+};
+
+/** Original native artifact slot identity; retained with a conflict across pane moves. */
+export type ArtifactSourceIdentity = {
+  header: string;
+  source: 'content' | 'text';
+  partIndex?: number;
+};
