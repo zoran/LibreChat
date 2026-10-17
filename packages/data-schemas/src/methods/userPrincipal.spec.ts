@@ -15,8 +15,9 @@ describe('native transactional User principal fence', () => {
       replSet: { count: 1 },
       binary: {
         version: '7.0.43',
-        systemBinary:
-          '/home/nodex/.local/share/nodex/tools/mongodb/7.0.43-ubuntu2204-linux-amd64/mongod',
+        ...(process.env.MONGOMS_SYSTEM_BINARY
+          ? { systemBinary: process.env.MONGOMS_SYSTEM_BINARY }
+          : {}),
       },
     });
     await db.connect(mongo.getUri('user-principal'));
