@@ -11,16 +11,24 @@ const bodyPath = '/api/uploads/operations/11111111-1111-4111-8111-111111111111/b
 const capability = 'A'.repeat(43);
 describe('isolated intake HTTP service with real router, socket lifecycle and attempt journal', () => {
   let root: string;
+  let cgroupDirectory: string;
   const services: Awaited<ReturnType<typeof startIntakeService>>[] = [];
   beforeEach(async () => {
     if (!process.env.UPLOAD_TEST_TMPDIR) throw new Error('Explicit upload test directory required');
     await mkdir(process.env.UPLOAD_TEST_TMPDIR, { recursive: true });
     root = await mkdtemp(join(process.env.UPLOAD_TEST_TMPDIR, 'intake-service-'));
+    cgroupDirectory = await mkdtemp(join(process.env.UPLOAD_TEST_TMPDIR, 'intake-cgroup-fixture-'));
+    // Synthetic cgroup files; the service's filesystem and resource guard remain real.
+    await Promise.all([
+      writeFile(join(cgroupDirectory, 'memory.current'), '33554432\n'),
+      writeFile(join(cgroupDirectory, 'memory.max'), '1073741824\n'),
+    ]);
   });
   afterEach(async () => {
     for (const service of services.splice(0))
       if (!(await service.close()).complete) throw new Error('Incomplete scoped service cleanup');
     await rm(root, { recursive: true, force: true });
+    await rm(cgroupDirectory, { recursive: true, force: true });
   });
   async function setup(channel?: IntakeChannel, stagingRoot = root) {
     const control = jest.fn(
@@ -47,6 +55,7 @@ describe('isolated intake HTTP service with real router, socket lifecycle and at
       security,
       worker: { hostId: 'intake-host', instanceId: 'intake-pod' },
       stagingRoot,
+      localResources: { cgroupDirectory, storage: 'disk' },
       allowedOrigins: [origin],
       host: '127.0.0.1',
       port: 0,
@@ -200,5 +209,10 @@ describe('isolated intake HTTP service with real router, socket lifecycle and at
     await symlink(root, link);
     await expect(setup(undefined, link)).rejects.toThrow('Invalid intake staging root');
     await rm(link);
+  });
+  it('refuses startup on unknown local memory rather than listening with an unchecked intake pool', async () => {
+    await rm(join(cgroupDirectory, 'memory.max'));
+    await expect(setup()).rejects.toMatchObject({ code: 'unavailable' });
+    expect(services).toHaveLength(0);
   });
 });

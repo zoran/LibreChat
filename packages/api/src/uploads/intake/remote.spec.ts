@@ -319,7 +319,13 @@ describe('remote intake adapters with the real Raw lifecycle and controlled App/
     expect(test.response.value).toEqual({ code: 'lease_lost' });
     expect(f.promote).not.toHaveBeenCalled();
     expect(await readdir(root)).toEqual([]);
-    expect(await f.journal.close()).toEqual({ complete: true });
+    // A foreign reply cannot prove that the dispatched remote claim never acquired a lease.
+    expect(await f.journal.maintenance.getMaintenanceCensus(null)).toMatchObject({
+      queuedContinuations: 0,
+      pendingWrites: 0,
+      complete: false,
+    });
+    expect(await f.journal.close()).toEqual({ complete: false });
   });
   it('does not revive a disconnected request after a late authorization response', async () => {
     const f = fixture();

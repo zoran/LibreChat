@@ -1,6 +1,7 @@
 /** One local attempt/cleanup journal per real writer incarnation; no processing or cleanup queue. */
 import {
   readUploadIntakeRecovery,
+  UPLOAD_MAX_FILE_BYTES,
   readUploadSecurityExecution,
   matchesUploadSecurityExecution,
   isCompleteUploadSecuritySettlement,
@@ -15,6 +16,8 @@ import type {
   UploadAttemptSettlement,
   UploadAttemptPort,
   UploadAttemptRegistration,
+  UploadAttemptLocalGuard,
+  UploadAttemptLocalReservation,
 } from './contract';
 import type { ApplicationWorkPort } from '~/app';
 import { uploadAttemptId } from './processing/paths';
@@ -44,10 +47,15 @@ async function withinSignal<T>(promise: Promise<T>, signal: AbortSignal): Promis
 }
 
 /** The supplied identity is this process's actual writer, never a lease owner's stand-in. */
-export function createUploadAttemptJournal(identity: UploadWorker): UploadAttemptJournal {
+export function createUploadAttemptJournal(
+  identity: UploadWorker,
+  options: { resources?: UploadAttemptLocalGuard } = {},
+): UploadAttemptJournal {
   const worker = { hostId: identity.hostId, instanceId: identity.instanceId };
+  const resources = options.resources;
   if (!worker.hostId || !worker.instanceId) throw new Error('Missing upload worker identity');
   type Record = {
+    declaredBytes?: number;
     binding?: UploadAttemptBinding;
     abort: () => void;
     active: boolean;
@@ -60,11 +68,13 @@ export function createUploadAttemptJournal(identity: UploadWorker): UploadAttemp
     securityExecution?: UploadSecurityExecution;
     invalidSecurity?: boolean;
   };
-  const active = new Set<Record>();
+  // The existing record is also the local reservation owner, including an
+  // unbound claim whose outcome cannot yet be established.
+  const records = new Set<Record>();
   const receipts = new Map<string, Record>();
   let pausedBy: string | null = null;
   let closed = false;
-  let uncertain = false;
+  let localChecks: Promise<void> = Promise.resolve();
   let recoveryCursor: string | undefined;
 
   const normalize = (proof: UploadAttemptSettlement): UploadAttemptSettlement => ({
@@ -81,17 +91,62 @@ export function createUploadAttemptJournal(identity: UploadWorker): UploadAttemp
   const lookup = (task: Pick<UploadCleanupTask, 'operationId' | 'generation' | 'worker'>) =>
     sameWorker(task.worker, worker) ? receipts.get(uploadAttemptId(task)) : undefined;
 
+  const localJoined = (record: Record) =>
+    !record.active &&
+    record.proof?.localCopiesAbsent === true &&
+    (record.proof.localWriterStopped ?? record.proof.writerStopped) === true;
+
+  function assertActive(record: Record, signal: AbortSignal): void {
+    signal.throwIfAborted();
+    if (closed || !record.active) throw new UploadManagementError('unavailable');
+  }
+
+  function checkLocal(record: Record, signal: AbortSignal, bytes?: number): Promise<void> {
+    // Install the flight before invoking a guard. A later candidate must see the
+    // previous candidate's committed reservation, never the same free capacity.
+    const flight = localChecks.then(async () => {
+      assertActive(record, signal);
+      if (
+        bytes !== undefined &&
+        record.declaredBytes !== undefined &&
+        bytes !== record.declaredBytes
+      )
+        throw new UploadManagementError('invalid_request');
+      const declaredBytes = bytes ?? record.declaredBytes;
+      if (resources && declaredBytes === undefined) throw new UploadManagementError('unavailable');
+      const reservations: UploadAttemptLocalReservation[] = [];
+      for (const current of records) {
+        const declared = current === record ? declaredBytes : current.declaredBytes;
+        if (declared === undefined || localJoined(current)) continue;
+        reservations.push(
+          Object.freeze({
+            declaredBytes: declared,
+            ...(current.binding ? { binding: Object.freeze({ ...current.binding }) } : {}),
+          }),
+        );
+      }
+      await resources?.assertSafe(Object.freeze(reservations), signal);
+      // Settle, shutdown or cancellation during measurement cannot mint capacity
+      // or revive a writer. Rejected candidates never enter the record.
+      assertActive(record, signal);
+      if (bytes !== undefined) record.declaredBytes = bytes;
+    });
+    localChecks = flight.catch(() => undefined);
+    return flight;
+  }
+
   const attempts: UploadAttemptPort = {
     begin(abort) {
       if (closed || pausedBy !== null) throw new UploadManagementError('unavailable');
       // A paused body consumes no document buffer; still bound outstanding local requests.
-      if (active.size >= 128) throw new UploadManagementError('queue_full');
+      if ([...records].filter((record) => record.active).length >= 128)
+        throw new UploadManagementError('queue_full');
       // Reserve a receipt before asynchronous claim. Only fully resolved evidence may be evicted.
-      const reserved = [...active].filter((record) => !record.binding).length;
-      if (receipts.size + reserved >= 256) {
+      if (records.size >= 256) {
         const oldest = [...receipts].find(([, record]) => !record.active && settled(record));
         if (!oldest) throw new UploadManagementError('queue_full');
         receipts.delete(oldest[0]);
+        records.delete(oldest[1]);
       }
       let resolve!: Record['resolve'];
       const record: Record = {
@@ -103,15 +158,29 @@ export function createUploadAttemptJournal(identity: UploadWorker): UploadAttemp
         }),
         resolve: (proof) => resolve(proof),
       };
-      active.add(record);
+      records.add(record);
       return {
+        async reserveLocal(bytes, signal) {
+          if (!Number.isSafeInteger(bytes) || bytes < 1 || bytes > UPLOAD_MAX_FILE_BYTES)
+            throw new UploadManagementError('invalid_request');
+          await checkLocal(record, signal, bytes);
+        },
+        async assertLocal(signal) {
+          await checkLocal(record, signal);
+        },
         bind(lease) {
-          if (!record.active || record.binding || !sameWorker(lease, worker))
+          if (
+            !record.active ||
+            record.binding ||
+            !sameWorker(lease, worker) ||
+            (resources && record.declaredBytes === undefined)
+          )
             throw new UploadManagementError('lease_lost');
           const key = uploadAttemptId(lease);
           const previous = receipts.get(key);
           if (previous && (previous.active || !settled(previous)))
             throw new UploadManagementError('lease_lost');
+          if (previous) records.delete(previous);
           record.binding = {
             hostId: lease.hostId,
             instanceId: lease.instanceId,
@@ -150,8 +219,7 @@ export function createUploadAttemptJournal(identity: UploadWorker): UploadAttemp
             }
           }
           record.revision++;
-          if (!record.binding && !settled(record)) uncertain = true;
-          active.delete(record);
+          if (!record.binding && settled(record)) records.delete(record);
           record.resolve(record.proof);
         },
       };
@@ -190,6 +258,7 @@ export function createUploadAttemptJournal(identity: UploadWorker): UploadAttemp
   function settled(record: Record): boolean {
     return (
       record.proof?.writerStopped === true &&
+      localJoined(record) &&
       record.proof.localCopiesAbsent === true &&
       (!record.recover || record.proof.localWriterStopped === true) &&
       !record.proof.securityPending &&
@@ -205,9 +274,9 @@ export function createUploadAttemptJournal(identity: UploadWorker): UploadAttemp
       throw new UploadManagementError('invalid_request');
     let attempted = 0;
     let recovered = 0;
-    const records = [...receipts];
-    const start = records.findIndex(([key]) => key === recoveryCursor) + 1;
-    for (const [key, record] of [...records.slice(start), ...records.slice(0, start)]) {
+    const entries = [...receipts];
+    const start = entries.findIndex(([key]) => key === recoveryCursor) + 1;
+    for (const [key, record] of [...entries.slice(start), ...entries.slice(0, start)]) {
       if (signal.aborted || attempted >= limit) break;
       if (
         record.active ||
@@ -301,7 +370,7 @@ export function createUploadAttemptJournal(identity: UploadWorker): UploadAttemp
   }
 
   function complete(): boolean {
-    return !uncertain && [...receipts.values()].every((record) => record.active || settled(record));
+    return [...records].every((record) => record.active || settled(record));
   }
   const maintenance: ApplicationWorkPort = {
     pauseAdmissions(requestId) {
@@ -317,8 +386,9 @@ export function createUploadAttemptJournal(identity: UploadWorker): UploadAttemp
     async getMaintenanceCensus(requestId) {
       return {
         admissionClosed: requestId !== null && pausedBy === requestId,
-        queuedContinuations: [...active].filter((record) => !record.binding).length,
-        pendingWrites: [...active].filter((record) => record.binding).length,
+        queuedContinuations: [...records].filter((record) => record.active && !record.binding)
+          .length,
+        pendingWrites: [...records].filter((record) => record.active && record.binding).length,
         complete: complete() && (pausedBy === null || pausedBy === requestId),
       };
     },
@@ -329,11 +399,13 @@ export function createUploadAttemptJournal(identity: UploadWorker): UploadAttemp
     recoverPending,
     async close(signal: AbortSignal = AbortSignal.timeout(125_000)) {
       closed = true;
+      const active = [...records].filter((record) => record.active);
       for (const record of active) record.abort();
       try {
-        await withinSignal(Promise.all([...active].map((record) => record.done)), signal);
+        await withinSignal(Promise.all(active.map((record) => record.done)), signal);
+        await withinSignal(localChecks, signal);
         await recoverPending(signal);
-        return { complete: active.size === 0 && complete() };
+        return { complete: ![...records].some((record) => record.active) && complete() };
       } catch {
         return { complete: false };
       }

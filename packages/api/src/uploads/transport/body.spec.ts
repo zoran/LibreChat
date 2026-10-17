@@ -12,9 +12,14 @@ import type {
   UploadSecuritySubject,
 } from 'librechat-data-provider';
 import type { Request, Response } from 'express';
+import type {
+  UploadAttemptPort,
+  UploadSecurityPort,
+  UploadAttemptLocalReservation,
+} from '../contract';
 import type { RawUploadBodyDependencies, RawUploadObservation } from './body';
-import type { UploadAttemptPort, UploadSecurityPort } from '../contract';
 import { createRawUploadBodyHandler, validateRawUploadHeaders } from './body';
+import { createUploadAttemptJournal } from '../attempts';
 import { UploadManagementError } from '../errors';
 
 const principal = { tenantId: 'tenant', userId: 'user', authentication: 'verified-email' as const };
@@ -248,6 +253,131 @@ describe('raw upload body admission and streaming', () => {
     await expect(readFile(test.ordinaryPath)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await readdir(root)).toEqual([]);
   }
+  it.each(['reserve', 'after-bind'] as const)(
+    'rejects local pressure at %s before reading or staging request bytes',
+    async (phase) => {
+      const assertSafe = jest.fn(async (reservations: readonly UploadAttemptLocalReservation[]) => {
+        if (phase === 'reserve' || reservations.some((entry) => entry.binding))
+          throw new UploadManagementError('unavailable');
+      });
+      const journal = createUploadAttemptJournal(lease, { resources: { assertSafe } });
+      const test = fixture('hello', { attempts: journal.attempts });
+      const done = test.run();
+      test.req.end('hello');
+      await done;
+      expect(test.response.statusCode).toBe(503);
+      expect(test.management.claimTransfer).toHaveBeenCalledTimes(phase === 'reserve' ? 0 : 1);
+      expect(test.claimBytes).not.toHaveBeenCalled();
+      expect(test.security.prepare).not.toHaveBeenCalled();
+      expect(test.req.readableLength).toBe(5);
+      await expectNoOrdinaryStorage(test);
+      expect(await journal.close()).toEqual({ complete: true });
+    },
+  );
+
+  it('reserves the declared bytes before claim and checks the real binding before receiving', async () => {
+    const assertSafe = jest.fn(
+      async (_reservations: readonly UploadAttemptLocalReservation[]) => {},
+    );
+    const journal = createUploadAttemptJournal(lease, { resources: { assertSafe } });
+    const test = fixture('hello', { attempts: journal.attempts });
+    const done = test.run();
+    test.req.end('hello');
+    await done;
+    expect(test.response.statusCode).toBe(202);
+    expect(assertSafe.mock.calls.map(([snapshot]) => snapshot)).toEqual([
+      [{ declaredBytes: 5 }],
+      [
+        {
+          declaredBytes: 5,
+          binding: {
+            hostId: lease.hostId,
+            instanceId: lease.instanceId,
+            operationId: lease.operationId,
+            generation: lease.generation,
+          },
+        },
+      ],
+    ]);
+    expect(assertSafe.mock.invocationCallOrder[0]).toBeLessThan(
+      test.management.claimTransfer.mock.invocationCallOrder[0],
+    );
+    expect(assertSafe.mock.invocationCallOrder[1]).toBeLessThan(
+      test.claimBytes.mock.invocationCallOrder[0],
+    );
+    expect(await journal.close()).toEqual({ complete: true });
+  });
+
+  it('checks local pressure before a heartbeat renew and joins/removes the stopped partial receiver', async () => {
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate'] });
+    const assertSafe = jest.fn(async () => {
+      if (assertSafe.mock.calls.length > 2) throw new UploadManagementError('unavailable');
+    });
+    const journal = createUploadAttemptJournal(lease, { resources: { assertSafe } });
+    try {
+      let received!: () => void;
+      const firstByte = new Promise<void>((resolve) => {
+        received = resolve;
+      });
+      const test = fixture('hello', { attempts: journal.attempts });
+      test.completeBytes.mockImplementation(async () => {
+        received();
+      });
+      const done = test.run();
+      test.req.write('h');
+      await firstByte;
+      await jest.advanceTimersByTimeAsync(5_000);
+      await done;
+      expect(assertSafe).toHaveBeenCalledTimes(3);
+      expect(test.management.renew).not.toHaveBeenCalled();
+      expect(test.management.fail).toHaveBeenCalledWith(lease, 'lease_lost');
+      await expectNoOrdinaryStorage(test);
+      expect(await journal.close()).toEqual({ complete: true });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it.each([
+    new Error('Claim acknowledgement lost'),
+    new UploadManagementError('unavailable'),
+    new UploadManagementError('lease_lost'),
+  ])('keeps the unbound reservation after an ambiguous claim error %s', async (error) => {
+    const assertSafe = jest.fn(
+      async (_reservations: readonly UploadAttemptLocalReservation[]) => {},
+    );
+    const journal = createUploadAttemptJournal(lease, { resources: { assertSafe } });
+    const test = fixture('hello', { attempts: journal.attempts });
+    test.management.claimTransfer.mockRejectedValueOnce(error);
+    const done = test.run();
+    test.req.end('hello');
+    await done;
+    const probe = journal.attempts.begin(jest.fn());
+    await probe.reserveLocal!(1, new AbortController().signal);
+    expect(assertSafe.mock.calls[1][0]).toEqual([{ declaredBytes: 5 }, { declaredBytes: 1 }]);
+    probe.settle({ writerStopped: true, localCopiesAbsent: true });
+    await expectNoOrdinaryStorage(test);
+    expect(await journal.close()).toEqual({ complete: false });
+  });
+
+  it('releases only the local reserve after a joined stream with an unknown remote PUT', async () => {
+    const assertSafe = jest.fn(
+      async (_reservations: readonly UploadAttemptLocalReservation[]) => {},
+    );
+    const journal = createUploadAttemptJournal(lease, { resources: { assertSafe } });
+    const test = fixture('hello', { attempts: journal.attempts, outcome: 'unknown' });
+    const done = test.run();
+    test.req.end('hello');
+    await done;
+    expect(test.response.statusCode).toBe(503);
+    expect(await readdir(root)).toEqual([]);
+    const probe = journal.attempts.begin(jest.fn());
+    await probe.reserveLocal!(1, new AbortController().signal);
+    expect(assertSafe.mock.calls[2][0]).toEqual([{ declaredBytes: 1 }]);
+    probe.settle({ writerStopped: true, localCopiesAbsent: true });
+    expect(await journal.close()).toEqual({ complete: false });
+  });
+
   it('commits the scanner binding before bytes and settlement before ordinary storage', async () => {
     const test = fixture();
     const filename = ' Unverändert 📄.txt ';

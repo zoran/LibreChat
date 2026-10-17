@@ -1,5 +1,9 @@
 import type { UploadIntakeRecovery, UploadSecurityExecution } from 'librechat-data-provider';
-import type { UploadAttemptBinding, UploadAttemptSettlement } from './contract';
+import type {
+  UploadAttemptBinding,
+  UploadAttemptSettlement,
+  UploadAttemptLocalReservation,
+} from './contract';
 import { createUploadAttemptJournal } from './attempts';
 
 const worker = { hostId: 'host', instanceId: 'current' };
@@ -12,6 +16,187 @@ const stopped = {
 };
 const unknown = { writerStopped: false, localCopiesAbsent: false };
 const signal = () => new AbortController().signal;
+
+describe('local reservations in the existing attempt record', () => {
+  it('serializes candidates so two admissions cannot both consume the same free capacity', async () => {
+    let finish!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const assertSafe = jest.fn(async (reservations: readonly UploadAttemptLocalReservation[]) => {
+      if (assertSafe.mock.calls.length === 1) {
+        finish();
+        await gate;
+      }
+      if (reservations.reduce((sum, item) => sum + item.declaredBytes, 0) > 10)
+        throw new Error('Local capacity exhausted');
+    });
+    const journal = createUploadAttemptJournal(worker, { resources: { assertSafe } });
+    const first = journal.attempts.begin(jest.fn());
+    const second = journal.attempts.begin(jest.fn());
+    const admitted = first.reserveLocal!(6, signal());
+    const rejected = second.reserveLocal!(6, signal()).catch((error: unknown) => error);
+    await entered;
+    expect(assertSafe).toHaveBeenCalledTimes(1);
+    release();
+    await admitted;
+    await expect(rejected).resolves.toMatchObject({ message: 'Local capacity exhausted' });
+    expect(assertSafe.mock.calls[1][0]).toEqual([{ declaredBytes: 6 }, { declaredBytes: 6 }]);
+    expect(() => second.bind({ ...binding, generation: 2 })).toThrow();
+    first.bind(binding);
+    first.settle(stopped);
+    second.settle(stopped);
+    expect(await journal.close()).toEqual({ complete: true });
+  });
+
+  it('takes immutable minimal snapshots, requires prior reserve and permits only exact repeats', async () => {
+    const assertSafe = jest.fn(
+      async (_reservations: readonly UploadAttemptLocalReservation[]) => {},
+    );
+    const journal = createUploadAttemptJournal(worker, { resources: { assertSafe } });
+    const registration = journal.attempts.begin(jest.fn());
+    expect(() => registration.bind(binding)).toThrow();
+    await expect(registration.assertLocal!(signal())).rejects.toThrow();
+    await registration.reserveLocal!(5, signal());
+    await registration.reserveLocal!(5, signal());
+    await expect(registration.reserveLocal!(6, signal())).rejects.toThrow('invalid_request');
+    const mutable = { ...binding };
+    registration.bind(mutable);
+    mutable.generation = 99;
+    await registration.assertLocal!(signal());
+    const snapshot = assertSafe.mock.calls[2][0];
+    expect(snapshot).toEqual([{ declaredBytes: 5, binding }]);
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    expect(Object.isFrozen(snapshot[0])).toBe(true);
+    expect(Object.isFrozen(snapshot[0].binding)).toBe(true);
+    expect(assertSafe.mock.calls[0][0]).toEqual([{ declaredBytes: 5 }]);
+    registration.settle(stopped);
+    await expect(registration.reserveLocal!(5, signal())).rejects.toThrow();
+    expect(await journal.close()).toEqual({ complete: true });
+  });
+
+  it.each([0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER, 31_457_281])(
+    'rejects invalid declared bytes %s without invoking the guard',
+    async (bytes) => {
+      const assertSafe = jest.fn(async () => {});
+      const journal = createUploadAttemptJournal(worker, { resources: { assertSafe } });
+      const registration = journal.attempts.begin(jest.fn());
+      await expect(registration.reserveLocal!(bytes, signal())).rejects.toThrow('invalid_request');
+      expect(assertSafe).not.toHaveBeenCalled();
+      registration.settle(stopped);
+      expect(await journal.close()).toEqual({ complete: true });
+    },
+  );
+
+  it.each(['settle', 'abort', 'close'] as const)(
+    'does not commit a late positive measurement after %s',
+    async (action) => {
+      let entered!: () => void;
+      const measuring = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const assertSafe = jest.fn(async () => {
+        entered();
+        await gate;
+      });
+      const journal = createUploadAttemptJournal(worker, { resources: { assertSafe } });
+      const registration = journal.attempts.begin(jest.fn());
+      const controller = new AbortController();
+      const pending = registration.reserveLocal!(5, controller.signal).catch(
+        (error: unknown) => error,
+      );
+      await measuring;
+      if (action === 'settle') registration.settle(stopped);
+      if (action === 'abort') controller.abort();
+      if (action === 'close')
+        expect(await journal.close(AbortSignal.abort())).toEqual({ complete: false });
+      release();
+      await expect(pending).resolves.toBeInstanceOf(Error);
+      expect(() => registration.bind(binding)).toThrow();
+      registration.settle(stopped);
+      expect(await journal.close()).toEqual({ complete: true });
+    },
+  );
+
+  it.each([
+    [{ writerStopped: false, localCopiesAbsent: true, storageOutcome: 'unknown' }, true],
+    [{ writerStopped: true, localWriterStopped: false, localCopiesAbsent: true }, true],
+    [{ writerStopped: false, localWriterStopped: true, localCopiesAbsent: false }, true],
+    [
+      {
+        writerStopped: false,
+        localWriterStopped: true,
+        localCopiesAbsent: true,
+        storageOutcome: 'unknown',
+        acknowledgementPending: true,
+      },
+      false,
+    ],
+  ] as const)(
+    'releases only proven local join and absence, independently of remote cleanup: %j',
+    async (proof, retained) => {
+      const assertSafe = jest.fn(
+        async (_reservations: readonly UploadAttemptLocalReservation[]) => {},
+      );
+      const journal = createUploadAttemptJournal(worker, { resources: { assertSafe } });
+      const registration = journal.attempts.begin(jest.fn());
+      await registration.reserveLocal!(5, signal());
+      registration.bind(binding);
+      registration.settle(proof);
+      const probe = journal.attempts.begin(jest.fn());
+      await probe.reserveLocal!(1, signal());
+      expect(assertSafe.mock.calls[1][0]).toEqual([
+        ...(retained ? [{ declaredBytes: 5, binding }] : []),
+        { declaredBytes: 1 },
+      ]);
+      expect((await journal.maintenance.getMaintenanceCensus(null)).complete).toBe(false);
+      expect(await journal.attempts.stopAndJoin(task, signal())).toMatchObject(proof);
+      probe.settle(stopped);
+      expect(await journal.close()).toEqual({ complete: false });
+    },
+  );
+
+  it('retains unbound uncertain reservations and enforces the existing 256-record ceiling', async () => {
+    const assertSafe = jest.fn(
+      async (_reservations: readonly UploadAttemptLocalReservation[]) => {},
+    );
+    const journal = createUploadAttemptJournal(worker, { resources: { assertSafe } });
+    for (let index = 0; index < 256; index++) {
+      const registration = journal.attempts.begin(jest.fn());
+      await registration.reserveLocal!(1, signal());
+      registration.settle({ writerStopped: false, localCopiesAbsent: true });
+    }
+    expect(assertSafe.mock.calls[255][0]).toEqual(
+      Array.from({ length: 256 }, () => ({ declaredBytes: 1 })),
+    );
+    expect(() => journal.attempts.begin(jest.fn())).toThrow('queue_full');
+    expect(await journal.close()).toEqual({ complete: false });
+  });
+
+  it('replaces a fully settled receipt without leaking obsolete records into the capacity bound', async () => {
+    const journal = createUploadAttemptJournal(worker, {
+      resources: { assertSafe: async () => {} },
+    });
+    for (let index = 0; index < 300; index++) {
+      const registration = journal.attempts.begin(jest.fn());
+      await registration.reserveLocal!(1, signal());
+      registration.bind(binding);
+      registration.settle(stopped);
+    }
+    const active = Array.from({ length: 128 }, () => journal.attempts.begin(jest.fn()));
+    expect(() => journal.attempts.begin(jest.fn())).toThrow('queue_full');
+    active.forEach((registration) => registration.settle(stopped));
+    expect(await journal.close()).toEqual({ complete: true });
+  });
+});
 
 describe('shared upload attempt journal', () => {
   it('binds a real App writer without inventing an intake lease', async () => {

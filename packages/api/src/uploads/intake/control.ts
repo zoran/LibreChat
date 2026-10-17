@@ -39,6 +39,7 @@ export type IntakeControlOptions = {
     UploadManagementRepository,
     | 'readIntake'
     | 'claim'
+    | 'renew'
     | 'preparePromotion'
     | 'beginPromotion'
     | 'settlePromotion'
@@ -50,7 +51,6 @@ export type IntakeControlOptions = {
   management: Pick<
     UploadManagement,
     | 'get'
-    | 'renew'
     | 'fail'
     | 'cancel'
     | 'bindSecurityExecution'
@@ -330,7 +330,7 @@ export function createIntakeControlHandlers(options: IntakeControlOptions): Inta
       case 'claim':
         if (auth.generation !== undefined) fail('lease_lost');
         await active(ctx, auth, 'waiting');
-        await options.resources.assertSafe({ phase: 'transfer', hostId: ctx.worker.hostId });
+        await options.resources.assertSafe({ phase: 'admission', hostId: appWorker.hostId });
         signal.throwIfAborted();
         return repository.claim({
           kind: 'transfer',
@@ -341,7 +341,11 @@ export function createIntakeControlHandlers(options: IntakeControlOptions): Inta
           now: now(),
         });
       case 'renew':
-        return management.renew(held!);
+        // Intake owns its local reserve; App checks only its downstream admission.
+        // The authenticated original worker/lease remains fenced by the native repository.
+        await options.resources.assertSafe({ phase: 'admission', hostId: appWorker.hostId });
+        signal.throwIfAborted();
+        return repository.renew(held!, now());
       case 'fail':
         if (!UPLOAD_ERROR_CODES.includes(command.code as UploadErrorCode)) fail();
         return management.fail(held!, command.code as UploadErrorCode);
@@ -553,7 +557,12 @@ export function createIntakeControlHandlers(options: IntakeControlOptions): Inta
           try {
             const current = await authorize(ctx, controller.signal);
             bound(record.lease, ctx, current);
-            const renewed = await management.renew(record.lease);
+            await options.resources.assertSafe({
+              phase: 'admission',
+              hostId: appWorker.hostId,
+            });
+            controller.signal.throwIfAborted();
+            const renewed = await repository.renew(record.lease, now());
             bound(lease(snapshot(renewed)), ctx, current);
             controller.signal.throwIfAborted();
             let complete = false;

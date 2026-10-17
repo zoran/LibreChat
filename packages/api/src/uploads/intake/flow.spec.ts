@@ -1,9 +1,10 @@
-/** Actual native grants, Mongo, HTTP Intake, mTLS Control and scanner thread; ordinary storage is a local-byte fixture. */
+/** Actual native grants, Mongo, HTTP Intake, mTLS Control, resource guards and scanner thread; cgroup files and ordinary byte storage are fixtures. */
 import path from 'node:path';
 import jwt from 'jsonwebtoken';
 import mongoose from 'mongoose';
 import { request } from 'node:http';
 import assert from 'node:assert/strict';
+import { performance } from 'node:perf_hooks';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import { readUploadIntakeRecovery } from 'librechat-data-provider';
 import { createHash, randomBytes, randomUUID, X509Certificate } from 'node:crypto';
@@ -21,11 +22,18 @@ import type {
   UploadSecurityApproval,
   UploadStorageReceipt,
 } from 'librechat-data-provider';
-import type { StoragePort } from '../contract';
+import type { ResourcePort, StoragePort } from '../contract';
 import type { IntakeChannel } from './channel';
+import {
+  LOCAL_FLOOR_BYTES,
+  LOCAL_POOL_BYTES,
+  measureUploadDirectory,
+  uploadLocalReservation,
+} from '../platform/local';
 import { createIntakeChannel, startIntakeControlService } from './channel';
 import { createSecurityTlsFixture } from '../security/tls-fixture.helper';
 import { createHttpUploadSecurityPort } from '../security/transport';
+import { createUploadResourcePort } from '../control/hardGuards';
 import { createEmailCodeUploadGrant } from '~/auth/emailCode';
 import { startSecurityService } from '../security/service';
 import { createUploadAttemptJournal } from '../attempts';
@@ -76,10 +84,14 @@ describe('isolated Intake through native authority, scanner and App promotion', 
   let repository: ReturnType<typeof createUploadManagementRepository>;
   let identity: ReturnType<typeof createEmailCodeMethods>;
   let management: ReturnType<typeof createUploadManagement>;
+  let appResources: ResourcePort;
   let channel: IntakeChannel;
   let ordinaryPut: jest.MockedFunction<StoragePort['put']>;
   let root: string;
   let stagingRoot: string;
+  let appStagingRoot: string;
+  let intakeCgroupDirectory: string;
+  let appCgroupDirectory: string;
   let ordinaryRoot: string;
   let grant: UploadIntakeGrant;
   let cancelBeforePromotion: boolean;
@@ -90,6 +102,9 @@ describe('isolated Intake through native authority, scanner and App promotion', 
   let recoveryRequests: number;
   let lostReplies: number;
   let ordinaryBytes: number;
+  let receivedBytes: number;
+  let renewals: UploadLease[];
+  let onRenew: (() => void) | undefined;
   let expectedCompleteDrain: boolean;
   let expectedAppDrain: boolean;
   let intakeDrain: { complete: boolean } | undefined;
@@ -116,8 +131,15 @@ describe('isolated Intake through native authority, scanner and App promotion', 
     await mkdir(process.env.UPLOAD_TEST_TMPDIR, { recursive: true });
     root = await mkdtemp(path.join(process.env.UPLOAD_TEST_TMPDIR, 'intake-composed-'));
     stagingRoot = path.join(root, 'intake-staging');
+    appStagingRoot = path.join(root, 'app-staging');
+    intakeCgroupDirectory = path.join(root, 'intake-cgroup-fixture');
+    appCgroupDirectory = path.join(root, 'app-cgroup-fixture');
     ordinaryRoot = path.join(root, 'ordinary-byte-storage-fixture');
-    await Promise.all([mkdir(stagingRoot, { mode: 0o700 }), mkdir(ordinaryRoot, { mode: 0o700 })]);
+    await Promise.all(
+      [stagingRoot, appStagingRoot, intakeCgroupDirectory, appCgroupDirectory, ordinaryRoot].map(
+        (directory) => mkdir(directory, { mode: 0o700 }),
+      ),
+    );
     tls = createSecurityTlsFixture();
     scanner = await startSecurityService({
       instanceId: '11111111-1111-4111-8111-111111111111',
@@ -199,11 +221,18 @@ describe('isolated Intake through native authority, scanner and App promotion', 
     for (const name of ['File', 'Message', 'UploadOperation', 'UploadCounter', 'Session', 'User'])
       if (db.models[name]) await db.models[name].deleteMany({});
     for (const name of await readdir(ordinaryRoot)) await rm(path.join(ordinaryRoot, name));
+    // Two synthetic cgroups model independent limits; both guards read the real files and mounts.
+    for (const directory of [intakeCgroupDirectory, appCgroupDirectory]) {
+      await writeFile(path.join(directory, 'memory.current'), '33554432\n');
+      await writeFile(path.join(directory, 'memory.max'), '1073741824\n');
+    }
     cancelBeforePromotion = false;
     revokeAfterClaim = losePromotionReply = unknownStorageOutcome = false;
     loseFirstRecoveryRequest = false;
     recoveryRequests = 0;
-    lostReplies = ordinaryBytes = 0;
+    lostReplies = ordinaryBytes = receivedBytes = 0;
+    renewals = [];
+    onRenew = undefined;
     expectedCompleteDrain = true;
     expectedAppDrain = true;
     intakeDrain = undefined;
@@ -221,15 +250,47 @@ describe('isolated Intake through native authority, scanner and App promotion', 
     await repository.initialize();
     await independent.initialize();
     grant = await nativeGrant();
-    // Resource admission is a trusted fixture; this suite does not qualify host capacity or namespaces.
-    const resources = {
-      assertSafe: async () => {
-        await stat(stagingRoot);
+    const clock = () => ({ nowMs: Date.now(), monotonicMs: performance.now() });
+    appResources = createUploadResourcePort({
+      cgroupDirectory: appCgroupDirectory,
+      mounts: [
+        {
+          slot: 'staging',
+          path: appStagingRoot,
+          capacityBytes: LOCAL_POOL_BYTES,
+          floorBytes: LOCAL_FLOOR_BYTES,
+        },
+      ],
+      reservations: async (phase, lease) => {
+        const held = await repository.localReservations(appWorker, Date.now());
+        const disk = await measureUploadDirectory(appStagingRoot, clock);
+        return {
+          ...uploadLocalReservation({
+            worker: appWorker,
+            journal: held,
+            disk,
+            phase,
+            lease,
+            clock: clock(),
+          }),
+          observedAtMs: Math.min(held.observedAt, disk.observedAtMs),
+        };
       },
-    };
+      // Backend durability is a fixture; local resource measurements and worker matching are real.
+      durability: async () => {
+        const at = clock();
+        return {
+          state: 'safe',
+          observedAtMs: at.nowMs,
+          expiresAtMs: at.nowMs + 60_000,
+          expiresMonotonicMs: at.monotonicMs + 60_000,
+        };
+      },
+      clock,
+    });
     management = createUploadManagement({
       repository,
-      resources,
+      resources: appResources,
       identity: {
         authorize: async (owner, scope) =>
           owner.tenantId === tenantId &&
@@ -277,7 +338,7 @@ describe('isolated Intake through native authority, scanner and App promotion', 
       repository,
       identityRepository: identity,
       management,
-      resources,
+      resources: appResources,
       storage: { put: ordinaryPut },
       attempts: journal.attempts,
       worker: appWorker,
@@ -333,6 +394,10 @@ describe('isolated Intake through native authority, scanner and App promotion', 
               tenantId,
             );
         }
+        if ((input.command as { action?: string })?.action === 'renew') {
+          renewals.push(result as UploadLease);
+          onRenew?.();
+        }
         return result;
       },
       async promote(input) {
@@ -360,10 +425,14 @@ describe('isolated Intake through native authority, scanner and App promotion', 
       }),
       worker: intakeWorker,
       stagingRoot,
+      localResources: { cgroupDirectory: intakeCgroupDirectory, storage: 'disk' },
       allowedOrigins: [origin],
       host: '127.0.0.1',
       port: 0,
       deadlineMs: 15_000,
+      observe: (event) => {
+        if (event.kind === 'received') receivedBytes += event.bytes;
+      },
     });
   }, 20_000);
 
@@ -417,6 +486,7 @@ describe('isolated Intake through native authority, scanner and App promotion', 
   function submit(
     input: { operationId: string; capability: string },
     bytes: Buffer,
+    finishAfter?: Promise<void>,
   ): Promise<{ status: number; body: Record<string, unknown> }> {
     return new Promise((resolve, reject) => {
       const req = request(
@@ -451,7 +521,13 @@ describe('isolated Intake through native authority, scanner and App promotion', 
         },
       );
       req.once('error', reject);
-      req.end(bytes);
+      if (finishAfter) {
+        req.write(bytes.subarray(0, 1));
+        void finishAfter.then(
+          () => req.end(bytes.subarray(1)),
+          (error) => req.destroy(error),
+        );
+      } else req.end(bytes);
     });
   }
 
@@ -490,6 +566,71 @@ describe('isolated Intake through native authority, scanner and App promotion', 
         channel.control({ ...input, command, signal: AbortSignal.timeout(5_000) }),
       ).rejects.toMatchObject({ code: 'unauthorized' });
   }
+
+  it('keeps separate Intake and App worker reservations valid through an actual five-second heartbeat', async () => {
+    const bytes = Buffer.from('Freigegebener Text nach einem echten Intake-Heartbeat.');
+    const issued = await ticket(bytes);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const renewed = new Promise<void>((resolve, reject) => {
+      onRenew = resolve;
+      timeout = setTimeout(
+        () => reject(new Error('Actual Intake heartbeat was not renewed')),
+        10_000,
+      );
+    });
+    const started = performance.now();
+    try {
+      const finish = renewed.then(async () => {
+        // This is the former failure path: an Intake lease cannot own App-local reservations.
+        await expect(
+          appResources.assertSafe({
+            phase: 'transfer',
+            hostId: intakeWorker.hostId,
+            lease: claimedLease!,
+          }),
+        ).rejects.toMatchObject({ code: 'unavailable' });
+        expect(ordinaryPut).not.toHaveBeenCalled();
+        expect(await observer.models.File.countDocuments({})).toBe(0);
+      });
+      const response = await submit(issued, bytes, finish);
+      await finish;
+      expect(performance.now() - started).toBeGreaterThanOrEqual(5_000);
+      expect(response).toMatchObject({ status: 202, body: { state: 'queued_processing' } });
+      expect(renewals).toHaveLength(1);
+      expect(renewals[0]).toMatchObject({
+        ...intakeWorker,
+        operationId: issued.operationId,
+        generation: claimedLease!.generation,
+      });
+      expect(Date.parse(renewals[0].expiresAt)).toBeGreaterThan(
+        Date.parse(claimedLease!.expiresAt),
+      );
+      expect(receivedBytes).toBe(bytes.length);
+      expect(ordinaryPut).toHaveBeenCalledTimes(1);
+      expect(await readFile(path.join(ordinaryRoot, issued.operationId))).toEqual(bytes);
+      expect(await observer.models.File.countDocuments({ file_id: issued.operationId })).toBe(1);
+    } finally {
+      clearTimeout(timeout);
+      onRenew = undefined;
+    }
+  }, 20_000);
+
+  it('rejects Intake memory pressure before claim or received bytes while App admission remains healthy', async () => {
+    const bytes = Buffer.from('Dieser Text darf den isolierten Eingangsstream nicht passieren.');
+    const issued = await ticket(bytes);
+    await writeFile(path.join(intakeCgroupDirectory, 'memory.current'), '939524096\n');
+    await expect(
+      appResources.assertSafe({ phase: 'admission', hostId: appWorker.hostId }),
+    ).resolves.toBeUndefined();
+    expect(await submit(issued, bytes)).toMatchObject({
+      status: 503,
+      body: { code: 'unavailable' },
+    });
+    expect(claimedLease).toBeUndefined();
+    expect(receivedBytes).toBe(0);
+    expect(await readdir(stagingRoot)).toEqual([]);
+    await noOrdinaryContent();
+  });
 
   it('accepts actual scanned bytes once, and rejects body replay and duplicate promotion without another source read', async () => {
     const bytes = Buffer.from('Freigegebener überprüfbarer Text.');

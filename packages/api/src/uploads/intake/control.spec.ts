@@ -144,6 +144,7 @@ function fixture() {
       bound = true;
       return copy(lease);
     }),
+    renew: jest.fn(async () => copy(lease)),
     preparePromotion: jest.fn(async (input) => {
       record = { ...copy(input), state: 'prepared', writerStopped: true };
       return copy(record);
@@ -167,7 +168,6 @@ function fixture() {
   };
   const management: IntakeControlOptions['management'] = {
     get: jest.fn(async () => copy(operation)),
-    renew: jest.fn(async () => copy(lease)),
     fail: jest.fn(async () => operation),
     cancel: jest.fn(async () => operation),
     bindSecurityExecution: jest.fn(async () => undefined),
@@ -385,7 +385,7 @@ describe('application intake control', () => {
     f.revoke();
     for (const action of ['authorize', 'get', 'claim', 'cancel', 'get-promotion'])
       await expect(f.command({ action })).rejects.toMatchObject({ code: 'unauthorized' });
-    expect(f.management.renew).not.toHaveBeenCalled();
+    expect(f.repository.renew).not.toHaveBeenCalled();
     expect(f.storage.put).not.toHaveBeenCalled();
   });
 
@@ -436,6 +436,10 @@ describe('application intake control', () => {
     });
     expect(f.repository.claim).not.toHaveBeenCalled();
     expect(await f.command({ action: 'claim' })).toEqual(lease);
+    expect(f.resources.assertSafe).toHaveBeenLastCalledWith({
+      phase: 'admission',
+      hostId: app.hostId,
+    });
     expect(f.repository.claim).toHaveBeenCalledWith({
       kind: 'transfer',
       principal,
@@ -445,6 +449,24 @@ describe('application intake control', () => {
       now,
     });
     await expect(f.command({ action: 'claim' })).rejects.toMatchObject({ code: 'lease_lost' });
+  });
+
+  it('renews the authenticated Intake lease through its repository after separate App admission', async () => {
+    const f = fixture();
+    jest
+      .mocked(f.resources.assertSafe)
+      .mockRejectedValueOnce(new UploadManagementError('unavailable'));
+    await expect(f.command({ action: 'renew', lease })).rejects.toMatchObject({
+      code: 'unavailable',
+    });
+    expect(f.repository.renew).not.toHaveBeenCalled();
+    await expect(f.command({ action: 'renew', lease })).resolves.toEqual(lease);
+    expect(f.resources.assertSafe).toHaveBeenLastCalledWith({
+      phase: 'admission',
+      hostId: app.hostId,
+    });
+    expect(f.repository.renew).toHaveBeenCalledWith(lease, now);
+    expect(f.repository.renew).toHaveBeenCalledTimes(1);
   });
 
   it('does not settle another in-flight App claim when journal binding loses a race', async () => {

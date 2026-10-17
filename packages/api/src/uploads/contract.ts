@@ -125,7 +125,20 @@ export type UploadAttemptSettlement = {
 };
 /** Actual local writer identity, independent of whether its work owns the transfer lease. */
 export type UploadAttemptBinding = UploadWorker & { operationId: string; generation: number };
+export type UploadAttemptLocalReservation = {
+  declaredBytes: number;
+  binding?: UploadAttemptBinding;
+};
+export type UploadAttemptLocalGuard = {
+  assertSafe(
+    reservations: readonly UploadAttemptLocalReservation[],
+    signal: AbortSignal,
+  ): Promise<void>;
+};
 export type UploadAttemptRegistration = {
+  /** Reserve before remote claim; these hooks are optional only for existing fixture ports. */
+  reserveLocal?(bytes: number, signal: AbortSignal): Promise<void>;
+  assertLocal?(signal: AbortSignal): Promise<void>;
   bind(binding: UploadAttemptBinding): void;
   /** Register once after bind and before settle; recovery must never start document work. */
   recover?(

@@ -220,6 +220,8 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
         try {
           if (lease && !signal.aborted) {
             await verifyPrincipal();
+            await registration?.assertLocal?.(signal);
+            signal.throwIfAborted();
             lease = await deps.management.renew(lease);
           }
         } catch {
@@ -282,6 +284,8 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
       const operation = await deps.management.get(principal, id);
       validateRawUploadHeaders(req.headers, operation.declaredBytes);
       signal.throwIfAborted();
+      await registration?.reserveLocal?.(operation.declaredBytes, signal);
+      signal.throwIfAborted();
       waitingOperation = { principal, id };
       stage = { name: 'wait', startedAt: performance.now() };
       while (!lease) {
@@ -300,6 +304,7 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
           deps.recoverAttempt!(boundLease, proof, recoverySignal),
         );
       }
+      await registration?.assertLocal?.(signal);
       signal.throwIfAborted();
       await verifyPrincipal();
       const attemptId = uploadAttemptId(lease);
@@ -522,7 +527,14 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
     } catch (error) {
       outcome = signal.aborted ? 'cancelled' : 'failure';
       finishStage(outcome);
-      claimUncertain = claimPending && !isUploadManagementError(error);
+      // The mTLS channel normalizes lost responses as `unavailable`; the remote
+      // adapter uses `lease_lost` for a reply it cannot safely bind. Neither error
+      // proves that the claim failed before committing at the durable owner.
+      claimUncertain =
+        claimPending &&
+        (!isUploadManagementError(error) ||
+          error.code === 'unavailable' ||
+          error.code === 'lease_lost');
       if (isUploadManagementError(error)) errorCode = error.code;
       else if (storing) errorCode = 'storage_uncertain';
       if (lease && !accepted) await deps.management.fail(lease, errorCode).catch(() => undefined);
@@ -601,6 +613,9 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
         localCopiesAbsent,
         storageOutcome,
         securityPending: !scannerSettled,
+        ...(registration?.reserveLocal
+          ? { localWriterStopped: !claimUncertain && !(stagingAttempted && !directory) }
+          : {}),
         ...(deps.recoverAttempt
           ? {
               localWriterStopped: !claimUncertain && !(stagingAttempted && !directory),

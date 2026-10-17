@@ -10,10 +10,12 @@ import type { ApplicationWorkPort } from '~/app';
 import type { IntakeChannel } from './channel';
 import { createRemoteIntakeBodyHandler } from './remote';
 import { createUploadAttemptJournal } from '../attempts';
+import { createIntakeResourceGuard } from './resources';
 import { createUploadBodyRouter } from '../http';
 
 export type IntakeServiceOptions = Omit<RemoteIntakeBodyOptions, 'attempts'> & {
   allowedOrigins: readonly string[];
+  localResources: { cgroupDirectory: string; storage: 'memory' | 'disk' };
   host?: string;
   port?: number;
 };
@@ -31,7 +33,24 @@ export async function startIntakeService(options: IntakeServiceOptions): Promise
     milliseconds > 120_000
   )
     throw new Error('Invalid intake configuration');
-  const journal = createUploadAttemptJournal(options.worker);
+  await mkdir(options.stagingRoot, { recursive: true, mode: 0o700 });
+  const staging = await lstat(options.stagingRoot);
+  if (
+    !staging.isDirectory() ||
+    staging.isSymbolicLink() ||
+    typeof process.getuid !== 'function' ||
+    staging.uid !== process.getuid() ||
+    (staging.mode & 0o077) !== 0 ||
+    (await realpath(options.stagingRoot)) !== path.resolve(options.stagingRoot)
+  )
+    throw new Error('Invalid intake staging root');
+  const resources = createIntakeResourceGuard({
+    stagingRoot: options.stagingRoot,
+    cgroupDirectory: options.localResources.cgroupDirectory,
+    storage: options.localResources.storage,
+  });
+  await resources.assertSafe([], AbortSignal.timeout(3000));
+  const journal = createUploadAttemptJournal(options.worker, { resources });
   const active = new Set<Promise<unknown>>();
   let stopped = false;
   let pausedBy: string | null = null;
@@ -94,17 +113,6 @@ export async function startIntakeService(options: IntakeServiceOptions): Promise
   app.use((_request, response) => {
     response.status(404).json({ code: 'not_found' });
   });
-  await mkdir(options.stagingRoot, { recursive: true, mode: 0o700 });
-  const staging = await lstat(options.stagingRoot);
-  if (
-    !staging.isDirectory() ||
-    staging.isSymbolicLink() ||
-    typeof process.getuid !== 'function' ||
-    staging.uid !== process.getuid() ||
-    (staging.mode & 0o077) !== 0 ||
-    (await realpath(options.stagingRoot)) !== path.resolve(options.stagingRoot)
-  )
-    throw new Error('Invalid intake staging root');
   const server = createServer(
     {
       maxHeaderSize: 8192,
