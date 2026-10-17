@@ -3,8 +3,8 @@ import path from 'node:path';
 import mongoose from 'mongoose';
 import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
-import { createHash, randomUUID } from 'node:crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import { createHash, randomUUID, X509Certificate } from 'node:crypto';
 import { createModels, createUploadManagementRepository } from '@librechat/data-schemas';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import type { UploadSecurityInspection, UploadSecurityExecution } from 'librechat-data-provider';
@@ -65,6 +65,14 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
     const ca = await certificate('ca.pem');
     serviceOptions = {
       instanceId: '11111111-1111-4111-8111-111111111111',
+      peers: [
+        {
+          certificateSha256: createHash('sha256')
+            .update(new X509Certificate(await certificate('client.pem')).raw)
+            .digest('hex'),
+          role: 'intake',
+        },
+      ],
       policyBytes,
       policySha256,
       threadPath,

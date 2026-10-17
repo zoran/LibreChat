@@ -1,6 +1,7 @@
 import { once } from 'node:events';
 import { request } from 'node:https';
 import { TLSSocket } from 'node:tls';
+import { createHash } from 'node:crypto';
 import {
   readUploadSecuritySubject,
   readUploadSecurityExecution,
@@ -10,11 +11,61 @@ import {
 } from 'librechat-data-provider';
 import type { IncomingMessage, RequestListener, ServerResponse } from 'node:http';
 import type { UploadSecurityPort } from '../contract';
+import { createPinnedServiceEndpoint } from '../intake/endpoint';
 
 const JSON_LIMIT = 8192;
 const CONTEXT_LIMIT = 4096;
 const DEADLINE_MS = 60_000;
 const failure = () => new Error('security_uninspectable');
+
+export type UploadSecurityClientPeer = {
+  certificateSha256: string;
+  role: 'intake' | 'application';
+};
+
+/** Startup authority is detached plain data; neither getters nor later edits can grant a role. */
+function configuration(value: unknown, keys: readonly string[]): Record<string, unknown> {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    ![null, Object.prototype].includes(Object.getPrototypeOf(value))
+  )
+    throw failure();
+  const copy: Record<string, unknown> = Object.create(null);
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (typeof key !== 'string' || !keys.includes(key) || !descriptor || !('value' in descriptor))
+      throw failure();
+    copy[key] = descriptor.value;
+  }
+  return copy;
+}
+function clientPeers(value: unknown): ReadonlyMap<string, UploadSecurityClientPeer['role']> {
+  if (
+    !Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Array.prototype ||
+    value.length < 1 ||
+    value.length > 64
+  )
+    throw failure();
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (Reflect.ownKeys(descriptors).length !== value.length + 1) throw failure();
+  const peers = new Map<string, UploadSecurityClientPeer['role']>();
+  for (let index = 0; index < value.length; index++) {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor || !('value' in descriptor)) throw failure();
+    const peer = configuration(descriptor.value, ['certificateSha256', 'role']);
+    if (
+      typeof peer.certificateSha256 !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(peer.certificateSha256) ||
+      peers.has(peer.certificateSha256) ||
+      (peer.role !== 'intake' && peer.role !== 'application')
+    )
+      throw failure();
+    peers.set(peer.certificateSha256, peer.role);
+  }
+  return peers;
+}
 
 /** These envelopes come from JSON; domain values use the shared descriptor-based readers. */
 function closed(value: unknown, keys: string[]): Record<string, unknown> {
@@ -132,16 +183,10 @@ export function createHttpUploadSecurityPort(options: {
   policySha256: string;
   tls: { ca: string | Buffer; cert: string | Buffer; key: string | Buffer };
 }): UploadSecurityPort {
-  let endpoint: URL;
+  let endpoint: ReturnType<typeof createPinnedServiceEndpoint>;
   try {
-    endpoint = new URL(options.endpoint);
-    if (
-      endpoint.protocol !== 'https:' ||
-      !options.allowedHosts.includes(endpoint.hostname) ||
-      (options.endpoint !== endpoint.origin && options.endpoint !== endpoint.origin + '/') ||
-      !/^[a-f0-9]{64}$/.test(options.policySha256)
-    )
-      throw failure();
+    endpoint = createPinnedServiceEndpoint(options);
+    if (!/^[a-f0-9]{64}$/.test(options.policySha256)) throw failure();
     for (const value of [options.tls.ca, options.tls.cert, options.tls.key])
       if (!(typeof value === 'string' || Buffer.isBuffer(value)) || value.length === 0)
         throw failure();
@@ -164,12 +209,13 @@ export function createHttpUploadSecurityPort(options: {
     const clock = deadline(signal);
     let req: ReturnType<typeof request>;
     try {
-      req = request(new URL(route, endpoint), {
+      req = request(new URL(route, endpoint.url), {
         method,
         ...tls,
         rejectUnauthorized: true,
         minVersion: 'TLSv1.2',
         agent: false,
+        lookup: endpoint.lookup,
         maxHeaderSize: JSON_LIMIT,
         signal: clock.signal,
         headers: { ...headers, 'content-length': String(expectedBytes) },
@@ -334,10 +380,34 @@ function reply(res: ServerResponse, status: number, value: unknown) {
 /** Composition must also configure HTTPS requestCert and rejectUnauthorized. */
 export function createSecurityRequestHandler(
   worker: UploadSecurityPort,
-  options: { track?: (work: Promise<void>) => void } = {},
+  options: { peers: readonly UploadSecurityClientPeer[]; track?: (work: Promise<void>) => void },
 ): RequestListener {
+  const config = configuration(options, ['peers', 'track']);
+  const peers = clientPeers(config.peers);
+  if (config.track !== undefined && typeof config.track !== 'function') throw failure();
+  const track = config.track as ((work: Promise<void>) => void) | undefined;
   return (req, res) => {
-    if (!(req.socket instanceof TLSSocket) || req.socket.authorized !== true) {
+    try {
+      if (!(req.socket instanceof TLSSocket) || req.socket.authorized !== true) throw failure();
+      const der = req.socket.getPeerCertificate().raw;
+      if (!Buffer.isBuffer(der) || !der.length) throw failure();
+      const role = peers.get(createHash('sha256').update(der).digest('hex'));
+      const shared =
+        (req.url === '/healthz' && req.method === 'GET') ||
+        (req.url === '/v1/cancel' && req.method === 'POST');
+      const intake =
+        (req.url === '/v1/prepare' && req.method === 'POST') ||
+        (req.url === '/v1/inspect' && req.method === 'PUT');
+      if (
+        !role ||
+        (!shared && !(role === 'intake' && intake)) ||
+        header(req, 'authorization') !== undefined ||
+        header(req, 'cookie') !== undefined ||
+        header(req, 'expect') !== undefined
+      )
+        throw failure();
+    } catch {
+      req.pause();
       reply(res, 403, { code: 'security_uninspectable' });
       return;
     }
@@ -420,7 +490,7 @@ export function createSecurityRequestHandler(
         }
       })();
       // Track the actual handler, not the deadline race or HTTP response lifetime.
-      options.track?.(work);
+      track?.(work);
       return work;
     }, clock.signal)
       .catch(() => reply(res, 400, { code: 'security_uninspectable' }))

@@ -53,6 +53,15 @@ export interface MaintenanceDependencies {
   probeDatabase(): Promise<boolean>;
   probeSharedState(): Promise<boolean>;
 }
+export interface WorkloadMaintenanceDependencies {
+  env: Record<string, string | undefined>;
+  identity: MaintenanceIdentity;
+  workOwners: Readonly<Record<string, ApplicationWorkPort>>;
+  startupReady(): boolean;
+}
+type LifecycleDependencies =
+  | (MaintenanceDependencies & { kind: 'application'; identity: MaintenanceIdentity })
+  | (WorkloadMaintenanceDependencies & { kind: 'workload' });
 export interface MaintenanceStatus {
   identity: MaintenanceIdentity;
   requestId: string | null;
@@ -138,12 +147,62 @@ async function readRequest(req: IncomingMessage): Promise<unknown> {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
-/** Private process-local lifecycle composition. It never owns or fabricates provider records. */
 export function createAppMaintenance(deps: MaintenanceDependencies): AppMaintenance {
+  return createMaintenanceController({
+    ...deps,
+    kind: 'application',
+    identity: createMaintenanceIdentity(
+      deps.env,
+      deps.env.LIBRECHAT_MAINTENANCE_TOKEN !== undefined || deps.requiredSharedState,
+    ),
+  });
+}
+
+/** Explicitly generation-free services reuse the native controller and their actual work owners. */
+export function createWorkloadMaintenance(deps: WorkloadMaintenanceDependencies): AppMaintenance {
+  const supplied = deps.identity;
+  if (
+    !object(supplied) ||
+    !exactKeys(supplied, ['podUid', 'source', 'incarnation']) ||
+    typeof supplied.podUid !== 'string' ||
+    !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/.test(supplied.podUid) ||
+    supplied.podUid !== deps.env.POD_UID ||
+    typeof supplied.source !== 'string' ||
+    !/^[a-f0-9]{40}$/.test(supplied.source) ||
+    supplied.source !== deps.env.BUILD_COMMIT ||
+    typeof supplied.incarnation !== 'string' ||
+    !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+      supplied.incarnation,
+    ) ||
+    deps.env.LIBRECHAT_MAINTENANCE_TOKEN === undefined ||
+    typeof deps.startupReady !== 'function' ||
+    !object(deps.workOwners) ||
+    !Object.keys(deps.workOwners).length ||
+    Object.entries(deps.workOwners).some(
+      ([name, owner]) =>
+        !name ||
+        !owner ||
+        typeof owner.pauseAdmissions !== 'function' ||
+        typeof owner.resumeAdmissions !== 'function' ||
+        typeof owner.getMaintenanceCensus !== 'function',
+    )
+  ) {
+    throw new Error('Invalid workload maintenance configuration');
+  }
+  const identity = Object.freeze({
+    podUid: supplied.podUid,
+    source: supplied.source,
+    incarnation: supplied.incarnation,
+  });
+  return createMaintenanceController({ ...deps, kind: 'workload', identity });
+}
+
+/** One private lifecycle/HTTP/authentication owner; provider records remain with actual owners. */
+function createMaintenanceController(deps: LifecycleDependencies): AppMaintenance {
   const token = deps.env.LIBRECHAT_MAINTENANCE_TOKEN;
   const controlEnabled = token !== undefined;
   const port = Number(deps.env.LIBRECHAT_MAINTENANCE_PORT ?? '3091');
-  const identity = createMaintenanceIdentity(deps.env, controlEnabled || deps.requiredSharedState);
+  const identity = deps.identity;
   if (
     controlEnabled &&
     (!token ||
@@ -161,7 +220,10 @@ export function createAppMaintenance(deps: MaintenanceDependencies): AppMaintena
   let cancelled: { requestId: string; revision: number } | undefined;
   let listener: Server | undefined;
   const owners = Object.entries(deps.workOwners ?? {});
-  const unqualifiedOwners = [...(deps.unqualifiedOwners ?? ['application coverage undeclared'])];
+  const unqualifiedOwners =
+    deps.kind === 'application'
+      ? [...(deps.unqualifiedOwners ?? ['application coverage undeclared'])]
+      : [];
   const coverageDeclared = deps.workOwners !== undefined;
 
   function changeOwners(action: 'pauseAdmissions' | 'resumeAdmissions', id: string): boolean {
@@ -173,14 +235,16 @@ export function createAppMaintenance(deps: MaintenanceDependencies): AppMaintena
         successful = false;
       }
     }
-    try {
-      const change =
-        action === 'pauseAdmissions'
-          ? deps.generation.closeGenerationAdmission
-          : deps.generation.reopenGenerationAdmission;
-      if (change.call(deps.generation, id) !== true) successful = false;
-    } catch {
-      successful = false;
+    if (deps.kind === 'application') {
+      try {
+        const change =
+          action === 'pauseAdmissions'
+            ? deps.generation.closeGenerationAdmission
+            : deps.generation.reopenGenerationAdmission;
+        if (change.call(deps.generation, id) !== true) successful = false;
+      } catch {
+        successful = false;
+      }
     }
     return successful;
   }
@@ -236,7 +300,8 @@ export function createAppMaintenance(deps: MaintenanceDependencies): AppMaintena
     ) {
       return false;
     }
-    if (!controlEnabled && !deps.requiredSharedState) {
+    // Busy or incomplete work is a drain concern, not a workload liveness probe.
+    if (deps.kind === 'workload' || (!controlEnabled && !deps.requiredSharedState)) {
       return true;
     }
     const sampledRevision = revision;
@@ -255,10 +320,24 @@ export function createAppMaintenance(deps: MaintenanceDependencies): AppMaintena
   }
   async function status(): Promise<MaintenanceStatus> {
     const sampledRevision = revision;
-    const [census, external] = await Promise.all([
-      observe(() => deps.generation.getGenerationAdmissionCensus()),
+    const [generationCensus, external] = await Promise.all([
+      deps.kind === 'application'
+        ? observe(() => deps.generation.getGenerationAdmissionCensus())
+        : undefined,
       externalCensus(),
     ]);
+    // These services have no generation subsystem; actual work still supplies queue/write counts.
+    const census =
+      deps.kind === 'application'
+        ? generationCensus
+        : {
+            admissionClosed: requestId !== null,
+            initializing: 0,
+            providerExecutions: 0,
+            activeStreams: 0,
+            unresolved: 0,
+            ...external,
+          };
     const known =
       sampledRevision === revision &&
       validCensus(census) &&

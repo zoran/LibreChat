@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { request } from 'node:https';
 import { readFileSync } from 'node:fs';
 import { createHash, X509Certificate } from 'node:crypto';
 import type { IntakeChannelContext } from './channel';
@@ -30,7 +31,10 @@ describe('isolated intake channel', () => {
       if (!(await service.close()).complete) throw new Error('Incomplete owned channel drain');
   });
   afterAll(() => fixture.close());
-  async function setup(overrides: Partial<Parameters<typeof startIntakeControlService>[0]> = {}) {
+  async function setup(
+    overrides: Partial<Parameters<typeof startIntakeControlService>[0]> = {},
+    clientWorker = worker,
+  ) {
     const control = jest.fn(async (_context: IntakeChannelContext) => ({ ok: true }));
     const received: Buffer[] = [];
     const consume = jest.fn(async (body: AsyncIterable<Uint8Array>) => {
@@ -50,7 +54,8 @@ describe('isolated intake channel', () => {
           certificateSha256: new X509Certificate(pem('client.pem')).fingerprint256
             .replaceAll(':', '')
             .toLowerCase(),
-          worker,
+          role: 'intake',
+          hostIds: [worker.hostId],
         },
       ],
       handlers: { control, promote },
@@ -62,11 +67,12 @@ describe('isolated intake channel', () => {
     const channel = createIntakeChannel({
       endpoint: `https://127.0.0.1:${service.address.port}`,
       allowedHosts: ['127.0.0.1'],
+      worker: clientWorker,
       tls: { ca: pem('ca.pem'), cert: pem('client.pem'), key: pem('client.key') },
     });
     return { service, channel, control, promote, consume, release, received };
   }
-  it('uses the authenticated certificate worker rather than caller identity', async () => {
+  it('binds the configured process to the authenticated role and host permission', async () => {
     const { channel, control } = await setup();
     await expect(
       channel.control({
@@ -80,16 +86,20 @@ describe('isolated intake channel', () => {
   });
   it('preserves worker identifiers accepted by the native durable contract', async () => {
     const nativeWorker = { hostId: 'intake.node', instanceId: 'intake_pod' };
-    const { channel, control } = await setup({
-      peers: [
-        {
-          certificateSha256: new X509Certificate(pem('client.pem')).fingerprint256
-            .replaceAll(':', '')
-            .toLowerCase(),
-          worker: nativeWorker,
-        },
-      ],
-    });
+    const { channel, control } = await setup(
+      {
+        peers: [
+          {
+            certificateSha256: new X509Certificate(pem('client.pem')).fingerprint256
+              .replaceAll(':', '')
+              .toLowerCase(),
+            role: 'intake',
+            hostIds: [nativeWorker.hostId],
+          },
+        ],
+      },
+      nativeWorker,
+    );
     await channel.control({
       operationId,
       capability,
@@ -173,7 +183,7 @@ describe('isolated intake channel', () => {
   });
   it('rejects a trusted CA client absent from the exact peer allowlist', async () => {
     const { channel, control } = await setup({
-      peers: [{ certificateSha256: 'f'.repeat(64), worker }],
+      peers: [{ certificateSha256: 'f'.repeat(64), role: 'intake', hostIds: [worker.hostId] }],
     });
     await expect(
       channel.control({
@@ -232,8 +242,207 @@ describe('isolated intake channel', () => {
       createIntakeChannel({
         endpoint,
         allowedHosts: ['127.0.0.1'],
+        worker,
         tls: { ca: pem('ca.pem'), cert: pem('client.pem'), key: pem('client.key') },
       }),
     ).toThrow();
+  });
+
+  it('allows two current process incarnations under the same pinned role certificate', async () => {
+    const { service, channel, control } = await setup();
+    const secondWorker = { ...worker, instanceId: 'next-process' };
+    const second = createIntakeChannel({
+      endpoint: `https://127.0.0.1:${service.address.port}`,
+      allowedHosts: ['127.0.0.1'],
+      worker: secondWorker,
+      tls: { ca: pem('ca.pem'), cert: pem('client.pem'), key: pem('client.key') },
+    });
+    for (const client of [channel, second])
+      await client.control({
+        operationId,
+        capability,
+        command: { action: 'get' },
+        signal: AbortSignal.timeout(5000),
+      });
+    expect(control.mock.calls.map(([context]) => context.worker)).toEqual([worker, secondWorker]);
+  });
+
+  it('snapshots role hosts and worker so configuration or request mutation cannot change authority', async () => {
+    const hosts = [worker.hostId];
+    const mutableWorker = { ...worker };
+    const peer = {
+      certificateSha256: new X509Certificate(pem('client.pem')).fingerprint256
+        .replaceAll(':', '')
+        .toLowerCase(),
+      role: 'intake' as const,
+      hostIds: hosts,
+    };
+    const { channel, control } = await setup({ peers: [peer] }, mutableWorker);
+    hosts[0] = 'foreign';
+    peer.certificateSha256 = 'f'.repeat(64);
+    mutableWorker.hostId = 'foreign';
+    mutableWorker.instanceId = 'forged';
+    await channel.control({
+      operationId,
+      capability,
+      command: { action: 'get' },
+      signal: AbortSignal.timeout(5000),
+      worker: mutableWorker,
+      headers: { 'X-Upload-Worker-Host': 'foreign' },
+    } as never);
+    expect(control.mock.calls[0][0].worker).toEqual(worker);
+  });
+
+  it.each([
+    ['missing host', { 'x-upload-worker-host': undefined }, 400],
+    ['missing instance', { 'x-upload-worker-instance': undefined }, 400],
+    ['invalid instance', { 'x-upload-worker-instance': 'not an instance' }, 400],
+    ['foreign host', { 'x-upload-worker-host': 'foreign-host' }, 401],
+    ['duplicate host', { 'x-upload-worker-host': ['intake-node', 'intake-node'] }, 400],
+    ['duplicate instance', { 'x-upload-worker-instance': ['intake-pod', 'intake-pod'] }, 400],
+    ['browser bearer', { authorization: 'Bearer forbidden' }, 400],
+    ['browser cookie', { cookie: 'session=forbidden' }, 400],
+  ] as const)(
+    'rejects %s before invoking the control owner',
+    async (_name, overrides, expected) => {
+      const { service, control } = await setup();
+      const headers: Record<string, string | readonly string[] | undefined> = {
+        'content-type': 'application/json',
+        'content-length': '2',
+        'x-upload-capability': capability,
+        'x-upload-worker-host': worker.hostId,
+        'x-upload-worker-instance': worker.instanceId,
+        ...overrides,
+      };
+      const requestHeaders: Record<string, string | string[]> = {};
+      for (const [name, value] of Object.entries(headers))
+        if (value !== undefined)
+          requestHeaders[name] = typeof value === 'string' ? value : [...value];
+      const status = await new Promise<number | undefined>((resolve, reject) => {
+        const req = request(
+          `https://127.0.0.1:${service.address.port}/v1/intake/control/${operationId}`,
+          {
+            ca: pem('ca.pem'),
+            cert: pem('client.pem'),
+            key: pem('client.key'),
+            method: 'POST',
+            headers: requestHeaders,
+            agent: false,
+            signal: AbortSignal.timeout(5000),
+          },
+          (response) => {
+            response.resume();
+            response.once('end', () => resolve(response.statusCode));
+            response.once('error', reject);
+          },
+        );
+        req.once('error', reject);
+        req.end('{}');
+      });
+      expect(status).toBe(expected);
+      expect(control).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    [{ certificateSha256: 'a'.repeat(64), worker }],
+    [{ certificateSha256: 'a'.repeat(64), role: 'app', hostIds: [worker.hostId] }],
+    [{ certificateSha256: 'a'.repeat(64), role: 'intake', hostIds: [] }],
+    [
+      {
+        certificateSha256: 'a'.repeat(64),
+        role: 'intake',
+        hostIds: [worker.hostId, worker.hostId],
+      },
+    ],
+    [{ certificateSha256: 'a'.repeat(64), role: 'intake', hostIds: [undefined] }],
+    [
+      { certificateSha256: 'a'.repeat(64), role: 'intake', hostIds: [worker.hostId] },
+      { certificateSha256: 'a'.repeat(64), role: 'intake', hostIds: ['other'] },
+    ],
+  ])(
+    'rejects legacy or invalid role configuration %# before opening a listener',
+    async (...peers) => {
+      await expect(setup({ peers: peers as never })).rejects.toThrow();
+    },
+  );
+
+  it('rejects missing, malformed, inherited and accessor worker identities without evaluating getters', () => {
+    const getter = jest.fn(() => worker.hostId);
+    const accessor = Object.defineProperty({ instanceId: worker.instanceId }, 'hostId', {
+      get: getter,
+    });
+    for (const identity of [
+      undefined,
+      {},
+      { ...worker, hostId: 123 },
+      { ...worker, instanceId: '' },
+      Object.create(worker),
+      accessor,
+    ])
+      expect(() =>
+        createIntakeChannel({
+          endpoint: 'https://127.0.0.1',
+          allowedHosts: ['127.0.0.1'],
+          worker: identity,
+          tls: { ca: pem('ca.pem'), cert: pem('client.pem'), key: pem('client.key') },
+        } as never),
+      ).toThrow();
+    expect(getter).not.toHaveBeenCalled();
+  });
+
+  it('shares one pinned DNS target across control and promotion without failover after disconnect', async () => {
+    const { service, control, release } = await setup();
+    const resolve = jest.fn(async () => [{ address: '127.0.0.1', family: 4 }]);
+    const channel = createIntakeChannel({
+      endpoint: `https://localhost:${service.address.port}`,
+      allowedHosts: ['localhost'],
+      worker,
+      resolve,
+      tls: { ca: pem('ca.pem'), cert: pem('client.pem'), key: pem('client.key') },
+    });
+    await channel.control({
+      operationId,
+      capability,
+      command: {},
+      signal: AbortSignal.timeout(5000),
+    });
+    resolve.mockImplementation(async () => [{ address: '127.0.0.2', family: 4 }]);
+    await expect(
+      channel.promote({
+        operationId,
+        capability,
+        promotionId,
+        bytes: 5,
+        integrity,
+        body: (async function* () {
+          yield Buffer.from('hello');
+        })(),
+        signal: AbortSignal.timeout(5000),
+      }),
+    ).resolves.toEqual({ received: 'hello' });
+    expect(control.mock.calls[0][0].worker).toEqual(worker);
+    expect(release).toHaveBeenCalledTimes(1);
+    await service.close();
+    await expect(
+      channel.control({ operationId, capability, command: {}, signal: AbortSignal.timeout(5000) }),
+    ).rejects.toThrow();
+    expect(resolve).toHaveBeenCalledTimes(1);
+    expect(resolve).toHaveBeenCalledWith('localhost');
+  });
+
+  it('keeps CA and URL-hostname verification when DNS is pinned to a valid server address', async () => {
+    const { service, control } = await setup();
+    const channel = createIntakeChannel({
+      endpoint: `https://wrong.invalid:${service.address.port}`,
+      allowedHosts: ['wrong.invalid'],
+      worker,
+      resolve: async () => [{ address: '127.0.0.1', family: 4 }],
+      tls: { ca: pem('ca.pem'), cert: pem('client.pem'), key: pem('client.key') },
+    });
+    await expect(
+      channel.control({ operationId, capability, command: {}, signal: AbortSignal.timeout(5000) }),
+    ).rejects.toMatchObject({ code: 'unavailable' });
+    expect(control).not.toHaveBeenCalled();
   });
 });

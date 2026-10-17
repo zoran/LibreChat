@@ -15,6 +15,7 @@ import {
   createUploadManagementRepository,
 } from '@librechat/data-schemas';
 import type {
+  UploadWorker,
   UploadIntakeGrant,
   UploadPromotionRecord,
   UploadLease,
@@ -34,6 +35,7 @@ import { createIntakeChannel, startIntakeControlService } from './channel';
 import { createSecurityTlsFixture } from '../security/tls-fixture.helper';
 import { createHttpUploadSecurityPort } from '../security/transport';
 import { createUploadResourcePort } from '../control/hardGuards';
+import { createMaintenanceIdentity } from '../../app/identity';
 import { createEmailCodeUploadGrant } from '~/auth/emailCode';
 import { startSecurityService } from '../security/service';
 import { createUploadAttemptJournal } from '../attempts';
@@ -42,7 +44,15 @@ import { createUploadManagement } from '../management';
 import { startIntakeService } from './service';
 
 const digest = (value: Buffer | string) => createHash('sha256').update(value).digest('hex');
-const intakeWorker = { hostId: 'intake-host', instanceId: 'intake-flow' };
+const intakeEnvironment = {
+  POD_UID: '11111111-1111-4111-8111-111111111111',
+  BUILD_COMMIT: 'a'.repeat(40),
+};
+// Real native identity creation; the synthetic Pod describes trusted test composition, not Pod attestation.
+const intakeWorker = {
+  hostId: 'intake-host',
+  instanceId: createMaintenanceIdentity(intakeEnvironment, true).incarnation,
+};
 const appWorker = { hostId: 'app-host', instanceId: 'app-flow' };
 const origin = 'https://intake.example.test';
 const tenantId = 'intake-flow';
@@ -111,6 +121,17 @@ describe('isolated Intake through native authority, scanner and App promotion', 
   let claimedLease: UploadLease | undefined;
   let promotionLease: UploadLease | undefined;
   const certificate = (name: string) => readFile(path.join(tls!.directory, name));
+  const clientFor = async (worker: UploadWorker) =>
+    createIntakeChannel({
+      endpoint: `https://127.0.0.1:${control!.address.port}`,
+      allowedHosts: ['127.0.0.1'],
+      worker,
+      tls: {
+        ca: await certificate('ca.pem'),
+        cert: await certificate('client.pem'),
+        key: await certificate('client.key'),
+      },
+    });
   const stored = (id: string) =>
     observer.models.UploadOperation.findById(id).lean<{
       state: string;
@@ -146,6 +167,12 @@ describe('isolated Intake through native authority, scanner and App promotion', 
       policyBytes,
       policySha256,
       threadPath,
+      peers: [
+        {
+          certificateSha256: digest(new X509Certificate(await certificate('client.pem')).raw),
+          role: 'intake',
+        },
+      ],
       host: '127.0.0.1',
       port: 0,
       tls: {
@@ -358,19 +385,12 @@ describe('isolated Intake through native authority, scanner and App promotion', 
           certificateSha256: new X509Certificate(await certificate('client.pem')).fingerprint256
             .replaceAll(':', '')
             .toLowerCase(),
-          worker: intakeWorker,
+          role: 'intake',
+          hostIds: [intakeWorker.hostId],
         },
       ],
     });
-    channel = createIntakeChannel({
-      endpoint: `https://127.0.0.1:${control.address.port}`,
-      allowedHosts: ['127.0.0.1'],
-      tls: {
-        ca: await certificate('ca.pem'),
-        cert: await certificate('client.pem'),
-        key: await certificate('client.key'),
-      },
-    });
+    channel = await clientFor(intakeWorker);
     const observedChannel: IntakeChannel = {
       async control(input) {
         if ((input.command as { action?: string })?.action === 'seal-recovery') {
@@ -672,6 +692,73 @@ describe('isolated Intake through native authority, scanner and App promotion', 
       }),
     ).rejects.toBeDefined();
     expect(consumed).not.toHaveBeenCalled();
+    expect(ordinaryPut).toHaveBeenCalledTimes(1);
+    expect(await observer.models.File.countDocuments({})).toBe(1);
+
+    const replacementWorker = {
+      hostId: intakeWorker.hostId,
+      instanceId: createMaintenanceIdentity(intakeEnvironment, true).incarnation,
+    };
+    expect(replacementWorker.instanceId).not.toBe(intakeWorker.instanceId);
+    const replacement = await clientFor(replacementWorker);
+    const localSettlement = {
+      version: 1,
+      operationId: issued.operationId,
+      transferGeneration: claimedLease!.generation,
+      worker: intakeWorker,
+      localWriterStopped: true,
+      localCopiesAbsent: true,
+    };
+    for (const [command, code] of [
+      [{ action: 'renew', lease: claimedLease }, 'lease_lost'],
+      [{ action: 'seal-recovery', transferGeneration: claimedLease!.generation }, 'unauthorized'],
+      [{ action: 'confirm-recovery', settlement: localSettlement }, 'lease_lost'],
+      [
+        {
+          action: 'confirm-recovery',
+          settlement: { ...localSettlement, worker: replacementWorker },
+        },
+        'unauthorized',
+      ],
+    ]) {
+      await expect(
+        replacement.control({ ...issued, command, signal: AbortSignal.timeout(5000) }),
+      ).rejects.toMatchObject({ code });
+    }
+    // The same authorized role may start its own attempt, but cannot inherit the old incarnation's obligations.
+    const fresh = await ticket(bytes);
+    const freshLease = (await replacement.control({
+      ...fresh,
+      command: { action: 'claim' },
+      signal: AbortSignal.timeout(5000),
+    })) as UploadLease;
+    expect(freshLease).toMatchObject({ ...replacementWorker, operationId: fresh.operationId });
+    await expect(
+      replacement.control({
+        ...fresh,
+        command: { action: 'seal-recovery', transferGeneration: freshLease.generation },
+        signal: AbortSignal.timeout(5000),
+      }),
+    ).resolves.toMatchObject({ closed: true, acknowledged: false, worker: replacementWorker });
+    await expect(
+      replacement.control({
+        ...fresh,
+        command: {
+          action: 'confirm-recovery',
+          settlement: {
+            ...localSettlement,
+            operationId: fresh.operationId,
+            transferGeneration: freshLease.generation,
+            worker: replacementWorker,
+          },
+        },
+        signal: AbortSignal.timeout(5000),
+      }),
+    ).resolves.toMatchObject({
+      acknowledged: true,
+      worker: replacementWorker,
+      storageOutcome: 'not_started',
+    });
     expect(ordinaryPut).toHaveBeenCalledTimes(1);
     expect(await observer.models.File.countDocuments({})).toBe(1);
   }, 30_000);

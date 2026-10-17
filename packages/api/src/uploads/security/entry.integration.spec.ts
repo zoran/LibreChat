@@ -4,7 +4,8 @@ import { join } from 'node:path';
 import { request } from 'node:https';
 import { createServer } from 'node:net';
 import { spawn } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
+import { request as httpRequest } from 'node:http';
+import { createHash, randomUUID, X509Certificate } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { createSecurityTlsFixture } from './tls-fixture.helper';
@@ -98,7 +99,48 @@ describe('built standalone scanner entry', () => {
     const pem = (name: string) => readFileSync(join(fixture.directory, name));
     const tls = { ca: pem('ca.pem'), cert: pem('client.pem'), key: pem('client.key') };
     let endpoint: string;
+    let maintenancePort: number;
     let environment: NodeJS.ProcessEnv;
+    const maintenanceToken = 'synthetic-private-maintenance-token-'.repeat(2);
+
+    async function maintenance(
+      method: string,
+      path: string,
+      body?: unknown,
+      token = maintenanceToken,
+    ) {
+      return await new Promise<{ status: number; body: Record<string, unknown> }>(
+        (resolve, reject) => {
+          const req = httpRequest(
+            {
+              host: '127.0.0.1',
+              port: maintenancePort,
+              path,
+              method,
+              signal: AbortSignal.timeout(3000),
+              headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+            },
+            (res) => {
+              const chunks: Buffer[] = [];
+              res.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+              res.once('error', reject);
+              res.once('end', () => {
+                try {
+                  resolve({
+                    status: res.statusCode!,
+                    body: JSON.parse(Buffer.concat(chunks).toString()),
+                  });
+                } catch (error) {
+                  reject(error);
+                }
+              });
+            },
+          );
+          req.once('error', reject);
+          req.end(body === undefined ? undefined : JSON.stringify(body));
+        },
+      );
+    }
 
     function launch(): OwnedChild {
       const artifacts = {
@@ -157,7 +199,14 @@ describe('built standalone scanner entry', () => {
               req.setTimeout(250, () => req.destroy());
               req.end();
             });
-            if (healthy) return;
+            if (
+              healthy &&
+              (await maintenance('GET', '/readyz').then(
+                (result) => result.status === 200,
+                () => false,
+              ))
+            )
+              return;
             await new Promise((resolve) => setTimeout(resolve, 20));
           }
           throw new Error(`Scanner did not become ready: ${output}`);
@@ -186,20 +235,33 @@ describe('built standalone scanner entry', () => {
       readFileSync(entry);
       readFileSync(thread);
       const port = await availablePort();
+      do {
+        maintenancePort = await availablePort();
+      } while (maintenancePort === port);
       endpoint = `https://127.0.0.1:${port}`;
       const policyFile = join(directory, 'policy.json');
       writeFileSync(policyFile, policyBytes);
+      const peersFile = join(directory, 'peers.json');
+      writeFileSync(
+        peersFile,
+        JSON.stringify([
+          { certificateSha256: hash(new X509Certificate(pem('client.pem')).raw), role: 'intake' },
+        ]),
+      );
       environment = {
         NODE_ENV: 'test',
         TMPDIR: directory,
         POD_UID: randomUUID(),
         BUILD_COMMIT: 'a'.repeat(40),
+        LIBRECHAT_MAINTENANCE_TOKEN: maintenanceToken,
+        LIBRECHAT_MAINTENANCE_PORT: String(maintenancePort),
         UPLOAD_SECURITY_PORT: String(port),
         UPLOAD_SECURITY_TLS_CA_FILE: join(fixture.directory, 'ca.pem'),
         UPLOAD_SECURITY_TLS_CERT_FILE: join(fixture.directory, 'server.pem'),
         UPLOAD_SECURITY_TLS_KEY_FILE: join(fixture.directory, 'server.key'),
         UPLOAD_SECURITY_POLICY_FILE: policyFile,
         UPLOAD_SECURITY_POLICY_SHA256: policySha256,
+        UPLOAD_SECURITY_PEERS_FILE: peersFile,
       };
       const client = createHttpUploadSecurityPort({
         endpoint,
@@ -209,7 +271,56 @@ describe('built standalone scanner entry', () => {
       });
       const first = launch();
       await first.ready();
+      expect(await maintenance('GET', '/readyz')).toMatchObject({
+        status: 200,
+        body: { ready: true },
+      });
+      expect((await maintenance('GET', '/status', undefined, 'wrong-token')).status).toBe(403);
       const old = await client.prepare({ attemptId: 'entry-upload.1', subject, signal: signal() });
+      // Admitted work must stay addressable; only maintenance closure makes readiness false.
+      expect((await maintenance('GET', '/readyz')).status).toBe(200);
+      const initial = await maintenance('GET', '/status');
+      expect(initial).toMatchObject({
+        status: 200,
+        body: {
+          phase: 'running',
+          revision: 0,
+          identity: {
+            podUid: environment.POD_UID,
+            source: environment.BUILD_COMMIT,
+            incarnation: old.instanceId,
+          },
+        },
+      });
+      const requestId = 'entry-maintenance';
+      const begin = {
+        requestId,
+        expectedRevision: initial.body.revision,
+        identity: initial.body.identity,
+      };
+      expect(
+        (
+          await maintenance('POST', '/begin', {
+            ...begin,
+            identity: { ...(initial.body.identity as object), incarnation: randomUUID() },
+          })
+        ).status,
+      ).toBe(400);
+      expect(await maintenance('POST', '/begin', begin)).toMatchObject({
+        status: 200,
+        body: { phase: 'quiescing', revision: 1 },
+      });
+      expect(await maintenance('GET', '/readyz')).toMatchObject({
+        status: 503,
+        body: { ready: false },
+      });
+      await expect(
+        client.prepare({
+          attemptId: 'paused.1',
+          subject: { ...subject, operationId: 'paused' },
+          signal: signal(),
+        }),
+      ).rejects.toThrow('security_uninspectable');
       expect(
         await client.inspect({ execution: old, subject, body: body(), signal: signal() }),
       ).toMatchObject({
@@ -221,6 +332,30 @@ describe('built standalone scanner entry', () => {
         writerStopped: true,
         transientDataRemoved: true,
       });
+      expect(await maintenance('GET', '/status')).toMatchObject({
+        status: 200,
+        body: {
+          phase: 'drained',
+          known: true,
+          revision: 1,
+          requestId,
+          census: {
+            initializing: 0,
+            providerExecutions: 0,
+            activeStreams: 0,
+            unresolved: 0,
+            queuedContinuations: 0,
+            pendingWrites: 0,
+            complete: true,
+            admissionClosed: true,
+          },
+        },
+      });
+      expect((await maintenance('POST', '/cancel', begin)).status).toBe(409);
+      expect(await maintenance('POST', '/cancel', { ...begin, expectedRevision: 1 })).toMatchObject(
+        { status: 200, body: { phase: 'running', revision: 2 } },
+      );
+      expect((await maintenance('GET', '/readyz')).status).toBe(200);
       // Leave a real prepared attempt for the signal handler to stop and join.
       await client.prepare({
         attemptId: 'pending.1',
@@ -237,6 +372,19 @@ describe('built standalone scanner entry', () => {
         signal: signal(),
       });
       expect(current.instanceId).not.toBe(old.instanceId);
+      expect(await maintenance('GET', '/status')).toMatchObject({
+        status: 200,
+        body: {
+          phase: 'running',
+          revision: 0,
+          identity: {
+            incarnation: current.instanceId,
+            podUid: environment.POD_UID,
+            source: environment.BUILD_COMMIT,
+          },
+        },
+      });
+      expect((await maintenance('POST', '/begin', begin)).status).toBe(400);
       expect(await client.cancel({ execution: old, signal: signal() })).toEqual({
         execution: old,
         writerStopped: false,
@@ -264,6 +412,7 @@ describe('built standalone scanner entry', () => {
       fixture.close();
       // Keep only the nonsensitive child provenance under the caller's owned TMPDIR.
       rmSync(join(directory, 'policy.json'), { force: true });
+      rmSync(join(directory, 'peers.json'), { force: true });
       for (const result of cleanup) {
         if (result.status === 'rejected') failures.push(result.reason);
       }

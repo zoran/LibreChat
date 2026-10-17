@@ -45,7 +45,7 @@ function createUploadTicketIssuer({ repository, identityRepository, management }
   };
 }
 
-/** Provisioned per-instance peer identities. No request supplies certificates, worker IDs or URLs. */
+/** Provisioned service roles and hosts. Native Intake composition owns each process identity. */
 async function managedIntakeControlConfig() {
   const paths = ['CA', 'CERT', 'KEY', 'PEERS'].map(
     (name) => process.env[`UPLOAD_INTAKE_${name}_FILE`],

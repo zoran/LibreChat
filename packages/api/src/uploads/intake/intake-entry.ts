@@ -1,13 +1,16 @@
 /** Isolated raw ingress. No App bootstrap, database credentials or ordinary object-store client. */
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
+import type { AppMaintenance } from '../../app/maintenance';
 import { createHttpUploadSecurityPort } from '../security/transport';
+import { createWorkloadMaintenance } from '../../app/maintenance';
 import { createMaintenanceIdentity } from '../../app/identity';
 import { createIntakeChannel } from './channel';
 import { startIntakeService } from './service';
 
 async function main(): Promise<void> {
   const identity = createMaintenanceIdentity(process.env, true);
+  const worker = { hostId: process.env.POD_NODE_NAME ?? '', instanceId: identity.incarnation };
   const storage = process.env.UPLOAD_INTAKE_STORAGE ?? 'memory';
   if (storage !== 'memory' && storage !== 'disk')
     throw new Error('Invalid intake storage configuration');
@@ -40,6 +43,7 @@ async function main(): Promise<void> {
     endpoint: process.env.UPLOAD_INTAKE_APP_ENDPOINT ?? '',
     allowedHosts: (process.env.UPLOAD_INTAKE_APP_ALLOWED_HOSTS ?? '').split(',').filter(Boolean),
     tls: appTls,
+    worker,
   });
   const security = createHttpUploadSecurityPort({
     endpoint: process.env.UPLOAD_SECURITY_ENDPOINT ?? '',
@@ -50,23 +54,40 @@ async function main(): Promise<void> {
   const service = await startIntakeService({
     channel,
     security,
-    worker: { hostId: process.env.POD_NODE_NAME ?? '', instanceId: identity.incarnation },
+    worker,
     stagingRoot: process.env.UPLOAD_INTAKE_ROOT ?? '/var/run/cortex-intake',
     localResources: { cgroupDirectory: '/sys/fs/cgroup', storage },
     allowedOrigins: (process.env.UPLOAD_INTAKE_ALLOWED_ORIGINS ?? '').split(',').filter(Boolean),
   });
   let closing = false;
+  let maintenance: AppMaintenance | undefined;
+  try {
+    maintenance = createWorkloadMaintenance({
+      env: process.env,
+      identity,
+      workOwners: { intake: service.maintenance },
+      startupReady: () => !closing,
+    });
+    await maintenance.listen();
+  } catch (error) {
+    await service.close(AbortSignal.timeout(30_000));
+    await maintenance?.close();
+    throw error;
+  }
   const close = (): void => {
     if (closing) return;
     closing = true;
-    void service.close(AbortSignal.timeout(30_000)).then(
-      (result) => {
-        process.exitCode = result.complete ? 0 : 1;
-      },
-      () => {
-        process.exitCode = 1;
-      },
-    );
+    void service
+      .close(AbortSignal.timeout(30_000))
+      .finally(() => maintenance!.close())
+      .then(
+        (result) => {
+          process.exitCode = result.complete ? 0 : 1;
+        },
+        () => {
+          process.exitCode = 1;
+        },
+      );
   };
   process.once('SIGTERM', close);
   process.once('SIGINT', close);

@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:https';
 import type { AddressInfo } from 'node:net';
+import type { UploadSecurityClientPeer } from './transport';
 import type { ApplicationWorkPort } from '~/app';
 import { createSecurityRequestHandler } from './transport';
 import { waitForSecurityResponse } from './cancellation';
@@ -13,6 +14,7 @@ export async function startSecurityService(options: {
   policyBytes: Uint8Array;
   policySha256: string;
   tls: { ca: Buffer; cert: Buffer; key: Buffer };
+  peers: readonly UploadSecurityClientPeer[];
   threadPath: string;
   host?: string;
   port?: number;
@@ -67,6 +69,13 @@ export async function startSecurityService(options: {
       };
     },
   };
+  const handler = createSecurityRequestHandler(worker, {
+    peers: options.peers,
+    track(work) {
+      active.add(work);
+      void work.finally(() => active.delete(work)).catch(() => undefined);
+    },
+  });
   const server = createServer(
     {
       ...options.tls,
@@ -78,13 +87,11 @@ export async function startSecurityService(options: {
       headersTimeout: 5000,
       keepAliveTimeout: 1000,
     },
-    createSecurityRequestHandler(worker, {
-      track(work) {
-        active.add(work);
-        void work.finally(() => active.delete(work)).catch(() => undefined);
-      },
-    }),
+    handler,
   );
+  // Do not let Node grant body admission before the same peer/role gate runs.
+  server.on('checkContinue', handler);
+  server.on('checkExpectation', handler);
   server.maxConnections = 8;
   server.maxRequestsPerSocket = 2;
   server.setTimeout(65000, (socket) => socket.destroy());

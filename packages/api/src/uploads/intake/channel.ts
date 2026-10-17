@@ -8,6 +8,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { UploadManagementError, isUploadManagementError } from '../errors';
 import { verifyOriginalIntegrity } from '../storage/integrity';
+import { createPinnedServiceEndpoint } from './endpoint';
 
 const JSON_BYTES = 32 * 1024;
 const IDENTIFIER = /^[a-zA-Z0-9-]{1,128}$/;
@@ -44,11 +45,56 @@ export interface IntakeChannel {
 function fail(code: 'invalid_request' | 'unauthorized' | 'unavailable' = 'invalid_request'): never {
   throw new UploadManagementError(code);
 }
-function tlsMaterial(value: TlsMaterial): { ca: Buffer; cert: Buffer; key: Buffer } {
-  for (const item of [value.ca, value.cert, value.key]) {
-    if (!(typeof item === 'string' || Buffer.isBuffer(item)) || !item.length) fail();
+function fields(value: unknown, keys: readonly string[]): Record<string, unknown> {
+  if (
+    !value ||
+    typeof value !== 'object' ||
+    ![null, Object.prototype].includes(Object.getPrototypeOf(value))
+  )
+    fail();
+  const copy: Record<string, unknown> = Object.create(null);
+  for (const key of Reflect.ownKeys(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (typeof key !== 'string' || !keys.includes(key) || !descriptor || !('value' in descriptor))
+      fail();
+    copy[key] = descriptor.value;
   }
-  return { ca: Buffer.from(value.ca), cert: Buffer.from(value.cert), key: Buffer.from(value.key) };
+  return copy;
+}
+function entries(value: unknown): unknown[] {
+  if (
+    !Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Array.prototype ||
+    value.length < 1 ||
+    value.length > 64
+  )
+    fail();
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (Reflect.ownKeys(descriptors).length !== value.length + 1) fail();
+  return Array.from({ length: value.length }, (_, index) => {
+    const descriptor = descriptors[String(index)];
+    if (!descriptor || !('value' in descriptor)) fail();
+    return descriptor.value;
+  });
+}
+function workerIdentity(value: unknown): UploadWorker {
+  const worker = fields(value, ['hostId', 'instanceId']);
+  if (
+    typeof worker.hostId !== 'string' ||
+    !WORKER_IDENTIFIER.test(worker.hostId) ||
+    typeof worker.instanceId !== 'string' ||
+    !WORKER_IDENTIFIER.test(worker.instanceId)
+  )
+    fail();
+  return Object.freeze({ hostId: worker.hostId, instanceId: worker.instanceId });
+}
+function tlsMaterial(value: TlsMaterial): { ca: Buffer; cert: Buffer; key: Buffer } {
+  const copy = fields(value, ['ca', 'cert', 'key']);
+  const material = (item: unknown): Buffer => {
+    if (!(typeof item === 'string' || Buffer.isBuffer(item)) || !item.length) fail();
+    return Buffer.from(item);
+  };
+  return { ca: material(copy.ca), cert: material(copy.cert), key: material(copy.key) };
 }
 function header(message: IncomingMessage, name: string): string | undefined {
   if (
@@ -120,19 +166,26 @@ function clock(parent: AbortSignal | undefined, milliseconds: number) {
   };
 }
 
-export function createIntakeChannel(options: {
-  endpoint: string;
-  allowedHosts: readonly string[];
-  tls: TlsMaterial;
-}): IntakeChannel {
-  const endpoint = new URL(options.endpoint);
-  if (
-    endpoint.protocol !== 'https:' ||
-    !options.allowedHosts.includes(endpoint.hostname) ||
-    ![endpoint.origin, endpoint.origin + '/'].includes(options.endpoint)
-  )
-    fail();
-  const tls = tlsMaterial(options.tls);
+export function createIntakeChannel(
+  options: Parameters<typeof createPinnedServiceEndpoint>[0] & {
+    worker: UploadWorker;
+    tls: TlsMaterial;
+  },
+): IntakeChannel {
+  const config = fields(options, [
+    'endpoint',
+    'allowedHosts',
+    'resolve',
+    'worker',
+    'tls',
+  ]) as unknown as typeof options;
+  const worker = workerIdentity(config.worker);
+  const tls = tlsMaterial(config.tls);
+  const { url: endpoint, lookup } = createPinnedServiceEndpoint({
+    endpoint: config.endpoint,
+    allowedHosts: config.allowedHosts,
+    resolve: config.resolve,
+  });
   async function call(
     context: ClientContext,
     promotion?: Parameters<IntakeChannel['promote']>[0],
@@ -162,6 +215,7 @@ export function createIntakeChannel(options: {
           {
             method: promotion ? 'PUT' : 'POST',
             ...tls,
+            lookup,
             rejectUnauthorized: true,
             minVersion: 'TLSv1.3',
             agent: false,
@@ -170,6 +224,8 @@ export function createIntakeChannel(options: {
               'Content-Type': promotion ? 'application/octet-stream' : 'application/json',
               'Content-Length': promotion?.bytes ?? body!.length,
               'X-Upload-Capability': context.capability,
+              'X-Upload-Worker-Host': worker.hostId,
+              'X-Upload-Worker-Instance': worker.instanceId,
               ...(promotion
                 ? { Expect: '100-continue', 'X-Upload-Promotion': promotion.promotionId }
                 : {}),
@@ -237,26 +293,55 @@ export function createIntakeChannel(options: {
 
 export async function startIntakeControlService(options: {
   tls: TlsMaterial;
-  peers: readonly { certificateSha256: string; worker: UploadWorker }[];
+  peers: readonly { certificateSha256: string; role: 'intake'; hostIds: readonly string[] }[];
   handlers: IntakeChannelHandlers;
   host?: string;
   port?: number;
   deadlineMs?: number;
 }): Promise<{ address: AddressInfo; close(signal?: AbortSignal): Promise<{ complete: boolean }> }> {
-  const tls = tlsMaterial(options.tls);
-  if (!options.peers.length || options.peers.length > 64) fail();
-  const peers = new Map<string, UploadWorker>();
-  for (const peer of options.peers) {
+  const config = fields(options, [
+    'tls',
+    'peers',
+    'handlers',
+    'host',
+    'port',
+    'deadlineMs',
+  ]) as unknown as typeof options;
+  const tls = tlsMaterial(config.tls);
+  const peers = new Map<string, ReadonlySet<string>>();
+  for (const input of entries(config.peers)) {
+    const peer = fields(input, ['certificateSha256', 'role', 'hostIds']);
     if (
+      typeof peer.certificateSha256 !== 'string' ||
       !/^[a-f0-9]{64}$/.test(peer.certificateSha256) ||
       peers.has(peer.certificateSha256) ||
-      !WORKER_IDENTIFIER.test(peer.worker.hostId) ||
-      !WORKER_IDENTIFIER.test(peer.worker.instanceId)
+      peer.role !== 'intake'
     )
       fail();
-    peers.set(peer.certificateSha256, { ...peer.worker });
+    const hosts = entries(peer.hostIds);
+    if (
+      hosts.some((host) => typeof host !== 'string' || !WORKER_IDENTIFIER.test(host)) ||
+      new Set(hosts).size !== hosts.length
+    )
+      fail();
+    peers.set(peer.certificateSha256, new Set(hosts as string[]));
   }
-  const milliseconds = options.deadlineMs ?? 120_000;
+  const handlers = fields(config.handlers, [
+    'control',
+    'promote',
+  ]) as unknown as IntakeChannelHandlers;
+  if (typeof handlers.control !== 'function' || typeof handlers.promote !== 'function') fail();
+  const host = config.host ?? '0.0.0.0';
+  const port = config.port ?? 8444;
+  if (
+    typeof host !== 'string' ||
+    !host.length ||
+    !Number.isSafeInteger(port) ||
+    port < 0 ||
+    port > 65535
+  )
+    fail();
+  const milliseconds = config.deadlineMs ?? 120_000;
   if (!Number.isSafeInteger(milliseconds) || milliseconds < 1 || milliseconds > 120_000) fail();
   const active = new Set<{ controller: AbortController; done: Promise<void> }>();
   let stopped = false;
@@ -284,8 +369,13 @@ export async function startIntakeControlService(options: {
         .getPeerCertificate()
         .fingerprint256?.replaceAll(':', '')
         .toLowerCase();
-      const worker = fingerprint && peers.get(fingerprint);
-      if (!worker) fail('unauthorized');
+      const hosts = fingerprint && peers.get(fingerprint);
+      if (!hosts) fail('unauthorized');
+      const worker = workerIdentity({
+        hostId: header(message, 'x-upload-worker-host'),
+        instanceId: header(message, 'x-upload-worker-instance'),
+      });
+      if (!hosts.has(worker.hostId)) fail('unauthorized');
       if (
         header(message, 'authorization') !== undefined ||
         header(message, 'cookie') !== undefined ||
@@ -300,7 +390,7 @@ export async function startIntakeControlService(options: {
       const context = { operationId: match[2], capability, worker: { ...worker } };
       if (match[1] === 'control') {
         if (expectContinue || message.method !== 'POST') fail();
-        const result = await options.handlers.control(
+        const result = await handlers.control(
           context,
           await readJson(message, deadline.signal),
           deadline.signal,
@@ -323,12 +413,7 @@ export async function startIntakeControlService(options: {
           header(message, 'transfer-encoding') !== undefined
         )
           fail();
-        promotion = await options.handlers.promote(
-          context,
-          promotionId,
-          Number(length),
-          deadline.signal,
-        );
+        promotion = await handlers.promote(context, promotionId, Number(length), deadline.signal);
         deadline.signal.throwIfAborted();
         response.writeContinue();
         const result = await promotion.consume(message);
@@ -377,7 +462,7 @@ export async function startIntakeControlService(options: {
   server.setTimeout(milliseconds, (socket) => socket.destroy());
   await new Promise<void>((resolve, reject) => {
     server.once('error', reject);
-    server.listen(options.port ?? 8444, options.host ?? '0.0.0.0', () => {
+    server.listen(port, host, () => {
       server.off('error', reject);
       resolve();
     });

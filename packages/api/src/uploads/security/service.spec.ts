@@ -2,7 +2,7 @@
 import { join } from 'node:path';
 import { request } from 'node:https';
 import { readFileSync, statSync } from 'node:fs';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, randomUUID, X509Certificate } from 'node:crypto';
 import type { ClientRequest } from 'node:http';
 import { createSecurityTlsFixture } from './tls-fixture.helper';
 import { createHttpUploadSecurityPort } from './transport';
@@ -51,17 +51,26 @@ describe('scanner service maintenance', () => {
   afterAll(() => {
     fixture?.close();
   });
-  async function start() {
+  async function start(overrides: Partial<Parameters<typeof startSecurityService>[0]> = {}) {
     const threadPath = join(__dirname, '../../../dist/uploads/security/worker-thread.cjs');
     statSync(threadPath);
     const service = await startSecurityService({
       instanceId: randomUUID(),
+      peers: [
+        {
+          certificateSha256: createHash('sha256')
+            .update(new X509Certificate(pem('client.pem')).raw)
+            .digest('hex'),
+          role: 'intake',
+        },
+      ],
       policyBytes,
       policySha256,
       threadPath,
       host: '127.0.0.1',
       port: 0,
       tls: { ca: pem('ca.pem'), cert: pem('server.pem'), key: pem('server.key') },
+      ...overrides,
     });
     services.push(service);
     const endpoint = `https://127.0.0.1:${service.address.port}`;
@@ -85,6 +94,73 @@ describe('scanner service maintenance', () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
   }
+
+  it.each([undefined, [], [{ certificateSha256: 'a'.repeat(64), role: 'scanner' }]])(
+    'rejects missing or invalid peer configuration before listening: %j',
+    async (peers) => {
+      await expect(start({ peers: peers as never })).rejects.toThrow('security_uninspectable');
+    },
+  );
+
+  it.each([undefined, '100-continue'])(
+    'rejects application preparation before body input or automatic continue: %s',
+    async (expectation) => {
+      const peers = [
+        {
+          certificateSha256: createHash('sha256')
+            .update(new X509Certificate(pem('client.pem')).raw)
+            .digest('hex'),
+          role: 'application' as const,
+        },
+      ];
+      const { service, endpoint, tls, client } = await start({ peers });
+      const continued = jest.fn();
+      const status = await new Promise<number | undefined>((resolve, reject) => {
+        const pending = request(
+          endpoint + '/v1/prepare',
+          {
+            ...tls,
+            method: 'POST',
+            agent: false,
+            signal: signal(),
+            headers: {
+              'content-type': 'application/json',
+              'content-length': '512',
+              ...(expectation ? { expect: expectation } : {}),
+            },
+          },
+          (res) => {
+            res.resume();
+            res.once('end', () => resolve(res.statusCode));
+            res.once('error', reject);
+          },
+        );
+        requests.push(pending);
+        pending.once('error', reject);
+        pending.on('continue', continued);
+        pending.flushHeaders(); // No body is ever sent; rejection cannot depend on parsing it.
+      });
+      expect(status).toBe(403);
+      expect(continued).not.toHaveBeenCalled();
+      expect(await service.maintenance.getMaintenanceCensus(null)).toMatchObject({
+        queuedContinuations: 0,
+        pendingWrites: 0,
+        complete: true,
+      });
+      const missing = {
+        version: 1 as const,
+        attemptId: 'upload.1',
+        instanceId: randomUUID(),
+        executionId: randomUUID(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      };
+      expect(await client.cancel({ execution: missing, signal: signal() })).toEqual({
+        execution: missing,
+        writerStopped: false,
+        transientDataRemoved: false,
+      });
+    },
+  );
 
   it('stops prepare admission while exact admitted scans and cancel remain available over mTLS', async () => {
     const { service, client } = await start();
