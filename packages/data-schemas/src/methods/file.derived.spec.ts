@@ -16,6 +16,7 @@ import type { ClientSession } from 'mongoose';
 import type { ManagedUploadAcceptance } from './fileRetention';
 import {
   createFileRetentionMethods,
+  FileSourceCapacityError,
   FileSourceUnavailableError,
   resolveFileSources,
   resizeRetainedDerivatives,
@@ -501,7 +502,7 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
     expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
     const rejected = results.find((result) => result.status === 'rejected');
     expect(rejected!.status === 'rejected' && rejected!.reason).toBeInstanceOf(
-      FileSourceUnavailableError,
+      FileSourceCapacityError,
     );
     expect(
       await db.models.File.countDocuments({
