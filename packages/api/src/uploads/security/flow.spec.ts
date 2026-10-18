@@ -439,9 +439,10 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         prepare: (input) => port.prepare(input),
         cancel: (input) => port.cancel(input),
         async inspect(input) {
-          bindings.push({ execution: input.execution, stored: await readOperation() });
-          expect(bindings.at(-1)!.stored).not.toHaveProperty('filename');
-          expect(JSON.stringify(bindings.at(-1)!.stored)).not.toContain('Cortex-TEST-Privat');
+          const binding = { execution: input.execution, stored: await readOperation() };
+          bindings.push(binding);
+          expect(binding.stored).not.toHaveProperty('filename');
+          expect(JSON.stringify(binding.stored)).not.toContain('Cortex-TEST-Privat');
           const result = await port.inspect(input);
           observedInspections.push(result);
           return result;

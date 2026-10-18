@@ -1,6 +1,7 @@
 import mongoose from 'mongoose';
 import { v4 as uuid } from 'uuid';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import type { CounterRow } from './uploadManagementStore';
 import { createUploadStore, RESOURCE_MAX } from './uploadManagementStore';
 import { createMessageMethods, CLIENT_MESSAGE_SELECT } from './message';
 import { tenantStorage, runAsSystem } from '~/config/tenantContext';
@@ -16,12 +17,14 @@ jest.mock('~/config/winston', () => ({
 }));
 
 let server: MongoMemoryReplSet;
+let models: ReturnType<typeof createModels>;
 const methods = createMessageMethods(mongoose);
 const tenant = <T>(id: string, fn: () => T) => tenantStorage.run({ tenantId: id }, fn);
 
 beforeAll(async () => {
   server = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
-  Object.assign(mongoose.models, createModels(mongoose));
+  models = createModels(mongoose);
+  Object.assign(mongoose.models, models);
   await mongoose.connect(server.getUri());
   await mongoose.models.Message.createIndexes();
   await mongoose.models.File.init();
@@ -64,7 +67,11 @@ describe('managed document derivative storage', () => {
     return { sourceFileIds: [fileId], sourceExpiresAt: new Date(Date.now() + 60_000) };
   }
   async function total() {
-    return (await mongoose.models.UploadCounter.findById('global').lean()).value.textBytes;
+    const counter = await mongoose.models.UploadCounter.findById('global')
+      .lean<CounterRow>()
+      .orFail();
+    if (!('textBytes' in counter.value)) throw new Error('Expected the global text counter');
+    return counter.value.textBytes;
   }
   async function initialize(textBytes = 0) {
     await createUploadStore(mongoose, {
@@ -83,9 +90,10 @@ describe('managed document derivative storage', () => {
         'sourceFileIds.0': 'forged',
       };
       await methods.saveMessage(owner, message, { insertOnly: true });
-      const raw = await mongoose.models.Message.findOne({ messageId: message.messageId })
+      const raw = await models.Message.findOne({ messageId: message.messageId })
         .select('+retainedTextAllocations')
-        .lean();
+        .lean()
+        .orFail();
       expect(raw.text).toBe(message.text);
       expect(raw.retainedTextAllocations).toBeUndefined();
       expect(raw.sourceFileIds).toBeUndefined();
@@ -113,9 +121,10 @@ describe('managed document derivative storage', () => {
         'retainedDerivativeBytes.value': 999,
         'retainedDerivativeReservations.0.bytes': 888,
       } as never);
-      const raw = await mongoose.models.File.findOne({ file_id: fileId })
+      const raw = await models.File.findOne({ file_id: fileId })
         .select('+retainedDerivativeBytes +retainedDerivativeReservations')
-        .lean();
+        .lean()
+        .orFail();
       expect(raw.retainedDerivativeBytes).toBe(0);
       expect(raw.retainedDerivativeReservations).toBeUndefined();
     }));
@@ -188,7 +197,7 @@ describe('managed document derivative storage', () => {
       } finally {
         await session.endSession();
       }
-      const stored = await mongoose.models.File.findOne({ file_id: operationId }).lean();
+      const stored = await models.File.findOne({ file_id: operationId }).lean().orFail();
       expect(stored).toMatchObject({
         text: 'usable parsed text',
         textFormat: 'text',
@@ -215,9 +224,10 @@ describe('managed document derivative storage', () => {
       expect(await total()).toBeLessThan(charged);
       const saved = await methods.getMessage({ user: userId, messageId: message.messageId });
       expect(saved).not.toHaveProperty('retainedTextAllocations');
-      const raw = await mongoose.models.Message.findOne({ messageId: message.messageId })
+      const raw = await models.Message.findOne({ messageId: message.messageId })
         .select('+retainedTextAllocations')
-        .lean();
+        .lean()
+        .orFail();
       expect(raw.retainedTextAllocations).toEqual([
         { fileId: context.sourceFileIds[0], bytes: await total() },
       ]);
@@ -234,9 +244,10 @@ describe('managed document derivative storage', () => {
       expect(await total()).toBe(RESOURCE_MAX.textBytes);
       expect(
         (
-          await mongoose.models.File.findOne({ file_id: context.sourceFileIds[0] })
+          await models.File.findOne({ file_id: context.sourceFileIds[0] })
             .select('+retainedDerivativeBytes')
             .lean()
+            .orFail()
         ).retainedDerivativeBytes,
       ).toBe(0);
     }));
@@ -288,9 +299,10 @@ describe('managed document derivative storage', () => {
       await files.releaseFileSourceCopies(owner, intent);
       await files.releaseFileSourceCopies(owner, { ...intent, bytes: RESOURCE_MAX.textBytes });
       expect(await total()).toBe(256);
-      const file = await mongoose.models.File.findOne({ file_id: intent.fileId })
+      const file = await models.File.findOne({ file_id: intent.fileId })
         .select('+retainedDerivativeBytes +retainedDerivativeReservations')
-        .lean();
+        .lean()
+        .orFail();
       expect(file.retainedDerivativeBytes).toBe(256);
       expect(file.retainedDerivativeReservations).toEqual([
         { reservationId: input.reservationId, bytes: 0, state: 'released' },
@@ -343,12 +355,13 @@ describe('managed document derivative storage', () => {
           competing.releaseFileSourceCopies(owner, held),
         ]);
         expect(await total()).toBe(512);
-        const file = await mongoose.models.File.findOne({ file_id: intent.fileId })
+        const file = await models.File.findOne({ file_id: intent.fileId })
           .select('+retainedDerivativeReservations')
-          .lean();
+          .lean()
+          .orFail();
         expect(file.retainedDerivativeReservations).toHaveLength(2);
         expect(
-          file.retainedDerivativeReservations.every(
+          file.retainedDerivativeReservations?.every(
             (entry: { state: string }) => entry.state === 'released',
           ),
         ).toBe(true);
@@ -397,9 +410,10 @@ describe('managed document derivative storage', () => {
             reason === 'unknown' ? 'document_inventory_unreconciled' : 'document_capacity_exceeded',
         });
         expect(await total()).toBe(charged);
-        const file = await mongoose.models.File.findOne({ file_id: fileId })
+        const file = await models.File.findOne({ file_id: fileId })
           .select('+retainedDerivativeReservations')
-          .lean();
+          .lean()
+          .orFail();
         expect(
           file.retainedDerivativeReservations?.some(
             (entry: { reservationId: string }) => entry.reservationId === intent.reservationId,
@@ -526,10 +540,11 @@ describe('managed document derivative storage', () => {
       expect(saved?.quotes).toEqual(['second quotation']);
       expect(await total()).toBeGreaterThan(0);
       expect(await total()).toBeLessThan(beforeEdit);
-      const raw = await mongoose.models.Message.findOne({ messageId: question.messageId })
+      const raw = await models.Message.findOne({ messageId: question.messageId })
         .select('+retainedTextAllocations')
-        .lean();
-      expect(raw.retainedTextAllocations.map((entry: { fileId: string }) => entry.fileId)).toEqual(
+        .lean()
+        .orFail();
+      expect(raw.retainedTextAllocations?.map((entry: { fileId: string }) => entry.fileId)).toEqual(
         second.sourceFileIds,
       );
     }));

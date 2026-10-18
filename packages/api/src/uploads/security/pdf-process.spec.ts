@@ -1,9 +1,9 @@
 /** Real built PDF child, wire and observer. Only OCR is a fixed synthetic test adapter. */
+import { resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
-import { observeSecurityProcess } from './process-observer';
 import { encodeSecurityProcessRequest } from './process-wire';
+import { observeSecurityProcess } from './process-observer';
 
 const entry = resolve(__dirname, '../../../dist/uploads/security/pdf-child.cjs');
 const policy = { version: 1 as const, markings: ['VS-NfD', 'GEHEIM'], labels: ['Einstufung'] };
@@ -41,11 +41,13 @@ function pdf(text = 'Synthetic source', malformedImage = false): Buffer {
   return Buffer.from(content);
 }
 
-// Fixed test-only adapter. Its quiet exit witness requires an actual rendered page and ink.
+// Fixed test-only adapter. The caller requires one rendered page or an explicit pre-OCR refusal.
 // No command, path, OCR selection or expected result comes from the request.
 const fakeOcrFixture = `
 setTimeout(()=>process.exit(90),7000).unref();
 const { runPdfSecurityChild } = require(process.argv[1]);
+const expectedPages = Number(process.argv[2]);
+if (expectedPages !== 0 && expectedPages !== 1) throw new Error('Invalid fixture page count');
 let calls = 0, rendered = false;
 runPdfSecurityChild({ readPage: async ({ page, width, height, rgba }) => {
   calls++;
@@ -53,7 +55,7 @@ runPdfSecurityChild({ readPage: async ({ page, width, height, rgba }) => {
     rgba.some((value,index)=>index % 4 !== 3 && value < 128);
   return { complete: true, readable: true, text: '' };
 }}).then(() => {
-  if (calls !== 1 || !rendered) process.exitCode = 91;
+  if (calls !== expectedPages || rendered !== (expectedPages === 1)) process.exitCode = 91;
 }, () => { process.exitCode = 92; });
 `;
 
@@ -67,9 +69,9 @@ function identity(pid: number) {
   return { pid, startTicks: fields[19], processGroup: Number(fields[2]), state: fields[0] };
 }
 
-async function run(bytes: Buffer, fakeOcr = false) {
+async function run(bytes: Buffer, fakeOcr = false, expectedPages = 1) {
   const request = encodeSecurityProcessRequest({ mediaType: 'application/pdf', policy, bytes });
-  const args = fakeOcr ? ['-e', fakeOcrFixture, entry] : [entry];
+  const args = fakeOcr ? ['-e', fakeOcrFixture, entry, String(expectedPages)] : [entry];
   const child = spawn(process.execPath, args, {
     stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
     env: { NODE_ENV: 'test', LANG: 'C.UTF-8' },
@@ -87,13 +89,19 @@ async function run(bytes: Buffer, fakeOcr = false) {
   try {
     actor = child.pid ? identity(child.pid) : undefined;
     if (process.env.SECURITY_PROCESS_PROVENANCE_PATH) {
+      if (
+        !process.env.SECURITY_PROCESS_SESSION ||
+        !process.env.SECURITY_PROCESS_LEASE ||
+        !process.env.SECURITY_PROCESS_OWNER
+      )
+        throw new Error('PDF test provenance is incomplete');
       appendFileSync(
         process.env.SECURITY_PROCESS_PROVENANCE_PATH,
         JSON.stringify({
           repository: process.cwd(),
           session: process.env.SECURITY_PROCESS_SESSION,
           lease: process.env.SECURITY_PROCESS_LEASE,
-          owner: '/root/workspace_sources',
+          owner: process.env.SECURITY_PROCESS_OWNER,
           scope: 'security-process-composition',
           bootId: readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(),
           ...actor,
@@ -158,12 +166,12 @@ describe('actual private PDF child and observer composition', () => {
     });
   });
 
-  it('rejects the known zero-dimension image warning at the actual diagnostic boundary', async () => {
-    expect(await run(pdf('Synthetic source', true), true)).toEqual({
-      result: null,
-      diagnostics: true,
+  it('delivers a quiet strict-image rejection through the actual observer after the child stops', async () => {
+    expect(await run(pdf('Synthetic source', true), true, 0)).toEqual({
+      result: { decision: 'uninspectable', reason: 'invalid_content' },
+      diagnostics: false,
       directChildStopped: true,
-      transportComplete: false,
+      transportComplete: true,
     });
   });
 

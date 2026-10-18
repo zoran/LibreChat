@@ -1,11 +1,11 @@
 /** Private process core only; its launcher must isolate credentials, diagnostics and native limits. */
-import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import type { Canvas } from '@napi-rs/canvas';
+import { readFile } from 'node:fs/promises';
 import type { PDFDocumentLoadingTask, RenderTask } from 'pdfjs-dist/types/src/display/api';
-import { inspectCompleteSecurityEvidence } from './inspection';
-import type { SecurityInspectionResult } from './inspection';
+import type { Canvas } from '@napi-rs/canvas';
 import type { SecurityMarkingEvidence, SecurityMarkingPolicy } from './markings';
+import type { SecurityInspectionResult } from './inspection';
+import { inspectCompleteSecurityEvidence } from './inspection';
 
 type Limits = {
   bytes: number;
@@ -187,6 +187,7 @@ export async function inspectPdfSecurity(
       disableRange: true,
       disableStream: true,
       stopAtErrors: true,
+      strictMetadata: true,
       enableXfa: false,
       isOffscreenCanvasSupported: false,
       isImageDecoderSupported: false,
@@ -200,7 +201,30 @@ export async function inspectPdfSecurity(
     const document = await wait(loading.promise);
     if (!Number.isSafeInteger(document.numPages) || document.numPages < 1) fail('invalid_content');
     if (document.numPages > limits.pages) fail('resource_limit');
-    const { info, metadata } = await wait(document.getMetadata());
+    const { info, metadata, metadataInspection } = await wait(document.getMetadata());
+    // PDF.js owns the bounded evidence validator. Require its opt-in contract here so a
+    // missing/incompatible dependency cannot turn refused catalog metadata into absence.
+    if (
+      !metadataInspection ||
+      metadataInspection.version !== 1 ||
+      metadataInspection.scope !== 'catalog-metadata' ||
+      metadataInspection.documentComplete !== false
+    )
+      fail('incomplete_coverage');
+    switch (metadataInspection.status) {
+      case 'absent':
+        if (metadata !== null) fail('incomplete_coverage');
+        break;
+      case 'validated':
+        if (!metadata) fail('incomplete_coverage');
+        break;
+      case 'refused':
+        return fail(
+          metadataInspection.reason === 'resource_limit' ? 'resource_limit' : 'incomplete_coverage',
+        );
+      default:
+        fail('incomplete_coverage');
+    }
     const properties = info as Record<string, unknown>;
     if (
       properties.EncryptFilterName !== null ||

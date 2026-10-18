@@ -1,7 +1,7 @@
 import { Schema } from 'mongoose';
-import type { EmailCodeChallenge } from '~/types/emailCode';
+import type { EmailCodeBudget, EmailCodeChallenge } from '~/types/emailCode';
 
-export const emailCodeChallengeSchema = new Schema<EmailCodeChallenge>(
+export const emailCodeChallengeSchema: Schema<EmailCodeChallenge> = new Schema<EmailCodeChallenge>(
   {
     _id: { type: String, required: true },
     tenantId: { type: String, required: true },
@@ -22,7 +22,7 @@ emailCodeChallengeSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 emailCodeChallengeSchema.index({ tenantId: 1, mailboxKey: 1 });
 
 /** Bounded rolling counters, owned only by auth admission; never a public tenant collection. */
-export const emailCodeBudgetSchema = new Schema(
+export const emailCodeBudgetSchema: Schema<EmailCodeBudget> = new Schema<EmailCodeBudget>(
   {
     _id: { type: String, required: true },
     sends: { type: [Number], default: [] },

@@ -22,7 +22,7 @@ export interface BrowserIdentity {
   expiration: Date;
   /** Current-read only; sendIdentity deliberately publishes only user and minted token. */
   sessionId?: string;
-  retirement?: { credentialsChangedAt?: Date; twoFactorEnrolledAt?: Date };
+  retirement?: Pick<IUser, 'credentialsChangedAt' | 'twoFactorEnrolledAt'>;
 }
 
 export interface BrowserMethods {

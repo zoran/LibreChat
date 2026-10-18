@@ -2,6 +2,7 @@
 import mongoose from 'mongoose';
 import { EventEmitter } from 'node:events';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import type { StoredUpload } from './uploadManagementStore';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createModels } from '~/models';
 
@@ -129,12 +130,15 @@ describe('tenant-bound upload change stream', () => {
 
   it('shares one fixed email/guest watch and never routes missing tenant rows as guest', async () => {
     const f = await watch(true);
-    await b.models.UploadOperation.collection.insertOne({
+    const operations = b.connection.db!.collection<
+      Partial<StoredUpload> & Pick<StoredUpload, '_id' | 'userId' | 'idempotencyKey'>
+    >(b.models.UploadOperation.collection.name);
+    await operations.insertOne({
       _id: 'missing',
       userId: owner.userId,
       idempotencyKey: 'missing',
     });
-    await b.models.UploadOperation.collection.insertOne({
+    await operations.insertOne({
       _id: 'malformed',
       userId: owner.userId,
       tenantId: '',
@@ -145,7 +149,7 @@ describe('tenant-bound upload change stream', () => {
       'owner',
       (value) => value.tenantId === null,
     );
-    await b.models.UploadOperation.collection.insertOne({
+    await operations.insertOne({
       _id: 'guest',
       userId: owner.userId,
       tenantId: null,

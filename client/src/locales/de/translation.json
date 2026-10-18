@@ -9,7 +9,6 @@
   "com_library_project_reconcile": "Projektzuordnung prüfen",
   "com_library_project_retry": "Verbleibende Dateien erneut hinzufügen",
   "com_library_project_results": "Im Projekt bestätigt: {{count}} von {{total}}",
-  "com_library_project_ineligible": "Diese Datei ist für das Projekt nicht verfügbar.",
   "com_library_select_page": "Alle Dateien auf dieser Seite auswählen",
   "com_library_select_file": "{{0}} auswählen",
   "com_library_tags": "Tags",

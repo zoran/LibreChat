@@ -1,5 +1,6 @@
 import jwt from 'jsonwebtoken';
 import mongoose from 'mongoose';
+import { randomBytes } from 'node:crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import { createBrowserMethods } from './browser';
 import { createSessionMethods } from './session';
@@ -89,27 +90,30 @@ describe('browser enrollment in native User/Session storage', () => {
   });
 
   it('binds a real native guest cookie and signed bearer through the public auth port until confirmed revocation', async () => {
-    const { validateBrowserBearer, BROWSER_COOKIE } = await import('@librechat/api');
+    const { validateBrowserBearer, BROWSER_COOKIE } = jest.requireActual<
+      typeof import('@librechat/api', {
+        with: { 'resolution-mode': 'require' }
+      })
+    >('@librechat/api');
     const previous = { ...process.env };
     const commands: { commandName: string; command: Record<string, unknown> }[] = [];
     const observe = (event: { commandName: string; command: Record<string, unknown> }) =>
       commands.push(event);
     process.env.AUTH_MODE = 'transition';
     process.env.CORTEX_UPLOAD_GUEST_TRANSITION_ENABLED = 'true';
-    process.env.JWT_SECRET = 'isolated-guest-token';
+    const secret = randomBytes(32).toString('hex');
+    process.env.JWT_SECRET = secret;
     try {
       const a = await methods.enrollBrowserIdentity(new Date(Date.now() + 60000));
       const b = await methods.enrollBrowserIdentity(new Date(Date.now() + 60000));
       const bearer = (id: string) =>
-        jwt.verify(
-          jwt.sign({ id, provider: 'browser' }, process.env.JWT_SECRET, { expiresIn: 60 }),
-          process.env.JWT_SECRET,
-          { algorithms: ['HS256'] },
-        );
+        jwt.verify(jwt.sign({ id, provider: 'browser' }, secret, { expiresIn: 60 }), secret, {
+          algorithms: ['HS256'],
+        });
       const req = {
         headers: { cookie: `${BROWSER_COOKIE}=${a.credential}` },
         cookies: { [BROWSER_COOKIE]: a.credential },
-      };
+      } as Parameters<typeof validateBrowserBearer>[1];
       mongoose.connection.getClient().on('commandStarted', observe);
       expect(await validateBrowserBearer(bearer(a.user.id), req, methods)).toMatchObject({
         grant: { userId: a.user.id, tenantId: null, sessionId: expect.any(String) },

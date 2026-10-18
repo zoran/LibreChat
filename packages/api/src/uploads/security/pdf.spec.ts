@@ -1,7 +1,7 @@
 /** Real installed PDF.js and native Canvas; only OCR is an explicit synthetic adapter. */
 import { createHash } from 'node:crypto';
-import { inspectPdfSecurity, PDF_SECURITY_LIMITS } from './pdf';
 import type { PdfSecurityInput, PdfSecurityOcr } from './pdf';
+import { inspectPdfSecurity, PDF_SECURITY_LIMITS } from './pdf';
 
 // The existing CommonJS Jest harness delegates ESM/native loading to real Node, not fake parsers.
 jest.mock('pdfjs-dist/legacy/build/pdf.mjs', () =>
@@ -12,6 +12,7 @@ jest.mock('@napi-rs/canvas', () =>
 );
 const policy = { version: 1 as const, markings: ['VS-NfD', 'GEHEIM'], labels: ['Einstufung'] };
 const incomplete = { decision: 'uninspectable', reason: 'incomplete_coverage' };
+const invalid = { decision: 'uninspectable', reason: 'invalid_content' };
 const limited = { decision: 'uninspectable', reason: 'resource_limit' };
 const rejected = { decision: 'rejected', reason: 'classification_marking' };
 
@@ -67,6 +68,19 @@ const fakeOcr = (text = ''): PdfSecurityOcr => ({
 });
 const inspect = (bytes: Uint8Array = pdf(), extra: Partial<PdfSecurityInput> = {}) =>
   inspectPdfSecurity({ bytes, mediaType: 'application/pdf', policy, ocr: fakeOcr(), ...extra });
+
+function metadata(xml: string, subtype = 'XML') {
+  return {
+    catalog: '/Metadata 6 0 R',
+    extra: [
+      `<< /Type /Metadata /Subtype /${subtype} /Length ${Buffer.byteLength(xml)} >>\nstream\n${xml}\nendstream`,
+    ],
+  };
+}
+const xmp =
+  '<x:xmpmeta xmlns:x="adobe:ns:meta/">' +
+  '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">' +
+  '<rdf:Description rdf:about="" /></rdf:RDF></x:xmpmeta>';
 
 // Real Standard/R2 encryption with an empty user password: PDF.js can open it without prompting.
 function encryptedPdf() {
@@ -214,18 +228,90 @@ describe('bounded PDF security inspection with explicit fake OCR', () => {
     expect(ocr.readPage).not.toHaveBeenCalled();
   });
 
-  it('does not clear an image silently skipped by PDF.js because its dimensions are invalid', async () => {
-    const ocr = fakeOcr();
-    const source = pdf(['Synthetic page'], {
-      resources: '/XObject << /Im1 6 0 R >>',
-      drawing: 'q 20 0 0 20 50 50 cm /Im1 Do Q',
-      extra: [
-        '<< /Type /XObject /Subtype /Image /Width 0 /Height 0 /ColorSpace /DeviceGray /BitsPerComponent 8 /Length 15 >>\nstream\nVS-NfD testdata\nendstream',
-      ],
-    });
-    expect(await inspect(source, { ocr })).toEqual(incomplete);
-    expect(ocr.readPage).toHaveBeenCalledTimes(1);
+  it('handles absent and validated catalog metadata without treating either as document approval', async () => {
+    for (const options of [{}, metadata(xmp)]) {
+      const ocr = fakeOcr();
+      expect(await inspect(pdf(['Synthetic page'], options), { ocr })).toEqual(incomplete);
+      expect(ocr.readPage).toHaveBeenCalledTimes(1);
+    }
   });
+
+  it('stops refused catalog metadata before pages or OCR and preserves the resource-limit reason', async () => {
+    for (const [options, expected] of [
+      [{ catalog: '/Metadata null' }, incomplete],
+      [metadata(xmp, 'Bogus'), incomplete],
+      [metadata('<broken>'), incomplete],
+      [metadata('x'.repeat(65_537)), limited],
+    ] as const) {
+      const ocr = fakeOcr();
+      expect(await inspect(pdf(['Synthetic page'], options), { ocr })).toEqual(expected);
+      expect(ocr.readPage).not.toHaveBeenCalled();
+    }
+  });
+
+  it('requires compatible metadata evidence even if a dependency drops or changes the native result', async () => {
+    const { getDocument } = await import('pdfjs-dist/legacy/build/pdf.mjs');
+    const loading = getDocument({ data: new Uint8Array(pdf()), isEvalSupported: false });
+    try {
+      const document = await loading.promise;
+      const prototype = Object.getPrototypeOf(document) as Pick<typeof document, 'getMetadata'>;
+      const original = prototype.getMetadata;
+      const absent = {
+        version: 1,
+        scope: 'catalog-metadata',
+        documentComplete: false,
+        status: 'absent',
+      };
+      for (const value of [
+        undefined,
+        { ...absent, version: 2 },
+        { ...absent, scope: 'other' },
+        { ...absent, documentComplete: true },
+        { ...absent, status: 'unknown' },
+        { ...absent, status: 'validated', decodedBytes: 1 },
+      ]) {
+        // Deliberate dependency-boundary corruption; parsing still uses the real document.
+        const changed = jest.spyOn(prototype, 'getMetadata').mockImplementation(async function (
+          this: typeof document,
+        ) {
+          return { ...(await original.call(this)), metadataInspection: value } as Awaited<
+            ReturnType<typeof original>
+          >;
+        });
+        try {
+          const ocr = fakeOcr();
+          expect(await inspect(pdf(), { ocr })).toEqual(incomplete);
+          expect(ocr.readPage).not.toHaveBeenCalled();
+        } finally {
+          changed.mockRestore();
+        }
+      }
+    } finally {
+      await loading.destroy();
+    }
+  });
+
+  it.each([
+    ['zero dimensions', 1, '/Width 0 /Height 0', 'VS-NfD testdata'],
+    ['asynchronous shared image decoding', 3, '/Width 1 /Height 1 /Filter /DCTDecode', 'NOTAJPEG'],
+  ] as const)(
+    'rejects %s before OCR through the actual strict renderer',
+    async (_name, pages, dimensions, bytes) => {
+      const ocr = fakeOcr();
+      const source = pdf(
+        Array.from({ length: pages }, () => 'Synthetic page'),
+        {
+          resources: `/XObject << /Im1 ${4 + pages * 2} 0 R >>`,
+          drawing: 'q 20 0 0 20 50 50 cm /Im1 Do /Im1 Do Q',
+          extra: [
+            `<< /Type /XObject /Subtype /Image ${dimensions} /ColorSpace /DeviceGray /BitsPerComponent 8 /Length ${Buffer.byteLength(bytes)} >>\nstream\n${bytes}\nendstream`,
+          ],
+        },
+      );
+      expect(await inspect(source, { ocr })).toEqual(invalid);
+      expect(ocr.readPage).not.toHaveBeenCalled();
+    },
+  );
 
   it('rejects a real encrypted PDF even when its empty password lets PDF.js open it', async () => {
     const ocr = fakeOcr();

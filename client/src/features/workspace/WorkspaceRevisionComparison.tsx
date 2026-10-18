@@ -1,13 +1,20 @@
 /** Read-only comparison inside one editor lifetime; no revision or file writes belong here. */
 import { useEffect, useRef, useState } from 'react';
+import type { WorkspaceSuggestionBase, WorkspaceTextModel } from './model';
+import type { TranslationKeys } from '~/hooks/useLocalize';
+import type { WorkspaceRevisionContent } from './api';
+import { assertWorkspaceModelText, decodeWorkspaceText } from './codec';
 import { DiffEditor } from '~/components/Artifacts/monaco';
 import useLocalize from '~/hooks/useLocalize';
-import { assertWorkspaceModelText, decodeWorkspaceText } from './codec';
-import type { WorkspaceRevisionContent } from './api';
-import type { WorkspaceSuggestionBase, WorkspaceTextModel } from './model';
 
 type Comparison = { revision: number; base: WorkspaceSuggestionBase; stored: string };
 type Failure = 'invalid' | 'limit' | 'unavailable' | 'error' | null;
+const failureKeys: Record<Exclude<Failure, null>, TranslationKeys> = {
+  invalid: 'com_workspace_compare_invalid',
+  limit: 'com_workspace_compare_limit',
+  unavailable: 'com_workspace_compare_unavailable',
+  error: 'com_workspace_compare_error',
+};
 const actionClass =
   'min-h-10 rounded-lg border border-border-light px-3 py-2 text-sm focus-visible:outline focus-visible:outline-2 disabled:cursor-not-allowed disabled:opacity-50';
 
@@ -202,7 +209,7 @@ export function WorkspaceRevisionComparison({
       )}
       {failure && (
         <p role="alert" className="mt-2">
-          {localize(`com_workspace_compare_${failure}`, { revision })}
+          {localize(failureKeys[failure], { revision })}
         </p>
       )}
       {comparison && (

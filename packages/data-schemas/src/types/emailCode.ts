@@ -16,6 +16,16 @@ export interface EmailCodeChallenge {
   consumedAt?: Date;
 }
 
+/** Stored admission counters; active entry fields are optional in the native schema. */
+export interface EmailCodeBudget {
+  _id: string;
+  sends: number[];
+  failures: number[];
+  requests: number[];
+  active: Array<{ key?: string; expiresAt?: number }>;
+  expiresAt: Date;
+}
+
 export interface EmailCodeUser {
   _id: string;
   id: string;

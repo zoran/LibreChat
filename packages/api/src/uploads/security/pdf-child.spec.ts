@@ -1,8 +1,8 @@
 /** Real built child/PDF.js/Canvas; only the fixed test fixture supplies synthetic OCR. */
-import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { existsSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import type { Readable } from 'node:stream';
 import {
   encodeSecurityProcessRequest,
@@ -51,6 +51,8 @@ const request = (bytes = pdf()) =>
 // Fixed test-only composition. No script, path or OCR choice is accepted from the wire.
 const fakeOcrFixture = `
 const entry = process.argv[1];
+const expectedPages = Number(process.argv[2]);
+if (expectedPages !== 0 && expectedPages !== 1) throw new Error('Invalid fixture page count');
 const maximum = 4 + 32768 + 4194304;
 const frames = [], chunks = [], pixels = [];
 let sawInput = false;
@@ -62,26 +64,29 @@ Buffer.alloc = function(...args) {
   return value;
 };
 Buffer.prototype.copy = function(target, ...args) {
-  if (frames.includes(target)) chunks.push(this);
+  if (frames.includes(target)) {
+    chunks.push(this);
+    sawInput ||= this.some(byte => byte !== 0);
+  }
   return Reflect.apply(copy, this, [target, ...args]);
 };
 const { runPdfSecurityChild } = require(entry);
 runPdfSecurityChild({ readPage: async ({ rgba }) => {
-  sawInput = frames.some(frame => frame.some(byte => byte !== 0));
   pixels.push(rgba);
   return { complete: true, readable: true, text: '' };
 }}).then(() => {
   Buffer.alloc = allocate;
   Buffer.prototype.copy = copy;
   const erased = [...frames, ...chunks, ...pixels].every(value => value.every(byte => byte === 0));
-  if (!sawInput || frames.length !== 1 || !chunks.length || !pixels.length || !erased) {
+  if (!sawInput || frames.length !== 1 || !chunks.length || pixels.length !== expectedPages || !erased) {
     process.exitCode = 91;
   } else process.stdout.write('SYNTHETIC_FIXTURE_CLEANUP_OK\\n');
 }, () => { process.exitCode = 92; });
 `;
 
-async function run(input: Buffer, fakeOcr = false, missingResultFd = false) {
-  const child = spawn(process.execPath, fakeOcr ? ['-e', fakeOcrFixture, entry] : [entry], {
+async function run(input: Buffer, fakeOcr = false, missingResultFd = false, expectedPages = 1) {
+  const args = fakeOcr ? ['-e', fakeOcrFixture, entry, String(expectedPages)] : [entry];
+  const child = spawn(process.execPath, args, {
     stdio: missingResultFd ? ['pipe', 'pipe', 'pipe'] : ['pipe', 'pipe', 'pipe', 'pipe'],
     env: { NODE_ENV: 'test', LANG: 'C.UTF-8' },
   });
@@ -196,14 +201,14 @@ describe('actual built private PDF child', () => {
     });
   });
 
-  it('exposes the known skipped-image warning only through private diagnostics and stays closed', async () => {
-    const result = await run(request(pdf('Synthetic source', true)), true);
-    expect(result.code).toBe(0);
-    expect(result.result).toEqual(incomplete);
-    expect(result.stdout + result.stderr).toContain(
-      'Image dimensions are missing, or not numbers.',
-    );
-    expect(result.stdout).toContain('SYNTHETIC_FIXTURE_CLEANUP_OK');
+  it('returns a quiet strict-image rejection before OCR and erases frames and chunks', async () => {
+    const result = await run(request(pdf('Synthetic source', true)), true, false, 0);
+    expect(result).toEqual({
+      code: 0,
+      stdout: 'SYNTHETIC_FIXTURE_CLEANUP_OK\n',
+      stderr: '',
+      result: { decision: 'uninspectable', reason: 'invalid_content' },
+    });
   });
 
   it('returns a real native classification rejection with explicit fake OCR', async () => {

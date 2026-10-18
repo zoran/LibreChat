@@ -1,5 +1,6 @@
 /** @jest-environment jsdom */
 import axios from 'axios';
+import { randomBytes } from 'node:crypto';
 import type { AxiosResponse, InternalAxiosRequestConfig } from 'axios';
 import { getTokenHeader, setTokenHeader } from './headers-helpers';
 import request from './request';
@@ -84,6 +85,7 @@ describe('serialized refresh and session generation', () => {
   });
 
   it('aborts and rejects a delayed refresh after the identity boundary', async () => {
+    const priorIdentityToken = randomBytes(32).toString('base64url');
     const pending = deferred<AxiosResponse>();
     let captured!: InternalAxiosRequestConfig;
     axios.defaults.adapter = async (config) => {
@@ -91,14 +93,17 @@ describe('serialized refresh and session generation', () => {
       return pending.promise;
     };
     const refresh = request.refreshToken();
-    const rejected = await expect(refresh).rejects.toMatchObject({ code: 'AUTH_SESSION_CHANGED' });
-    await nextTask();
-    window.dispatchEvent(
-      new CustomEvent('librechat:auth-session-ending', { detail: { generation: 1 } }),
-    );
-    expect(captured.signal?.aborted).toBe(true);
-    pending.resolve(response(captured, { token: 'old-identity-token' }));
-    await rejected;
+    await Promise.all([
+      expect(refresh).rejects.toMatchObject({ code: 'AUTH_SESSION_CHANGED' }),
+      (async () => {
+        await nextTask();
+        window.dispatchEvent(
+          new CustomEvent('librechat:auth-session-ending', { detail: { generation: 1 } }),
+        );
+        expect(captured.signal?.aborted).toBe(true);
+        pending.resolve(response(captured, { token: priorIdentityToken }));
+      })(),
+    ]);
     expect(getTokenHeader()).toBeUndefined();
   });
 
@@ -110,13 +115,14 @@ describe('serialized refresh and session generation', () => {
       return pending.promise;
     };
     const operation = request.get('/api/test-private-state');
-    const rejected = await expect(operation).rejects.toMatchObject({
-      code: 'AUTH_SESSION_CHANGED',
-    });
-    await nextTask();
-    window.dispatchEvent(new Event('librechat:auth-session-ending'));
-    pending.resolve(response(captured, { private: 'old state' }));
-    await rejected;
+    await Promise.all([
+      expect(operation).rejects.toMatchObject({ code: 'AUTH_SESSION_CHANGED' }),
+      (async () => {
+        await nextTask();
+        window.dispatchEvent(new Event('librechat:auth-session-ending'));
+        pending.resolve(response(captured, { private: 'old state' }));
+      })(),
+    ]);
   });
 
   it('rejects delayed external token publication captured before the identity boundary', () => {
@@ -140,16 +146,20 @@ describe('serialized refresh and session generation', () => {
 
   it('cancels an old authenticatedFetch body instead of returning it after a session change', async () => {
     const pending = deferred<Response>();
-    global.fetch = jest.fn(() => pending.promise);
+    global.fetch = Object.assign(
+      jest.fn(() => pending.promise),
+      { preconnect: jest.fn() },
+    );
     const cancel = jest.fn(async () => undefined);
     const operation = request.authenticatedFetch('/api/test-private-state');
-    const rejected = await expect(operation).rejects.toMatchObject({
-      code: 'AUTH_SESSION_CHANGED',
-    });
-    await nextTask();
-    window.dispatchEvent(new Event('librechat:auth-session-ending'));
-    pending.resolve({ status: 200, body: { cancel } } as unknown as Response);
-    await rejected;
+    await Promise.all([
+      expect(operation).rejects.toMatchObject({ code: 'AUTH_SESSION_CHANGED' }),
+      (async () => {
+        await nextTask();
+        window.dispatchEvent(new Event('librechat:auth-session-ending'));
+        pending.resolve({ status: 200, body: { cancel } } as unknown as Response);
+      })(),
+    ]);
     expect(cancel).toHaveBeenCalledTimes(1);
   });
 });

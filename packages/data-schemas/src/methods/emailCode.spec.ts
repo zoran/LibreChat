@@ -10,13 +10,14 @@ import { createUserModel } from '~/models/user';
 
 describe('email-code native transactional authority', () => {
   let mongo: MongoMemoryReplSet;
+  let User: ReturnType<typeof createUserModel>;
   let a: ReturnType<typeof createEmailCodeMethods>;
   let b: ReturnType<typeof createEmailCodeMethods>;
 
   beforeAll(async () => {
     mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
     await mongoose.connect(mongo.getUri());
-    createUserModel(mongoose);
+    User = createUserModel(mongoose);
     createSessionModel(mongoose);
     createBalanceModel(mongoose);
     a = createEmailCodeMethods(mongoose);
@@ -106,7 +107,7 @@ describe('email-code native transactional authority', () => {
         mongoose.models.User.updateOne({ _id: user._id }, { $set: { name: 'My chosen name' } }),
       ),
     ]);
-    expect((await runAsSystem(() => mongoose.models.User.findById(user._id).lean())).name).toBe(
+    expect((await runAsSystem(() => User.findById(user._id).lean().orFail())).name).toBe(
       'My chosen name',
     );
   });

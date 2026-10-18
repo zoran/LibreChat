@@ -1,14 +1,15 @@
 import mongoose from 'mongoose';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
-import { createModels } from '~/models';
+import { touchActiveUserPrincipal, touchDeletingUserPrincipal } from './userPrincipal';
 import { tenantStorage } from '~/config/tenantContext';
 import { createUserMethods } from './user';
-import { touchActiveUserPrincipal, touchDeletingUserPrincipal } from './userPrincipal';
+import { createModels } from '~/models';
 
 describe('native transactional User principal fence', () => {
   const db = new mongoose.Mongoose();
   const owner = { userId: new mongoose.Types.ObjectId().toString(), tenantId: 'tenant.test' };
   let mongo: MongoMemoryReplSet;
+  let models: ReturnType<typeof createModels>;
   const unavailable = { code: 'principal_unavailable' };
   beforeAll(async () => {
     mongo = await MongoMemoryReplSet.create({
@@ -21,7 +22,7 @@ describe('native transactional User principal fence', () => {
       },
     });
     await db.connect(mongo.getUri('user-principal'));
-    createModels(db);
+    models = createModels(db);
     await db.models.User.init();
   });
   beforeEach(async () => {
@@ -46,13 +47,13 @@ describe('native transactional User principal fence', () => {
     }
   }
   it('writes the existing version atomically without touching authentication or timestamps', async () => {
-    const before = await db.models.User.findById(owner.userId).lean();
+    const before = await models.User.findById(owner.userId).lean().orFail();
     await transaction((session) => touchActiveUserPrincipal(db, owner, session));
-    const after = await db.models.User.findById(owner.userId).lean();
+    const after = await models.User.findById(owner.userId).lean().orFail();
     expect(after).toMatchObject({
-      __v: before!.__v + 1,
-      authVersion: before!.authVersion,
-      updatedAt: before!.updatedAt,
+      __v: before.__v + 1,
+      authVersion: before.authVersion,
+      updatedAt: before.updatedAt,
     });
     await expect(
       transaction(async (session) => {
@@ -60,7 +61,7 @@ describe('native transactional User principal fence', () => {
         throw new Error('rollback');
       }),
     ).rejects.toThrow('rollback');
-    expect((await db.models.User.findById(owner.userId).lean())!.__v).toBe(after!.__v);
+    expect((await models.User.findById(owner.userId).lean().orFail()).__v).toBe(after.__v);
   });
   it('rejects absent transactions and cross-tenant identities before writing', async () => {
     const session = await db.startSession();

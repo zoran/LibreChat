@@ -316,7 +316,7 @@ describe('bounded approved SMTP submission', () => {
   it.each([null, 123, ['Help'], { text: 'Help' }])(
     'rejects non-text public help: %p',
     (supportText) => {
-      expect(() => fixture({ ...config, supportText } as EmailCodeMailConfig)).toThrow(
+      expect(() => fixture({ ...config, supportText } as unknown as EmailCodeMailConfig)).toThrow(
         'Invalid email-code SMTP configuration',
       );
     },

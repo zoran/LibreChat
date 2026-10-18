@@ -197,7 +197,7 @@ Keep npm lifecycle scripts enabled so a Git-installed `@librechat/agents` can bu
 exports during `prepare`.
 
 The assistant-history capability uses the public `zoran/LibreChat-agents` SDK fork at commit
-`a2ccbc528f52821bcce150dbbe7813523945adaa`, pinned in `api/package.json` and the root
+`311e1d2b0c0155dd020991afd30ddd6524c520ba`, pinned in `api/package.json` and the root
 `package-lock.json`. Use the declared dependency and lock together. npm builds the Git dependency
 through its own `prepare` script; no local SDK tarball or generated `dist` directory is required.
 This source pin does not replace application and model acceptance for the capability.

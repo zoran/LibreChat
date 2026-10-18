@@ -1,4 +1,6 @@
 const fs = require('fs');
+const { spawn } = require('child_process');
+const { constants } = require('os');
 const net = require('net');
 const path = require('path');
 require('dotenv').config();
@@ -7,7 +9,14 @@ const DEFAULT_MONGO_URI = 'mongodb://127.0.0.1:27017/LibreChat-e2e';
 const DEFAULT_RUNTIME_ENV_PATH = path.resolve(__dirname, '../specs/.test-results/runtime-env.json');
 const REDIS_STREAM_STARTUP_TIMEOUT_MS = 15_000;
 const REDIS_PING_TIMEOUT_MS = 10_000;
+const APPLICATION_CHILD_ARG = '--e2e-application-child';
 let mongoServer;
+let mongoStartup;
+let applicationChild;
+let applicationClosed;
+let shutdownPromise;
+let shutdownExitCode;
+let startupInterrupted = false;
 
 function decodeMongoValue(value) {
   try {
@@ -152,10 +161,33 @@ async function maybeStartMemoryMongo() {
   console.log(`[e2e] Started memory MongoDB at ${process.env.MONGO_URI}`);
 }
 
-async function shutdown() {
-  if (mongoServer) {
-    await mongoServer.stop();
-  }
+function shutdown(signal = 'SIGTERM') {
+  startupInterrupted = true;
+  shutdownPromise ??= (async () => {
+    await mongoStartup?.catch(() => {});
+    if (applicationChild) {
+      if (applicationChild.exitCode === null && applicationChild.signalCode === null) {
+        applicationChild.kill(signal);
+      }
+      await applicationClosed;
+    }
+    if (mongoServer) {
+      await mongoServer.stop();
+      mongoServer = undefined;
+    }
+  })();
+  return shutdownPromise;
+}
+
+function stopAndExit(exitCode, signal) {
+  shutdownExitCode ??= exitCode;
+  return shutdown(signal).then(
+    () => process.exit(shutdownExitCode),
+    (error) => {
+      console.error('[e2e] Failed to stop test server resources:', error);
+      process.exit(1);
+    },
+  );
 }
 
 async function requireRedisStreams() {
@@ -198,31 +230,64 @@ async function verifyRedisStreams() {
   throw new Error('[e2e] Redis stream mode was required but the server fell back to memory');
 }
 
-process.once('SIGINT', async () => {
-  await shutdown();
-  process.exit(130);
-});
+async function startServer() {
+  // Only this process owns Mongo; the application keeps its own shutdown lifecycle.
+  process.on('SIGINT', () => void stopAndExit(130, 'SIGINT'));
+  process.on('SIGTERM', () => void stopAndExit(143, 'SIGTERM'));
+  try {
+    if (startupInterrupted) {
+      return;
+    }
+    mongoStartup = maybeStartMemoryMongo();
+    await mongoStartup;
+    if (startupInterrupted) {
+      return;
+    }
+    applicationChild = spawn(process.execPath, [__filename, APPLICATION_CHILD_ARG], {
+      env: process.env,
+      stdio: 'inherit',
+    });
+    applicationClosed = new Promise((resolve) => {
+      let spawnError;
+      applicationChild.once('error', (error) => {
+        spawnError = error;
+      });
+      applicationChild.once('close', (code, signal) => {
+        resolve({ code, signal, error: spawnError });
+      });
+    });
+    const result = await applicationClosed;
+    if (result.error) {
+      throw result.error;
+    }
+    const signalNumber = constants.signals[result.signal];
+    const exitCode = result.code ?? (Number.isInteger(signalNumber) ? 128 + signalNumber : 1);
+    await stopAndExit(exitCode);
+  } catch (error) {
+    console.error('[e2e] Failed to start test server:', error);
+    await stopAndExit(1);
+  }
+}
 
-process.once('SIGTERM', async () => {
-  await shutdown();
-  process.exit(143);
-});
-
-function startServer() {
-  return maybeStartMemoryMongo()
-    .then(requireRedisStreams)
+function startApplication() {
+  // Redis verification must share the application process and module instances.
+  return requireRedisStreams()
     .then(async () => {
       require(path.resolve(__dirname, '../../api/server/index.js'));
       await verifyRedisStreams();
     })
     .catch((error) => {
-      console.error('[e2e] Failed to start test server:', error);
+      console.error('[e2e] Failed to start test application:', error);
       process.exit(1);
     });
 }
 
 if (require.main === module) {
-  startServer();
+  if (process.argv[2] === APPLICATION_CHILD_ARG) {
+    startApplication();
+  } else {
+    startServer();
+  }
 }
 
 module.exports = {

@@ -9,7 +9,6 @@
   "com_library_project_reconcile": "Check whether files were added",
   "com_library_project_retry": "Retry remaining files",
   "com_library_project_results": "Confirmed in project: {{count}} of {{total}}",
-  "com_library_project_ineligible": "This file is unavailable for this project.",
   "com_library_select_page": "Select all files on this page",
   "com_library_select_file": "Select {{0}}",
   "com_library_tags": "Tags",

@@ -3028,12 +3028,13 @@ describe('permanent unified uploads and unknown tool sets', () => {
   });
 
   test('files a permanent upload under the tool that will consume it', async () => {
+    const { Readable } = require('stream');
     const { addAgentResourceFile } = require('~/models');
-    setupStoredFileUpload();
-    /* The code-env branch streams the upload from disk after this assertion resolves, and
-     * an unhandled stream error would take down the worker. Left in place rather than
-     * cleaned up, since the read happens later than the test body. */
-    jest.requireActual('fs').writeFileSync('/tmp/upload.bin', 'zip');
+    const handleFileUpload = setupStoredFileUpload();
+    getStrategyFunctions.mockReturnValue({
+      handleFileUpload,
+      getDownloadStream: jest.fn(async () => Readable.from(Buffer.from('zip'))),
+    });
 
     await processAgentFileUpload({
       req: zipReq(),
