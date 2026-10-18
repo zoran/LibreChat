@@ -3680,6 +3680,7 @@
   "com_workspace_editor_load_error": "Das Dokument kann gerade nicht geöffnet werden. Öffne es später erneut.",
   "com_workspace_editor_encoding_error": "Dein Text enthält ein Zeichen, das nicht gespeichert werden kann. Korrigiere es und versuche es erneut.",
   "com_workspace_editor_save_error": "Das Speichern konnte nicht bestätigt werden. Dein Text bleibt hier erhalten. Prüfe den Speichervorgang, bevor du erneut speicherst.",
+  "com_workspace_editor_capacity_error": "Die Kapazitätsgrenze für weitere Versionen ist erreicht. Dein Entwurf bleibt in diesem geöffneten Editor erhalten.",
   "com_workspace_editor_conflict_error": "Es gibt inzwischen eine andere gespeicherte Version. Deine Änderungen bleiben hier erhalten. Lade die gespeicherte Version nur, wenn du deine lokalen Änderungen verwerfen möchtest.",
   "com_workspace_editor_reload_error": "Die gespeicherte Version konnte nicht geladen werden. Dein Text bleibt hier erhalten.",
   "com_workspace_editor_edited_error": "Dein Text hat sich während des Ladens geändert. Deine neue Änderung bleibt erhalten. Prüfe sie, bevor du erneut lädst.",

@@ -3,6 +3,7 @@ import {
   UPLOAD_MAX_TEXT_BYTES,
   UPLOAD_DERIVED_MAX_SOURCES,
   UPLOAD_DERIVED_MAX_DESCENDANTS,
+  UPLOAD_DERIVED_MAX_ORIGIN_BYTES,
   isUploadPrincipal,
   readUploadSecuritySubject,
   readUploadDerivedIntent,
@@ -110,6 +111,16 @@ export class FileSourceUnavailableError extends Error {
   constructor() {
     super('Document source unavailable');
     this.name = 'FileSourceUnavailableError';
+  }
+}
+
+/** Admission capacity is distinct from revoked sources; retained readers preserve this safe code. */
+export class FileSourceCapacityError extends Error {
+  readonly code = 'capacity_exceeded';
+
+  constructor() {
+    super('Document source capacity exceeded');
+    this.name = 'FileSourceCapacityError';
   }
 }
 
@@ -345,13 +356,13 @@ export function createFileRetentionMethods(
         throw new FileSourceUnavailableError();
       return lineage;
     };
+    // Validated heads bound this nonrecursive union to MAX_SOURCES * (MAX_SOURCES + 1) IDs.
     const sources = new Map<string, UploadDerivedSource>();
     const add = (source: UploadDerivedSource): void => {
       const previous = sources.get(source.subject.operationId);
       if (previous && JSON.stringify(previous) !== JSON.stringify(source))
         throw new FileSourceUnavailableError();
       sources.set(source.subject.operationId, source);
-      if (sources.size > UPLOAD_DERIVED_MAX_SOURCES) throw new FileSourceUnavailableError();
     };
     for (const row of await load(intent.directSourceFileIds)) {
       add(sourceOf(row));
@@ -377,11 +388,19 @@ export function createFileRetentionMethods(
           throw new FileSourceUnavailableError();
       }
     }
-    const origin = readUploadDerivedOrigin({
+    // Unavailable transitive sources take precedence over capacity, before any source touches.
+    if (sources.size > UPLOAD_DERIVED_MAX_SOURCES) throw new FileSourceCapacityError();
+    const assembled = {
       version: 1,
       ...intent,
       ancestors: [...sources.values()],
-    });
+    };
+    // Stored origins were validated above; only this newly assembled bounded value can exhaust capacity.
+    if (
+      new TextEncoder().encode(JSON.stringify(assembled)).length > UPLOAD_DERIVED_MAX_ORIGIN_BYTES
+    )
+      throw new FileSourceCapacityError();
+    const origin = readUploadDerivedOrigin(assembled);
     if (!origin) throw new FileSourceUnavailableError();
     const touched = await File.updateMany(
       { ...live, file_id: { $in: ids } },
@@ -616,7 +635,7 @@ export function createFileRetentionMethods(
         )
           .limit(UPLOAD_DERIVED_MAX_DESCENDANTS + 1)
           .session(session);
-        if (count >= UPLOAD_DERIVED_MAX_DESCENDANTS) throw new FileSourceUnavailableError();
+        if (count >= UPLOAD_DERIVED_MAX_DESCENDANTS) throw new FileSourceCapacityError();
       }
     }
     await File.create(

@@ -3600,6 +3600,7 @@
   "com_workspace_editor_load_error": "The document cannot be opened right now. Try opening it again later.",
   "com_workspace_editor_encoding_error": "Your text contains a character that cannot be saved. Correct it and try again.",
   "com_workspace_editor_save_error": "Saving could not be confirmed. Your text is preserved here. Check the save status before saving again.",
+  "com_workspace_editor_capacity_error": "The capacity limit for additional versions has been reached. Your draft remains in this open editor.",
   "com_workspace_editor_conflict_error": "Another version has been saved. Your changes are kept here. Load the saved version only if you want to discard your local changes.",
   "com_workspace_editor_reload_error": "The saved version could not be loaded. Your text is kept here.",
   "com_workspace_editor_edited_error": "Your text changed while loading. Your new change is kept. Review it before reloading.",

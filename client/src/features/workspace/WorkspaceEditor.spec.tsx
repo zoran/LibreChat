@@ -12,6 +12,7 @@ function mockCreateModel(initial: string, _language: string, uri: { toString(): 
   let text = initial.replace(/^\uFEFF/, '');
   let version = 1;
   let disposed = false;
+  const history = [text];
   const listeners = new Set<() => void>();
   const model = {
     id: `model-${++mockModelNumber}`,
@@ -33,6 +34,14 @@ function mockCreateModel(initial: string, _language: string, uri: { toString(): 
     },
     edit: (value: string) => {
       text = value;
+      history.push(value);
+      version += 1;
+      listeners.forEach((listener) => listener());
+    },
+    undo: () => {
+      if (history.length < 2) return;
+      history.pop();
+      text = history[history.length - 1];
       version += 1;
       listeners.forEach((listener) => listener());
     },
@@ -302,6 +311,35 @@ describe('workspace editor view with real codec and model adapter', () => {
     },
   );
 
+  it('preserves local text and undo after capacity exhaustion without another save', async () => {
+    const input = props(document('Original\n', 65));
+    input.onSave = jest.fn().mockRejectedValue({ code: 'capacity_exceeded' });
+    const view = render(<WorkspaceEditor {...input} />);
+    const text = await editor();
+    const model = [...mockModels.values()][0];
+    fireEvent.change(text, { target: { value: 'Ungespeicherter Entwurf' } });
+    fireEvent.click(saveButton());
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        mockGerman.com_workspace_editor_capacity_error,
+      ),
+    );
+    expect(text).toHaveValue('Ungespeicherter Entwurf');
+    expect(model.dispose).not.toHaveBeenCalled();
+    expect([...mockModels.values()]).toEqual([model]);
+    expect(saveButton()).toBeDisabled();
+    fireEvent.keyDown(text, { key: 's', ctrlKey: true });
+    fireEvent.change(text, { target: { value: 'Weitere lokale Änderung' } });
+    expect(input.onSave).toHaveBeenCalledTimes(1);
+    act(() => model.undo());
+    expect(text).toHaveValue('Ungespeicherter Entwurf');
+    act(() => model.undo());
+    expect(text).toHaveValue('Original\n');
+    expect(input.onReload).not.toHaveBeenCalled();
+    expect(input.onSave).toHaveBeenCalledTimes(1);
+    view.unmount();
+  });
+
   it('reconciles the original save without replacing the model, newer edits or selection', async () => {
     Object.defineProperty(crypto, 'randomUUID', {
       configurable: true,
@@ -488,17 +526,20 @@ describe('workspace editor view with real codec and model adapter', () => {
     view.unmount();
   });
 
-  it('removes the model and content when a source is no longer authorized', async () => {
-    const input = props();
-    input.onSave = jest.fn().mockRejectedValue({ code: 'source_unavailable' });
-    const view = render(<WorkspaceEditor {...input} />);
-    fireEvent.change(await editor(), { target: { value: 'Entzug' } });
-    fireEvent.click(saveButton());
-    await waitFor(() => expect(screen.queryByRole('textbox')).not.toBeInTheDocument());
-    expect(screen.getByRole('alert')).toHaveTextContent(/nicht mehr verfügbar/);
-    expect(mockModels.size).toBe(0);
-    view.unmount();
-  });
+  it.each(['source_unavailable', 'not_found'])(
+    'removes the model and content on %s',
+    async (code) => {
+      const input = props();
+      input.onSave = jest.fn().mockRejectedValue({ code });
+      const view = render(<WorkspaceEditor {...input} />);
+      fireEvent.change(await editor(), { target: { value: 'Entzug' } });
+      fireEvent.click(saveButton());
+      await waitFor(() => expect(screen.queryByRole('textbox')).not.toBeInTheDocument());
+      expect(screen.getByRole('alert')).toHaveTextContent(/nicht mehr verfügbar/);
+      expect(mockModels.size).toBe(0);
+      view.unmount();
+    },
+  );
 
   it.each([
     ['security_rejected', 'com_upload_security_rejected'],

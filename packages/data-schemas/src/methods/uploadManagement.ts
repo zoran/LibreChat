@@ -84,7 +84,11 @@ import {
   readStoredUploadPromotion,
 } from './uploadManagementIntake';
 import { createUploadAdmissionMethods, readUploadAdmission } from './uploadManagementAdmission';
-import { createFileRetentionMethods, FileSourceUnavailableError } from './fileRetention';
+import {
+  createFileRetentionMethods,
+  FileSourceCapacityError,
+  FileSourceUnavailableError,
+} from './fileRetention';
 import { createUploadMigrationMethods } from './uploadManagementMigration';
 import { createUploadControlMethods } from './uploadManagementControl';
 import { touchActiveUserPrincipal } from './userPrincipal';
@@ -433,6 +437,7 @@ export function createUploadManagementRepository(
             session,
           );
         } catch (error) {
+          if (error instanceof FileSourceCapacityError) reject('capacity_exceeded');
           if (error instanceof FileSourceUnavailableError) reject('not_found');
           throw error;
         }
@@ -849,21 +854,26 @@ export function createUploadManagementRepository(
         row.writerStopped = true;
         delete row.slot;
         delete row.leaseExpiresAt;
-        await lifecycle.acceptManagedUpload(
-          {
-            principal,
-            operationId: row._id,
-            transferGeneration: row.attemptGeneration!,
-            filename: row.filename,
-            mediaType: row.mediaType,
-            receipt: original,
-            securityApproval: row.securityApproval,
-            acceptedAt: now,
-            expiresAt: row.expiresAt,
-            ...(derivedOrigin ? { derivedOrigin } : {}),
-          },
-          session,
-        );
+        try {
+          await lifecycle.acceptManagedUpload(
+            {
+              principal,
+              operationId: row._id,
+              transferGeneration: row.attemptGeneration!,
+              filename: row.filename,
+              mediaType: row.mediaType,
+              receipt: original,
+              securityApproval: row.securityApproval,
+              acceptedAt: now,
+              expiresAt: row.expiresAt,
+              ...(derivedOrigin ? { derivedOrigin } : {}),
+            },
+            session,
+          );
+        } catch (error) {
+          if (error instanceof FileSourceCapacityError) reject('capacity_exceeded');
+          throw error;
+        }
         await store.save(row, session);
         return project(row, now);
       });

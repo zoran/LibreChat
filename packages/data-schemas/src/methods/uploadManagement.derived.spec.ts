@@ -5,12 +5,14 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import {
   UPLOAD_RETENTION_MS,
   UPLOAD_RECORD_BYTES,
+  UPLOAD_DERIVED_MAX_ORIGIN_BYTES,
   uploadReservationFingerprint,
   readUploadDerivedOrigin,
   readUploadPromotionRecord,
 } from 'librechat-data-provider';
 import type {
   UploadDerivedIntent,
+  UploadDerivedOrigin,
   UploadLease,
   UploadPrincipal,
   UploadSecurityApproval,
@@ -20,6 +22,7 @@ import type { StoredUpload } from './uploadManagementStore';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createFileRetentionMethods } from './fileRetention';
 import { createModels } from '~/models';
+import type { IMongoFile } from '~/types';
 
 describe('private derived upload reservations', () => {
   const db = new mongoose.Mongoose();
@@ -349,6 +352,149 @@ describe('private derived upload reservations', () => {
       repository.reserveDerived(user, { ...reservation('derived', derived), derived }, now),
     ).rejects.toMatchObject({ code: 'not_found' });
     expect(await raw('derived')).toBeNull();
+  });
+  it.each(['live', 'missing', 'malformed', 'expired'] as const)(
+    'validates %s transitive sources before lineage capacity without changing existing sources',
+    async (ancestorState) => {
+      await source();
+      const template = (await db.models.File.findOne({ file_id: 'source' })
+        .select('+securityApproval')
+        .lean<IMongoFile>())!;
+      const ids = Array.from({ length: 64 }, (_, index) => `ancestor-${index}`);
+      const copy = (id: string) => ({
+        ...template,
+        _id: new mongoose.Types.ObjectId(),
+        file_id: id,
+        uploadOperationId: id,
+        filepath: `/api/files/managed/${id}`,
+        storageKey: `t/${user.tenantId}/managed-uploads/${user.userId}/${id}.${template.securityApproval!.subject.transferGeneration}__original`,
+        securityApproval: {
+          ...template.securityApproval,
+          subject: { ...template.securityApproval!.subject, operationId: id },
+        },
+      });
+      const heads = [ids.slice(0, 32), ids.slice(32)].map((group, index) => {
+        const derivedOrigin = {
+          version: 1,
+          binding: { purpose: 'workspace-draft', sourceId: 'draft', sourceRevision: 1 },
+          directSourceFileIds: group,
+          ancestors: group.map((id) => ({
+            subject: copy(id).securityApproval.subject,
+            policySha256: policy,
+            expiresAt: new Date(template.expiredAt!).getTime(),
+          })),
+        };
+        expect(readUploadDerivedOrigin(derivedOrigin)).not.toBeNull();
+        return { ...copy(`head-${index}`), derivedOrigin };
+      });
+      await db.models.File.collection.insertMany([...ids.map(copy), ...heads]);
+      if (ancestorState === 'missing') {
+        await db.models.File.deleteOne({ file_id: ids[0] });
+      } else if (ancestorState === 'malformed') {
+        await db.models.File.collection.updateOne(
+          { file_id: ids[0] },
+          { $set: { derivedOrigin: { version: 2 } } },
+        );
+      } else if (ancestorState === 'expired') {
+        await db.models.File.updateOne({ file_id: ids[0] }, { expiredAt: new Date(now) });
+      }
+      const derived = { ...intent(), directSourceFileIds: heads.map((head) => head.file_id) };
+      const revisions = await db.models.File.find({}).select('file_id retentionRevision').lean();
+      const counter = await db.models.UploadCounter.findById('global').lean();
+      await expect(
+        repository.reserveDerived(user, { ...reservation('overflow', derived), derived }, now),
+      ).rejects.toMatchObject({
+        code: ancestorState === 'live' ? 'capacity_exceeded' : 'not_found',
+      });
+      expect(await raw('overflow')).toBeNull();
+      expect(await db.models.UploadCounter.findById('global').lean()).toEqual(counter);
+      expect(await db.models.File.find({}).select('file_id retentionRevision').lean()).toEqual(
+        revisions,
+      );
+      await db.models.File.updateOne({ file_id: 'head-0' }, { deletionRequestedAt: new Date(now) });
+      await expect(
+        repository.reserveDerived(user, { ...reservation('revoked', derived), derived }, now),
+      ).rejects.toMatchObject({ code: 'not_found' });
+    },
+  );
+  it('reports newly assembled origin byte capacity while keeping malformed stored origins unavailable', async () => {
+    await source();
+    const template = (await db.models.File.findOne({ file_id: 'source' })
+      .select('+securityApproval')
+      .lean<IMongoFile>())!;
+    const ancestor = (id: string) => ({
+      subject: { ...template.securityApproval!.subject, operationId: id },
+      policySha256: policy,
+      expiresAt: new Date(template.expiredAt!).getTime(),
+    });
+    const ancestors = [ancestor('source')];
+    let previous = 'source';
+    let next: UploadDerivedOrigin | undefined;
+    for (let index = 1; index <= 64; index++) {
+      next = {
+        version: 1,
+        binding: intent().binding,
+        directSourceFileIds: [previous],
+        ancestors: [...ancestors],
+      };
+      if (!readUploadDerivedOrigin(next)) break;
+      const fileId = `lineage-${index}`;
+      await db.models.File.collection.insertOne({
+        ...template,
+        _id: new mongoose.Types.ObjectId(),
+        file_id: fileId,
+        uploadOperationId: fileId,
+        filepath: `/api/files/managed/${fileId}`,
+        storageKey: `t/${user.tenantId}/managed-uploads/${user.userId}/${fileId}.${template.securityApproval!.subject.transferGeneration}__original`,
+        securityApproval: { ...template.securityApproval!, subject: ancestor(fileId).subject },
+        derivedOrigin: next,
+      });
+      ancestors.push(ancestor(fileId));
+      previous = fileId;
+    }
+    expect(ancestors.length).toBeLessThanOrEqual(64);
+    expect(readUploadDerivedOrigin(next)).toBeNull();
+    expect(Buffer.byteLength(JSON.stringify(next), 'utf8')).toBeGreaterThan(
+      UPLOAD_DERIVED_MAX_ORIGIN_BYTES,
+    );
+    const derived = { ...intent(), directSourceFileIds: [previous] };
+    const revisions = await db.models.File.find({}).select('file_id retentionRevision').lean();
+    const counter = await db.models.UploadCounter.findById('global').lean();
+    await expect(
+      repository.reserveDerived(user, { ...reservation('byte-overflow', derived), derived }, now),
+    ).rejects.toMatchObject({ code: 'capacity_exceeded' });
+    expect(await raw('byte-overflow')).toBeNull();
+    expect(await db.models.UploadCounter.findById('global').lean()).toEqual(counter);
+    expect(await db.models.File.find({}).select('file_id retentionRevision').lean()).toEqual(
+      revisions,
+    );
+    await db.models.File.updateOne({ file_id: previous }, { 'derivedOrigin.version': 2 });
+    await expect(
+      repository.reserveDerived(user, { ...reservation('malformed', derived), derived }, now),
+    ).rejects.toMatchObject({ code: 'not_found' });
+  });
+  it('reports descendant capacity while preserving the pending durable-byte obligation', async () => {
+    await source();
+    const derived = intent();
+    await repository.reserveDerived(user, { ...reservation('derived', derived), derived }, now);
+    const lease = await transfer('derived', now);
+    const origin = (await raw('derived'))!.derivedOrigin;
+    const template = (await db.models.File.findOne({ file_id: 'source' }).lean())!;
+    await db.models.File.collection.insertMany(
+      Array.from({ length: 64 }, (_, index) => ({
+        ...template,
+        _id: new mongoose.Types.ObjectId(),
+        file_id: `descendant-${index}`,
+        derivedOrigin: origin,
+      })),
+    );
+    const before = await raw('derived');
+    const counter = await db.models.UploadCounter.findById('global').lean();
+    await expect(accept(lease, now)).rejects.toMatchObject({ code: 'capacity_exceeded' });
+    expect(await db.models.File.findOne({ file_id: 'derived' })).toBeNull();
+    expect(await raw('derived')).toEqual(before);
+    expect((await raw('derived'))!.stagingHeld).toBe(true);
+    expect(await db.models.UploadCounter.findById('global').lean()).toEqual(counter);
   });
   it('rejects origin headroom overflow before admission and rolls source touches back', async () => {
     const ids = Array.from(

@@ -31,6 +31,7 @@ type Failure =
   | 'load'
   | 'encoding'
   | 'save'
+  | 'capacity'
   | 'conflict'
   | 'reload'
   | 'edited'
@@ -44,6 +45,7 @@ const failureKeys: Record<Exclude<Failure, null>, TranslationKeys> = {
   load: 'com_workspace_editor_load_error',
   encoding: 'com_workspace_editor_encoding_error',
   save: 'com_workspace_editor_save_error',
+  capacity: 'com_workspace_editor_capacity_error',
   conflict: 'com_workspace_editor_conflict_error',
   reload: 'com_workspace_editor_reload_error',
   edited: 'com_workspace_editor_edited_error',
@@ -235,7 +237,9 @@ function WorkspaceEditorSession({
         setFailure(null);
         setSaveHeld(false);
       } else {
-        if (code === 'security_rejected' || code === 'security_uninspectable') setFailure(code);
+        if (code === 'capacity_exceeded') setFailure('capacity');
+        else if (code === 'security_rejected' || code === 'security_uninspectable')
+          setFailure(code);
         else setFailure(code === 'revision_conflict' ? 'conflict' : 'save');
         setSaveHeld(true);
       }

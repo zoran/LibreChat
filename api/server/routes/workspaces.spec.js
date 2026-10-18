@@ -167,6 +167,23 @@ describe('Workspace metadata API on the native upload boundary', () => {
     expect((await get('/draft/saves/operation?baseRevision=-1')).status).toBe(400);
     expect((await get('/draft/saves/operation?baseRevision=0&tenantId=other')).status).toBe(400);
   });
+  it.each([
+    ['capacity_exceeded', 429],
+    ['not_found', 404],
+  ])('preserves the reservation error %s as HTTP %s', async (code, status) => {
+    runtime.management.reserveDerived.mockRejectedValueOnce(
+      Object.assign(new Error(code), { code }),
+    );
+    const response = await jsonPost('/draft/saves', {
+      baseRevision: 0,
+      declaredBytes: 8,
+      idempotencyKey: '11111111-1111-4111-8111-111111111111',
+    });
+    expect(response.status).toBe(status);
+    expect(response.body).toEqual({ code });
+    expect(methods.commitDocumentWorkspaceVersion).not.toHaveBeenCalled();
+    expect(original.read).not.toHaveBeenCalled();
+  });
   it('rejects a stale source before reservation', async () => {
     methods.getDocumentWorkspaceSaveIntent.mockRejectedValueOnce(
       Object.assign(new Error('conflict'), { code: 'revision_conflict' }),

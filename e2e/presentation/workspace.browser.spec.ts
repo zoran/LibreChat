@@ -69,9 +69,11 @@ test('native workspace saves, restores and protects a local draft across hiding 
     committedVersions: 0,
     receiptReplays: 0,
     content: 0,
+    capacityRejections: 0,
   };
   const commitRequests: { baseRevision: number; fileId: string }[] = [];
   let conflict = false;
+  let capacity = false;
   const capability = 'A'.repeat(43);
   const stamp = () => new Date().toISOString();
 
@@ -122,6 +124,10 @@ test('native workspace saves, restores and protects a local draft across hiding 
       expect(input.idempotencyKey).toMatch(
         /^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i,
       );
+      if (capacity) {
+        counts.capacityRejections++;
+        return route.fulfill({ status: 429, json: { code: 'capacity_exceeded' } });
+      }
       if (conflict) return route.fulfill({ status: 409, json: { code: 'revision_conflict' } });
       expect(input.baseRevision).toBe(metadata?.revision);
       const operationId = randomUUID();
@@ -456,6 +462,45 @@ test('native workspace saves, restores and protects a local draft across hiding 
     await comparison.getByRole('button', { name: 'Vergleich schließen', exact: true }).click();
     expect(counts).toMatchObject({ reservations: 2, tickets: 1, bodies: 1, commits: 2 });
     await page.screenshot({ path: testInfo.outputPath('native-workspace-reconciled.png') });
+
+    // The server boundary now rejects admission; the compiled editor and native undo remain real.
+    conflict = false;
+    capacity = true;
+    const beforeCapacity = { ...counts };
+    await editor.getByRole('textbox', { name: 'Dokumenttext', exact: true }).focus();
+    await page.keyboard.press('Control+End');
+    await page.keyboard.type(' KAPAZITAETSENTWURF-BLEIBT-LOKAL');
+    await expect(editor).toContainText('KAPAZITAETSENTWURF-BLEIBT-LOKAL');
+    const capacityDraft = await editor.locator('.view-lines').innerText();
+    await save.click();
+    const capacityMessage =
+      'Die Kapazitätsgrenze für weitere Versionen ist erreicht. Dein Entwurf bleibt in diesem geöffneten Editor erhalten.';
+    await expect(surface.getByRole('alert')).toHaveText(capacityMessage);
+    await expect(save).toBeDisabled();
+    await expect.poll(() => editor.locator('.view-lines').innerText()).toBe(capacityDraft);
+    await editor.getByRole('textbox', { name: 'Dokumenttext', exact: true }).focus();
+    await page.keyboard.press('Control+z');
+    await expect.poll(() => editor.locator('.view-lines').innerText()).not.toBe(capacityDraft);
+    await expect(editor).toContainText(serverUpdate);
+    await page.keyboard.press('Control+Shift+z');
+    await expect.poll(() => editor.locator('.view-lines').innerText()).toBe(capacityDraft);
+    await page.keyboard.press('Control+s');
+    await surface
+      .getByRole('button', { name: 'Arbeitsbereich ausblenden', exact: true })
+      .press('Enter');
+    await expect(surface).toBeHidden();
+    await toggle.click();
+    await expect(surface.getByRole('alert')).toHaveText(capacityMessage);
+    await expect.poll(() => editor.locator('.view-lines').innerText()).toBe(capacityDraft);
+    await expect(save).toBeDisabled();
+    await page.screenshot({ path: testInfo.outputPath('native-workspace-capacity-draft.png') });
+    expect(counts).toEqual({
+      ...beforeCapacity,
+      reservations: beforeCapacity.reservations + 1,
+      capacityRejections: 1,
+    });
+    expect(metadata?.revision).toBe(2);
+    expect(versions.get(2)?.toString('utf8')).toBe(serverUpdate);
   } finally {
     await testInfo.attach('workspace-server-boundary-fixtures', {
       body: JSON.stringify(
