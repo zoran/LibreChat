@@ -5,6 +5,7 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import type { IMessage } from '~/types';
 import { FileSourceUnavailableError, touchFileSources } from './fileRetention';
 import { CLIENT_MESSAGE_SELECT, createMessageMethods } from './message';
+import { createCheckpointSourceMethods } from './checkpointSource';
 import { createUploadStore } from './uploadManagementStore';
 import { createFileMethods } from './file';
 import { createModels } from '~/models';
@@ -653,5 +654,275 @@ describe('source-dependent message retention', () => {
     const tombstone = await messages.getMessage({ user, messageId: body });
     expect(tombstone?.text).toBe('');
     expect(tombstone?.quotes).toEqual(['independent quote']);
+  });
+
+  describe('checkpoint-bound historical quote admission', () => {
+    const policy = 'c'.repeat(64);
+    let previousPolicy: string | undefined;
+    let previousEnabled: string | undefined;
+    beforeEach(async () => {
+      previousPolicy = process.env.UPLOAD_SECURITY_POLICY_SHA256;
+      previousEnabled = process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED;
+      process.env.UPLOAD_SECURITY_POLICY_SHA256 = policy;
+      process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = 'true';
+      await mongoose.models.User.replaceOne(
+        { _id: user },
+        {
+          _id: user,
+          name: 'Synthetic quote owner',
+          email: 'quote@example.invalid',
+          provider: 'local',
+        },
+        { upsert: true },
+      );
+      await mongoose.models.File.collection.updateOne(
+        { file_id: sourceId },
+        {
+          $set: {
+            uploadOperationId: sourceId,
+            tenantId: null,
+            status: 'ready',
+            source: 's3',
+            storageKey: `managed-uploads/${user}/${sourceId}.1__original`,
+            securityApproval: {
+              version: 1,
+              decision: 'approved',
+              policySha256: policy,
+              subject: {
+                userId: user,
+                tenantId: null,
+                operationId: sourceId,
+                transferGeneration: 1,
+                mediaType: 'text/plain',
+                bytes: 6,
+                sha256: 'a'.repeat(64),
+              },
+              scannerVersion: 'explicit-synthetic/v1',
+              checkedAt: new Date().toISOString(),
+              coverage: { complete: true, pages: 1, parts: 1 },
+            },
+          },
+        },
+      );
+    });
+    afterEach(async () => {
+      jest.restoreAllMocks();
+      if (previousPolicy === undefined) delete process.env.UPLOAD_SECURITY_POLICY_SHA256;
+      else process.env.UPLOAD_SECURITY_POLICY_SHA256 = previousPolicy;
+      if (previousEnabled === undefined) delete process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED;
+      else process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = previousEnabled;
+      await mongoose.models.User.deleteOne({ _id: user });
+    });
+    const checkpoint = createCheckpointSourceMethods(mongoose);
+    const transaction = async <T>(work: (session: mongoose.ClientSession) => Promise<T>) => {
+      const session = await mongoose.startSession();
+      try {
+        session.startTransaction();
+        const result = await work(session);
+        await session.commitTransaction();
+        return result;
+      } finally {
+        await session.endSession();
+      }
+    };
+    const capturedQuote = async () => {
+      const parent = uuid();
+      const messageId = uuid();
+      const sourceRetention = await context();
+      await messages.saveMessage(owner, row(parent, 'Source text'), { sourceRetention });
+      const quoteRetention = await messages.resolveQuoteRetention(owner, [
+        { text: 'Selected quotation', sourceRef: { messageId: parent } },
+      ]);
+      await messages.saveMessage(
+        owner,
+        {
+          ...row(messageId, 'Complete retained answer'),
+          content: [{ type: 'text', text: 'Full answer content' }],
+          quotes: quoteRetention.quotes,
+        },
+        { sourceRetention, quoteRetention },
+      );
+      const loaded = (await mongoose.models.Message.findOne({ messageId }).lean<IMessage>())!;
+      const captured = await transaction((session) =>
+        checkpoint.captureCheckpointSources(
+          owner,
+          {
+            fileIds: [],
+            messages: [{ conversationId, messageId, expectedVersion: loaded.__v ?? null }],
+          },
+          session,
+        ),
+      );
+      return {
+        messageId,
+        captured,
+        input: {
+          fileIds: [],
+          historyMessageIds: [messageId],
+          checkpointSourceBinding: captured.binding,
+          historyQuoteSnapshots: [
+            { messageId, messageVersion: loaded.__v ?? null, quotes: [...loaded.quotes!] },
+          ],
+        },
+      };
+    };
+
+    it('accepts the exact quote after repeated native checkpoint touches and keeps every read in the fence transaction', async () => {
+      const fixture = await capturedQuote();
+      for (let i = 0; i < 3; i++)
+        await transaction((session) =>
+          checkpoint.fenceCheckpointSources(owner, fixture.captured.binding, session),
+        );
+      const reads: Array<{ lsid?: unknown; txnNumber?: unknown; autocommit?: boolean }> = [];
+      const observe = (event: {
+        commandName: string;
+        command: { find?: string; lsid?: unknown; txnNumber?: unknown; autocommit?: boolean };
+      }) => {
+        if (
+          event.commandName === 'find' &&
+          ['messages', 'files'].includes(event.command.find ?? '')
+        )
+          reads.push(event.command);
+      };
+      mongoose.connection.getClient().on('commandStarted', observe);
+      try {
+        await expect(
+          messages.resolveFileRetentionContext(owner, fixture.input),
+        ).resolves.toMatchObject({ sourceFileIds: [sourceId] });
+      } finally {
+        mongoose.connection.getClient().off('commandStarted', observe);
+      }
+      expect(reads.length).toBeGreaterThan(3);
+      expect(
+        reads.every(
+          (read) => read.lsid != null && read.txnNumber != null && read.autocommit === false,
+        ),
+      ).toBe(true);
+      await expect(
+        messages.resolveFileRetentionContext(owner, {
+          ...fixture.input,
+          checkpointSourceBinding: undefined,
+        }),
+      ).rejects.toBeInstanceOf(FileSourceUnavailableError);
+    });
+
+    it('detaches the owner, source binding and quote selection before its first await', async () => {
+      const fixture = await capturedQuote();
+      const selectedOwner = { ...owner };
+      const selected = {
+        ...fixture.input,
+        historyMessageIds: [...fixture.input.historyMessageIds],
+        historyQuoteSnapshots: fixture.input.historyQuoteSnapshots.map((snapshot) => ({
+          ...snapshot,
+          quotes: [...snapshot.quotes],
+        })),
+      };
+      const binding = {
+        ...selected.checkpointSourceBinding,
+        files: selected.checkpointSourceBinding.files.map((file) => ({ ...file })),
+      };
+      const pending = messages.resolveFileRetentionContext(selectedOwner, {
+        ...selected,
+        checkpointSourceBinding: binding,
+      });
+      selectedOwner.userId = new mongoose.Types.ObjectId().toString();
+      selected.historyMessageIds.push(uuid());
+      selected.historyQuoteSnapshots[0].quotes[0] = 'Changed after entry';
+      binding.files[0].approvalSha256 = 'e'.repeat(64);
+      await expect(pending).resolves.toMatchObject({ sourceFileIds: [sourceId] });
+    });
+
+    it.each(['captured-version', 'missing-witness', 'conversation', 'owner', 'tenant'] as const)(
+      'rejects %s identity mismatch',
+      async (kind) => {
+        const fixture = await capturedQuote();
+        let selectedOwner = owner;
+        if (kind === 'captured-version')
+          fixture.input.historyQuoteSnapshots[0].messageVersion =
+            (fixture.input.historyQuoteSnapshots[0].messageVersion ?? 0) + 1;
+        if (kind === 'missing-witness') fixture.input.historyMessageIds.push(uuid());
+        if (kind === 'conversation')
+          await mongoose.models.Message.collection.updateOne(
+            { messageId: fixture.messageId },
+            { $set: { conversationId: uuid() } },
+          );
+        if (kind === 'owner') selectedOwner = { userId: new mongoose.Types.ObjectId().toString() };
+        const scope =
+          kind === 'tenant' ? { ...selectedOwner, tenantId: 'foreign-tenant' } : selectedOwner;
+        await expect(
+          messages.resolveFileRetentionContext(scope, fixture.input),
+        ).rejects.toBeInstanceOf(FileSourceUnavailableError);
+      },
+    );
+
+    it.each([
+      'text',
+      'content',
+      'quotes',
+      'source-ref',
+      'expiry',
+      'approval',
+      'revocation',
+      'deletion',
+    ] as const)('rejects changed %s after capture', async (kind) => {
+      const fixture = await capturedQuote();
+      if (kind === 'text')
+        await mongoose.models.Message.collection.updateOne(
+          { messageId: fixture.messageId },
+          { $set: { text: 'Changed complete body' } },
+        );
+      if (kind === 'content')
+        await mongoose.models.Message.collection.updateOne(
+          { messageId: fixture.messageId },
+          { $set: { content: [{ type: 'text', text: 'Changed' }] } },
+        );
+      if (kind === 'quotes')
+        await mongoose.models.Message.collection.updateOne(
+          { messageId: fixture.messageId },
+          { $set: { quotes: ['Changed quotation'] } },
+        );
+      if (kind === 'source-ref')
+        await mongoose.models.Message.collection.updateOne(
+          { messageId: fixture.messageId },
+          { $set: { 'quoteSourceRetention.0.sourceRef.messageId': uuid() } },
+        );
+      if (kind === 'expiry')
+        await mongoose.models.File.collection.updateOne(
+          { file_id: sourceId },
+          { $set: { expiredAt: new Date(0) } },
+        );
+      if (kind === 'approval')
+        await mongoose.models.File.collection.updateOne(
+          { file_id: sourceId },
+          { $set: { 'securityApproval.policySha256': 'd'.repeat(64) } },
+        );
+      if (kind === 'revocation') await files.revokeFileSources(owner, [sourceId]);
+      if (kind === 'deletion')
+        await mongoose.models.Message.deleteOne({ messageId: fixture.messageId });
+      await expect(
+        messages.resolveFileRetentionContext(owner, fixture.input),
+      ).rejects.toBeInstanceOf(FileSourceUnavailableError);
+    });
+
+    it.each(['commit', 'close'] as const)(
+      'returns no context after a committed result loses %s acknowledgment',
+      async (stage) => {
+        const fixture = await capturedQuote();
+        const start = mongoose.startSession.bind(mongoose);
+        jest.spyOn(mongoose, 'startSession').mockImplementation(async (...args) => {
+          const session = await start(...args);
+          const name = stage === 'commit' ? 'commitTransaction' : 'endSession';
+          const original = session[name].bind(session);
+          jest.spyOn(session, name).mockImplementation(async () => {
+            await original();
+            throw new Error('Injected lost acknowledgment');
+          });
+          return session;
+        });
+        await expect(messages.resolveFileRetentionContext(owner, fixture.input)).rejects.toThrow(
+          'Injected lost acknowledgment',
+        );
+      },
+    );
   });
 });

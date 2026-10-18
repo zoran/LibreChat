@@ -15,6 +15,7 @@ import {
 } from '~/cache/redisClients';
 import { serializeQuoteRetention, deserializeQuoteRetention } from '~/files/retention';
 import { prepareSourceReplayForTest } from './helpers/sourceReplay';
+import { createCheckpointNamespace } from '../checkpoints';
 import { SteeringLifecycle } from '../SteeringLifecycle';
 import { clearRedisTestPrefix } from './helpers/redis';
 
@@ -108,6 +109,123 @@ describe('RedisJobStore Integration Tests', () => {
     }
     process.env = originalEnv;
   });
+
+  test('native Redis creates and reads the exact trusted checkpoint namespace', async () => {
+    expect(ioredisClient).not.toBeNull();
+    const { RedisJobStore } = await import('../implementations/RedisJobStore');
+    const store = new RedisJobStore(ioredisClient!);
+    const namespace = createCheckpointNamespace('owner', 'tenant');
+    const job = await store.createJob(
+      'checkpoint-native',
+      'owner',
+      'checkpoint-native',
+      'tenant',
+      { generationProtocolVersion: 2 },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      namespace,
+    );
+    expect(job).toMatchObject({ checkpointNamespace: namespace, generationProtocolVersion: 2 });
+    expect(await store.getJob(job.streamId)).toMatchObject({
+      createdAt: job.createdAt,
+      checkpointNamespace: namespace,
+      generationProtocolVersion: 2,
+    });
+    const replacement = await store.createJob(job.streamId, 'owner', job.streamId, 'tenant');
+    expect(replacement.checkpointNamespace).not.toBe(namespace);
+    expect(replacement.checkpointNamespace).toMatch(/^lcg:v2:/);
+  });
+
+  test('native provider CAS preserves a same-generation successor and rejects stale drains', async () => {
+    expect(ioredisClient).not.toBeNull();
+    const { RedisJobStore } = await import('../implementations/RedisJobStore');
+    const store = new RedisJobStore(ioredisClient!);
+    const job = await store.createJob(
+      'recovery-provider-cas',
+      'owner',
+      'recovery-provider-cas',
+      undefined,
+      { providerExecutionId: 'prior', providerDrained: false },
+    );
+    const before = await store.getJob(job.streamId);
+    expect(
+      await store.transitionStatusAndDrainSteers(job.streamId, {
+        from: 'running',
+        to: 'aborted',
+        expectCreatedAt: job.createdAt,
+        expectProviderExecutionId: 'foreign',
+      }),
+    ).toBeNull();
+    expect(await store.getJob(job.streamId)).toEqual(before);
+    const results = await Promise.all(
+      ['a', 'b'].map((segment) =>
+        store.transitionStatus(job.streamId, {
+          from: 'running',
+          to: 'running',
+          expectCreatedAt: job.createdAt,
+          expectProviderExecutionId: 'prior',
+          patch: { providerExecutionId: segment, providerDrained: true },
+        }),
+      ),
+    );
+    expect(results.filter(Boolean)).toHaveLength(1);
+    const successor = (await store.getJob(job.streamId))!;
+    expect(successor.createdAt).toBe(job.createdAt);
+    expect(await store.markProviderExecutionDrained(job.streamId, job.createdAt, 'prior')).toBe(
+      false,
+    );
+    expect(await store.beginProviderExecution(job.streamId, job.createdAt, 'prior')).toBe(false);
+    expect(await store.getJob(job.streamId)).toEqual(successor);
+  });
+
+  test.each(['foreign owner', 'foreign tenant', 'malformed', 'legacy protocol'])(
+    'native Redis preserves the live job after rejecting a %s checkpoint namespace',
+    async (reason) => {
+      expect(ioredisClient).not.toBeNull();
+      const { RedisJobStore } = await import('../implementations/RedisJobStore');
+      const store = new RedisJobStore(ioredisClient!);
+      const original = await store.createJob(
+        'checkpoint-native',
+        'owner',
+        'checkpoint-native',
+        'tenant',
+      );
+      let namespace = createCheckpointNamespace('owner', 'tenant');
+      if (reason === 'foreign owner') namespace = createCheckpointNamespace('other', 'tenant');
+      if (reason === 'foreign tenant') namespace = createCheckpointNamespace('owner', 'other');
+      if (reason === 'malformed') namespace = 'invalid-namespace';
+      await expect(
+        store.createJob(
+          original.streamId,
+          'owner',
+          original.streamId,
+          'tenant',
+          { generationProtocolVersion: reason === 'legacy protocol' ? 1 : 2 },
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          namespace,
+        ),
+      ).rejects.toThrow('Invalid trusted generation checkpoint namespace');
+      expect(await store.getJob(original.streamId)).toMatchObject({
+        createdAt: original.createdAt,
+        checkpointNamespace: original.checkpointNamespace,
+        status: 'running',
+      });
+      expect(await store.getActiveJobIdsByUser('owner', 'tenant')).toContain(original.streamId);
+    },
+  );
 
   test('Redis quote recovery purge preserves paired independent entries and the current generation', async () => {
     expect(ioredisClient).not.toBeNull();

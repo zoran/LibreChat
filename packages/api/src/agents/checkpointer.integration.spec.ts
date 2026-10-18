@@ -830,7 +830,7 @@ describe('LazyMongoSaver (lazy persistence — mongodb-memory-server)', () => {
     const { config, checkpoint, metadata } = putArgs(threadId);
 
     const spy = jest
-      .spyOn(MongoDBSaver.prototype, 'putWrites')
+      .spyOn(mongoose.mongo.Collection.prototype, 'bulkWrite')
       .mockRejectedValueOnce(new Error('transient mongo failure'));
     try {
       await expect(

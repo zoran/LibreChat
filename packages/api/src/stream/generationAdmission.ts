@@ -1,12 +1,26 @@
 import { createHash } from 'node:crypto';
-import { SYSTEM_TENANT_ID, snapshotGenerationCheckpointAdmission } from '@librechat/data-schemas';
+import {
+  SYSTEM_TENANT_ID,
+  snapshotGenerationCheckpointAdmission,
+  snapshotGenerationCheckpointBinding,
+  snapshotCheckpointSourceBinding,
+} from '@librechat/data-schemas';
 import type {
   GenerationAdmissionInput,
+  GenerationPreparationInput,
   GenerationAdmissionMethods,
+  GenerationAdmissionTerminal,
   GenerationCheckpointBinding,
+  GenerationAdmissionRecoveryReceipt,
+  GenerationCheckpointSourceRecovery,
 } from '@librechat/data-schemas';
 import type { ExternalApplicationWorkCensus } from '~/app';
 
+/** Only the issuing live coordinator may consume this acknowledged preparation once. */
+export interface GenerationPreparationReceipt {
+  readonly input: Readonly<GenerationPreparationInput>;
+  readonly continuation: Readonly<GenerationCheckpointBinding>;
+}
 export interface GenerationRequestBinding {
   clientRequestId: string;
   requestFingerprint: string;
@@ -20,6 +34,13 @@ export interface GenerationAdmissionConfiguration {
 }
 /** Server-owned proof ports. Process termination alone never proves remote effects settled. */
 export interface GenerationCheckpointRecoveryPorts {
+  /** Host projection only, after acknowledged Mongo recovery; never releases source payloads. */
+  adoptRecoveredGeneration(
+    admission: Readonly<GenerationAdmissionInput>,
+    sourceExpiresAt?: number,
+  ): Promise<boolean>;
+  /** Database-only, called inside the recovery CAS transaction; mandatory for source-bound rows. */
+  recoverSources?: GenerationCheckpointSourceRecovery;
   authorize(predecessor: Readonly<GenerationAdmissionInput>): Promise<boolean>;
   confirmTerminatedOwner(predecessor: Readonly<GenerationAdmissionInput>): Promise<{
     predecessor: GenerationAdmissionInput;
@@ -103,6 +124,8 @@ const localKey = (stream: string, epoch: number, segment: string): string =>
 interface LocalAdmission {
   input: GenerationAdmissionInput;
   phase: 'admitted' | 'dispatching' | 'held';
+  /** Confirmed recovery deadline remains binding through the final provider-start gate. */
+  sourceExpiresAt?: number;
   pending?: Set<Promise<void>>;
 }
 
@@ -114,8 +137,13 @@ export class GenerationAdmissionCoordinator {
   private writes = 0;
   private uncertain = 0;
   private readonly local = new Map<string, LocalAdmission>();
+  private readonly prepared = new Map<
+    GenerationPreparationReceipt,
+    'ready' | 'creating' | 'spent'
+  >();
+
   configure(config: GenerationAdmissionConfiguration): void {
-    if (this.local.size || this.initializing || this.writes)
+    if (this.local.size || this.initializing || this.writes || this.prepared.size)
       throw new GenerationAdmissionHeldError();
     this.config = config;
   }
@@ -145,11 +173,88 @@ export class GenerationAdmissionCoordinator {
     };
   }
 
+  /** A committed preparation is a durable hold, not permission to repeat its source operation. */
+  async prepareCheckpoint(
+    principalId: string,
+    tenantId: string | undefined,
+    conversationId: string,
+    binding: GenerationRequestBinding,
+    attemptId: string,
+    prepare: () => Promise<GenerationCheckpointBinding>,
+  ): Promise<GenerationPreparationReceipt> {
+    const methods = this.config?.methods;
+    if (
+      !this.required ||
+      !methods?.beginGenerationPreparation ||
+      !methods.completeGenerationPreparation ||
+      typeof prepare !== 'function'
+    )
+      throw new GenerationAdmissionHeldError();
+    const input = Object.freeze({
+      ...binding,
+      principalId,
+      tenantId: tenant(tenantId),
+      conversationId,
+      protocol: '2',
+      preparationAttemptId: attemptId,
+      ownerInstanceId: this.config!.ownerInstanceId,
+      processBootId: this.config!.processBootId,
+    });
+    const done = this.initialize();
+    try {
+      const begun = await methods.beginGenerationPreparation(input);
+      if (!begun.ok) throw new GenerationAdmissionHeldError();
+      const continuation = snapshotGenerationCheckpointBinding(await prepare());
+      const result = await methods.completeGenerationPreparation(input, continuation);
+      if (!result.ok) throw new GenerationAdmissionHeldError();
+      const receipt = Object.freeze({ input, continuation });
+      this.prepared.set(receipt, 'ready');
+      return receipt;
+    } catch (error) {
+      this.uncertain++;
+      throw error;
+    } finally {
+      done();
+    }
+  }
+
+  /** Read-only denial gate: a read can preserve a hold but cannot acknowledge preparation. */
+  async assertClaimMayChange(
+    principalId: string,
+    tenantId: string | undefined,
+    clientRequestId: string,
+  ): Promise<void> {
+    if (!this.required) return;
+    if (!this.config?.methods) throw new GenerationAdmissionHeldError();
+    const result = await this.config.methods.getGenerationAdmission({
+      principalId,
+      tenantId: tenant(tenantId),
+      clientRequestId,
+    });
+    if (!result.ok) throw new GenerationAdmissionHeldError();
+  }
+
   async verifyReplay(
     principalId: string,
     tenantId: string | undefined,
     binding?: GenerationRequestBinding,
+    preparation?: GenerationPreparationReceipt,
+    continuation?: GenerationCheckpointBinding,
   ): Promise<void> {
+    if (preparation !== undefined) {
+      if (
+        !this.required ||
+        this.prepared.get(preparation) !== 'ready' ||
+        preparation.input.principalId !== principalId ||
+        preparation.input.tenantId !== tenant(tenantId) ||
+        preparation.input.clientRequestId !== binding?.clientRequestId ||
+        preparation.input.requestFingerprint !== binding?.requestFingerprint ||
+        JSON.stringify(preparation.continuation) !== JSON.stringify(continuation)
+      )
+        throw new GenerationAdmissionHeldError();
+      this.prepared.set(preparation, 'creating');
+      return;
+    }
     if (!this.required) return;
     if (!binding || !this.config?.methods) throw new GenerationAdmissionHeldError();
     const result = await this.config.methods.getGenerationAdmission({
@@ -175,6 +280,7 @@ export class GenerationAdmissionCoordinator {
     protocol: number,
     binding?: GenerationRequestBinding,
     continuation?: GenerationCheckpointBinding,
+    preparation?: GenerationPreparationReceipt,
   ): Promise<void> {
     if (!this.required) return;
     if (!binding || !this.config?.methods) throw new GenerationAdmissionHeldError();
@@ -197,12 +303,21 @@ export class GenerationAdmissionCoordinator {
     }
     const key = localKey(stream, epoch, segment);
     this.local.set(key, { input, phase: 'held' });
-    const result = await this.config.methods.acquireGenerationAdmission(input);
+    if (
+      preparation &&
+      (this.prepared.get(preparation) !== 'creating' ||
+        preparation.input.conversationId !== conversationId ||
+        preparation.input.protocol !== String(protocol))
+    )
+      throw new GenerationAdmissionHeldError();
+    if (preparation) this.prepared.set(preparation, 'spent');
+    const result = await this.config.methods.acquireGenerationAdmission(input, preparation?.input);
     if (!result.ok || !result.value.acquired) {
       if (result.ok || result.error.code !== 'OUTCOME_UNKNOWN') this.local.delete(key);
       throw new GenerationAdmissionHeldError();
     }
     this.local.set(key, { input, phase: 'admitted' });
+    if (preparation) this.prepared.delete(preparation);
   }
 
   /**
@@ -214,7 +329,7 @@ export class GenerationAdmissionCoordinator {
     predecessor: GenerationAdmissionInput,
     successorSegment: string,
     ports: GenerationCheckpointRecoveryPorts,
-  ): Promise<GenerationAdmissionInput | undefined> {
+  ): Promise<GenerationAdmissionRecoveryReceipt | undefined> {
     const config = this.config;
     if (!config?.required || !config.methods || this.closedBy) return undefined;
     let prior: Readonly<GenerationAdmissionInput>;
@@ -229,9 +344,11 @@ export class GenerationAdmissionCoordinator {
         segmentId: successorSegment,
       });
       callbacks = Object.freeze({
+        adoptRecoveredGeneration: ports.adoptRecoveredGeneration,
         authorize: ports.authorize,
         confirmTerminatedOwner: ports.confirmTerminatedOwner,
         reconcileEffects: ports.reconcileEffects,
+        ...(ports.recoverSources === undefined ? {} : { recoverSources: ports.recoverSources }),
       });
       if (
         stream !== prior.conversationId ||
@@ -239,7 +356,9 @@ export class GenerationAdmissionCoordinator {
         successorSegment === prior.segmentId ||
         (prior.ownerInstanceId === next.ownerInstanceId &&
           prior.processBootId === next.processBootId) ||
-        Object.values(callbacks).some((callback) => typeof callback !== 'function')
+        Object.values(callbacks).some((callback) => typeof callback !== 'function') ||
+        (prior.continuation!.sourceBindingSha256 !== undefined &&
+          typeof callbacks.recoverSources !== 'function')
       )
         return undefined;
     } catch {
@@ -281,23 +400,65 @@ export class GenerationAdmissionCoordinator {
       // Revalidate access after potentially slow termination/effects reconciliation.
       if ((await callbacks.authorize(prior)) !== true || this.closedBy) return undefined;
       retain = true; // A thrown or unacknowledged CAS must remain an unresolved obligation.
-      const result = await config.methods.recoverGenerationAdmission(prior, evidence, {
-        ownerInstanceId: next.ownerInstanceId,
-        processBootId: next.processBootId,
-        segmentId: next.segmentId,
-      });
+      const result = await config.methods.recoverGenerationAdmission(
+        prior,
+        evidence,
+        {
+          ownerInstanceId: next.ownerInstanceId,
+          processBootId: next.processBootId,
+          segmentId: next.segmentId,
+        },
+        callbacks.recoverSources,
+      );
       if (!result.ok) {
         retain = result.error.code === 'OUTCOME_UNKNOWN';
         return undefined;
       }
       if (
-        result.value.state !== 'admitted' ||
-        result.value.active !== true ||
-        JSON.stringify(snapshotGenerationCheckpointAdmission(result.value)) !== JSON.stringify(next)
+        result.value.admission.state !== 'admitted' ||
+        result.value.admission.active !== true ||
+        JSON.stringify(snapshotGenerationCheckpointAdmission(result.value.admission)) !==
+          JSON.stringify(next)
       )
         return undefined;
+      const source = result.value.source;
+      if (prior.continuation!.sourceBindingSha256 !== undefined) {
+        if (!source) return undefined;
+        const binding = snapshotCheckpointSourceBinding(
+          source.sourceBinding.owner,
+          source.sourceBinding,
+        );
+        const bindingTenant =
+          binding.owner.tenantId && binding.owner.tenantId !== SYSTEM_TENANT_ID
+            ? binding.owner.tenantId
+            : '__single_tenant__';
+        if (
+          binding.owner.userId !== next.principalId ||
+          bindingTenant !== next.tenantId ||
+          binding.bindingSha256 !== prior.continuation!.sourceBindingSha256 ||
+          !Number.isSafeInteger(source.expiresAt) ||
+          source.expiresAt <= Date.now() ||
+          source.expiresAt > Date.parse(binding.expiresAt) ||
+          source.checkpoint.threadId !== stream ||
+          source.checkpoint.checkpointNs !== '' ||
+          typeof source.checkpoint.checkpointId !== 'string' ||
+          !source.checkpoint.checkpointId.length
+        )
+          return undefined;
+      } else if (source !== undefined) return undefined;
+      if (
+        this.closedBy ||
+        (await callbacks.adoptRecoveredGeneration(next, source?.expiresAt)) !== true ||
+        this.closedBy ||
+        (source && source.expiresAt <= Date.now())
+      )
+        return undefined;
+      entry.sourceExpiresAt = source?.expiresAt;
       entry.phase = 'admitted';
-      return this.closedBy ? undefined : next;
+      return Object.freeze({
+        admission: Object.freeze({ ...result.value.admission, ...next }),
+        ...(source ? { source } : {}),
+      });
     } catch {
       return undefined;
     } finally {
@@ -306,7 +467,8 @@ export class GenerationAdmissionCoordinator {
     }
   }
 
-  async authorize(
+  /** Prepare the existing lazy successor admission before any Redis provider-start mutation. */
+  async prepareProviderExecution(
     stream: string,
     epoch: number,
     segment: string,
@@ -350,14 +512,78 @@ export class GenerationAdmissionCoordinator {
         this.initializing--;
       }
     }
-    if (!entry || entry.phase !== 'admitted') return false;
+    return (
+      !this.closedBy &&
+      !!entry &&
+      entry.phase === 'admitted' &&
+      (entry.sourceExpiresAt == null || entry.sourceExpiresAt > Date.now()) &&
+      entry.input.principalId === principalId &&
+      entry.input.tenantId === tenant(tenantId) &&
+      entry.input.conversationId === conversationId
+    );
+  }
+
+  canBeginProviderExecution(stream: string, epoch: number, segment: string): boolean {
+    const entry = this.local.get(localKey(stream, epoch, segment));
+    return (
+      !this.closedBy &&
+      (!this.required ||
+        (!!entry &&
+          entry.phase === 'admitted' &&
+          (entry.sourceExpiresAt == null || entry.sourceExpiresAt > Date.now())))
+    );
+  }
+
+  isProviderDispatchReady(stream: string, epoch: number, segment: string): boolean {
+    const entry = this.local.get(localKey(stream, epoch, segment));
+    return (
+      !this.closedBy &&
+      (!this.required ||
+        (!!entry &&
+          entry.phase === 'dispatching' &&
+          (entry.sourceExpiresAt == null || entry.sourceExpiresAt > Date.now())))
+    );
+  }
+
+  /** An uncertain native write/read never becomes a new start permission. */
+  holdProviderExecution(stream: string, epoch: number, segment: string): void {
+    const entry = this.local.get(localKey(stream, epoch, segment));
+    if (entry) entry.phase = 'held';
+  }
+
+  async authorize(
+    stream: string,
+    epoch: number,
+    segment: string,
+    principalId: string,
+    tenantId: string | undefined,
+    conversationId: string,
+    successor: boolean,
+  ): Promise<boolean> {
+    if (
+      !(await this.prepareProviderExecution(
+        stream,
+        epoch,
+        segment,
+        principalId,
+        tenantId,
+        conversationId,
+        successor,
+      ))
+    )
+      return false;
+    if (!this.required) return !this.closedBy;
+    const entry = this.local.get(localKey(stream, epoch, segment));
+    if (!entry || entry.phase !== 'admitted' || !this.config?.methods || this.closedBy)
+      return false;
     entry.phase = 'held';
     this.writes++;
     try {
       const result = await this.config.methods.dispatchGenerationAdmission(entry.input);
       if (!result.ok) return false;
       entry.phase = 'dispatching';
-      return true;
+      // Preserve acknowledged dispatch for the existing drain/settlement owner.
+      return this.isProviderDispatchReady(stream, epoch, segment);
     } finally {
       this.writes--;
     }
@@ -396,7 +622,13 @@ export class GenerationAdmissionCoordinator {
     return entry.phase !== 'held';
   }
 
-  async settle(stream: string, epoch: number, segment: string, evidence: string): Promise<boolean> {
+  async settle(
+    stream: string,
+    epoch: number,
+    segment: string,
+    outcome: GenerationAdmissionTerminal['outcome'],
+    evidence: string,
+  ): Promise<boolean> {
     if (!this.required) return true;
     const key = localKey(stream, epoch, segment);
     const entry = this.local.get(key);
@@ -405,7 +637,7 @@ export class GenerationAdmissionCoordinator {
     this.writes++;
     try {
       const result = await this.config.methods.settleGenerationAdmission(entry.input, {
-        outcome: 'completed',
+        outcome,
         evidenceSha256: createHash('sha256').update(evidence).digest('hex'),
       });
       if (!result.ok) return false;

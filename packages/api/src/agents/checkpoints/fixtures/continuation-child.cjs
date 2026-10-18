@@ -1,4 +1,4 @@
-/* Real compiled host/SDK process. Only the external model is synthetic. */
+/* Real compiled host/SDK process. Model, approval receipt and original bytes are explicit fixtures. */
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -14,6 +14,8 @@ deadline.unref();
 
 process.once('message', async (input) => {
   let mongoose;
+  const managers = [];
+  const redisClients = [];
   try {
     const manifest = JSON.parse(fs.readFileSync(path.join(input.sdkRoot, 'package.json'), 'utf8'));
     assert.equal(manifest.name, '@librechat/agents');
@@ -53,8 +55,17 @@ process.once('message', async (input) => {
       );
     });
     const schemas = require('@librechat/data-schemas');
+    process.env.UPLOAD_SECURITY_POLICY_SHA256 = input.sourcePolicy;
+    process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = 'true';
     const models = schemas.createModels(mongoose);
+    // Each fresh process registers the native quota owner; the parent already initialized it.
+    schemas.createUploadManagementRepository(mongoose);
+    const quota = await mongoose.models.UploadCounter.findById('global').lean();
+    assert.equal(quota?.value.enabled, true);
+    assert.equal(quota?.value.reconciled, true);
     const methods = schemas.createGenerationAdmissionMethods(mongoose);
+    const sources = schemas.createCheckpointSourceMethods(mongoose);
+    const sourceOwner = { userId: input.scope.userId, tenantId: input.scope.tenantId };
     const { getConvoOwnership } = schemas.createMethods(mongoose);
     await methods.ensureGenerationAdmissionIndexes();
     assert.equal(typeof host.GenerationAdmissionCoordinator, 'function');
@@ -66,25 +77,97 @@ process.once('message', async (input) => {
       },
       true,
     );
-    const coordinator = () => {
-      const result = new host.GenerationAdmissionCoordinator();
-      result.configure({
+    const redisUrl = new URL(input.redisUri);
+    assert.equal(redisUrl.protocol, 'redis:');
+    assert.equal(redisUrl.hostname, '127.0.0.1');
+    assert.equal(redisUrl.username + redisUrl.password, '');
+    assert.match(input.redisPrefix, /^checkpoint-process:[a-f0-9-]+:$/);
+    const Redis = require('ioredis');
+    const managerOwner = async () => {
+      const publisher = new Redis(input.redisUri, {
+        keyPrefix: input.redisPrefix,
+        maxRetriesPerRequest: 1,
+        retryStrategy: () => null,
+      });
+      const subscriber = publisher.duplicate();
+      redisClients.push(publisher, subscriber);
+      await Promise.all([publisher.ping(), subscriber.ping()]);
+      const jobStore = new host.RedisJobStore(publisher);
+      const eventTransport = new host.RedisEventTransport(publisher, subscriber);
+      const result = new host.GenerationJobManagerClass({ jobStore, eventTransport });
+      result.configure({ jobStore, eventTransport, isRedis: true, cleanupOnComplete: false });
+      result.configureGenerationAdmission({
         required: true,
         methods,
         ownerInstanceId: nativeIdentity.podUid,
         processBootId: nativeIdentity.incarnation,
+        externalCensus: async () => ({ queuedContinuations: 0, pendingWrites: 0, complete: true }),
       });
+      managers.push(result);
+      if (input.storeCommitUnknown) {
+        const transition = jobStore.transitionStatus.bind(jobStore);
+        jobStore.transitionStatus = async (...args) => {
+          const committed = await transition(...args);
+          if (committed && args[1].expectProviderExecutionId)
+            throw new Error('Injected lost acknowledgment after actual Redis CAS');
+          return committed;
+        };
+      }
       return result;
     };
     assert.equal(sha256(fs.readFileSync(__filename)), input.graphFingerprint);
     assert.equal(sha256('checkpoint-only-v1; synthetic-model; no-tools'), input.policyFingerprint);
     let admission;
     let recovery;
+    let sourceBinding;
+    let capturedMessages;
+    let nativeJob;
+    let executionJob;
+    let executionManager;
+    const authorizedPrincipal = async (principalId, conversationId, tenantId) => {
+      const user = await models.User.findOne({
+        _id: principalId,
+        tenantId,
+        authDisabled: false,
+        authVersion: 0,
+      }).lean();
+      const conversation = await getConvoOwnership(principalId, conversationId, tenantId);
+      return (
+        !!user &&
+        conversation?.user === principalId &&
+        conversation.tenantId === tenantId &&
+        !conversation.subagentThread
+      );
+    };
     if (input.phase === 'first') {
-      const owner = coordinator();
+      assert.equal(
+        await authorizedPrincipal(input.scope.userId, input.scope.threadId, input.scope.tenantId),
+        true,
+      );
+      const session = await mongoose.startSession();
+      try {
+        session.startTransaction();
+        const captured = await sources.captureCheckpointSources(
+          sourceOwner,
+          input.sourceInput,
+          session,
+        );
+        await session.commitTransaction();
+        sourceBinding = captured.binding;
+        capturedMessages = captured.messages;
+      } finally {
+        await session.endSession();
+      }
+      if (input.captureCommitUnknown) {
+        // Explicit lost capture acknowledgment after a real commit: no native job or provider.
+        process.send({ type: 'capture-denied' });
+        return;
+      }
       const binding = host.generationRequestBinding(input.clientRequestId, {
         runId: input.runId,
         conversationId: input.scope.threadId,
+        sourceBindingSha256: sourceBinding.bindingSha256,
+        sourceInput: input.sourceInput,
       });
       const continuation = {
         version: 1,
@@ -94,27 +177,40 @@ process.once('message', async (input) => {
         graphFingerprint: input.graphFingerprint,
         policyFingerprint: input.policyFingerprint,
         mode: 'checkpoint-only-v1',
+        sourceBindingSha256: sourceBinding.bindingSha256,
       };
-      await owner.enroll(
-        input.scope.threadId,
-        input.generationEpoch,
-        input.segmentId,
-        input.scope.userId,
-        input.scope.tenantId,
-        input.scope.threadId,
-        1,
-        binding,
-        continuation,
-      );
-      assert.equal(
-        await owner.authorize(
-          input.scope.threadId,
-          input.generationEpoch,
-          input.segmentId,
+      const manager = await managerOwner();
+      const job = await schemas.tenantStorage.run({ tenantId: input.scope.tenantId }, async () => {
+        const claim = await manager.claimGeneration(
           input.scope.userId,
-          input.scope.tenantId,
+          input.clientRequestId,
           input.scope.threadId,
-          false,
+          input.scope.threadId,
+          2,
+          binding,
+        );
+        assert.equal(claim.claimed, true);
+        return manager.createJob(input.scope.threadId, input.scope.userId, input.scope.threadId, {
+          trustedTenantId: input.scope.tenantId,
+          generationAdmission: binding,
+          checkpointContinuation: continuation,
+          idempotencyClientRequestId: input.clientRequestId,
+          idempotencyClaimToken: claim.existing.claimToken,
+        });
+      });
+      executionJob = job;
+      executionManager = manager;
+      nativeJob = {
+        createdAt: job.createdAt,
+        providerExecutionId: job.metadata.providerExecutionId,
+        checkpointNamespace: job.metadata.checkpointNamespace,
+        generationProtocolVersion: job.metadata.generationProtocolVersion,
+      };
+      assert.equal(
+        await manager.beginProviderExecution(
+          job.streamId,
+          job.createdAt,
+          job.metadata.providerExecutionId,
         ),
         true,
       );
@@ -126,7 +222,29 @@ process.once('message', async (input) => {
       assert.equal(current.ok, true);
       assert.equal(current.value.state, 'dispatching');
       admission = schemas.snapshotGenerationCheckpointAdmission(current.value);
+      assert.equal(admission.generationEpoch, job.createdAt);
+      assert.equal(admission.segmentId, job.metadata.providerExecutionId);
+      assert.equal(admission.continuation.checkpointNamespace, job.metadata.checkpointNamespace);
     } else {
+      for (const key of ['sourceBinding', 'sourceInput', 'capturedMessages', 'expectedSourceText'])
+        assert.equal(Object.hasOwn(input, key), false, `Restart must not receive ${key}`);
+      assert.equal(input.config.configurable.checkpoint_id, undefined);
+      const persisted = await methods.getGenerationAdmission({
+        tenantId: input.scope.tenantId,
+        principalId: input.scope.userId,
+        clientRequestId: input.clientRequestId,
+      });
+      assert.equal(persisted.ok, true);
+      assert.ok(persisted.value);
+      input.predecessor = schemas.snapshotGenerationCheckpointAdmission(persisted.value);
+      if (input.sourceCommitUnknown) {
+        const recover = methods.recoverGenerationAdmission;
+        methods.recoverGenerationAdmission = async (...args) => {
+          const result = await recover(...args);
+          // The real recovery committed; its acknowledgment is deliberately lost.
+          return result.ok ? { ok: false, error: { code: 'OUTCOME_UNKNOWN' } } : result;
+        };
+      }
       const terminationBytes = fs.readFileSync(input.terminationFile);
       const terminated = JSON.parse(terminationBytes);
       assert.deepEqual(terminated.admission, input.predecessor);
@@ -155,24 +273,11 @@ process.once('message', async (input) => {
         authorize: async (prior) => {
           aclChecks++;
           assert.deepEqual(prior, input.predecessor);
-          const user = await models.User.findOne({
-            _id: prior.principalId,
-            tenantId: prior.tenantId,
-            authDisabled: false,
-            authVersion: 0,
-          }).lean();
-          const conversation = await getConvoOwnership(
-            prior.principalId,
-            prior.conversationId,
-            prior.tenantId,
-          );
-          return (
-            !!user &&
-            conversation?.user === prior.principalId &&
-            conversation.tenantId === prior.tenantId &&
-            !conversation.subagentThread
-          );
+          if (!(await authorizedPrincipal(prior.principalId, prior.conversationId, prior.tenantId)))
+            return false;
+          return true;
         },
+        recoverSources: host.createCheckpointSourceRecovery(input.storage),
         confirmTerminatedOwner: async (prior) => {
           assert.deepEqual(prior, terminated.admission);
           return { predecessor: prior, terminationEvidenceSha256: sha256(terminationBytes) };
@@ -200,39 +305,125 @@ process.once('message', async (input) => {
           };
         },
       };
-      const candidates = [coordinator(), coordinator()];
+      const candidates = await Promise.all([managerOwner(), managerOwner()]);
       const segments = [randomUUID(), randomUUID()];
       const results = await Promise.all(
         candidates.map((owner, index) =>
-          owner.recoverCheckpoint(input.scope.threadId, input.predecessor, segments[index], ports),
+          owner.recoverCheckpointGeneration(
+            input.scope.threadId,
+            input.predecessor,
+            segments[index],
+            ports,
+          ),
         ),
       );
       const winners = results.filter(Boolean);
+      if (input.expectedSourceDenial && !input.expireSourceAt) {
+        assert.equal(winners.length, 0);
+        const current = await methods.getGenerationAdmission(input.predecessor);
+        assert.equal(current.ok, true);
+        if (input.sourceCommitUnknown || input.storeCommitUnknown) {
+          assert.equal(current.value.state, 'admitted');
+          assert.equal(current.value.recoveries.length, 1);
+        } else {
+          assert.deepEqual(
+            schemas.snapshotGenerationCheckpointAdmission(current.value),
+            input.predecessor,
+          );
+        }
+        for (let i = 0; i < candidates.length; i++)
+          assert.equal(
+            await candidates[i].beginProviderExecution(
+              input.scope.threadId,
+              input.predecessor.generationEpoch,
+              segments[i],
+            ),
+            false,
+          );
+        const durableJob = await candidates[0].getJobStore().getJob(input.scope.threadId);
+        assert.equal(durableJob.createdAt, input.predecessor.generationEpoch);
+        assert.equal(
+          durableJob.providerExecutionId === input.predecessor.segmentId,
+          !input.storeCommitUnknown,
+        );
+        process.send({ type: 'denied', admission: current.value, aclChecks, effectChecks });
+        return;
+      }
       assert.equal(winners.length, 1);
-      admission = winners[0];
-      const winner = results.indexOf(admission);
+      const receipt = winners[0];
+      admission = receipt.admission;
+      sourceBinding = receipt.source.sourceBinding;
+      assert.equal(sourceBinding.bindingSha256, admission.continuation.sourceBindingSha256);
+      input.config = {
+        ...input.config,
+        configurable: {
+          ...input.config.configurable,
+          thread_id: receipt.source.checkpoint.threadId,
+          checkpoint_ns: receipt.source.checkpoint.checkpointNs,
+          checkpoint_id: receipt.source.checkpoint.checkpointId,
+        },
+      };
+      const winner = results.indexOf(receipt);
       const loser = 1 - winner;
       assert.equal(
-        await candidates[loser].authorize(
+        await candidates[loser].beginProviderExecution(
           input.scope.threadId,
-          input.generationEpoch,
+          input.predecessor.generationEpoch,
           segments[loser],
-          input.scope.userId,
-          input.scope.tenantId,
-          input.scope.threadId,
-          false,
         ),
         false,
       );
+      executionManager = candidates[winner];
+      executionJob = await executionManager.getJob(input.scope.threadId);
+      assert.ok(executionJob);
+      assert.equal(executionJob.createdAt, input.predecessor.generationEpoch);
+      assert.equal(executionJob.metadata.providerExecutionId, admission.segmentId);
+      if (input.expireSourceAt) {
+        const now = Date.now;
+        const dispatch = methods.dispatchGenerationAdmission;
+        try {
+          if (input.expireSourceAt === 'before') Date.now = () => receipt.source.expiresAt;
+          else
+            methods.dispatchGenerationAdmission = async (...args) => {
+              const result = await dispatch(...args);
+              Date.now = () => receipt.source.expiresAt;
+              return result;
+            };
+          assert.equal(
+            await executionManager.beginProviderExecution(
+              input.scope.threadId,
+              input.predecessor.generationEpoch,
+              admission.segmentId,
+            ),
+            false,
+          );
+        } finally {
+          Date.now = now;
+          methods.dispatchGenerationAdmission = dispatch;
+        }
+        if (input.expireSourceAt === 'authorize')
+          assert.equal(
+            await executionManager.markProviderExecutionDrained(
+              input.scope.threadId,
+              input.predecessor.generationEpoch,
+              admission.segmentId,
+            ),
+            true,
+          );
+        const current = await methods.getGenerationAdmission(input.predecessor);
+        assert.equal(current.ok, true);
+        assert.equal(
+          current.value.state,
+          input.expireSourceAt === 'before' ? 'admitted' : 'dispatching',
+        );
+        process.send({ type: 'denied', admission: current.value, aclChecks, effectChecks });
+        return;
+      }
       assert.equal(
-        await candidates[winner].authorize(
+        await executionManager.beginProviderExecution(
           input.scope.threadId,
-          input.generationEpoch,
+          input.predecessor.generationEpoch,
           admission.segmentId,
-          input.scope.userId,
-          input.scope.tenantId,
-          input.scope.threadId,
-          false,
         ),
         true,
       );
@@ -267,7 +458,14 @@ process.once('message', async (input) => {
       bindTools() {
         return this;
       }
-      async response() {
+      async response(messages) {
+        assert.ok(
+          messages.some(
+            (message) =>
+              typeof message.content === 'string' &&
+              sha256(message.content) === input.expectedSourceTextSha256,
+          ),
+        );
         if (this.model === 'second' && input.phase === 'first') {
           assert.equal(blocked, false);
           blocked = true;
@@ -280,6 +478,8 @@ process.once('message', async (input) => {
             steps: closedSteps,
             admission,
             nativeIdentity,
+            sourceBinding,
+            nativeJob,
           });
           // No second response/effect is produced in this process. The parent joins it.
           await new Promise(() => {});
@@ -290,12 +490,12 @@ process.once('message', async (input) => {
         );
         return `answer-${this.model}`;
       }
-      async _generate() {
-        const text = await this.response();
+      async _generate(messages) {
+        const text = await this.response(messages);
         return { generations: [{ text, message: new AIMessage({ content: text }) }] };
       }
-      async *_streamResponseChunks() {
-        const text = await this.response();
+      async *_streamResponseChunks(messages) {
+        const text = await this.response(messages);
         yield new ChatGenerationChunk({ text, message: new AIMessageChunk({ content: text }) });
       }
     }
@@ -326,8 +526,9 @@ process.once('message', async (input) => {
       tenantId: input.scope.tenantId,
       durableCheckpointScope: input.scope,
       durableCheckpointAdmission: admission,
+      durableCheckpointSourceBinding: sourceBinding,
       agents: [agent('agent_a', 'first'), agent('agent_b', 'second')],
-      signal: new AbortController().signal,
+      signal: executionJob.abortController.signal,
       centralTraceExportEnabled: false,
       customHandlers: {
         [sdk.GraphEvents.ON_RUN_STEP_CLOSED]: {
@@ -344,7 +545,11 @@ process.once('message', async (input) => {
     assert.ok(run instanceof sdk.Run, 'Native createRun must return the actual public SDK Run');
     if (input.phase === 'first') {
       await run.processStream(
-        { messages: [new HumanMessage('Synthetic two-step process proof')] },
+        {
+          messages: capturedMessages.map(
+            (message) => new HumanMessage({ id: message.messageId, content: message.text }),
+          ),
+        },
         input.config,
       );
       throw new Error('First process must remain blocked before its second response');
@@ -353,6 +558,22 @@ process.once('message', async (input) => {
     const state = await run.graphRunnable.getState({
       configurable: { thread_id: input.scope.threadId, checkpoint_ns: '' },
     });
+    assert.equal(
+      await executionManager.completeJob(
+        input.scope.threadId,
+        undefined,
+        admission.generationEpoch,
+      ),
+      true,
+    );
+    assert.equal(
+      await executionManager.settleGenerationExecution(
+        input.scope.threadId,
+        admission.generationEpoch,
+        admission.segmentId,
+      ),
+      true,
+    );
     process.send({
       type: 'completed',
       next: state.next,
@@ -367,8 +588,6 @@ process.once('message', async (input) => {
       nativeIdentity,
       recovery,
     });
-    await mongoose.disconnect();
-    process.disconnect();
   } catch (error) {
     process.stderr.write(`${error.stack ?? error}\n`);
     if (mongoose?.models.GenerationAdmission) {
@@ -378,8 +597,11 @@ process.once('message', async (input) => {
       ).lean();
       process.stderr.write(`Native admission at failure: ${JSON.stringify(records)}\n`);
     }
-    await mongoose?.disconnect();
     process.exitCode = 1;
-    process.disconnect?.();
+  } finally {
+    for (const manager of managers) await manager.destroy({ settlementBudgetMs: 0 });
+    for (const client of redisClients) client.disconnect();
+    await mongoose?.disconnect();
+    if (process.connected) process.disconnect();
   }
 });

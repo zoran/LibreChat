@@ -6,6 +6,7 @@ import {
   logger,
   SYSTEM_TENANT_ID,
   snapshotGenerationCheckpointAdmission,
+  snapshotCheckpointSourceBinding,
 } from '@librechat/data-schemas';
 import {
   KnownEndpoints,
@@ -58,6 +59,7 @@ import type {
   IAgentFadingTier,
   IUser,
   GenerationAdmissionInput,
+  CheckpointSourceBinding,
 } from '@librechat/data-schemas';
 import type { CallbackHandlerMethods } from '@langchain/core/callbacks/base';
 import type { ToolApprovalGrantStorage } from 'librechat-data-provider';
@@ -2179,54 +2181,7 @@ function resolveRunTraceContext({
   };
 }
 
-export async function createRun({
-  runId,
-  signal,
-  conversationId,
-  agents,
-  messages,
-  discoveredToolNames,
-  requestBody,
-  codeApprovalMode: requestedCodeApprovalMode,
-  user,
-  tenantId,
-  centralTraceExportEnabled,
-  traceContext,
-  tokenCounter,
-  customHandlers,
-  indexTokenCountMap,
-  initialSessions,
-  summarizationConfig,
-  summarizeOnly = false,
-  compactionSemanticIndex,
-  initialSummary,
-  modelCallbacks,
-  clientToolNames,
-  calibrationRatio,
-  fadingTier,
-  fadingTiers,
-  appConfig,
-  subagentUsageSink,
-  subagentTasks,
-  runFiles,
-  steering,
-  activityLabel,
-  activityPhase,
-  eventActorCheckpointing = false,
-  durableCheckpointScope,
-  durableCheckpointAdmission,
-  hitlCapable = false,
-  resolvedToolApprovalHooks,
-  toolApprovalStorage,
-  reviewedToolApprovals,
-  scheduledMCPExecution,
-  recordScheduledMCPDenial,
-  toolApprovalAllows,
-  toolInputValidationErrors,
-  sessionStartSource,
-  streaming = true,
-  streamUsage = true,
-}: {
+type CreateRunOptions = {
   agents: RunAgent[];
   signal: AbortSignal;
   runId?: string;
@@ -2361,8 +2316,18 @@ export async function createRun({
    * this profile only binds persistence and synchronous SDK checkpointing.
    */
   durableCheckpointScope?: DurableAgentCheckpointScope;
+  /** Trusted pure checkpoint-input inspection; never supplied through request/config metadata. */
+  inspectCheckpointInput?: (
+    input: Readonly<{
+      messages: readonly BaseMessage[];
+      runId: string;
+      threadId: string;
+    }>,
+  ) => void | Promise<void>;
   /** Exact active native segment acquired and dispatched by the trusted host coordinator. */
   durableCheckpointAdmission?: GenerationAdmissionInput;
+  /** Private captured sources; the native host owns selection, capture and current authorization. */
+  durableCheckpointSourceBinding?: CheckpointSourceBinding;
   /**
    * Whether the caller implements the HITL pause/resume lifecycle (inspects
    * `run.getInterrupt()`, persists a pending action, exposes a resume route). Gates the
@@ -2384,10 +2349,78 @@ export async function createRun({
   sessionStartSource?: string;
   /** Request-scoped tool input failures consumed by the completion handler. */
   toolInputValidationErrors?: Map<string, ToolInputValidationError>;
-} & Pick<
-  RunConfig,
-  'tokenCounter' | 'customHandlers' | 'indexTokenCountMap' | 'initialSessions'
->): Promise<Run<IState>> {
+} & Pick<RunConfig, 'tokenCounter' | 'customHandlers' | 'indexTokenCountMap' | 'initialSessions'>;
+
+export async function createRun(options: CreateRunOptions): Promise<Run<IState>> {
+  const inspectionOption = Object.getOwnPropertyDescriptor(options, 'inspectCheckpointInput');
+  if (
+    (inspectionOption && !('value' in inspectionOption)) ||
+    (!inspectionOption && 'inspectCheckpointInput' in options)
+  )
+    throw new Error('Invalid checkpoint input inspector');
+  const inspectCheckpointInput = inspectionOption?.value;
+  if (
+    inspectCheckpointInput !== undefined &&
+    (typeof inspectCheckpointInput !== 'function' ||
+      options.durableCheckpointScope === undefined ||
+      (Run as typeof Run & { checkpointInputInspectionVersion?: number })
+        .checkpointInputInspectionVersion !== 1)
+  )
+    throw new Error('Checkpoint input inspection requires a durable scope and compatible SDK');
+  const sourceOption = Object.getOwnPropertyDescriptor(options, 'durableCheckpointSourceBinding');
+  if (
+    (sourceOption && !('value' in sourceOption)) ||
+    (!sourceOption && 'durableCheckpointSourceBinding' in options)
+  )
+    throw new Error('Invalid durable checkpoint source binding');
+  const {
+    runId,
+    signal,
+    conversationId,
+    agents,
+    messages,
+    discoveredToolNames,
+    requestBody,
+    codeApprovalMode: requestedCodeApprovalMode,
+    user,
+    tenantId,
+    centralTraceExportEnabled,
+    traceContext,
+    tokenCounter,
+    customHandlers,
+    indexTokenCountMap,
+    initialSessions,
+    summarizationConfig,
+    summarizeOnly = false,
+    compactionSemanticIndex,
+    initialSummary,
+    modelCallbacks,
+    clientToolNames,
+    calibrationRatio,
+    fadingTier,
+    fadingTiers,
+    appConfig,
+    subagentUsageSink,
+    subagentTasks,
+    runFiles,
+    steering,
+    activityLabel,
+    activityPhase,
+    eventActorCheckpointing = false,
+    durableCheckpointScope,
+    durableCheckpointAdmission,
+    hitlCapable = false,
+    resolvedToolApprovalHooks,
+    toolApprovalStorage,
+    reviewedToolApprovals,
+    scheduledMCPExecution,
+    recordScheduledMCPDenial,
+    toolApprovalAllows,
+    toolInputValidationErrors,
+    sessionStartSource,
+    streaming = true,
+    streamUsage = true,
+  } = options;
   const completeAssistantHistory = assertCompleteAssistantHistorySingleton(agents);
   const durableScope =
     durableCheckpointScope === undefined ? undefined : Object.freeze({ ...durableCheckpointScope });
@@ -2454,6 +2487,18 @@ export async function createRun({
       throw new Error('Durable execution requires SDK checkpoint policy support');
     }
   }
+  const durableSourceBinding =
+    sourceOption?.value === undefined
+      ? undefined
+      : snapshotCheckpointSourceBinding(
+          { userId: durableScope?.userId ?? '', tenantId: durableScope?.tenantId ?? null },
+          sourceOption.value,
+        );
+  if (
+    (durableSourceBinding && (!durableScope || !durableAdmission)) ||
+    durableSourceBinding?.bindingSha256 !== durableAdmission?.continuation?.sourceBindingSha256
+  )
+    throw new Error('Durable checkpoint sources require their exact native admission');
   const durableCheckpointer =
     durableScope === undefined
       ? undefined
@@ -2461,6 +2506,7 @@ export async function createRun({
           durableScope,
           appConfig?.endpoints?.[EModelEndpoint.agents]?.checkpointer,
           durableAdmission,
+          durableSourceBinding,
         );
   if (durableScope !== undefined && durableCheckpointer == null) {
     throw new Error('Durable execution requires a persistent checkpointer');
@@ -3191,6 +3237,7 @@ export async function createRun({
 
   const runConfig = {
     runId: resolvedRunId,
+    ...(inspectCheckpointInput === undefined ? {} : { inspectCheckpointInput }),
     ...(durableScope !== undefined && {
       checkpointPolicy: { threadId: durableScope.threadId, durability: 'sync' as const },
     }),

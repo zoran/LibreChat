@@ -1,9 +1,9 @@
 import { Schema } from 'mongoose';
-import type { GenerationAdmissionRecord } from '~/types/generationAdmission';
+import type { GenerationAdmissionStorageRecord } from '~/types/generationAdmission';
 
 /** One durable segment; unresolved receipts have no TTL or lease-based takeover. */
-const generationAdmissionSchema: Schema<GenerationAdmissionRecord> =
-  new Schema<GenerationAdmissionRecord>(
+const generationAdmissionSchema: Schema<GenerationAdmissionStorageRecord> =
+  new Schema<GenerationAdmissionStorageRecord>(
     {
       tenantId: { type: String, required: true, immutable: true },
       principalId: { type: String, required: true, immutable: true },
@@ -13,8 +13,20 @@ const generationAdmissionSchema: Schema<GenerationAdmissionRecord> =
       protocol: { type: String, required: true, immutable: true },
       ownerInstanceId: { type: String, required: true },
       processBootId: { type: String, required: true },
-      generationEpoch: { type: Number, required: true, immutable: true },
-      segmentId: { type: String, required: true },
+      generationEpoch: {
+        type: Number,
+        required(this: GenerationAdmissionStorageRecord) {
+          return !['preparing', 'prepared'].includes(this.state);
+        },
+        immutable: true,
+      },
+      segmentId: {
+        type: String,
+        required(this: GenerationAdmissionStorageRecord) {
+          return !['preparing', 'prepared'].includes(this.state);
+        },
+      },
+      preparationAttemptId: { type: String, immutable: true },
       continuation: {
         type: new Schema(
           {
@@ -45,7 +57,11 @@ const generationAdmissionSchema: Schema<GenerationAdmissionRecord> =
         default: undefined,
       },
       checkpointWriteRevision: { type: Number, default: 0, required: true },
-      state: { type: String, enum: ['admitted', 'dispatching', 'settled'], required: true },
+      state: {
+        type: String,
+        enum: ['preparing', 'prepared', 'admitted', 'dispatching', 'settled'],
+        required: true,
+      },
       active: { type: Boolean, required: true },
       createdAt: { type: String, required: true, immutable: true },
       predecessors: [

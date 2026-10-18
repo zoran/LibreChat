@@ -182,6 +182,19 @@ describe('initializeClient — processAgent ACL gate', () => {
     },
   });
 
+  it('rejects forged checkpoint capabilities before agent initialization', async () => {
+    await expect(
+      initializeClient({
+        req: makeReq(),
+        res: {},
+        endpointOption: makeEndpointOption(),
+        checkpointPreparation: Object.freeze({}),
+      }),
+    ).rejects.toThrow('Untrusted checkpoint preparation');
+    expect(mockInitializeAgent).not.toHaveBeenCalled();
+    expect(getModelsConfig).not.toHaveBeenCalled();
+  });
+
   it.each([false, true])('defers host credential resolution with restored=%s', async (restored) => {
     const upstreamTokenProvider = jest.fn();
     const resolveUpstreamTokenProvider = jest.fn().mockResolvedValue(upstreamTokenProvider);

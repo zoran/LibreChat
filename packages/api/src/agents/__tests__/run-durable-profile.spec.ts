@@ -1,5 +1,5 @@
 import * as agentsSdk from '@librechat/agents';
-import type { GenerationAdmissionInput } from '@librechat/data-schemas';
+import type { GenerationAdmissionInput, CheckpointSourceBinding } from '@librechat/data-schemas';
 import type { DurableAgentCheckpointScope } from '~/agents/checkpointer';
 import { getAgentCheckpointer, getDurableAgentCheckpointer } from '~/agents/checkpointer';
 import { createCheckpointNamespace } from '~/stream/checkpoints';
@@ -60,6 +60,53 @@ function admission(): GenerationAdmissionInput {
   };
 }
 
+function sourceBinding(): CheckpointSourceBinding {
+  // Fixed canonical digest fixture; this host unit suite makes no source authorization claim.
+  return {
+    version: 1,
+    owner: { userId: '111111111111111111111111', tenantId: 'tenant' },
+    files: [
+      { fileId: 'file-one', approvalSha256: 'd'.repeat(64), expiresAt: '2035-01-01T00:00:00.000Z' },
+    ],
+    messages: [
+      {
+        conversationId: 'conversation',
+        messageId: 'message-one',
+        capturedVersion: 0,
+        bodySha256: 'e'.repeat(64),
+        sourceFileIds: ['file-one'],
+        expiresAt: '2035-01-01T00:00:00.000Z',
+      },
+    ],
+    expiresAt: '2035-01-01T00:00:00.000Z',
+    bindingSha256: 'f8da87caf2255e8c284e26346b39e81bf1ae452aee8cd0784d9ba077ea62e802',
+  };
+}
+
+function sourceOptions(): Options {
+  const binding = sourceBinding();
+  const admitted = admission();
+  const sourceScope = {
+    ...scope(),
+    userId: binding.owner.userId,
+    checkpointNamespace: createCheckpointNamespace(binding.owner.userId, 'tenant'),
+  };
+  return options({
+    user: { id: binding.owner.userId, tenantId: 'tenant' } as Options['user'],
+    durableCheckpointScope: sourceScope,
+    durableCheckpointAdmission: {
+      ...admitted,
+      principalId: binding.owner.userId,
+      continuation: {
+        ...admitted.continuation!,
+        checkpointNamespace: sourceScope.checkpointNamespace,
+        sourceBindingSha256: binding.bindingSha256,
+      },
+    },
+    durableCheckpointSourceBinding: binding,
+  });
+}
+
 function options(extra: Partial<Options> = {}): Options {
   return {
     signal: new AbortController().signal,
@@ -104,7 +151,7 @@ const lazySaver = { kind: 'lazy-fixture' };
 const sdk = jest.requireMock('@librechat/agents') as { CHECKPOINT_CONTINUATION_VERSION?: number };
 
 beforeEach(() => {
-  jest.clearAllMocks();
+  jest.resetAllMocks();
   sdk.CHECKPOINT_CONTINUATION_VERSION = 1;
   jest.mocked(agentsSdk.Run.create).mockResolvedValue(nativeRun as never);
   jest.mocked(getDurableAgentCheckpointer).mockResolvedValue(durableSaver as never);
@@ -135,7 +182,12 @@ it('binds the native durable saver and SDK sync policy without replacing Run', a
   await expect(
     createRun(options({ durableCheckpointScope: binding, eventActorCheckpointing: true })),
   ).resolves.toBe(nativeRun);
-  expect(getDurableAgentCheckpointer).toHaveBeenCalledWith(binding, undefined, admission());
+  expect(getDurableAgentCheckpointer).toHaveBeenCalledWith(
+    binding,
+    undefined,
+    admission(),
+    undefined,
+  );
   expect(getAgentCheckpointer).not.toHaveBeenCalled();
   expect(agentsSdk.Run.create).toHaveBeenCalledWith(
     expect.objectContaining({
@@ -147,6 +199,97 @@ it('binds the native durable saver and SDK sync policy without replacing Run', a
     }),
   );
 });
+
+it('captures and forwards the exact private source binding before the durable factory yields', async () => {
+  const input = sourceOptions();
+  const expected = sourceBinding();
+  jest
+    .mocked(getDurableAgentCheckpointer)
+    .mockImplementationOnce(async (_scope, _cfg, savedAdmission, savedSource) => {
+      expect(savedSource).toEqual(expected);
+      expect(savedSource).not.toBe(input.durableCheckpointSourceBinding);
+      expect(Object.isFrozen(savedSource)).toBe(true);
+      expect(Object.isFrozen(savedSource!.messages[0].sourceFileIds)).toBe(true);
+      expect(savedAdmission!.continuation!.sourceBindingSha256).toBe(savedSource!.bindingSha256);
+      Object.assign(input.durableCheckpointSourceBinding!.files[0], {
+        approvalSha256: 'f'.repeat(64),
+      });
+      input.durableCheckpointSourceBinding = undefined;
+      input.durableCheckpointAdmission!.continuation = {
+        ...admission().continuation!,
+        sourceBindingSha256: 'f'.repeat(64),
+      };
+      await Promise.resolve();
+      expect(savedSource).toEqual(expected);
+      return durableSaver as never;
+    });
+  await expect(createRun(input)).resolves.toBe(nativeRun);
+  expect(getAgentCheckpointer).not.toHaveBeenCalled();
+});
+
+it.each(['option', 'inherited option', 'binding field'] as const)(
+  'rejects a private source %s accessor without evaluating it',
+  async (kind) => {
+    const input = sourceOptions();
+    const getter = jest.fn(() => sourceBinding());
+    if (kind === 'option')
+      Object.defineProperty(input, 'durableCheckpointSourceBinding', { get: getter });
+    if (kind === 'inherited option') {
+      delete input.durableCheckpointSourceBinding;
+      Object.setPrototypeOf(
+        input,
+        Object.defineProperty({}, 'durableCheckpointSourceBinding', { get: getter }),
+      );
+    }
+    if (kind === 'binding field')
+      Object.defineProperty(input.durableCheckpointSourceBinding!, 'files', { get: getter });
+    await expect(createRun(input)).rejects.toThrow();
+    expect(getter).not.toHaveBeenCalled();
+    expect(getDurableAgentCheckpointer).not.toHaveBeenCalled();
+    expect(getAgentCheckpointer).not.toHaveBeenCalled();
+    expect(agentsSdk.Run.create).not.toHaveBeenCalled();
+  },
+);
+
+it.each([
+  'missing binding',
+  'missing digest',
+  'different digest',
+  'foreign owner',
+  'foreign tenant',
+  'missing scope',
+  'missing admission',
+])('rejects %s before source storage or SDK construction', async (kind) => {
+  const input = sourceOptions();
+  if (kind === 'missing binding') input.durableCheckpointSourceBinding = undefined;
+  if (kind === 'missing digest') input.durableCheckpointAdmission = admission();
+  if (kind === 'different digest')
+    input.durableCheckpointAdmission!.continuation = {
+      ...admission().continuation!,
+      sourceBindingSha256: 'f'.repeat(64),
+    };
+  if (kind === 'foreign owner')
+    Object.assign(input.durableCheckpointSourceBinding!.owner, { userId: 'foreign' });
+  if (kind === 'foreign tenant')
+    Object.assign(input.durableCheckpointSourceBinding!.owner, { tenantId: 'foreign' });
+  if (kind === 'missing scope') input.durableCheckpointScope = undefined;
+  if (kind === 'missing admission') input.durableCheckpointAdmission = undefined;
+  await expect(createRun(input)).rejects.toThrow();
+  expect(getDurableAgentCheckpointer).not.toHaveBeenCalled();
+  expect(getAgentCheckpointer).not.toHaveBeenCalled();
+  expect(agentsSdk.Run.create).not.toHaveBeenCalled();
+});
+
+it.each(['unavailable source', 'unknown source read commit'])(
+  'preserves %s failure without constructing a fallback run',
+  async (reason) => {
+    const failure = new Error(reason);
+    jest.mocked(getDurableAgentCheckpointer).mockRejectedValueOnce(failure);
+    await expect(createRun(sourceOptions())).rejects.toBe(failure);
+    expect(getAgentCheckpointer).not.toHaveBeenCalled();
+    expect(agentsSdk.Run.create).not.toHaveBeenCalled();
+  },
+);
 
 it.each([
   ['foreign owner', { userId: 'other' }, {}],

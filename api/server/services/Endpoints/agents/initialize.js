@@ -122,6 +122,8 @@ const { encodeAndFormat } = require('~/server/services/Files/images/encode');
 const { processCodeOutput, runPreviewFinalize } = require('~/server/services/Files/Code/process');
 const { determineFileType } = require('~/server/utils');
 
+const { getCheckpointPreparation } = require('~/server/services/Agents/checkpointRun');
+
 const SUBAGENT_GRAPH_LOAD_CONCURRENCY = 4;
 
 /**
@@ -226,10 +228,12 @@ const initializeClientWithProvider = async ({
   foregroundRunId,
   requestBody,
   toolTimingReplayEvents,
+  checkpointPreparation,
   upstreamTokenProvider,
   upstreamTokenProviderResolver,
   isResume,
 }) => {
+  const checkpointContext = getCheckpointPreparation(checkpointPreparation, req);
   if (!endpointOption) {
     throw new Error('Endpoint option not provided');
   }
@@ -255,7 +259,7 @@ const initializeClientWithProvider = async ({
   const startupTelemetry = getAgentStartupTelemetry(req);
 
   /** @type {string | null} */
-  const streamId = req._resumableStreamId || null;
+  let streamId = req._resumableStreamId || null;
 
   /** @type {Array<UsageMetadata>} */
   const collectedUsage = [];
@@ -432,6 +436,7 @@ const initializeClientWithProvider = async ({
    * server-owned per-agent map. This covers both traditional TOOL_END events
    * and event-driven ON_TOOL_EXECUTE callbacks. */
   const toolEndCallback = async (data, metadata = {}) => {
+    if (checkpointContext) throw new Error('Checkpoint-only execution excludes tool dispatch');
     /** Event-actor action receipt: recorded in graph context at execution time
      * so fork classification never races the asynchronously populated run-step
      * collection. Observational only — a recorder failure must not disturb the
@@ -489,6 +494,7 @@ const initializeClientWithProvider = async ({
       runSignal,
       executionContext,
     ) => {
+      if (checkpointContext) throw new Error('Checkpoint-only execution excludes tool dispatch');
       const ctx =
         getRoutedToolContext(agentId, executionContext) ??
         runFileBindings.getContext(agentId, executionContext) ??
@@ -701,7 +707,7 @@ const initializeClientWithProvider = async ({
   const allowedProviders = new Set(appConfig?.endpoints?.[EModelEndpoint.agents]?.allowedProviders);
 
   /** Event-driven mode: only load tool definitions, not full instances */
-  const loadTools = createToolLoader(
+  const ordinaryLoadTools = createToolLoader(
     req,
     res,
     signal,
@@ -711,6 +717,12 @@ const initializeClientWithProvider = async ({
     upstreamTokenProvider,
     upstreamTokenProviderResolver,
   );
+  const loadTools = checkpointContext
+    ? async ({ tools }) => {
+        if (tools?.length) throw new Error('Checkpoint-only execution excludes tool discovery');
+        return { tools: [], toolDefinitions: [], toolRegistry: new Map(), toolContextMap: {} };
+      }
+    : ordinaryLoadTools;
   /** @type {Array<MongoFile>} */
   const requestFiles = req.body.files ?? [];
   /** @type {string | undefined} */
@@ -771,6 +783,12 @@ const initializeClientWithProvider = async ({
     skillsCapabilityEnabled,
     ephemeralSkillsToggle,
   });
+  if (checkpointContext) {
+    checkpointContext.assertAgents([primaryAgent]);
+    if (primaryScopedSkillIds.length || manualSkills?.length || primarySkillAuthoringAvailable) {
+      throw new Error('Checkpoint-only execution excludes skill preparation');
+    }
+  }
   const primaryConfig = await initializeAgent(
     {
       useChatProjectContext: true,
@@ -931,7 +949,15 @@ const initializeClientWithProvider = async ({
       },
       // Pass through the `@librechat/api` exports so that tests which
       // `jest.mock('@librechat/api')` can override the initializer/validator.
-      initializeAgent,
+      initializeAgent: checkpointContext
+        ? async (params, methods) => {
+            checkpointContext.assertAgents([params.agent]);
+            if (params.accessibleSkillIds?.length || params.skillAuthoringAvailable) {
+              throw new Error('Checkpoint-only execution excludes skill preparation');
+            }
+            return initializeAgent(params, methods);
+          }
+        : initializeAgent,
       validateAgentModel,
     },
   );
@@ -947,6 +973,9 @@ const initializeClientWithProvider = async ({
   let userMCPAuthMap = discoveredMCPAuthMap;
   let edges = discoveredEdges;
 
+  if (checkpointContext && req.body?.addedConvo?.length) {
+    throw new Error('Checkpoint-only execution excludes additional conversation graphs');
+  }
   /** Multi-Convo: Process addedConvo for parallel agent execution */
   const { userMCPAuthMap: updatedMCPAuthMap } = await processAddedConvo({
     req,
@@ -1816,6 +1845,7 @@ const initializeClientWithProvider = async ({
         (config.subagentGraphConfigs?.length ?? 0) > 0),
   );
   const trustedSubagentTasks =
+    !checkpointContext &&
     backgroundToolsAvailable &&
     typeof req.user?.id === 'string' &&
     req.user.id !== '' &&
@@ -1920,18 +1950,19 @@ const initializeClientWithProvider = async ({
       conversationId,
     },
   );
-  const handlePrimeInvokedSkills = skillsCapabilityEnabled
-    ? (payload, skillNames) =>
-        primeInvokedSkillsForProfiles({
-          req,
-          payload,
-          skillNames,
-          signal,
-          accessibleSkillIds,
-          executionProfiles: codeExecutionProfiles,
-          ...getSkillToolDeps(),
-        })
-    : undefined;
+  const handlePrimeInvokedSkills =
+    skillsCapabilityEnabled && !checkpointContext
+      ? (payload, skillNames) =>
+          primeInvokedSkillsForProfiles({
+            req,
+            payload,
+            skillNames,
+            signal,
+            accessibleSkillIds,
+            executionProfiles: codeExecutionProfiles,
+            ...getSkillToolDeps(),
+          })
+      : undefined;
 
   /** Per-agent resolved endpoint token config, keyed by agent id. Built from
    *  `agentToolContexts` (the one map holding every agent, including pure
@@ -1973,75 +2004,85 @@ const initializeClientWithProvider = async ({
         }
       : null;
 
-  runFileBindings = createChatRunFileBindings({
-    req,
-    contexts: agentToolContexts,
-    createdAt: jobCreatedAt,
-    requestFiles,
-    audit: (event) => logger.info('[agents:run-files]', event),
-    getInputs: () => primaryConfig.currentRequestAttachments,
-    loadFiles: (fileIds) => db.getRunFileCandidates(fileIds, req.user.tenantId),
-    filterFiles: filterFilesByAgentAccess,
-    listPublications: db.listRunArtifacts,
-    provisioning: {
-      provisionToCodeEnv,
-      provisionToVectorDB,
-      updateFile: db.updateFile,
-      updateCodeEnvRef: db.updateFileCodeEnvRef,
-      addEmbeddedEntity: db.addFileEmbeddedEntity,
-    },
-    fileMethods: {
-      claimRunArtifactFile: db.claimRunArtifactFile,
-      publishRunArtifactFile: db.publishRunArtifactFile,
-      findRunArtifactFile: db.findRunArtifactFile,
-    },
-    processCodeOutput,
-    snapshotAdapter: {
-      request: createAxiosInstance(),
-      getAuthHeaders: getCodeApiAuthHeaders,
-      getBaseURL: getCodeExecutionBaseUrl,
-      determineFileType,
-    },
-    finalize: runPreviewFinalize,
-    getStrategyFunctions,
-    artifactPromises,
-    emitAttachment: createAttachmentEmitter({ res, streamId, jobCreatedAt }),
-    encoder: {
-      getAgent: (agentId) => agentToolContexts.get(agentId)?.fileEncodingAgent,
-      encodeImages: (request, files, params) =>
-        encodeAndFormat(request, files, params, VisionModes.agents),
-      encodeDocuments: encodeAndFormatDocuments,
-      encodeAudios: encodeAndFormatAudios,
-      encodeVideos: encodeAndFormatVideos,
-      extractText: extractFileContext,
-    },
-  });
-  toolExecuteOptions.runFiles = runFileBindings.session;
-  toolExecuteOptions.provisionFiles = runFileBindings.wrapProvision(
-    toolExecuteOptions.provisionFiles,
-  );
+  if (checkpointContext) {
+    checkpointContext.assertAgents([primaryConfig, ...agentConfigs.values()]);
+    if (subagentTasks || handlePrimeInvokedSkills) {
+      throw new Error('Checkpoint-only execution excludes auxiliary hosts');
+    }
+  } else {
+    runFileBindings = createChatRunFileBindings({
+      req,
+      contexts: agentToolContexts,
+      createdAt: jobCreatedAt,
+      requestFiles,
+      audit: (event) => logger.info('[agents:run-files]', event),
+      getInputs: () => primaryConfig.currentRequestAttachments,
+      loadFiles: (fileIds) => db.getRunFileCandidates(fileIds, req.user.tenantId),
+      filterFiles: filterFilesByAgentAccess,
+      listPublications: db.listRunArtifacts,
+      provisioning: {
+        provisionToCodeEnv,
+        provisionToVectorDB,
+        updateFile: db.updateFile,
+        updateCodeEnvRef: db.updateFileCodeEnvRef,
+        addEmbeddedEntity: db.addFileEmbeddedEntity,
+      },
+      fileMethods: {
+        claimRunArtifactFile: db.claimRunArtifactFile,
+        publishRunArtifactFile: db.publishRunArtifactFile,
+        findRunArtifactFile: db.findRunArtifactFile,
+      },
+      processCodeOutput,
+      snapshotAdapter: {
+        request: createAxiosInstance(),
+        getAuthHeaders: getCodeApiAuthHeaders,
+        getBaseURL: getCodeExecutionBaseUrl,
+        determineFileType,
+      },
+      finalize: runPreviewFinalize,
+      getStrategyFunctions,
+      artifactPromises,
+      emitAttachment: createAttachmentEmitter({ res, streamId, jobCreatedAt }),
+      encoder: {
+        getAgent: (agentId) => agentToolContexts.get(agentId)?.fileEncodingAgent,
+        encodeImages: (request, files, params) =>
+          encodeAndFormat(request, files, params, VisionModes.agents),
+        encodeDocuments: encodeAndFormatDocuments,
+        encodeAudios: encodeAndFormatAudios,
+        encodeVideos: encodeAndFormatVideos,
+        extractText: extractFileContext,
+      },
+    });
+    toolExecuteOptions.runFiles = runFileBindings.session;
+    toolExecuteOptions.provisionFiles = runFileBindings.wrapProvision(
+      toolExecuteOptions.provisionFiles,
+    );
+  }
 
-  const eventHandlers = getDefaultHandlers({
-    res,
-    contentParts,
-    stepMap,
-    toolInputValidationErrors,
-    toolExecuteOptions,
-    summarizationOptions,
-    aggregateContent,
-    toolEndCallback,
-    collectedUsage,
-    collectedThoughtSignatures,
-    streamId,
-    jobCreatedAt,
-    subagentAggregatorsByToolCallId,
-    usageCost,
-    contextUsageSink,
-    usageEmitSink,
-    eventChildActivity,
-    resolveMcpServerName,
-    toolTimingReplayEvents,
-  });
+  const buildEventHandlers = () =>
+    getDefaultHandlers({
+      res,
+      contentParts,
+      stepMap,
+      toolInputValidationErrors,
+      toolExecuteOptions,
+      summarizationOptions,
+      aggregateContent,
+      toolEndCallback,
+      collectedUsage,
+      collectedThoughtSignatures,
+      streamId,
+      jobCreatedAt,
+      subagentAggregatorsByToolCallId,
+      usageCost,
+      contextUsageSink,
+      usageEmitSink,
+      eventChildActivity,
+      resolveMcpServerName,
+      toolTimingReplayEvents,
+    });
+
+  const eventHandlers = checkpointContext ? {} : buildEventHandlers();
 
   const client = new AgentClient({
     req,
@@ -2071,7 +2112,8 @@ const initializeClientWithProvider = async ({
     endpoint: isEphemeralAgentId(primaryConfig.id) ? primaryConfig.endpoint : EModelEndpoint.agents,
     subagentAggregatorsByToolCallId,
     subagentTasks,
-    runFiles: runFileBindings.session,
+    runFiles: runFileBindings?.session,
+    checkpointPreparation,
     /** Resolved endpoint token/pricing config so spending and cost reflect
      *  configured rates for custom-endpoint agents instead of defaults. */
     endpointTokenConfig: primaryConfig.endpointTokenConfig,
@@ -2090,11 +2132,36 @@ const initializeClientWithProvider = async ({
     mcpRequestBody: runtimeRequestBody,
   });
 
-  if (streamId) {
+  if (streamId && !checkpointContext) {
     GenerationJobManager.setCollectedUsage(streamId, collectedUsage, jobCreatedAt);
   }
 
-  return { client, userMCPAuthMap };
+  let checkpointBound = false;
+  return {
+    client,
+    userMCPAuthMap,
+    ...(checkpointContext && {
+      bindCheckpointGeneration(job) {
+        if (
+          checkpointBound ||
+          !Number.isSafeInteger(job.createdAt) ||
+          job.streamId !== conversationId
+        ) {
+          throw new Error('Checkpoint generation binding changed');
+        }
+        checkpointBound = true;
+        streamId = job.streamId;
+        jobCreatedAt = job.createdAt;
+        signal = job.abortController.signal;
+        toolExecuteOptions.runSignal = signal;
+        client.jobCreatedAt = jobCreatedAt;
+        client.checkpointNamespace = job.metadata.checkpointNamespace;
+        client.options.jobCreatedAt = jobCreatedAt;
+        client.options.eventHandlers = buildEventHandlers();
+        GenerationJobManager.setCollectedUsage(streamId, collectedUsage, jobCreatedAt);
+      },
+    }),
+  };
 };
 
 /**

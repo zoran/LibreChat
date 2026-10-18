@@ -5,14 +5,14 @@ import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import { emptyCheckpoint } from '@langchain/langgraph-checkpoint';
 import { MongoDBSaver } from '@langchain/langgraph-checkpoint-mongodb';
-import type { RunnableConfig } from '@langchain/core/runnables';
 import type { CheckpointTuple, CheckpointListOptions } from '@langchain/langgraph-checkpoint';
-import { checkpointTestEnvironment } from './__tests__/helpers/mongo';
+import type { RunnableConfig } from '@langchain/core/runnables';
 import {
   OwnedMongoSaver,
   LIBRECHAT_CHECKPOINT_OWNER_KEY,
   LIBRECHAT_LEGACY_CHECKPOINT_KEY,
 } from './saver';
+import { checkpointTestEnvironment } from './__tests__/helpers/mongo';
 
 const owner = `lcg:v2:${'a'.repeat(64)}:`;
 const metadata = { source: 'input' as const, step: -1, parents: {} };
@@ -282,17 +282,18 @@ it('matches installed native get/list/filter/before/limit/parent/pending semanti
 });
 
 it('preserves the native empty parent distinction and retains unowned duplicate pending slots', async () => {
-  const config = await saver.put(
+  // Historical duplicates predate write-index admission; reading must preserve them.
+  const native = nativeSaver();
+  const config = await native.put(
     { configurable: { ...base.configurable, checkpoint_id: '' } },
     emptyCheckpoint(),
     metadata,
   );
-  await saver.putWrites(config, [['events', 'first']], 'task');
+  await native.putWrites(config, [['events', 'first']], 'task');
   const collection = mongoose.connection.db!.collection(collections.checkpointWritesCollectionName);
   const row = await collection.findOne({});
   const { _id, ...duplicate } = row!;
   await collection.insertOne(duplicate);
-  const native = nativeSaver();
   expect(await saver.getTuple(config)).toEqual(await native.getTuple(config));
   expect((await saver.getTuple(config))?.pendingWrites).toHaveLength(2);
   expect(await collect(saver.list(config))).toEqual(await collect(native.list(config)));

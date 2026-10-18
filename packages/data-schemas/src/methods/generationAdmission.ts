@@ -1,6 +1,8 @@
 import type { ClientSession, FilterQuery } from 'mongoose';
 import type {
   GenerationAdmissionKey,
+  GenerationAdmissionStorageRecord,
+  GenerationPreparationInput,
   GenerationAdmissionSuccessor,
   GenerationAdmissionInput,
   GenerationAdmissionRecord,
@@ -10,8 +12,13 @@ import type {
   GenerationAdmissionResult,
   GenerationCheckpointBinding,
   GenerationCheckpointRecoveryEvidence,
+  GenerationAdmissionRecoveryReceipt,
+  GenerationCheckpointSourceRecovery,
+  GenerationCheckpointRecoverySource,
 } from '~/types/generationAdmission';
+import { createCheckpointSourceMethods, snapshotCheckpointSourceBinding } from './checkpointSource';
 import { createGenerationAdmissionModel } from '~/models/generationAdmission';
+import { createGenerationPreparationMethods } from './generationPreparation';
 
 /** Unexpected storage failures expose a safe code, never database/query/credential text. */
 export class GenerationAdmissionStorageError extends Error {
@@ -117,14 +124,24 @@ function dataSnapshot<T>(value: T): T {
     throw new Error();
   return Object.create(null, descriptors) as T;
 }
+/** Captures identity before native job creation; this grants no admission or source access. */
+export function snapshotGenerationCheckpointBinding(
+  input: GenerationCheckpointBinding,
+): Readonly<GenerationCheckpointBinding> {
+  try {
+    const data = dataSnapshot(input);
+    if (!validContinuation(data)) throw new Error();
+    return Object.freeze(continuation(data));
+  } catch {
+    throw new Error('Invalid generation checkpoint binding');
+  }
+}
 function snapshotAdmission(input: GenerationAdmissionInput): Readonly<GenerationAdmissionInput> {
   const data = dataSnapshot(input);
-  const copy = fence({
-    ...data,
-    ...(data.continuation === undefined ? {} : { continuation: dataSnapshot(data.continuation) }),
-  });
+  const copy = fence({ ...data, continuation: undefined });
+  if (data.continuation !== undefined)
+    copy.continuation = snapshotGenerationCheckpointBinding(data.continuation);
   if (!valid(copy)) throw new Error();
-  if (copy.continuation !== undefined) Object.freeze(copy.continuation);
   return Object.freeze(copy);
 }
 /** One detached, immutable server-owned admission snapshot shared by checkpoint consumers. */
@@ -155,7 +172,11 @@ function sameContinuation(
     left.sourceBindingSha256 === right.sourceBindingSha256
   );
 }
-function plain(row: GenerationAdmissionRecord): GenerationAdmissionRecord {
+class PreparationHeldError extends Error {}
+function plain(value: GenerationAdmissionStorageRecord): GenerationAdmissionRecord {
+  if (!['admitted', 'dispatching', 'settled'].includes(value.state))
+    throw new PreparationHeldError();
+  const row = value as GenerationAdmissionRecord;
   return {
     ...fence(row),
     state: row.state,
@@ -225,6 +246,7 @@ function errorLabel(error: unknown, label: string): boolean {
   );
 }
 function storageFailure(error: unknown): GenerationAdmissionResult<never> {
+  if (error instanceof PreparationHeldError) return failure('HELD');
   if (unknownWrite(error)) return failure('OUTCOME_UNKNOWN');
   throw new GenerationAdmissionStorageError();
 }
@@ -244,6 +266,12 @@ export function createGenerationAdmissionMethods(
       });
     await indexes;
   }
+  const preparationMethods = createGenerationPreparationMethods({
+    model: Model,
+    ensureIndexes: ensureGenerationAdmissionIndexes,
+    snapshotBinding: snapshotGenerationCheckpointBinding,
+    storageFailure,
+  });
   async function read(input: GenerationAdmissionKey): Promise<GenerationAdmissionRecord | null> {
     const row = await Model.findOne(key(input)).read('primary').readConcern('majority').lean();
     return row ? plain(row) : null;
@@ -257,13 +285,22 @@ export function createGenerationAdmissionMethods(
       return storageFailure(error);
     }
   }
-  async function acquireGenerationAdmission(input: GenerationAdmissionInput) {
+  async function acquireGenerationAdmission(
+    input: GenerationAdmissionInput,
+    preparation?: GenerationPreparationInput,
+  ) {
     try {
       input = snapshotAdmission(input);
     } catch {
       return failure('INVALID_INPUT');
     }
     await ensureGenerationAdmissionIndexes();
+    if (preparation) {
+      const result = await preparationMethods.acquirePreparedGeneration(input, preparation);
+      return result.ok
+        ? { ok: true as const, value: { acquired: true, record: plain(result.value) } }
+        : result;
+    }
     try {
       const [row] = await Model.create(
         [
@@ -457,7 +494,8 @@ export function createGenerationAdmissionMethods(
     predecessor: GenerationAdmissionInput,
     evidence: GenerationCheckpointRecoveryEvidence,
     successor: GenerationAdmissionSuccessor,
-  ): Promise<GenerationAdmissionResult<GenerationAdmissionRecord>> {
+    recoverSources?: GenerationCheckpointSourceRecovery,
+  ): Promise<GenerationAdmissionResult<GenerationAdmissionRecoveryReceipt>> {
     try {
       predecessor = snapshotGenerationCheckpointAdmission(predecessor);
       evidence = {
@@ -483,9 +521,11 @@ export function createGenerationAdmissionMethods(
       successor.segmentId === predecessor.segmentId
     )
       return failure('INVALID_INPUT');
+    const sourceHash = predecessor.continuation!.sourceBindingSha256;
+    if (sourceHash !== undefined && typeof recoverSources !== 'function') return failure('HELD');
     await ensureGenerationAdmissionIndexes();
-    try {
-      const row = await Model.findOneAndUpdate(
+    const recover = (session?: ClientSession) => {
+      return Model.findOneAndUpdate(
         {
           ...queryFence(predecessor),
           active: true,
@@ -522,12 +562,120 @@ export function createGenerationAdmissionMethods(
             },
           },
         ],
-        { new: true, writeConcern },
+        session
+          ? { new: true, session, maxTimeMS: 5000 }
+          : { new: true, writeConcern, maxTimeMS: 5000 },
       ).lean();
-      return row ? { ok: true, value: plain(row) } : failure('HELD');
-    } catch (error) {
-      return storageFailure(error);
+    };
+    // Ordinary recovery keeps its existing standalone Mongo semantics.
+    if (sourceHash === undefined) {
+      try {
+        const row = await recover();
+        return row
+          ? { ok: true, value: Object.freeze({ admission: plain(row) }) }
+          : failure('HELD');
+      } catch (error) {
+        return storageFailure(error);
+      }
     }
+    for (let attempt = 0; attempt < 3; attempt++) {
+      let session: ClientSession;
+      try {
+        session = await mongoose.startSession();
+      } catch (error) {
+        return storageFailure(error);
+      }
+      let committing = false;
+      let retry = false;
+      let result: GenerationAdmissionResult<GenerationAdmissionRecoveryReceipt> = failure('HELD');
+      try {
+        session.startTransaction({
+          readConcern: { level: 'snapshot' },
+          writeConcern,
+          maxCommitTimeMS: 5000,
+        });
+        const row = await recover(session);
+        if (row === null) {
+          await session.abortTransaction();
+        } else {
+          const candidate = dataSnapshot(await recoverSources!(predecessor, session));
+          const owner = {
+            userId: predecessor.principalId,
+            tenantId: predecessor.tenantId === '__single_tenant__' ? null : predecessor.tenantId,
+          };
+          const binding = snapshotCheckpointSourceBinding(owner, candidate.sourceBinding);
+          const checkpoint = dataSnapshot(candidate.checkpoint);
+          if (
+            binding.bindingSha256 !== sourceHash ||
+            checkpoint.threadId !== predecessor.conversationId ||
+            checkpoint.checkpointNs !== '' ||
+            typeof checkpoint.checkpointId !== 'string' ||
+            !checkpoint.checkpointId.length ||
+            checkpoint.checkpointId.length > 4096 ||
+            Array.from(checkpoint.checkpointId).some(
+              (character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127,
+            ) ||
+            !Number.isSafeInteger(candidate.expiresAt) ||
+            candidate.expiresAt <= Date.now() ||
+            candidate.expiresAt > Date.parse(binding.expiresAt)
+          )
+            throw new Error('Unverified source recovery');
+          const source: GenerationCheckpointRecoverySource = Object.freeze({
+            sourceBinding: binding,
+            checkpoint: Object.freeze({
+              threadId: checkpoint.threadId,
+              checkpointId: checkpoint.checkpointId,
+              checkpointNs: '' as const,
+            }),
+            expiresAt: candidate.expiresAt,
+          });
+          await createCheckpointSourceMethods(mongoose).fenceCheckpointSources(
+            owner,
+            binding,
+            session,
+          );
+          if (source.expiresAt <= Date.now()) throw new Error('Source recovery expired');
+          committing = true;
+          await session.commitTransaction();
+          result = { ok: true, value: Object.freeze({ admission: plain(row), source }) };
+        }
+      } catch (error) {
+        let abortUncertain = false;
+        if (session.inTransaction()) {
+          try {
+            await session.abortTransaction();
+          } catch {
+            abortUncertain = true;
+          }
+        }
+        if (
+          !committing &&
+          !abortUncertain &&
+          !unknownWrite(error) &&
+          code(error) === 112 &&
+          errorLabel(error, 'TransientTransactionError')
+        ) {
+          retry = attempt < 2;
+        } else {
+          result =
+            committing || abortUncertain || unknownWrite(error)
+              ? failure('OUTCOME_UNKNOWN')
+              : failure('HELD');
+        }
+      } finally {
+        try {
+          await session.endSession();
+        } catch {
+          result = failure('OUTCOME_UNKNOWN');
+          retry = false;
+        }
+      }
+      if (retry) continue;
+      if (result.ok && result.value.source!.expiresAt <= Date.now())
+        return failure('OUTCOME_UNKNOWN');
+      return result;
+    }
+    return failure('HELD');
   }
   async function writeGenerationCheckpoint<T>(
     input: GenerationAdmissionInput,
@@ -639,6 +787,8 @@ export function createGenerationAdmissionMethods(
     }
   }
   return {
+    beginGenerationPreparation: preparationMethods.beginGenerationPreparation,
+    completeGenerationPreparation: preparationMethods.completeGenerationPreparation,
     recoverGenerationAdmission,
     writeGenerationCheckpoint,
     cancelUndispatchedGenerationAdmission,

@@ -42,6 +42,7 @@ describe('native checkpoint recovery coordinator', () => {
     },
   });
   const ports = (): GenerationCheckpointRecoveryPorts => ({
+    adoptRecoveredGeneration: jest.fn(async () => true),
     authorize: jest.fn(async () => true),
     confirmTerminatedOwner: jest.fn(async (predecessor) => ({
       predecessor,
@@ -110,9 +111,9 @@ describe('native checkpoint recovery coordinator', () => {
     });
     if (row.ok) expect(row.value?.terminal).toBeUndefined();
     expect(Object.isFrozen(results[winner])).toBe(true);
-    expect(Object.isFrozen(results[winner]?.continuation)).toBe(true);
+    expect(Object.isFrozen(results[winner]?.admission.continuation)).toBe(true);
     await expect(
-      getDurableAgentCheckpointer(scope(), undefined, results[winner]),
+      getDurableAgentCheckpointer(scope(), undefined, results[winner]?.admission),
     ).resolves.toBeDefined();
     await expect(getDurableAgentCheckpointer(scope(), undefined, input())).rejects.toThrow(
       'active dispatch',
@@ -240,7 +241,7 @@ describe('native checkpoint recovery coordinator', () => {
       return true;
     };
     const recovered = await owner.recoverCheckpoint('conversation', supplied, 'next', proof);
-    expect(recovered?.continuation?.runId).toBe('response');
+    expect(recovered?.admission.continuation?.runId).toBe('response');
     expect(order).toEqual(['terminated', 'effects', 'authorized']);
   });
 
@@ -301,7 +302,7 @@ describe('native checkpoint recovery coordinator', () => {
     });
   });
 
-  it('retains a late acknowledged owner during closure for real cancellation, never dispatch', async () => {
+  it('holds a late Mongo acknowledgment before host adoption during closure', async () => {
     await seed();
     const owner = coordinator();
     const recover = methods.recoverGenerationAdmission;
@@ -315,9 +316,63 @@ describe('native checkpoint recovery coordinator', () => {
     expect(await owner.recoverCheckpoint('conversation', input(), 'next', ports())).toBeUndefined();
     expect(await dispatch(owner, 'next')).toBe(false);
     expect((await owner.census(idle)).unresolved).toBe(1);
-    expect(await owner.cancel('conversation', 7, 'next')).toBe(true);
-    expect((await owner.census(idle)).unresolved).toBe(0);
+    expect(await owner.cancel('conversation', 7, 'next')).toBe(false);
+    expect((await owner.census(idle)).unresolved).toBe(1);
+    expect(await methods.getGenerationAdmission(input())).toMatchObject({
+      ok: true,
+      value: { state: 'admitted', segmentId: 'next' },
+    });
     spy.mockRestore();
+  });
+
+  it.each(['denied', 'thrown', 'closed'])(
+    'retains HELD after a real Mongo commit when adoption is %s',
+    async (failure) => {
+      await seed();
+      const owner = coordinator();
+      const proof = ports();
+      proof.adoptRecoveredGeneration = async () => {
+        if (failure === 'thrown') throw new Error('Unknown jobstore outcome');
+        if (failure === 'closed') owner.close('maintenance');
+        return failure === 'closed';
+      };
+      expect(await owner.recoverCheckpoint('conversation', input(), 'next', proof)).toBeUndefined();
+      expect(await dispatch(owner, 'next')).toBe(false);
+      expect((await owner.census(idle)).unresolved).toBe(1);
+      expect(await methods.getGenerationAdmission(input())).toMatchObject({
+        ok: true,
+        value: { state: 'admitted', segmentId: 'next', active: true },
+      });
+    },
+  );
+
+  it('allows dispatch only after the host adoption acknowledgment completes', async () => {
+    await seed();
+    const owner = coordinator();
+    let release!: () => void;
+    let entered!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const wait = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const proof = ports();
+    proof.adoptRecoveredGeneration = async () => {
+      entered();
+      await wait;
+      return true;
+    };
+    const recovering = owner.recoverCheckpoint('conversation', input(), 'next', proof);
+    try {
+      await barrier;
+      expect(owner.canBeginProviderExecution('conversation', 7, 'next')).toBe(false);
+      expect(await dispatch(owner, 'next')).toBe(false);
+    } finally {
+      release();
+    }
+    expect(await recovering).toBeDefined();
+    expect(await dispatch(owner, 'next')).toBe(true);
   });
 
   it('refuses malformed/foreign/disabled/local-live recovery before calling proof ports', async () => {

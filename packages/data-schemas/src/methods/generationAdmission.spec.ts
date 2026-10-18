@@ -52,6 +52,82 @@ describe('durable generation admission', () => {
       },
     });
   }
+  const preparation = () => {
+    const { generationEpoch: _epoch, segmentId: _segment, ...identity } = input;
+    return { ...identity, preparationAttemptId: 'exact-native-claim-token' };
+  };
+  const continuation = () => ({
+    version: 1 as const,
+    mode: 'checkpoint-only-v1' as const,
+    runId: 'run',
+    threadId: input.conversationId,
+    checkpointNamespace: 'private-namespace',
+    graphFingerprint: 'c'.repeat(64),
+    policyFingerprint: 'd'.repeat(64),
+    sourceBindingSha256: 'e'.repeat(64),
+  });
+  it('holds preparation without inventing an epoch and admits only the exact completed attempt', async () => {
+    const attempt = preparation();
+    expect((await methods.beginGenerationPreparation!(attempt)).ok).toBe(true);
+    const held = await mongoose.models.GenerationAdmission.findOne({}).lean();
+    expect(held).toMatchObject({
+      state: 'preparing',
+      preparationAttemptId: attempt.preparationAttemptId,
+    });
+    expect(held).not.toHaveProperty('generationEpoch');
+    expect(held).not.toHaveProperty('segmentId');
+    expect(await methods.getGenerationAdmission(input)).toEqual({
+      ok: false,
+      error: { code: 'HELD' },
+    });
+    expect((await methods.acquireGenerationAdmission(input)).ok).toBe(false);
+    expect((await methods.completeGenerationPreparation!(attempt, continuation())).ok).toBe(true);
+    expect(
+      (
+        await methods.acquireGenerationAdmission(
+          { ...input, continuation: continuation() },
+          { ...attempt, preparationAttemptId: 'other' },
+        )
+      ).ok,
+    ).toBe(false);
+    const admitted = await methods.acquireGenerationAdmission(
+      { ...input, continuation: continuation() },
+      attempt,
+    );
+    expect(admitted.ok && admitted.value.acquired).toBe(true);
+    expect(
+      (await methods.dispatchGenerationAdmission({ ...input, continuation: continuation() })).ok,
+    ).toBe(true);
+  });
+  it.each(['begin', 'complete'] as const)(
+    'retains a lost %s preparation acknowledgement across fresh method instances',
+    async (stage) => {
+      const attempt = preparation();
+      if (stage === 'complete') await methods.beginGenerationPreparation!(attempt);
+      await uncertain(stage === 'begin' ? 'insert' : 'findAndModify');
+      const result =
+        stage === 'begin'
+          ? await methods.beginGenerationPreparation!(attempt)
+          : await methods.completeGenerationPreparation!(attempt, continuation());
+      expect(result).toEqual({ ok: false, error: { code: 'OUTCOME_UNKNOWN' } });
+      const fresh = createGenerationAdmissionMethods(mongoose);
+      expect(await fresh.getGenerationAdmission(input)).toEqual({
+        ok: false,
+        error: { code: 'HELD' },
+      });
+      expect(
+        (
+          await fresh.beginGenerationPreparation!({
+            ...attempt,
+            preparationAttemptId: 'replacement',
+          })
+        ).ok,
+      ).toBe(false);
+      expect((await fresh.acquireGenerationAdmission(input)).ok).toBe(false);
+      expect((await fresh.dispatchGenerationAdmission(input)).ok).toBe(false);
+      expect(await mongoose.models.GenerationAdmission.countDocuments({ active: true })).toBe(1);
+    },
+  );
   it('acquires once across concurrent owners and returns plain same-request receipts', async () => {
     const results = await Promise.all(
       Array.from({ length: 12 }, (_, i) =>

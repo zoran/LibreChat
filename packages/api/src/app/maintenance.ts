@@ -581,6 +581,12 @@ export async function initializeMaintenanceGeneration(deps: {
   }): void;
 }): Promise<void> {
   const methods: GenerationAdmissionMethods = {
+    ...(deps.methods.beginGenerationPreparation && deps.methods.completeGenerationPreparation
+      ? {
+          beginGenerationPreparation: deps.methods.beginGenerationPreparation,
+          completeGenerationPreparation: deps.methods.completeGenerationPreparation,
+        }
+      : {}),
     ensureGenerationAdmissionIndexes: deps.methods.ensureGenerationAdmissionIndexes,
     acquireGenerationAdmission: deps.methods.acquireGenerationAdmission,
     getGenerationAdmission: deps.methods.getGenerationAdmission,

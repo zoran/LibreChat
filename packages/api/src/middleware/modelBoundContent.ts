@@ -11,6 +11,7 @@ import type {
   MessageFilterPiiConfig,
   UserSubmittedMessageFieldPath,
 } from 'librechat-data-provider';
+import type { BaseMessage } from '@librechat/agents/langchain/messages';
 import type {
   AgentContentInput,
   AssistantActionContentInput,
@@ -3257,22 +3258,10 @@ function snapshotBoundedSourceFileIds(
   return { values, overflowed };
 }
 
-/** Creates a run-stable callback shared by root, summary, and subagent model clients. */
-export function createModelBoundChatModelCallback(
+/** One run-stable policy/provenance snapshot shared by persistence and actual model boundaries. */
+function createModelBoundInspection(
   input: Omit<ModelBoundProviderContentInput, 'providerMessages'>,
-  options: {
-    readonly onContentRejected?: (error: unknown) => void;
-    readonly onSourceProjection?: (sources: {
-      fileIds: readonly string[];
-      sourceMessageIds: readonly string[];
-    }) => Promise<void>;
-    readonly onContentAllowed?: (context: {
-      runId?: string;
-      parentRunId?: string;
-      metadata?: Record<string, unknown>;
-    }) => void | Promise<void>;
-  } = {},
-): ModelBoundChatModelCallback {
+) {
   const storedMessageSnapshot = snapshotBoundedProviderArray(input.storedMessages);
   const resolvedFileSnapshot = snapshotBoundedProviderArray(input.resolvedFiles);
   const sourceFileIdSnapshot = snapshotBoundedSourceFileIds(input.fileIdsBySourceMessageId);
@@ -3292,6 +3281,51 @@ export function createModelBoundChatModelCallback(
       sourceFileIdSnapshot.overflowed ||
       input.sourceFileProjectionOverflowed === true,
   );
+  return { stableInput, index };
+}
+
+/** Pure inspection only: never grants model admission, starts persistence, or resolves sources. */
+export function createModelBoundInputInspector(
+  input: Omit<ModelBoundProviderContentInput, 'providerMessages'>,
+): (messages: readonly (ModelBoundProviderMessage | BaseMessage)[]) => Readonly<{
+  fileIds: readonly string[];
+  sourceMessageIds: readonly string[];
+}> {
+  const { stableInput, index } = createModelBoundInspection(input);
+  return (messages) => {
+    if (!Array.isArray(messages)) throw new ContentTraversalLimitError();
+    const projection = assertIndexedModelBoundProviderContent(
+      // The existing bounded projector validates native metadata/provenance, including unknown fields.
+      { ...stableInput, providerMessages: messages as readonly ModelBoundProviderMessage[] },
+      index,
+      undefined,
+      true,
+    );
+    if (!projection) throw new ContentTraversalLimitError();
+    return Object.freeze({
+      fileIds: Object.freeze([...projection.sourceFileIds]),
+      sourceMessageIds: Object.freeze([...projection.sourceMessageIds]),
+    });
+  };
+}
+
+/** Creates a run-stable callback shared by root, summary, and subagent model clients. */
+export function createModelBoundChatModelCallback(
+  input: Omit<ModelBoundProviderContentInput, 'providerMessages'>,
+  options: {
+    readonly onContentRejected?: (error: unknown) => void;
+    readonly onSourceProjection?: (sources: {
+      fileIds: readonly string[];
+      sourceMessageIds: readonly string[];
+    }) => Promise<void>;
+    readonly onContentAllowed?: (context: {
+      runId?: string;
+      parentRunId?: string;
+      metadata?: Record<string, unknown>;
+    }) => void | Promise<void>;
+  } = {},
+): ModelBoundChatModelCallback {
+  const { stableInput, index } = createModelBoundInspection(input);
   const callback: ModelBoundChatModelCallback = Object.freeze({
     name: 'librechat-model-bound-content-filter',
     raiseError: true,

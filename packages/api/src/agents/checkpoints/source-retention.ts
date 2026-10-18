@@ -1,12 +1,12 @@
-/** Native checkpoint deletion owns atomic release of existing File copy liabilities. */
+/** Native checkpoint rows own exact File copy liabilities in their caller's transaction. */
 import mongoose from 'mongoose';
 import { performance } from 'node:perf_hooks';
 import {
   resizeRetainedDerivatives,
   snapshotCheckpointSourceBinding,
 } from '@librechat/data-schemas';
-import type { RetainedTextAllocation } from '@librechat/data-schemas';
-import type { Document, Filter } from 'mongodb';
+import type { CheckpointSourceBinding, RetainedTextAllocation } from '@librechat/data-schemas';
+import type { Document, Filter, UpdateOneModel, UpdateFilter } from 'mongodb';
 import type { ResolvedCheckpointerConfig } from './config';
 import { checkpointOwnerNamespacePrefix } from '../../stream/checkpoints';
 
@@ -16,8 +16,12 @@ const SOURCE_FIELDS = [
   'lc_source_expires_at',
   'lc_retained_allocations',
 ] as const;
-const SOURCE_FREE = Object.fromEntries(SOURCE_FIELDS.map((field) => [field, { $exists: false }]));
-const SOURCE_PRESENT = { $or: SOURCE_FIELDS.map((field) => ({ [field]: { $exists: true } })) };
+export const SOURCE_FREE = Object.fromEntries(
+  SOURCE_FIELDS.map((field) => [field, { $exists: false }]),
+);
+export const SOURCE_PRESENT = {
+  $or: SOURCE_FIELDS.map((field) => ({ [field]: { $exists: true } })),
+};
 const BATCH_ROWS = 16;
 const MAX_METADATA_BYTES = 65536;
 
@@ -31,13 +35,15 @@ type PurgeStorage = Pick<
 >;
 type MetadataRow = { meta: Document | null; bytes: number; metadataBytes: number };
 
-function liability(row: MetadataRow): {
+export function checkpointRowLiability(row: MetadataRow): {
+  binding: CheckpointSourceBinding;
   owner: { userId: string; tenantId: string | null };
   allocation: RetainedTextAllocation;
 } {
   const meta = row.meta;
   if (
     !meta ||
+    !(meta._id instanceof mongoose.mongo.ObjectId) ||
     !SOURCE_FIELDS.every((field) => Object.prototype.hasOwnProperty.call(meta, field)) ||
     Object.prototype.hasOwnProperty.call(meta, 'upserted_at')
   )
@@ -84,7 +90,132 @@ function liability(row: MetadataRow): {
     allocations[0].bytes !== row.bytes
   )
     held();
-  return { owner, allocation: { fileId: ids[0], bytes: row.bytes } };
+  return { binding, owner, allocation: { fileId: ids[0], bytes: row.bytes } };
+}
+
+/** Private writer only: source fences and generation authority belong to the enclosing transaction. */
+export async function writeCheckpointSourceRows(
+  input: {
+    collectionName: string;
+    operations: readonly UpdateOneModel<Document>[];
+    binding: CheckpointSourceBinding;
+    expiresAt: Date;
+    maxBsonBytes: number;
+  },
+  session: mongoose.ClientSession,
+): Promise<void> {
+  if (
+    !(session instanceof mongoose.mongo.ClientSession) ||
+    session.hasEnded ||
+    !session.inTransaction()
+  )
+    held();
+  const binding = snapshotCheckpointSourceBinding(input.binding.owner, input.binding);
+  let expiry = input.expiresAt.getTime();
+  if (
+    !Number.isFinite(expiry) ||
+    expiry <= Date.now() ||
+    expiry > Date.parse(binding.expiresAt) ||
+    input.operations.length > 1024 ||
+    !Number.isSafeInteger(input.maxBsonBytes) ||
+    input.maxBsonBytes <= 0
+  )
+    held();
+  const db = mongoose.connection.db;
+  if (!db) held();
+  const collection = db.collection(input.collectionName);
+  const prefix = checkpointOwnerNamespacePrefix(
+    binding.owner.userId,
+    binding.owner.tenantId ?? undefined,
+  );
+  const projection = Object.fromEntries(
+    ['_id', 'thread_id', 'checkpoint_ns', 'lc_owner', 'upserted_at', ...SOURCE_FIELDS].map(
+      (field) => [field, `$${field}`],
+    ),
+  );
+  const read = (filter: Document) =>
+    collection
+      .aggregate<MetadataRow>(
+        [
+          { $match: filter },
+          { $limit: 2 },
+          { $project: { _id: 0, bytes: { $bsonSize: '$$ROOT' }, meta: projection } },
+          { $set: { metadataBytes: { $bsonSize: '$meta' } } },
+          {
+            $project: {
+              bytes: 1,
+              metadataBytes: 1,
+              meta: { $cond: [{ $lte: ['$metadataBytes', MAX_METADATA_BYTES] }, '$meta', null] },
+            },
+          },
+        ],
+        { session, collation: { locale: 'simple' }, maxTimeMS: 5000 },
+      )
+      .toArray();
+  for (const operation of input.operations) {
+    const { lc_owner: owner, ...slot } = operation.filter;
+    if (
+      owner !== prefix ||
+      typeof slot.thread_id !== 'string' ||
+      !slot.thread_id.startsWith(prefix) ||
+      typeof slot.checkpoint_ns !== 'string' ||
+      !slot.checkpoint_ns.startsWith(prefix)
+    )
+      held();
+    const previous = await read(slot);
+    if (previous.length > 1) held();
+    const prior = previous[0] ? checkpointRowLiability(previous[0]) : undefined;
+    if (prior && prior.binding.bindingSha256 !== binding.bindingSha256) held();
+    const update = operation.update as UpdateFilter<Document>;
+    if (Array.isArray(update) || (!update.$set && !update.$setOnInsert)) held();
+    if (prior && update.$setOnInsert) {
+      // Native insert-only replay retains the original expiry as well as its payload and charge.
+      expiry = Math.min(expiry, previous[0].meta!.lc_source_expires_at.getTime());
+      if (expiry <= Date.now()) held();
+      continue;
+    }
+    const fields = { ...(update.$set ?? update.$setOnInsert) };
+    delete fields.upserted_at;
+    const id = previous[0]?.meta?._id ?? new mongoose.mongo.ObjectId();
+    await collection.updateOne(
+      { ...slot, lc_owner: prefix, _id: id },
+      {
+        $set: {
+          ...fields,
+          lc_source_binding: binding,
+          lc_source_file_ids: binding.files.map((file) => file.fileId),
+          lc_source_expires_at: input.expiresAt,
+          lc_retained_allocations: [{ fileId: binding.files[0].fileId, bytes: 1 }],
+        },
+        $unset: { upserted_at: '' },
+      },
+      { session, upsert: true, collation: { locale: 'simple' }, maxTimeMS: 5000 },
+    );
+    const [postimage] = await read({ _id: id });
+    if (
+      !postimage?.meta ||
+      !Number.isSafeInteger(postimage.bytes) ||
+      postimage.bytes <= 0 ||
+      postimage.bytes > input.maxBsonBytes
+    )
+      held();
+    await collection.updateOne(
+      { _id: id },
+      { $set: { 'lc_retained_allocations.0.bytes': postimage.bytes } },
+      { session, maxTimeMS: 5000 },
+    );
+    const [settled] = await read({ _id: id });
+    if (!settled || settled.bytes !== postimage.bytes) held();
+    const next = checkpointRowLiability(settled);
+    await resizeRetainedDerivatives(
+      mongoose,
+      binding.owner,
+      prior ? [prior.allocation] : [],
+      [next.allocation],
+      session,
+    );
+  }
+  if (expiry <= Date.now()) held();
 }
 
 /** Existing caller filters authorize targets. Unknown or malformed liabilities are held. */
@@ -256,7 +387,7 @@ export async function purgeCheckpointRows(
                 for (const entry of loaded) {
                   const selected: MetadataRow[] = [];
                   for (const row of entry.rows) {
-                    const { owner, allocation } = liability(row);
+                    const { owner, allocation } = checkpointRowLiability(row);
                     if (
                       options.sourceFileIds &&
                       !row.meta!.lc_source_file_ids.some((id: string) =>

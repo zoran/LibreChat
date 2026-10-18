@@ -8,15 +8,15 @@ import type {
   CheckpointPendingWrite,
   PendingWrite,
 } from '@langchain/langgraph-checkpoint';
+import type { Binary, Document, Filter, UpdateOneModel } from 'mongodb';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type { Binary, Filter } from 'mongodb';
-
 import type { CheckpointStorageRecord } from './storage';
 import {
   CHECKPOINT_STORAGE_COLLECTION,
   LIBRECHAT_CHECKPOINT_STORAGE_OWNER_KEY,
   checkpointStorageKey,
 } from './storage';
+import { SOURCE_FREE, SOURCE_PRESENT } from './source-retention';
 
 export const LIBRECHAT_CHECKPOINT_OWNER_KEY = '__librechat_checkpoint_owner';
 export const LIBRECHAT_LEGACY_CHECKPOINT_KEY = '__librechat_legacy_checkpoint_id';
@@ -24,7 +24,7 @@ export type CheckpointWriteSession = ReturnType<
   ConstructorParameters<typeof MongoDBSaver>[0]['client']['startSession']
 >;
 
-interface CheckpointRow {
+export interface CheckpointRow {
   thread_id: string;
   checkpoint_ns: string;
   checkpoint_id: string;
@@ -36,7 +36,7 @@ interface CheckpointRow {
   metadata_search: CheckpointMetadata;
 }
 
-interface WriteRow {
+export interface WriteRow {
   thread_id: string;
   checkpoint_ns: string;
   checkpoint_id: string;
@@ -71,6 +71,21 @@ function identity(config: RunnableConfig): {
   return { thread_id, checkpoint_ns, ...(checkpoint_id == null ? {} : { checkpoint_id }) };
 }
 
+function logicalReference(doc: CheckpointRow, owner?: string) {
+  const namespace =
+    owner != null && doc.checkpoint_ns.startsWith(owner)
+      ? doc.checkpoint_ns.slice(owner.length)
+      : doc.checkpoint_ns;
+  return {
+    thread_id:
+      owner != null && doc.thread_id.startsWith(owner)
+        ? doc.thread_id.slice(owner.length)
+        : doc.thread_id,
+    checkpoint_ns: namespace,
+    checkpoint_id: doc.checkpoint_id,
+  };
+}
+
 /** Mirrors the installed SDK's optional string-config contract for unowned reads. */
 function nativeStringConfig(name: string, value: unknown): string | undefined {
   if (value === undefined) return undefined;
@@ -93,6 +108,90 @@ function requireSourceFree(row: CheckpointRow | WriteRow): void {
 
 /** Isolate physical storage by owner while preserving logical SDK references. */
 export class OwnedMongoSaver extends MongoDBSaver {
+  /** Raw native deletion has no source liability authority; concurrent markers also prevent deletion. */
+  override async deleteThread(threadId: string): Promise<void> {
+    if (typeof threadId !== 'string') throw new Error('Invalid threadId: expected a string');
+    const names = [this.checkpointCollectionName, this.checkpointWritesCollectionName];
+    const requireOrdinary = async (): Promise<void> => {
+      for (const name of names) {
+        if (
+          await this.db
+            .collection(name)
+            .countDocuments({ thread_id: threadId, ...SOURCE_PRESENT }, { limit: 1 })
+        )
+          throw new Error('Source-bound checkpoint deletion requires quota-aware cleanup');
+      }
+    };
+    await requireOrdinary();
+    for (const name of names)
+      await this.db.collection(name).deleteMany({ thread_id: threadId, ...SOURCE_FREE });
+    await requireOrdinary();
+  }
+
+  /** Full physical slots are unique for every writer, including native unowned callers. */
+  protected async ensureWriteIndexes(): Promise<void> {
+    for (const [name, key, indexName] of [
+      [
+        this.checkpointCollectionName,
+        { thread_id: 1, checkpoint_ns: 1, checkpoint_id: -1 },
+        'lc_checkpoint_slot_unique',
+      ],
+      [
+        this.checkpointWritesCollectionName,
+        { thread_id: 1, checkpoint_ns: 1, checkpoint_id: 1, task_id: 1, idx: 1 },
+        'lc_pending_slot_unique',
+      ],
+    ] as const) {
+      const collection = this.db.collection(name);
+      await collection.createIndex(key, {
+        name: indexName,
+        unique: true,
+        collation: { locale: 'simple' },
+      });
+      const index = (await collection.indexes()).find((candidate) => candidate.name === indexName);
+      if (
+        !index ||
+        index.unique !== true ||
+        index.sparse ||
+        index.partialFilterExpression ||
+        JSON.stringify(index.key) !== JSON.stringify(key) ||
+        (index.collation && index.collation.locale !== 'simple')
+      ) {
+        throw new Error('Checkpoint physical slot uniqueness is unverified');
+      }
+    }
+  }
+
+  override async setup(): Promise<Error[]> {
+    const errors = await super.setup();
+    if (errors.length > 0) return errors;
+    try {
+      await this.ensureWriteIndexes();
+    } catch (error) {
+      errors.push(error as Error);
+    }
+    return errors;
+  }
+
+  /** Ordinary writes cannot mutate marked rows; uniqueness also prevents an uncharged duplicate. */
+  protected async persistRows(
+    collectionName: string,
+    operations: readonly UpdateOneModel<Document>[],
+    session?: CheckpointWriteSession,
+  ): Promise<void> {
+    if (!operations.length) return;
+    await this.db.collection(collectionName).bulkWrite(
+      operations.map((operation) => ({
+        updateOne: {
+          ...operation,
+          filter: { $and: [operation.filter, SOURCE_FREE] },
+          collation: { locale: 'simple' },
+        },
+      })),
+      session ? { session } : {},
+    );
+  }
+
   /** Ordinary/HITL saves remain unchanged; durable runs may fence the actual writes. */
   protected withWriteSession<T>(
     _config: RunnableConfig,
@@ -131,18 +230,8 @@ export class OwnedMongoSaver extends MongoDBSaver {
     legacy = false,
     listed = false,
   ): Promise<CheckpointTuple> {
-    const namespace =
-      owner != null && doc.checkpoint_ns.startsWith(owner)
-        ? doc.checkpoint_ns.slice(owner.length)
-        : doc.checkpoint_ns;
-    const key = {
-      thread_id:
-        owner != null && doc.thread_id.startsWith(owner)
-          ? doc.thread_id.slice(owner.length)
-          : doc.thread_id,
-      checkpoint_ns: namespace,
-      checkpoint_id: doc.checkpoint_id,
-    };
+    const key = logicalReference(doc, owner);
+    const namespace = key.checkpoint_ns;
     const rows = await this.db
       .collection<WriteRow>(this.checkpointWritesCollectionName)
       .find(
@@ -172,6 +261,24 @@ export class OwnedMongoSaver extends MongoDBSaver {
     requireSourceFree(doc);
     // Even a legacy duplicate that loses its slot must be checked before any decode starts.
     for (const row of rows) requireSourceFree(row);
+    return this.decodeTuple(doc, rows, owner, legacy, listed);
+  }
+
+  /** Decode only detached, already authorized rows; source reads supply a live deadline guard. */
+  protected async decodeTuple(
+    doc: CheckpointRow,
+    rows: WriteRow[],
+    owner?: string,
+    legacy = false,
+    listed = false,
+    assertReadable: () => void = () => {},
+  ): Promise<CheckpointTuple> {
+    const key = logicalReference(doc, owner);
+    const namespace = key.checkpoint_ns;
+    const decode = (type: string, bytes: Uint8Array) => {
+      assertReadable();
+      return this.serde.loadsTyped(type, bytes);
+    };
     let pendingRows: WriteRow[] = rows;
     if (owner != null) {
       const slots = new Map<string, WriteRow>();
@@ -183,12 +290,10 @@ export class OwnedMongoSaver extends MongoDBSaver {
     }
     // Preserve the installed SDK's decode order, after the shared raw-row guard.
     const checkpoint =
-      owner == null
-        ? ((await this.serde.loadsTyped(doc.type, doc.checkpoint.value())) as Checkpoint)
-        : undefined;
+      owner == null ? ((await decode(doc.type, doc.checkpoint.value())) as Checkpoint) : undefined;
     const metadata =
       owner == null && listed
-        ? ((await this.serde.loadsTyped(doc.type, doc.metadata.value())) as CheckpointMetadata)
+        ? ((await decode(doc.type, doc.metadata.value())) as CheckpointMetadata)
         : undefined;
     const pendingWrites: CheckpointPendingWrite[] = await Promise.all(
       pendingRows.map(
@@ -196,7 +301,7 @@ export class OwnedMongoSaver extends MongoDBSaver {
           [
             row.task_id,
             row.channel,
-            await this.serde.loadsTyped(row.type, row.value.value()),
+            await decode(row.type, row.value.value()),
           ] as CheckpointPendingWrite,
       ),
     );
@@ -218,7 +323,7 @@ export class OwnedMongoSaver extends MongoDBSaver {
           },
         }
       : undefined;
-    return {
+    const tuple: CheckpointTuple = {
       config: {
         configurable: {
           ...key,
@@ -229,14 +334,16 @@ export class OwnedMongoSaver extends MongoDBSaver {
       checkpoint:
         owner == null
           ? checkpoint!
-          : ((await this.serde.loadsTyped(doc.type, doc.checkpoint.value())) as Checkpoint),
+          : ((await decode(doc.type, doc.checkpoint.value())) as Checkpoint),
       metadata:
         owner == null && listed
           ? metadata!
-          : ((await this.serde.loadsTyped(doc.type, doc.metadata.value())) as CheckpointMetadata),
+          : ((await decode(doc.type, doc.metadata.value())) as CheckpointMetadata),
       pendingWrites,
       ...(owner == null || hasParent ? { parentConfig } : {}),
     };
+    assertReadable();
+    return tuple;
   }
 
   override async getTuple(config: RunnableConfig): Promise<CheckpointTuple | undefined> {
@@ -332,8 +439,8 @@ export class OwnedMongoSaver extends MongoDBSaver {
   ): Promise<RunnableConfig> {
     const owner = ownerOf(config);
     if (owner == null) {
-      await this.recordStorage(config);
-      return super.put(config, checkpoint, metadata);
+      for (const name of ['thread_id', 'checkpoint_ns', 'checkpoint_id'])
+        nativeStringConfig(name, config.configurable?.[name]);
     }
     const key = identity(config);
     const [[type, serializedCheckpoint], [metadataType, serializedMetadata]] = await Promise.all([
@@ -346,29 +453,45 @@ export class OwnedMongoSaver extends MongoDBSaver {
       checkpoint_ns: key.checkpoint_ns,
       checkpoint_id: checkpoint.id,
     };
+    await this.ensureWriteIndexes();
     await this.withWriteSession(config, async (session) => {
       await this.recordStorage(config, session);
-      await this.db.collection(this.checkpointCollectionName).updateOne(
-        {
-          ...stored,
-          thread_id: `${owner}${key.thread_id}`,
-          checkpoint_ns: `${owner}${key.checkpoint_ns}`,
-          lc_owner: owner,
-        },
-        {
-          $set: {
-            parent_checkpoint_id: key.checkpoint_id,
-            type,
-            checkpoint: serializedCheckpoint,
-            metadata: serializedMetadata,
-            metadata_search: metadata,
+      await this.persistRows(
+        this.checkpointCollectionName,
+        [
+          {
+            filter: {
+              ...stored,
+              ...(owner == null
+                ? {}
+                : {
+                    thread_id: `${owner}${key.thread_id}`,
+                    checkpoint_ns: `${owner}${key.checkpoint_ns}`,
+                    lc_owner: owner,
+                  }),
+            },
+            update: {
+              $set: {
+                parent_checkpoint_id: key.checkpoint_id,
+                type,
+                checkpoint: serializedCheckpoint,
+                metadata: serializedMetadata,
+                metadata_search: metadata,
+              },
+              ...(this.enableTimestamps ? { $currentDate: { upserted_at: true as const } } : {}),
+            },
+            upsert: true,
           },
-          ...(this.enableTimestamps ? { $currentDate: { upserted_at: true as const } } : {}),
-        },
-        { upsert: true, ...(session && { session }) },
+        ],
+        session,
       );
     });
-    return { configurable: { ...stored, [LIBRECHAT_CHECKPOINT_OWNER_KEY]: owner } };
+    return {
+      configurable: {
+        ...stored,
+        ...(owner == null ? {} : { [LIBRECHAT_CHECKPOINT_OWNER_KEY]: owner }),
+      },
+    };
   }
 
   override async putWrites(
@@ -378,13 +501,16 @@ export class OwnedMongoSaver extends MongoDBSaver {
   ): Promise<void> {
     const owner = ownerOf(config);
     if (owner == null) {
-      await this.recordStorage(config);
-      return super.putWrites(config, writes, taskId);
+      for (const name of ['thread_id', 'checkpoint_ns', 'checkpoint_id']) {
+        if (nativeStringConfig(name, config.configurable?.[name]) === undefined)
+          throw new Error(`Missing configurable.${name}`);
+      }
     }
     const key = identity(config);
     if (key.checkpoint_id == null) throw new Error('Owned writes require a checkpoint id');
     const allSpecial = writes.every(([channel]) => channel in WRITES_IDX_MAP);
-    const legacy = key.checkpoint_id === config.configurable?.[LIBRECHAT_LEGACY_CHECKPOINT_KEY];
+    const legacy =
+      owner != null && key.checkpoint_id === config.configurable?.[LIBRECHAT_LEGACY_CHECKPOINT_KEY];
     const existing =
       !allSpecial && legacy
         ? await this.db
@@ -397,46 +523,51 @@ export class OwnedMongoSaver extends MongoDBSaver {
         : [];
     const legacySlots = new Set(existing.map((row) => row.idx));
     const operations = await Promise.all(
-      writes.map(async ([channel, value], idx) => {
+      writes.map(async ([channel, value], idx): Promise<UpdateOneModel<Document> | null> => {
         if (legacySlots.has(WRITES_IDX_MAP[channel] ?? idx)) return null;
         const [type, serializedValue] = await this.serde.dumpsTyped(value);
-        const fields = { channel, type, value: serializedValue, lc_owner: owner };
+        const fields = {
+          channel,
+          type,
+          value: serializedValue,
+          ...(owner == null ? {} : { lc_owner: owner }),
+        };
         return {
-          updateOne: {
-            filter: {
-              ...key,
-              thread_id: `${owner}${key.thread_id}`,
-              checkpoint_ns: `${owner}${key.checkpoint_ns}`,
-              task_id: taskId,
-              idx: WRITES_IDX_MAP[channel] ?? idx,
-              lc_owner: owner,
-            },
-            update: allSpecial
-              ? {
-                  $set: fields,
-                  ...(this.enableTimestamps
-                    ? { $currentDate: { upserted_at: true as const } }
-                    : {}),
-                }
+          filter: {
+            ...key,
+            ...(owner == null
+              ? {}
               : {
-                  $setOnInsert: {
-                    ...fields,
-                    ...(this.enableTimestamps ? { upserted_at: new Date() } : {}),
-                  },
-                },
-            upsert: true,
+                  thread_id: `${owner}${key.thread_id}`,
+                  checkpoint_ns: `${owner}${key.checkpoint_ns}`,
+                  lc_owner: owner,
+                }),
+            task_id: taskId,
+            idx: WRITES_IDX_MAP[channel] ?? idx,
           },
+          update: allSpecial
+            ? {
+                $set: fields,
+                ...(this.enableTimestamps ? { $currentDate: { upserted_at: true as const } } : {}),
+              }
+            : {
+                $setOnInsert: {
+                  ...fields,
+                  ...(this.enableTimestamps ? { upserted_at: new Date() } : {}),
+                },
+              },
+          upsert: true,
         };
       }),
     );
-    const pending = operations.filter((operation) => operation != null);
+    await this.ensureWriteIndexes();
     await this.withWriteSession(config, async (session) => {
       await this.recordStorage(config, session);
-      if (pending.length > 0) {
-        await this.db
-          .collection(this.checkpointWritesCollectionName)
-          .bulkWrite(pending, session ? { session } : {});
-      }
+      await this.persistRows(
+        this.checkpointWritesCollectionName,
+        operations.filter((operation): operation is UpdateOneModel<Document> => operation != null),
+        session,
+      );
     });
   }
 }

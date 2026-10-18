@@ -77,6 +77,7 @@ const responseSourceRetention = (req) =>
     ? {}
     : { sourceRetention: readFileSourceRetention(req._fileSourceRetention) };
 const { disposeClient } = require('~/server/cleanup');
+const { assertCheckpointRunHost } = require('~/server/services/Agents/checkpointRun');
 const {
   getMCPRequestContext,
   cleanupMCPRequestContextForReq,
@@ -790,7 +791,16 @@ function rejectMissingTriggerParentMessageId(res, generationProtocolVersion) {
  * Resumable Agent Controller - Generation runs independently of HTTP connection.
  * Returns streamId immediately, client subscribes separately via SSE.
  */
-const ResumableAgentController = async (req, res, next, initializeClient, addTitle) => {
+const ResumableAgentController = async (
+  req,
+  res,
+  next,
+  initializeClient,
+  addTitle,
+  checkpointHost,
+) => {
+  assertCheckpointRunHost(checkpointHost);
+  let checkpointPrepared;
   applyForcedTemporaryRequest(req);
   const startupTelemetry = getAgentStartupTelemetry(req);
   let generationProtocolVersion = negotiateNewGenerationProtocol(req);
@@ -1730,7 +1740,42 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
             req._agentEventTriggerProjection,
           ),
         );
+    const turnMessageOptions = {
+      user: userId,
+      isContinued,
+      isRegenerate,
+      isCompaction,
+      editedContent,
+      conversationId,
+      parentMessageId,
+      overrideParentMessageId,
+      isEdited: !!editedContent,
+      responseMessageId: editedResponseMessageId,
+      preallocatedUserMessageId,
+      preallocatedResponseMessageId,
+    };
+    if (checkpointHost) {
+      checkpointPrepared = await checkpointHost.prepare({
+        req,
+        res,
+        initializeClient,
+        endpointOption,
+        requestBody: mcpRequestBody,
+        binding: durableRequestBinding,
+        claimToken: ownedIdempotencyClaim?.claimToken,
+        conversationId,
+        runId: preallocatedResponseMessageId,
+        text,
+        messageOptions: turnMessageOptions,
+        protocol: generationProtocolVersion,
+      });
+      client = checkpointPrepared.client;
+    }
     const job = await GenerationJobManager.createJob(streamId, userId, conversationId, {
+      ...(checkpointPrepared && {
+        generationPreparation: checkpointPrepared.generationPreparation,
+        checkpointContinuation: checkpointPrepared.checkpointContinuation,
+      }),
       generationAdmission: durableRequestBinding,
       trustedTenantId: tenantId,
       startupTelemetry,
@@ -1953,6 +1998,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         status: 409,
       });
     }
+    await checkpointPrepared?.bindDispatchedJob(job);
     acceptAgentStartupTelemetry(req, streamId);
     startupTelemetry?.mark('metadata_persisted');
     req._resumableStreamId = streamId;
@@ -2120,17 +2166,19 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
     });
 
     /** @type {{ client: TAgentClient; userMCPAuthMap?: Record<string, Record<string, string>> }} */
-    const result = await initializeClient({
-      req,
-      res,
-      endpointOption,
-      // Use the job's abort controller signal - allows abort via GenerationJobManager.abortJob()
-      signal: job.abortController.signal,
-      jobCreatedAt,
-      checkpointNamespace: job.metadata?.checkpointNamespace,
-      foregroundRunId: mcpRequestBody.messageId,
-      requestBody: mcpRequestBody,
-    });
+    const result =
+      checkpointPrepared?.initialized ??
+      (await initializeClient({
+        req,
+        res,
+        endpointOption,
+        // Use the job's abort controller signal - allows abort via GenerationJobManager.abortJob()
+        signal: job.abortController.signal,
+        jobCreatedAt,
+        checkpointNamespace: job.metadata?.checkpointNamespace,
+        foregroundRunId: mcpRequestBody.messageId,
+        requestBody: mcpRequestBody,
+      }));
     startupTelemetry?.mark('client_initialized');
     client = result.client;
     const normalizedMCPRequestBody = createMCPRuntimeRequestBody({
@@ -2417,7 +2465,11 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         job.abortController.signal.addEventListener('abort', abortTitleOnJobAbort, { once: true });
       }
       const titleEligible =
-        addTitle && parentMessageId === Constants.NO_PARENT && isNewConvo && !req.body?.isTemporary;
+        !checkpointPrepared &&
+        addTitle &&
+        parentMessageId === Constants.NO_PARENT &&
+        isNewConvo &&
+        !req.body?.isTemporary;
       const emitTitleEvent = ({ conversationId: titleConversationId, title }) => {
         titleEventPromise = (async () => {
           if (!acceptsTitleEvents || titleAbortController.signal.aborted) {
@@ -2561,23 +2613,12 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         };
 
         const messageOptions = {
-          user: userId,
+          ...turnMessageOptions,
           onStart,
           getReqData,
-          isContinued,
-          isRegenerate,
-          isCompaction,
-          editedContent,
-          conversationId,
-          parentMessageId,
           abortController: job.abortController,
-          overrideParentMessageId,
-          isEdited: !!editedContent,
           beforeResponsePersistence: claimBeforeResponsePersistence,
           userMCPAuthMap: result.userMCPAuthMap,
-          responseMessageId: editedResponseMessageId,
-          preallocatedUserMessageId,
-          preallocatedResponseMessageId,
           progressOptions: {
             res: {
               write: () => true,
@@ -2805,6 +2846,10 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               },
             )
           : undefined;
+        const sendCurrentTurn = () =>
+          checkpointPrepared
+            ? checkpointPrepared.consume(messageOptions)
+            : client.sendMessage(text, messageOptions);
         const sendPromise = eventActorTurn
           ? eventActorTurn.run().then(async ({ adapter, value, execution }) => {
               if (adapter !== 'checkpoint') {
@@ -2843,7 +2888,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
               });
               return value;
             })
-          : client.sendMessage(text, messageOptions);
+          : sendCurrentTurn();
 
         if (hasQueuedTurnAdmissionSource) {
           const {
@@ -3163,6 +3208,7 @@ const ResumableAgentController = async (req, res, next, initializeClient, addTit
         }
 
         const shouldGenerateTitle =
+          !checkpointPrepared &&
           addTitle &&
           parentMessageId === Constants.NO_PARENT &&
           isNewConvo &&

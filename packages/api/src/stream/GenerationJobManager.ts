@@ -1,5 +1,11 @@
 import { randomUUID } from 'crypto';
-import { logger, getTenantId, SYSTEM_TENANT_ID } from '@librechat/data-schemas';
+import {
+  logger,
+  getTenantId,
+  SYSTEM_TENANT_ID,
+  snapshotGenerationCheckpointBinding,
+  snapshotGenerationCheckpointAdmission,
+} from '@librechat/data-schemas';
 import {
   Constants,
   ContentTypes,
@@ -13,12 +19,19 @@ import {
   reconcileContextUsageFromEvent,
 } from 'librechat-data-provider';
 import type {
+  SourceRetentionContext,
+  FileOwnerScope,
+  GenerationAdmissionTerminal,
+  GenerationCheckpointBinding,
+  GenerationAdmissionInput,
+  GenerationAdmissionRecoveryReceipt,
+} from '@librechat/data-schemas';
+import type {
   TMessageContentParts,
   TContextUsageEvent,
   TTokenUsageEvent,
   Agents,
 } from 'librechat-data-provider';
-import type { SourceRetentionContext, FileOwnerScope } from '@librechat/data-schemas';
 import type { StandardGraph } from '@librechat/agents';
 import type {
   SerializableJobData,
@@ -36,15 +49,17 @@ import type {
   DetachedAgentEventActionStoreMode,
 } from './interfaces/IJobStore';
 import type {
+  GenerationAdmissionConfiguration,
+  GenerationAdmissionCensus,
+  GenerationRequestBinding,
+  GenerationPreparationReceipt,
+  GenerationCheckpointRecoveryPorts,
+} from './generationAdmission';
+import type {
   EarlyBufferOverflowState,
   EarlyBufferRecoveryFailureReason,
   EarlyBufferRecoveryOutcome,
 } from '../types/earlyBufferRecovery';
-import type {
-  GenerationAdmissionConfiguration,
-  GenerationAdmissionCensus,
-  GenerationRequestBinding,
-} from './generationAdmission';
 import type { SourceReplayConfiguration } from './internal/sourceReplayLifecycle';
 import type { GenerationSourceRetention } from './interfaces/IJobStore';
 import type { AgentStartupTelemetry } from '~/agents/startup';
@@ -72,15 +87,20 @@ import {
   STEER_QUEUE_MAX_DEPTH,
 } from './interfaces/IJobStore';
 import {
+  GenerationAdmissionCoordinator,
+  GenerationAdmissionHeldError,
+  generationRequestBinding,
+} from './generationAdmission';
+import {
   SOURCE_REPLAY_LIMITS,
   SourceReplayError,
   assertSourceObjectSize,
   sourceChunkBytes,
 } from './internal/sourceBudget';
-import { GenerationAdmissionCoordinator, generationRequestBinding } from './generationAdmission';
 import { isRecoveredSteerPayload, RecoveredSteerPayloadMismatchError } from './SteerRecovery';
 import { sourceRetentionAvailable, isStopConfirmed } from './interfaces/IJobStore';
 import { SourceReplayLifecycle } from './internal/sourceReplayLifecycle';
+import { checkpointNamespaceBelongsToOwner } from './checkpoints';
 import { projectTerminalEvent } from './terminalProjection';
 import { assertJobStoreV2 } from './jobStoreCapabilities';
 export type {
@@ -685,6 +705,10 @@ export type TerminalHostActionHandler = (
 
 export interface CreateGenerationJobOptions {
   generationAdmission?: GenerationRequestBinding;
+  /** Exact local acknowledged preparation; public request fields never populate this. */
+  generationPreparation?: GenerationPreparationReceipt;
+  /** Trusted host-only initial binding; never accepted from public request or job metadata. */
+  checkpointContinuation?: GenerationCheckpointBinding;
   trustedTenantId?: string;
   startupTelemetry?: AgentStartupTelemetry;
   initialMetadata?: Partial<t.GenerationJobMetadata>;
@@ -986,6 +1010,139 @@ class GenerationJobManagerClass {
     this.durableAdmission.configure(config);
   }
 
+  /** Private host recovery. Mongo authority stays HELD until this exact job and listener are adopted. */
+  async recoverCheckpointGeneration(
+    streamId: string,
+    predecessor: GenerationAdmissionInput,
+    successorSegment: string,
+    ports: Omit<GenerationCheckpointRecoveryPorts, 'adoptRecoveredGeneration'>,
+  ): Promise<GenerationAdmissionRecoveryReceipt | undefined> {
+    let createdRuntime: RuntimeJobState | undefined;
+    let adoptedRuntime: RuntimeJobState | undefined;
+    let adopted = false;
+    let prior: Readonly<GenerationAdmissionInput>;
+    try {
+      prior = snapshotGenerationCheckpointAdmission(predecessor);
+      const callbacks = Object.freeze({
+        authorize: ports.authorize,
+        confirmTerminatedOwner: ports.confirmTerminatedOwner,
+        reconcileEffects: ports.reconcileEffects,
+        ...(ports.recoverSources === undefined ? {} : { recoverSources: ports.recoverSources }),
+      });
+      const boundJob = (job: SerializableJobData | null, segment: string) =>
+        !!job &&
+        job.streamId === streamId &&
+        job.createdAt === prior.generationEpoch &&
+        job.userId === prior.principalId &&
+        (job.tenantId ?? '__single_tenant__') === prior.tenantId &&
+        (job.conversationId ?? streamId) === prior.conversationId &&
+        job.idempotencyClientRequestId === prior.clientRequestId &&
+        job.providerExecutionId === segment &&
+        job.status === 'running' &&
+        job.generationProtocolVersion === 2 &&
+        job.checkpointNamespace === prior.continuation!.checkpointNamespace &&
+        !job.scheduleId &&
+        !job.agentEventDeliveryKey &&
+        !job.preserveForScheduleReconcile &&
+        !job.pendingAction &&
+        !job.pendingActionId &&
+        !job.recoveredSteerId &&
+        !job.terminalPersistencePending &&
+        !job.terminalHostActionPending &&
+        sourceRetentionAvailable(job) &&
+        !job.sourceRetentionPurged;
+      if (
+        !this.durableAdmission.required ||
+        this.shuttingDown ||
+        !boundJob(await this.jobStore.getJob(streamId), prior.segmentId)
+      )
+        return undefined;
+      const receipt = await this.durableAdmission.recoverCheckpoint(
+        streamId,
+        prior,
+        successorSegment,
+        {
+          ...callbacks,
+          adoptRecoveredGeneration: async (next, sourceExpiresAt) => {
+            if (this.shuttingDown || (sourceExpiresAt != null && sourceExpiresAt <= Date.now()))
+              return false;
+            const job = await this.jobStore.getJob(streamId);
+            if (
+              !boundJob(job, prior.segmentId) ||
+              typeof this.eventTransport.onAbort !== 'function'
+            )
+              return false;
+            const runtime = await this.getOrCreateRuntimeState(streamId, job, (created) => {
+              createdRuntime = created;
+            });
+            const current = () =>
+              !!runtime &&
+              this.runtimeState.get(streamId) === runtime &&
+              runtime.createdAt === prior.generationEpoch &&
+              typeof runtime.abortUnsubscribe === 'function' &&
+              !runtime.abortController.signal.aborted &&
+              !this.shuttingDown;
+            if (!current()) return false;
+            const acknowledged = await this.jobStore.transitionStatus(streamId, {
+              from: 'running',
+              to: 'running',
+              expectCreatedAt: prior.generationEpoch,
+              expectProviderExecutionId: prior.segmentId,
+              notAfterMs: sourceExpiresAt,
+              patch: {
+                providerExecutionId: next.segmentId,
+                providerDrained: true,
+                providerAbortReady: true,
+                preemptCapable: false,
+                lastActiveAt: Date.now(),
+              },
+              clear: ['providerExecutionStartedId', 'steerQuotesExecutionId'],
+            });
+            if (!acknowledged || !current()) return false;
+            const confirmed = await this.jobStore.getJob(streamId);
+            if (
+              !current() ||
+              !boundJob(confirmed, next.segmentId) ||
+              (sourceExpiresAt != null && sourceExpiresAt <= Date.now())
+            )
+              return false;
+            this.acquireResumedJobOwnership(streamId, prior.generationEpoch);
+            adopted = this.ownedJobs.get(streamId) === prior.generationEpoch;
+            if (adopted) adoptedRuntime = runtime!;
+            return adopted;
+          },
+        },
+      );
+      if (receipt) {
+        if (
+          adoptedRuntime &&
+          this.runtimeState.get(streamId) === adoptedRuntime &&
+          typeof adoptedRuntime.abortUnsubscribe === 'function' &&
+          !adoptedRuntime.abortController.signal.aborted &&
+          !this.shuttingDown &&
+          this.ownedJobs.get(streamId) === prior.generationEpoch &&
+          (!receipt.source || receipt.source.expiresAt > Date.now())
+        )
+          return receipt;
+        this.durableAdmission.holdProviderExecution(
+          streamId,
+          prior.generationEpoch,
+          successorSegment,
+        );
+      }
+    } catch {
+      // No read or compensating mutation may turn a lost adoption acknowledgment into success.
+    }
+    if (createdRuntime && this.runtimeState.get(streamId) === createdRuntime) {
+      this.releaseAbortSubscription(createdRuntime);
+      this.stopSubscriberLease(createdRuntime);
+      createdRuntime.abortController.abort();
+      this.runtimeState.delete(streamId);
+    }
+    if (adopted) this.releaseJobOwnership(streamId, prior!.generationEpoch);
+    return undefined;
+  }
+
   generationRequestBinding: typeof generationRequestBinding = generationRequestBinding;
 
   closeGenerationAdmission(requestId: string): boolean {
@@ -1056,23 +1213,39 @@ class GenerationJobManagerClass {
     }
 
     const job = await this.jobStore.getJob(streamId);
+    let outcome: GenerationAdmissionTerminal['outcome'] | undefined;
+    switch (job?.status) {
+      case 'complete':
+      case 'requires_action':
+        // A pause completes this execution segment; the job still awaits its successor.
+        outcome = 'completed';
+        break;
+      case 'error':
+        outcome = 'failed';
+        break;
+      case 'aborted':
+        outcome = 'cancelled';
+        break;
+    }
     if (
       this.durableAdmission.required &&
       (!job ||
         job.createdAt !== epoch ||
         job.providerExecutionId !== segment ||
-        job.status === 'running' ||
+        outcome == null ||
         job.terminalPersistencePending ||
         job.terminalHostActionPending)
     )
       return false;
     await this.flushCoalescedStreamBuffers(streamId);
     const drained = await this.markProviderExecutionDrained(streamId, epoch, segment);
-    if (!drained) return false;
+    if (!drained || !this.durableAdmission.required) return drained;
+    if (outcome == null) return false;
     return this.durableAdmission.settle(
       streamId,
       epoch,
       segment,
+      outcome,
       JSON.stringify({ streamId, epoch, segment, status: job?.status, persistence: 'settled' }),
     );
   }
@@ -2421,11 +2594,12 @@ class GenerationJobManagerClass {
     tenantId: string | undefined,
     options: CreateGenerationJobOptions,
     creationAttemptId: string,
+    trustedCheckpointNamespace?: string,
   ): Promise<CreatedJobData | null> {
     const clientRequestId = options.idempotencyClientRequestId;
     const claimToken = options.idempotencyClaimToken;
     const expectedConversationId = conversationId ?? streamId;
-    const matchesCommittedCreate = (job: SerializableJobData | null): job is CreatedJobData =>
+    const isOwnedCommittedCreate = (job: SerializableJobData | null): job is CreatedJobData =>
       job != null &&
       job.status === 'running' &&
       (job as CreatedJobData).creationAttemptId === creationAttemptId &&
@@ -2433,8 +2607,21 @@ class GenerationJobManagerClass {
       (job.tenantId ?? undefined) === tenantId &&
       (job.conversationId ?? streamId) === expectedConversationId &&
       (job.idempotencyClientRequestId ?? undefined) === clientRequestId;
+    const matchesCommittedCreate = (job: SerializableJobData | null): job is CreatedJobData =>
+      isOwnedCommittedCreate(job) &&
+      (trustedCheckpointNamespace === undefined ||
+        (job.generationProtocolVersion === 2 &&
+          job.checkpointNamespace === trustedCheckpointNamespace));
 
     let committedJob = (await this.jobStore.getJob(streamId)) as CreatedJobData | null;
+    if (isOwnedCommittedCreate(committedJob) && !matchesCommittedCreate(committedJob)) {
+      await this.terminalizeUnexposedGeneration(
+        streamId,
+        committedJob,
+        'Generation checkpoint binding did not match its creation',
+      );
+      return null;
+    }
     if (
       committedJob != null &&
       committedJob.userId === userId &&
@@ -2830,18 +3017,136 @@ class GenerationJobManagerClass {
     return { complete: !recoveryIncomplete && pending.length === 0, pending };
   }
 
+  /** Holds one exact native claim durably before the host may mutate source preparation. */
+  async prepareCheckpointGeneration(
+    userId: string,
+    conversationId: string,
+    binding: GenerationRequestBinding,
+    claimToken: string,
+    prepare: () => Promise<GenerationCheckpointBinding>,
+    trustedTenantId?: string,
+  ): Promise<GenerationPreparationReceipt> {
+    const tenantId = trustedTenantId ?? getTenantId();
+    const frozen = Object.freeze({
+      clientRequestId: binding.clientRequestId,
+      requestFingerprint: binding.requestFingerprint,
+    });
+    return this.durableAdmission.prepareCheckpoint(
+      userId,
+      tenantId,
+      conversationId,
+      frozen,
+      claimToken,
+      async () => {
+        const claim = await this.jobStore.getIdempotencyClaim?.(
+          this.generationClaimKey(userId, frozen.clientRequestId, conversationId),
+        );
+        if (
+          !claim ||
+          claim.claimToken !== claimToken ||
+          claim.startedAt != null ||
+          claim.streamId !== conversationId ||
+          claim.conversationId !== conversationId
+        )
+          throw new GenerationAdmissionHeldError();
+        return prepare();
+      },
+    );
+  }
+
   async createJob(
     streamId: string,
     userId: string,
     conversationId?: string,
     options: CreateGenerationJobOptions = {},
   ): Promise<t.GenerationJob> {
+    // Snapshot trusted identity before replay/storage can yield. A getter must never select a binding.
+    const descriptor = Object.getOwnPropertyDescriptor(options, 'checkpointContinuation');
+    if (
+      (descriptor && !('value' in descriptor)) ||
+      (!descriptor && 'checkpointContinuation' in options)
+    )
+      throw new Error('Invalid generation checkpoint binding');
+    const continuation =
+      descriptor?.value === undefined
+        ? undefined
+        : snapshotGenerationCheckpointBinding(descriptor.value);
+    const preparation = options.generationPreparation;
+    if (
+      preparation &&
+      (options.idempotencyClaimToken !== preparation.input.preparationAttemptId ||
+        options.idempotencyClientRequestId !== preparation.input.clientRequestId)
+    )
+      throw new GenerationAdmissionHeldError();
+    const tenantId = options.trustedTenantId ?? getTenantId();
+    const safeTenantId = tenantId && tenantId !== SYSTEM_TENANT_ID ? tenantId : undefined;
+    if (continuation) {
+      const request = Object.getOwnPropertyDescriptor(options, 'generationAdmission');
+      const fields =
+        request && 'value' in request && request.value
+          ? Object.getOwnPropertyDescriptors(request.value)
+          : undefined;
+      if (
+        !fields ||
+        !('value' in (fields.clientRequestId ?? {})) ||
+        !('value' in (fields.requestFingerprint ?? {})) ||
+        typeof fields.clientRequestId.value !== 'string' ||
+        !fields.clientRequestId.value.length ||
+        fields.clientRequestId.value.length > 256 ||
+        typeof fields.requestFingerprint.value !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(fields.requestFingerprint.value) ||
+        !this.durableAdmission.required ||
+        streamId !== (conversationId ?? streamId) ||
+        continuation.threadId !== streamId ||
+        !checkpointNamespaceBelongsToOwner(
+          continuation.checkpointNamespace,
+          userId,
+          safeTenantId,
+        ) ||
+        options.initialMetadata?.generationProtocolVersion === 1 ||
+        options.initialMetadata?.scheduleId ||
+        options.initialMetadata?.agentEventDeliveryKey ||
+        options.initialMetadata?.preserveForScheduleReconcile ||
+        options.recoveredSteerId
+      )
+        throw new Error('Invalid initial generation checkpoint binding');
+    }
+    const request = options.generationAdmission;
+    options = {
+      ...options,
+      generationAdmission: request
+        ? Object.freeze({
+            clientRequestId: request.clientRequestId,
+            requestFingerprint: request.requestFingerprint,
+          })
+        : undefined,
+      checkpointContinuation: continuation,
+      initialMetadata: options.initialMetadata ? { ...options.initialMetadata } : undefined,
+    };
     const done = this.durableAdmission.initialize();
     try {
-      const tenantId = options.trustedTenantId ?? getTenantId();
       if (this.durableAdmission.required)
-        await this.durableAdmission.verifyReplay(userId, tenantId, options.generationAdmission);
-      const job = await this.createJobInternal(streamId, userId, conversationId, options);
+        await this.durableAdmission.verifyReplay(
+          userId,
+          tenantId,
+          options.generationAdmission,
+          preparation,
+          continuation,
+        );
+      const job = await this.createJobInternal(
+        streamId,
+        userId,
+        conversationId,
+        options,
+        safeTenantId,
+        continuation?.checkpointNamespace,
+      );
+      if (
+        continuation &&
+        (job.metadata.generationProtocolVersion !== 2 ||
+          job.metadata.checkpointNamespace !== continuation.checkpointNamespace)
+      )
+        throw new Error('Generation checkpoint binding did not match its creation');
       await this.durableAdmission.enroll(
         streamId,
         job.createdAt,
@@ -2851,6 +3156,8 @@ class GenerationJobManagerClass {
         conversationId ?? streamId,
         job.metadata.generationProtocolVersion ?? 1,
         options.generationAdmission,
+        continuation,
+        preparation,
       );
       return job;
     } finally {
@@ -2863,6 +3170,8 @@ class GenerationJobManagerClass {
     userId: string,
     conversationId?: string,
     options: CreateGenerationJobOptions = {},
+    safeTenantId?: string,
+    trustedCheckpointNamespace?: string,
   ): Promise<t.GenerationJob> {
     if (this.shuttingDown) {
       throw new Error(SHUTTING_DOWN_ERROR);
@@ -2899,8 +3208,6 @@ class GenerationJobManagerClass {
       throw new Error('Invalid active generation predecessor policy');
     }
 
-    const tenantId = options.trustedTenantId ?? getTenantId();
-    const safeTenantId = tenantId && tenantId !== SYSTEM_TENANT_ID ? tenantId : undefined;
     const creationAttemptId = randomUUID();
     const sanitizedMetadata = sanitizeJobMetadata(options.initialMetadata ?? {});
     /** Translate the transient capability assertion into its execution-bound
@@ -2958,6 +3265,7 @@ class GenerationJobManagerClass {
         creationAttemptId,
         options.expectedPredecessorCreatedAt,
         options.rejectActivePredecessor,
+        trustedCheckpointNamespace,
       );
     } catch (error) {
       if (error instanceof JobPredecessorMismatchError) {
@@ -3003,6 +3311,7 @@ class GenerationJobManagerClass {
           safeTenantId,
           options,
           creationAttemptId,
+          trustedCheckpointNamespace,
         );
       } catch (recoveryError) {
         logger.error(
@@ -3014,6 +3323,24 @@ class GenerationJobManagerClass {
         throw error;
       }
       jobData = recovered;
+    }
+
+    if (
+      trustedCheckpointNamespace !== undefined &&
+      (jobData.generationProtocolVersion !== 2 ||
+        jobData.checkpointNamespace !== trustedCheckpointNamespace)
+    ) {
+      if (
+        jobData.creationAttemptId === creationAttemptId &&
+        jobData.userId === userId &&
+        (jobData.tenantId ?? undefined) === safeTenantId
+      )
+        await this.terminalizeUnexposedGeneration(
+          streamId,
+          jobData,
+          'Generation checkpoint binding did not match its creation',
+        );
+      throw new Error('Generation checkpoint binding did not match its creation');
     }
 
     if (options.idempotencyClientRequestId != null && options.idempotencyClaimToken != null) {
@@ -3539,6 +3866,7 @@ class GenerationJobManagerClass {
   private async getOrCreateRuntimeState(
     streamId: string,
     knownJobData?: SerializableJobData | null,
+    onCreated?: (runtime: RuntimeJobState) => void,
   ): Promise<RuntimeJobState | null> {
     const jobData =
       knownJobData === undefined ? await this.jobStore.getJob(streamId) : knownJobData;
@@ -3621,6 +3949,9 @@ class GenerationJobManagerClass {
     };
 
     this.runtimeState.set(streamId, runtime);
+    // Creation provenance belongs to this object, even if an awaited listener later
+    // observes and returns another owner's replacement runtime.
+    onCreated?.(runtime);
 
     this.registerAllSubscribersLeft(streamId);
 
@@ -4036,6 +4367,7 @@ class GenerationJobManagerClass {
     streamId: string,
     expected: IdempotencyClaimValue,
   ): Promise<IdempotencyClaimResult> {
+    await this.durableAdmission.assertClaimMayChange(userId, getTenantId(), clientRequestId);
     if (expected.claimToken == null) {
       return {
         claimed: false,
@@ -4275,6 +4607,7 @@ class GenerationJobManagerClass {
     streamId: string,
     expected?: IdempotencyClaimValue,
   ): Promise<void> {
+    await this.durableAdmission.assertClaimMayChange(userId, getTenantId(), clientRequestId);
     // Releasing without a token would let a stale/old request delete another
     // replica's owner. Tokenless legacy claims are duplicate-only and are
     // never owned by this manager.
@@ -8793,46 +9126,90 @@ class GenerationJobManagerClass {
     if (providerExecutionId.length === 0 || providerExecutionId.length > 128) {
       return false;
     }
-    /** A provider that has not started by the time shutdown begins must not start. The
-     *  settlement wait only covers executions begun before it returned; one begun after it
-     *  would commit `providerDrained: false` against a store that is about to close and
-     *  fence its successor. Callers already treat `false` as "stopped before provider
-     *  startup", and nothing has been committed. */
-    if (this.shuttingDown) {
-      return false;
-    }
-    /** Opened before the CAS and closed only on a definitive `false`. A rejected reply is
-     *  ambiguous — the store may already have committed `providerDrained: false` — and every
-     *  caller treats it that way, running or cleaning up and recording the drain either way.
-     *  Leaving the tracker open makes shutdown wait for that record instead of tearing the
-     *  transport down underneath it; the deadline still bounds the wait if it never comes. */
-    this.openProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
-    let started =
-      (await this.jobStore.beginProviderExecution?.(
+    const runtime = this.runtimeState.get(streamId);
+    const currentRuntime = () =>
+      !!runtime &&
+      this.runtimeState.get(streamId) === runtime &&
+      runtime.createdAt === expectedCreatedAt &&
+      this.ownedJobs.get(streamId) === expectedCreatedAt &&
+      !runtime.abortController.signal.aborted &&
+      !this.shuttingDown;
+    const currentJob = (job: SerializableJobData | null) =>
+      !!job &&
+      job.createdAt === expectedCreatedAt &&
+      job.providerExecutionId === providerExecutionId &&
+      job.status === 'running' &&
+      sourceRetentionAvailable(job) &&
+      !job.sourceRetentionPurged;
+    const key = this.providerExecutionKey(streamId, expectedCreatedAt, providerExecutionId);
+    if (!currentRuntime() || this.openProviderExecutions.has(key)) return false;
+    const job = await this.jobStore.getJob(streamId);
+    if (!currentRuntime() || !currentJob(job)) return false;
+    if (
+      !(await this.durableAdmission.prepareProviderExecution(
         streamId,
         expectedCreatedAt,
         providerExecutionId,
-      )) ?? false;
-    if (started) {
-      const job = await this.jobStore.getJob(streamId);
-      started =
-        !!job &&
-        job.createdAt === expectedCreatedAt &&
-        job.providerExecutionId === providerExecutionId &&
-        (await this.durableAdmission.authorize(
+        job!.userId,
+        job!.tenantId,
+        job!.conversationId ?? streamId,
+        successor,
+      ))
+    )
+      return false;
+    // No await between this exact local gate and opening our one existing provider tracker.
+    if (
+      !currentRuntime() ||
+      this.openProviderExecutions.has(key) ||
+      !this.durableAdmission.canBeginProviderExecution(
+        streamId,
+        expectedCreatedAt,
+        providerExecutionId,
+      )
+    )
+      return false;
+    this.openProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
+    try {
+      const started = await this.jobStore.beginProviderExecution(
+        streamId,
+        expectedCreatedAt,
+        providerExecutionId,
+      );
+      if (!started) {
+        // Only an acknowledged no-mutation result discharges this start attempt.
+        this.closeProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
+        return false;
+      }
+      // From here on the existing exact-segment drain owns the open obligation, even on false.
+      if (!currentRuntime()) return false;
+      const observed = await this.jobStore.getJob(streamId);
+      if (!currentRuntime() || !currentJob(observed)) return false;
+      if (
+        !(await this.durableAdmission.authorize(
           streamId,
           expectedCreatedAt,
           providerExecutionId,
-          job.userId,
-          job.tenantId,
-          job.conversationId ?? streamId,
-          successor,
-        ));
+          observed!.userId,
+          observed!.tenantId,
+          observed!.conversationId ?? streamId,
+          false,
+        ))
+      )
+        return false;
+      const confirmed = await this.jobStore.getJob(streamId);
+      return (
+        currentRuntime() &&
+        currentJob(confirmed) &&
+        this.durableAdmission.isProviderDispatchReady(
+          streamId,
+          expectedCreatedAt,
+          providerExecutionId,
+        )
+      );
+    } catch (error) {
+      this.durableAdmission.holdProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
+      throw error;
     }
-    if (!started) {
-      this.closeProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
-    }
-    return started;
   }
 
   private providerExecutionKey(

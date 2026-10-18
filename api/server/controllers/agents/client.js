@@ -174,6 +174,7 @@ const {
   assertModelBoundContent,
   reportLocatorTraversalFailure,
   filterFilesByEndpointRuntimeConfig,
+  createModelBoundInputInspector,
   createModelBoundChatModelCallback: createModelBoundContentCallback,
   getPrivateTextInspectionTokens,
   getPrivateTextModelHooks,
@@ -386,6 +387,9 @@ function getUserFacingRequestError(baseMessage, error, appConfig) {
   }
   return `${baseMessage}: ${message}`;
 }
+
+const { getCheckpointPreparation } = require('~/server/services/Agents/checkpointRun');
+const checkpointAgentInputs = new WeakMap();
 
 class AgentClient extends BaseClient {
   getModelBoundAttachmentsForEndpoint(attachments) {
@@ -2197,6 +2201,10 @@ class AgentClient extends BaseClient {
                 historyMessageIds: sourceMessageIds.filter(
                   (id) => dependentHistory.has(id) && id !== req._quoteRetentionMessageId,
                 ),
+                ...getCheckpointPreparation(
+                  this.options.checkpointPreparation,
+                  req,
+                )?.sourceRetentionOptions(this),
                 ...(historyQuoteSnapshots.length > 0 && { historyQuoteSnapshots }),
               }),
             );
@@ -3426,6 +3434,12 @@ class AgentClient extends BaseClient {
    * @returns {Promise<{ withKeys?: string; withoutKeys?: string } | undefined>}
    */
   async useMemory() {
+    if (
+      getCheckpointPreparation(this.options.checkpointPreparation, this.options.req) &&
+      isMemoryAgentEnabled(this.options.req.config?.memory)
+    ) {
+      throw new Error('Checkpoint-only execution excludes memory dispatch');
+    }
     const user = this.options.req.user;
     if (user.personalization?.memories === false) {
       return;
@@ -4662,10 +4676,278 @@ class AgentClient extends BaseClient {
     }
   }
 
+  async prepareAgentInput(payload) {
+    const appConfig = this.options.req.config;
+    const toolSet = buildRunToolSet(
+      this.options.agent,
+      this.agentConfigs?.values(),
+      this.options.subagentTasks == null ? undefined : [Constants.CHECK_BACKGROUND_TASK],
+      payload,
+    );
+    const tokenCounter = withRetainedAnswerTokenCounter(
+      await createCachedTokenCounter(this.getEncoding()),
+      this.getEncoding(),
+    );
+
+    /** Pre-resolve invoked skill bodies + re-prime files before formatting messages */
+    if (this.eventActorContinuation === 'cold') {
+      this.eventActorSkillPrimeResult = undefined;
+      this.eventActorDiscoveredToolNames = undefined;
+    }
+    let skillPrimeResult = this.eventActorSkillPrimeResult;
+    if (skillPrimeResult == null) {
+      skillPrimeResult = this.options.primeInvokedSkills
+        ? await this.options.primeInvokedSkills(payload)
+        : undefined;
+    }
+    this.eventActorSkillPrimeResult = skillPrimeResult;
+
+    /** Seed each reachable agent's trusted code-session partition. */
+    const initialSessions = buildInitialToolSessions({
+      skillSessions: skillPrimeResult?.initialSessions,
+      agents: [this.options.agent, ...(this.agentConfigs ? this.agentConfigs.values() : [])],
+    });
+
+    /**
+     * Reconstruct `reasoning_content` on prior tool-call turns: DeepSeek
+     * thinking-mode (#13366) or custom endpoints opting in via
+     * `customParams.includeReasoningHistory` (e.g. Xiaomi MiMo, Kimi).
+     * Walks subagents too — the opted-in endpoint may appear only as a
+     * nested subagent, not the primary or a top-level handoff agent.
+     */
+    const needsReasoningContentFormat = anyAgentReplaysReasoningContent([
+      this.options.agent,
+      ...(this.agentConfigs ? Array.from(this.agentConfigs.values()) : []),
+    ]);
+    /**
+     * Skills primed fresh this turn — manual ($ popover) and always-apply
+     * (frontmatter). `injectSkillPrimes` (below) splices their SKILL.md
+     * bodies in, so `formatAgentMessages` must NOT also reconstruct the
+     * same names from a historical `skill` tool_call — otherwise the body
+     * lands twice and a prompt-cache marker can pin to the duplicated
+     * synthetic prefix. Names NOT primed this turn still reconstruct from
+     * history, preserving sticky manual re-priming across turns.
+     */
+    /** A compaction summarizes what was already said. No user turn was
+     *  submitted, so it primes no skills into the transcript it is about
+     *  to summarize and runs no memory pass over it. */
+    const isCompactionTurn = this.isCompactionTurn();
+    const manualSkillPrimes = isCompactionTurn ? undefined : this.options.agent?.manualSkillPrimes;
+    const alwaysApplySkillPrimes = isCompactionTurn
+      ? undefined
+      : this.options.agent?.alwaysApplySkillPrimes;
+    const freshSkillPrimeNames = collectFreshSkillPrimeNames({
+      manualSkillPrimes,
+      alwaysApplySkillPrimes,
+    });
+    const useLegacyContent = this.options.agent?.useLegacyContent === true;
+    const reachableAgents = collectReachableAgents([
+      this.options.agent,
+      ...(this.agentConfigs?.values() ?? []),
+    ]);
+    const completeAssistantHistory = assertCompleteAssistantHistorySingleton([
+      this.options.agent,
+      ...(this.agentConfigs?.values() ?? []),
+    ]);
+    const messageFormatOptions = {
+      ...(completeAssistantHistory ? { preserveAssistantHistory: true } : {}),
+      ...(needsReasoningContentFormat ? { preserveReasoningContent: true } : {}),
+      ...(freshSkillPrimeNames.size > 0 ? { skipSkillBodyNames: freshSkillPrimeNames } : {}),
+      ...(useLegacyContent ? { legacyContent: true } : {}),
+    };
+    const semanticIntentToolNames = new Set();
+    const semanticIntentBlockedToolNames = new Set();
+    for (const agent of reachableAgents) {
+      for (const toolName of agent.semanticIntentToolNames ?? []) {
+        semanticIntentToolNames.add(toolName);
+      }
+      for (const toolName of agent.semanticIntentBlockedToolNames ?? []) {
+        semanticIntentBlockedToolNames.add(toolName);
+      }
+    }
+    for (const toolName of semanticIntentBlockedToolNames) {
+      semanticIntentToolNames.delete(toolName);
+    }
+    const hasMessageFormatOptions =
+      needsReasoningContentFormat || freshSkillPrimeNames.size > 0 || useLegacyContent;
+    const formatOptions = {
+      ...messageFormatOptions,
+      compactionSemanticIndex: {
+        ...(this.eventActorContinuation === 'warm' && this.compactionSemanticIndexSnapshot != null
+          ? { baseSnapshot: this.compactionSemanticIndexSnapshot }
+          : {}),
+        intentToolNames: semanticIntentToolNames,
+      },
+    };
+    /** The payload reached here already free of unusable summary parts:
+     *  `buildMessages` drops them from each prompt copy before counting it,
+     *  so the formatter's summary scan cannot take a failed round's prefix as
+     *  the history boundary and every count describes what is sent. */
+    let {
+      messages: initialMessages,
+      indexTokenCountMap,
+      summary: initialSummary,
+      boundaryTokenAdjustment,
+      compactionSemanticIndexSnapshot,
+    } = formatAgentMessages(
+      payload,
+      this.indexTokenCountMap,
+      toolSet,
+      skillPrimeResult?.skills,
+      formatOptions,
+    );
+    if (this.eventActorContinuation !== 'warm') {
+      this.eventActorSummary = initialSummary;
+    }
+    this.compactionSemanticIndexSnapshot =
+      compactionSemanticIndexSnapshot ??
+      (this.eventActorContinuation === 'warm' ? this.compactionSemanticIndexSnapshot : undefined);
+    const continuationSummary =
+      this.eventActorContinuation === 'warm' ? this.eventActorSummary : initialSummary;
+    const continuationCompactionSemanticIndex = this.compactionSemanticIndexSnapshot?.entries;
+    if (boundaryTokenAdjustment) {
+      logger.debug(
+        `[AgentClient] Boundary token adjustment: ${boundaryTokenAdjustment.original} → ${boundaryTokenAdjustment.adjusted} (${boundaryTokenAdjustment.remainingChars}/${boundaryTokenAdjustment.totalChars} chars)`,
+      );
+    }
+
+    /**
+     * Skill priming — both manual ($ popover) and always-apply (frontmatter).
+     *
+     * Splice + index-shift logic lives in `injectSkillPrimes`
+     * (packages/api/src/agents/skills.ts) so the delicate position math
+     * can be unit-tested in TS without standing up AgentClient. The
+     * resolver enforces a combined ceiling (manual-first, always-apply
+     * truncated first when over cap) before reaching here; the splice
+     * re-applies the cap as defense-in-depth. Runs for both single-
+     * agent and multi-agent runs; how primes interact with handoff /
+     * added-convo agents' per-agent state is an agents-SDK concern,
+     * not this layer's to gate.
+     *
+     * `manualSkillPrimes` / `alwaysApplySkillPrimes` are resolved above
+     * (used to build `freshSkillPrimeNames` for dedupe against historical
+     * skill reconstruction).
+     */
+    if (
+      (manualSkillPrimes && manualSkillPrimes.length > 0) ||
+      (alwaysApplySkillPrimes && alwaysApplySkillPrimes.length > 0)
+    ) {
+      const primeResult = injectSkillPrimes({
+        initialMessages,
+        indexTokenCountMap,
+        manualSkillPrimes,
+        alwaysApplySkillPrimes,
+      });
+      indexTokenCountMap = primeResult.indexTokenCountMap;
+      if (primeResult.inserted > 0) {
+        logger.debug(
+          `[AgentClient] Primed ${primeResult.inserted} skill(s) at message index ${primeResult.insertIdx} ` +
+            `(${manualSkillPrimes?.length ?? 0} manual, ${alwaysApplySkillPrimes?.length ?? 0} always-apply)`,
+        );
+      }
+      if (primeResult.alwaysApplyDropped > 0) {
+        logger.warn(
+          `[AgentClient] Dropped ${primeResult.alwaysApplyDropped} always-apply prime(s) to stay within MAX_PRIMED_SKILLS_PER_TURN.`,
+        );
+      }
+    }
+
+    assertModelBoundContent({
+      onTraversalFailure: reportLocatorTraversalFailure,
+      filters: appConfig?.filters,
+      legacyPii: appConfig?.messageFilter?.pii,
+      agents: reachableAgents,
+      skills: [...(manualSkillPrimes ?? []), ...(alwaysApplySkillPrimes ?? [])],
+      memories: this.modelBoundMemoryContexts,
+      files: this.modelBoundFileContexts,
+    });
+
+    if (indexTokenCountMap && isEnabled(process.env.AGENT_DEBUG_LOGGING)) {
+      const entries = Object.entries(indexTokenCountMap);
+      const perMsg = entries.map(([idx, count]) => {
+        const msg = initialMessages[Number(idx)];
+        const type = msg ? msg._getType() : '?';
+        return `${idx}:${type}=${count}`;
+      });
+      logger.debug(
+        `[AgentClient] Token map after format: [${perMsg.join(', ')}] (payload=${payload.length}, formatted=${initialMessages.length})`,
+      );
+    }
+    indexTokenCountMap = hydrateMissingIndexTokenCounts({
+      messages: initialMessages,
+      indexTokenCountMap,
+      tokenCounter,
+    });
+
+    const memorySourceMessages = initialMessages;
+    ({ messages: initialMessages, indexTokenCountMap } = applyRetainedAnswers({
+      block: this.retainedAnswers?.block,
+      messages: initialMessages,
+      indexTokenCountMap,
+      tokenCounter,
+    }));
+
+    const memoryMessages =
+      this.processMemory && this.memoryPayload && !isCompactionTurn
+        ? formatAgentMessages(
+            stripUnusableSummaryParts(stripActivityLabelParts(this.memoryPayload)),
+            undefined,
+            toolSet,
+            skillPrimeResult?.skills,
+            hasMessageFormatOptions ? messageFormatOptions : undefined,
+          ).messages
+        : memorySourceMessages;
+
+    return {
+      initialMessages,
+      indexTokenCountMap,
+      tokenCounter,
+      initialSessions,
+      continuationSummary,
+      continuationCompactionSemanticIndex,
+      memoryMessages,
+      isCompactionTurn,
+    };
+  }
+
+  /** Private host preparation; final provider/private admission remains in chatCompletion. */
+  async prepareCheckpointMessage(text, opts) {
+    const context = getCheckpointPreparation(this.options.checkpointPreparation, this.options.req);
+    if (!context || checkpointAgentInputs.has(this))
+      throw new Error('Checkpoint input is unavailable');
+    const token = await this.prepareMessage(text, opts);
+    const prepared = this.getPreparedMessageInput(token);
+    const formatted = await this.prepareAgentInput(structuredClone(prepared.payload));
+    context.assertAgents([this.options.agent, ...(this.agentConfigs?.values() ?? [])]);
+    if (this.processMemory != null)
+      throw new Error('Checkpoint-only execution excludes memory dispatch');
+    const fileProjection = BaseClient.prototype.getModelBoundFileProjection.call(this);
+    const inspect = createModelBoundInputInspector({
+      onTraversalFailure: reportLocatorTraversalFailure,
+      filters: this.options.req.config?.filters,
+      legacyPii: this.options.req.config?.messageFilter?.pii,
+      storedMessages: this.modelBoundStoredMessages,
+      privateTextTokens: getPrivateTextInspectionTokens(this.modelBoundStoredMessages ?? []),
+      fileIdsBySourceMessageId: fileProjection.fileIdsBySourceMessageId,
+      resolvedFiles: fileProjection.resolvedFiles,
+      sourceFileProjectionOverflowed: fileProjection.overflowed,
+    });
+    const projection = inspect(formatted.initialMessages);
+    checkpointAgentInputs.set(this, { formatted });
+    return {
+      token,
+      projection,
+      inspect,
+      currentMessageId: prepared.userMessageId,
+      history: this.modelBoundStoredMessages ?? [],
+    };
+  }
+
   async chatCompletion({ payload, userMCPAuthMap, abortController = null }) {
-    /** The inherited state is on the job before any abortable setup begins; a
-     * publish already started while loading history is simply awaited. */
-    await this.publishRunContextMeta?.();
+    const checkpointContext = getCheckpointPreparation(
+      this.options.checkpointPreparation,
+      this.options.req,
+    );
     /** @type {Partial<GraphRunnableConfig>} */
     let config;
     /** @type {ReturnType<createRun>} */
@@ -4687,6 +4969,10 @@ class AgentClient extends BaseClient {
     const balanceConfig = getBalanceConfig(appConfig);
     const transactionsConfig = getTransactionsConfig(appConfig);
     try {
+      const checkpointOptions = checkpointContext?.runOptions(this);
+      /** The inherited state is on the job before abortable setup; pending history metadata
+       * publication stays inside the same persistence-cancelling error boundary. */
+      await this.publishRunContextMeta?.();
       if (!abortController) {
         abortController = new AbortController();
       }
@@ -4755,6 +5041,7 @@ class AgentClient extends BaseClient {
       // reject before creating a run or prewarming an external environment.
       if (
         AgentClient.prototype.hasRetainedDocumentSources.call(this) &&
+        !checkpointContext &&
         (runUsesCheckpointer ||
           this.options.req?._isScheduledFire === true ||
           this.options.req?._isAgentTrigger === true ||
@@ -4856,227 +5143,20 @@ class AgentClient extends BaseClient {
         version: 'v2',
       };
 
-      const toolSet = buildRunToolSet(
-        this.options.agent,
-        this.agentConfigs?.values(),
-        this.options.subagentTasks == null ? undefined : [Constants.CHECK_BACKGROUND_TASK],
-        payload,
-      );
-      const tokenCounter = withRetainedAnswerTokenCounter(
-        await createCachedTokenCounter(this.getEncoding()),
-        this.getEncoding(),
-      );
-
-      /** Pre-resolve invoked skill bodies + re-prime files before formatting messages */
-      if (this.eventActorContinuation === 'cold') {
-        this.eventActorSkillPrimeResult = undefined;
-        this.eventActorDiscoveredToolNames = undefined;
-      }
-      let skillPrimeResult = this.eventActorSkillPrimeResult;
-      if (skillPrimeResult == null) {
-        skillPrimeResult = this.options.primeInvokedSkills
-          ? await this.options.primeInvokedSkills(payload)
-          : undefined;
-      }
-      this.eventActorSkillPrimeResult = skillPrimeResult;
-
-      /** Seed each reachable agent's trusted code-session partition. */
-      const initialSessions = buildInitialToolSessions({
-        skillSessions: skillPrimeResult?.initialSessions,
-        agents: [this.options.agent, ...(this.agentConfigs ? this.agentConfigs.values() : [])],
-      });
-
-      /**
-       * Reconstruct `reasoning_content` on prior tool-call turns: DeepSeek
-       * thinking-mode (#13366) or custom endpoints opting in via
-       * `customParams.includeReasoningHistory` (e.g. Xiaomi MiMo, Kimi).
-       * Walks subagents too — the opted-in endpoint may appear only as a
-       * nested subagent, not the primary or a top-level handoff agent.
-       */
-      const needsReasoningContentFormat = anyAgentReplaysReasoningContent([
-        this.options.agent,
-        ...(this.agentConfigs ? Array.from(this.agentConfigs.values()) : []),
-      ]);
-      /**
-       * Skills primed fresh this turn — manual ($ popover) and always-apply
-       * (frontmatter). `injectSkillPrimes` (below) splices their SKILL.md
-       * bodies in, so `formatAgentMessages` must NOT also reconstruct the
-       * same names from a historical `skill` tool_call — otherwise the body
-       * lands twice and a prompt-cache marker can pin to the duplicated
-       * synthetic prefix. Names NOT primed this turn still reconstruct from
-       * history, preserving sticky manual re-priming across turns.
-       */
-      /** A compaction summarizes what was already said. No user turn was
-       *  submitted, so it primes no skills into the transcript it is about
-       *  to summarize and runs no memory pass over it. */
-      const isCompactionTurn = this.isCompactionTurn();
-      const manualSkillPrimes = isCompactionTurn
-        ? undefined
-        : this.options.agent?.manualSkillPrimes;
-      const alwaysApplySkillPrimes = isCompactionTurn
-        ? undefined
-        : this.options.agent?.alwaysApplySkillPrimes;
-      const freshSkillPrimeNames = collectFreshSkillPrimeNames({
-        manualSkillPrimes,
-        alwaysApplySkillPrimes,
-      });
-      const useLegacyContent = this.options.agent?.useLegacyContent === true;
-      const reachableAgents = collectReachableAgents([
-        this.options.agent,
-        ...(this.agentConfigs?.values() ?? []),
-      ]);
-      const completeAssistantHistory = assertCompleteAssistantHistorySingleton([
-        this.options.agent,
-        ...(this.agentConfigs?.values() ?? []),
-      ]);
-      const messageFormatOptions = {
-        ...(completeAssistantHistory ? { preserveAssistantHistory: true } : {}),
-        ...(needsReasoningContentFormat ? { preserveReasoningContent: true } : {}),
-        ...(freshSkillPrimeNames.size > 0 ? { skipSkillBodyNames: freshSkillPrimeNames } : {}),
-        ...(useLegacyContent ? { legacyContent: true } : {}),
-      };
-      const semanticIntentToolNames = new Set();
-      const semanticIntentBlockedToolNames = new Set();
-      for (const agent of reachableAgents) {
-        for (const toolName of agent.semanticIntentToolNames ?? []) {
-          semanticIntentToolNames.add(toolName);
-        }
-        for (const toolName of agent.semanticIntentBlockedToolNames ?? []) {
-          semanticIntentBlockedToolNames.add(toolName);
-        }
-      }
-      for (const toolName of semanticIntentBlockedToolNames) {
-        semanticIntentToolNames.delete(toolName);
-      }
-      const hasMessageFormatOptions =
-        needsReasoningContentFormat || freshSkillPrimeNames.size > 0 || useLegacyContent;
-      const formatOptions = {
-        ...messageFormatOptions,
-        compactionSemanticIndex: {
-          ...(this.eventActorContinuation === 'warm' && this.compactionSemanticIndexSnapshot != null
-            ? { baseSnapshot: this.compactionSemanticIndexSnapshot }
-            : {}),
-          intentToolNames: semanticIntentToolNames,
-        },
-      };
-      /** The payload reached here already free of unusable summary parts:
-       *  `buildMessages` drops them from each prompt copy before counting it,
-       *  so the formatter's summary scan cannot take a failed round's prefix as
-       *  the history boundary and every count describes what is sent. */
-      let {
-        messages: initialMessages,
-        indexTokenCountMap,
-        summary: initialSummary,
-        boundaryTokenAdjustment,
-        compactionSemanticIndexSnapshot,
-      } = formatAgentMessages(
-        payload,
-        this.indexTokenCountMap,
-        toolSet,
-        skillPrimeResult?.skills,
-        formatOptions,
-      );
-      if (this.eventActorContinuation !== 'warm') {
-        this.eventActorSummary = initialSummary;
-      }
-      this.compactionSemanticIndexSnapshot =
-        compactionSemanticIndexSnapshot ??
-        (this.eventActorContinuation === 'warm' ? this.compactionSemanticIndexSnapshot : undefined);
-      const continuationSummary =
-        this.eventActorContinuation === 'warm' ? this.eventActorSummary : initialSummary;
-      const continuationCompactionSemanticIndex = this.compactionSemanticIndexSnapshot?.entries;
-      if (boundaryTokenAdjustment) {
-        logger.debug(
-          `[AgentClient] Boundary token adjustment: ${boundaryTokenAdjustment.original} → ${boundaryTokenAdjustment.adjusted} (${boundaryTokenAdjustment.remainingChars}/${boundaryTokenAdjustment.totalChars} chars)`,
-        );
-      }
-
-      /**
-       * Skill priming — both manual ($ popover) and always-apply (frontmatter).
-       *
-       * Splice + index-shift logic lives in `injectSkillPrimes`
-       * (packages/api/src/agents/skills.ts) so the delicate position math
-       * can be unit-tested in TS without standing up AgentClient. The
-       * resolver enforces a combined ceiling (manual-first, always-apply
-       * truncated first when over cap) before reaching here; the splice
-       * re-applies the cap as defense-in-depth. Runs for both single-
-       * agent and multi-agent runs; how primes interact with handoff /
-       * added-convo agents' per-agent state is an agents-SDK concern,
-       * not this layer's to gate.
-       *
-       * `manualSkillPrimes` / `alwaysApplySkillPrimes` are resolved above
-       * (used to build `freshSkillPrimeNames` for dedupe against historical
-       * skill reconstruction).
-       */
-      if (
-        (manualSkillPrimes && manualSkillPrimes.length > 0) ||
-        (alwaysApplySkillPrimes && alwaysApplySkillPrimes.length > 0)
-      ) {
-        const primeResult = injectSkillPrimes({
-          initialMessages,
-          indexTokenCountMap,
-          manualSkillPrimes,
-          alwaysApplySkillPrimes,
-        });
-        indexTokenCountMap = primeResult.indexTokenCountMap;
-        if (primeResult.inserted > 0) {
-          logger.debug(
-            `[AgentClient] Primed ${primeResult.inserted} skill(s) at message index ${primeResult.insertIdx} ` +
-              `(${manualSkillPrimes?.length ?? 0} manual, ${alwaysApplySkillPrimes?.length ?? 0} always-apply)`,
-          );
-        }
-        if (primeResult.alwaysApplyDropped > 0) {
-          logger.warn(
-            `[AgentClient] Dropped ${primeResult.alwaysApplyDropped} always-apply prime(s) to stay within MAX_PRIMED_SKILLS_PER_TURN.`,
-          );
-        }
-      }
-
-      assertModelBoundContent({
-        onTraversalFailure: reportLocatorTraversalFailure,
-        filters: appConfig?.filters,
-        legacyPii: appConfig?.messageFilter?.pii,
-        agents: reachableAgents,
-        skills: [...(manualSkillPrimes ?? []), ...(alwaysApplySkillPrimes ?? [])],
-        memories: this.modelBoundMemoryContexts,
-        files: this.modelBoundFileContexts,
-      });
-
-      if (indexTokenCountMap && isEnabled(process.env.AGENT_DEBUG_LOGGING)) {
-        const entries = Object.entries(indexTokenCountMap);
-        const perMsg = entries.map(([idx, count]) => {
-          const msg = initialMessages[Number(idx)];
-          const type = msg ? msg._getType() : '?';
-          return `${idx}:${type}=${count}`;
-        });
-        logger.debug(
-          `[AgentClient] Token map after format: [${perMsg.join(', ')}] (payload=${payload.length}, formatted=${initialMessages.length})`,
-        );
-      }
-      indexTokenCountMap = hydrateMissingIndexTokenCounts({
-        messages: initialMessages,
+      const checkpointInput = checkpointAgentInputs.get(this);
+      if (checkpointContext && !checkpointInput)
+        throw new Error('Checkpoint input was not prepared');
+      const {
+        initialMessages,
         indexTokenCountMap,
         tokenCounter,
-      });
-
-      const memorySourceMessages = initialMessages;
-      ({ messages: initialMessages, indexTokenCountMap } = applyRetainedAnswers({
-        block: this.retainedAnswers?.block,
-        messages: initialMessages,
-        indexTokenCountMap,
-        tokenCounter,
-      }));
-
-      const memoryMessages =
-        this.processMemory && this.memoryPayload && !isCompactionTurn
-          ? formatAgentMessages(
-              stripUnusableSummaryParts(stripActivityLabelParts(this.memoryPayload)),
-              undefined,
-              toolSet,
-              skillPrimeResult?.skills,
-              hasMessageFormatOptions ? messageFormatOptions : undefined,
-            ).messages
-          : memorySourceMessages;
+        initialSessions,
+        continuationSummary,
+        continuationCompactionSemanticIndex,
+        memoryMessages,
+        isCompactionTurn,
+      } = checkpointInput?.formatted ?? (await this.prepareAgentInput(payload));
+      checkpointAgentInputs.delete(this);
 
       /**
        * @param {BaseMessage[]} messages
@@ -5148,7 +5228,10 @@ class AgentClient extends BaseClient {
         // Start the prune alongside graph construction. The all-settled barrier
         // below still guarantees it completes before the graph is exposed or run.
         const shouldPruneCheckpoint =
-          streamId && this.eventActorInvocationId == null && runUsesCheckpointer;
+          streamId &&
+          !checkpointContext &&
+          this.eventActorInvocationId == null &&
+          runUsesCheckpointer;
         let checkpointPrunePromise = Promise.resolve();
         if (shouldPruneCheckpoint && this.checkpointNamespace !== '') {
           checkpointPrunePromise = deleteAgentCheckpoint(
@@ -5189,9 +5272,15 @@ class AgentClient extends BaseClient {
           });
         }
 
-        const activityLabel = this.buildActivityLabelWiring(streamId, abortController.signal);
-        const activityPhase = this.buildActivityPhaseWiring(streamId, abortController.signal);
-        const reasoningLabel = this.buildReasoningLabelWiring(streamId, abortController.signal);
+        const activityLabel = checkpointContext
+          ? undefined
+          : this.buildActivityLabelWiring(streamId, abortController.signal);
+        const activityPhase = checkpointContext
+          ? undefined
+          : this.buildActivityPhaseWiring(streamId, abortController.signal);
+        const reasoningLabel = checkpointContext
+          ? undefined
+          : this.buildReasoningLabelWiring(streamId, abortController.signal);
         const offsetHandlers = createSteerIndexOffsetHandlers(
           this.options.eventHandlers,
           this.steerOffsetState,
@@ -5200,6 +5289,7 @@ class AgentClient extends BaseClient {
           activityPhase?.handlers(offsetHandlers) ??
           (activityLabel ? createAssistantPhaseStampingHandlers(offsetHandlers) : offsetHandlers);
         const createRunPromise = createRun({
+          ...checkpointOptions,
           scheduledMCPExecution: getScheduleMCPExecution(getMCPRequestContext(this.options.req)),
           recordScheduledMCPDenial: createScheduledMCPPolicyRecorder(
             getScheduleMCPExecution(getMCPRequestContext(this.options.req)),
@@ -5239,7 +5329,7 @@ class AgentClient extends BaseClient {
           // Mid-run steering: drain queued user messages at each tool-batch
           // boundary and inject them into graph state. The offset wrapper
           // shifts SDK content indices past any spliced steer parts.
-          steering: this.buildSteerWiring(streamId),
+          steering: checkpointContext ? undefined : this.buildSteerWiring(streamId),
           activityLabel,
           activityPhase,
           eventActorCheckpointing: this.eventActorInvocationId != null,
@@ -5426,6 +5516,10 @@ class AgentClient extends BaseClient {
         err?.code === PENDING_ACTION_EXPIRED_CODE
       ) {
         logger.warn(`[api/server/controllers/agents/client.js #sendCompletion] ${err.message}`);
+        throw err;
+      }
+      if (checkpointContext && !isContentFilterError(err)) {
+        BaseClient.prototype.getModelBoundUserMessagePersistence.call(this)?.cancel();
         throw err;
       }
       if (isContentFilterError(err)) {

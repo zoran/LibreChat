@@ -18,9 +18,10 @@ import type {
   MessageArtifactSourceInput,
   CapturedMessageArtifactSource,
 } from '~/types/message';
-import type { SchemaWithMeiliMethods } from '~/models/plugins/mongoMeili';
-import type { AppConfig, IConversation, IMessage } from '~/types';
 import type { FileOwnerScope, RetainedTextAllocation } from '~/types/file';
+import type { SchemaWithMeiliMethods } from '~/models/plugins/mongoMeili';
+import type { CheckpointSourceBinding } from '~/types/checkpointSource';
+import type { AppConfig, IConversation, IMessage } from '~/types';
 import {
   FileSourceUnavailableError,
   fileSourceScope,
@@ -30,12 +31,13 @@ import {
   resizeRetainedDerivatives,
   unreconciledDocumentStorage,
 } from './fileRetention';
+import { createCheckpointSourceMethods, snapshotCheckpointSourceBinding } from './checkpointSource';
 import { createChatExpirationDate, createTempChatExpirationDate } from '~/utils/tempChatRetention';
 import { activeExpirationFilter, createFallbackRetentionDate } from '~/utils/retention';
+import { createMessageArtifactSourceMethods } from './messageArtifactSource';
 import { fitBoundAppSnapshots, hasBoundAppSnapshots } from './appSnapshots';
 import { tenantSafeBulkWrite } from '~/utils/tenantBulkWrite';
 import { publicMessageProjection } from '~/schema/message';
-import { createMessageArtifactSourceMethods } from './messageArtifactSource';
 import { tenantStorage } from '~/config/tenantContext';
 import logger from '~/config/winston';
 
@@ -845,6 +847,8 @@ export interface MessageMethods {
     input: {
       fileIds: readonly string[];
       historyMessageIds: readonly string[];
+      /** Acknowledged server-only source witness; never populated from request metadata. */
+      checkpointSourceBinding?: CheckpointSourceBinding;
       /** Server-read quote bytes actually selected for this model call. */
       historyQuoteSnapshots?: readonly {
         messageId: string;
@@ -1404,54 +1408,115 @@ export function createMessageMethods(
     owner: FileOwnerScope,
     input: Parameters<MessageMethods['resolveFileRetentionContext']>[1],
   ): Promise<SourceRetentionContext | undefined> {
-    const Message = mongoose.models.Message as Model<IMessage>;
+    // Own all input before the first await. Native revisions are write fences;
+    // only the exact acknowledged complete-body witness can survive our own touches.
+    owner = {
+      userId: owner.userId,
+      ...(owner.tenantId !== undefined && { tenantId: owner.tenantId }),
+    };
+    const binding =
+      input.checkpointSourceBinding === undefined
+        ? undefined
+        : snapshotCheckpointSourceBinding(owner, input.checkpointSourceBinding);
     const ids = [...new Set(input.historyMessageIds)];
-    const history = ids.length
-      ? await Message.find({ ...fileSourceScope(owner), messageId: { $in: ids } })
-          .select(
-            'messageId __v sourceFileIds sourceExpiresAt sourceContentRemovedAt quotes +quoteSourceRetention',
-          )
-          .lean<IMessage[]>()
-      : [];
+    const fileIds = [...new Set(input.fileIds)];
+    const snapshots = new Map(
+      (input.historyQuoteSnapshots ?? []).map((snapshot) => [
+        snapshot.messageId,
+        { ...snapshot, quotes: [...snapshot.quotes] },
+      ]),
+    );
     if (
-      history.length !== ids.length ||
-      history.some(
-        (row) =>
-          row.sourceContentRemovedAt || (row.sourceExpiresAt && row.sourceExpiresAt <= new Date()),
-      )
+      binding &&
+      (fileIds.some((id) => !binding.files.some((file) => file.fileId === id)) ||
+        ids.some((id) => !binding.messages.some((message) => message.messageId === id)) ||
+        snapshots.size !== (input.historyQuoteSnapshots?.length ?? 0) ||
+        [...snapshots].some(
+          ([id, snapshot]) =>
+            !ids.includes(id) ||
+            !binding.messages.some(
+              (message) =>
+                message.messageId === id && message.capturedVersion === snapshot.messageVersion,
+            ),
+        ))
     )
       throw new FileSourceUnavailableError();
-    const quoteLive = await liveQuoteIds(
-      owner,
-      history.flatMap((row) => row.quoteSourceRetention ?? []),
-    );
-    const snapshots = new Map(
-      (input.historyQuoteSnapshots ?? []).map((snapshot) => [snapshot.messageId, snapshot]),
-    );
-    const inherited = history.flatMap((row) => {
-      const visible = filterQuotes(
-        row,
-        (binding) =>
-          binding.sourceExpiresAt <= new Date() ||
-          binding.sourceFileIds.some((id) => !quoteLive.has(id)),
-      );
-      const snapshot = snapshots.get(row.messageId);
+    const resolve = async (session?: ClientSession) => {
+      const Message = mongoose.models.Message as Model<IMessage>;
+      const history = ids.length
+        ? await Message.find({ ...fileSourceScope(owner), messageId: { $in: ids } })
+            .select(
+              'conversationId messageId __v sourceFileIds sourceExpiresAt sourceContentRemovedAt quotes +quoteSourceRetention',
+            )
+            .session(session ?? null)
+            .lean<IMessage[]>()
+        : [];
       if (
-        snapshot &&
-        ((row.__v ?? null) !== snapshot.messageVersion ||
-          JSON.stringify(visible.quotes) !== JSON.stringify(snapshot.quotes))
-      ) {
+        history.length !== ids.length ||
+        history.some(
+          (row) =>
+            row.sourceContentRemovedAt ||
+            (row.sourceExpiresAt && row.sourceExpiresAt <= new Date()),
+        )
+      )
         throw new FileSourceUnavailableError();
-      }
-      return [
-        ...(row.sourceFileIds ?? []),
-        ...visible.quoteSourceRetention.flatMap((binding) => binding.sourceFileIds),
-      ];
-    });
-    const resolved = await resolveFileSources(mongoose, owner, [...input.fileIds, ...inherited]);
-    if (inherited.some((id) => !resolved?.sourceFileIds.includes(id)))
-      throw new FileSourceUnavailableError();
-    return resolved;
+      const quoteLive = await liveQuoteIds(
+        owner,
+        history.flatMap((row) => row.quoteSourceRetention ?? []),
+        session,
+      );
+      const inherited = history.flatMap((row) => {
+        const visible = filterQuotes(
+          row,
+          (binding) =>
+            binding.sourceExpiresAt <= new Date() ||
+            binding.sourceFileIds.some((id) => !quoteLive.has(id)),
+        );
+        const witness = binding?.messages.find((entry) => entry.messageId === row.messageId);
+        if (binding && (!witness || witness.conversationId !== row.conversationId)) {
+          throw new FileSourceUnavailableError();
+        }
+        const snapshot = snapshots.get(row.messageId);
+        if (
+          snapshot &&
+          ((witness
+            ? witness.capturedVersion !== snapshot.messageVersion
+            : (row.__v ?? null) !== snapshot.messageVersion) ||
+            JSON.stringify(visible.quotes) !== JSON.stringify(snapshot.quotes))
+        ) {
+          throw new FileSourceUnavailableError();
+        }
+        return [
+          ...(row.sourceFileIds ?? []),
+          ...visible.quoteSourceRetention.flatMap((binding) => binding.sourceFileIds),
+        ];
+      });
+      const resolved = await resolveFileSources(
+        mongoose,
+        owner,
+        [...fileIds, ...inherited],
+        session,
+      );
+      if (inherited.some((id) => !resolved?.sourceFileIds.includes(id)))
+        throw new FileSourceUnavailableError();
+      return resolved;
+    };
+    if (!binding) return resolve();
+    const session = await mongoose.startSession();
+    let result: SourceRetentionContext | undefined;
+    try {
+      session.startTransaction({
+        readConcern: { level: 'snapshot' },
+        writeConcern: { w: 'majority', j: true },
+      });
+      await createCheckpointSourceMethods(mongoose).fenceCheckpointSources(owner, binding, session);
+      result = await resolve(session);
+      await session.commitTransaction();
+    } finally {
+      // An uncertain commit/close never returns a context or grants model admission.
+      await session.endSession();
+    }
+    return result;
   }
 
   async function writeRetainedMessage(

@@ -80,7 +80,7 @@ async function recover() {
     { ownerInstanceId: 'pod-b', processBootId: 'incarnation-b', segmentId: 'segment-b' },
   );
   if (!result.ok) throw new Error('Fixture recovery CAS did not win');
-  return result.value;
+  return result.value.admission;
 }
 
 beforeAll(async () => {

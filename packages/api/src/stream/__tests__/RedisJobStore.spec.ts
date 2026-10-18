@@ -1,6 +1,7 @@
 import type { Cluster } from 'ioredis';
 import { InMemoryJobStore } from '../implementations/InMemoryJobStore';
 import { RedisJobStore } from '../implementations/RedisJobStore';
+import { createCheckpointNamespace } from '../checkpoints';
 
 jest.mock('~/cache/redisTelemetry', () => ({
   RedisUseCases: { GENERATION_STREAM: 'generation_stream' },
@@ -44,6 +45,101 @@ function jobHashFromCreationCall(call: unknown[]): Record<string, string> {
 }
 
 describe('RedisJobStore', () => {
+  test.each(['transition', 'drain'] as const)(
+    'rejects a stale provider before the %s status CAS changes the same generation',
+    async (operation) => {
+      const store = new InMemoryJobStore();
+      const original = await store.createJob('provider-cas', 'owner', 'provider-cas');
+      const args = {
+        from: 'running' as const,
+        to: 'aborted' as const,
+        expectCreatedAt: original.createdAt,
+        expectProviderExecutionId: 'stale-provider',
+        patch: { providerExecutionId: 'unexpected-successor' },
+      };
+      const before = await store.getJob('provider-cas');
+      const result =
+        operation === 'drain'
+          ? await store.transitionStatusAndDrainSteers('provider-cas', args)
+          : await store.transitionStatus('provider-cas', args);
+      expect(result).toBe(operation === 'drain' ? null : false);
+      expect(await store.getJob('provider-cas')).toEqual(before);
+    },
+  );
+
+  test('serializes the trusted checkpoint namespace in the initial atomic Redis create', async () => {
+    const evalJobCreation = jest
+      .fn()
+      .mockImplementation((...args: unknown[]) => ['', '', args[Number(args[1]) + 3]]);
+    const redis = {
+      isCluster: true,
+      get: jest.fn().mockResolvedValue(null),
+      hvals: jest.fn().mockResolvedValue([]),
+      eval: evalJobCreation,
+      hgetall: jest.fn(() => jobHashFromCreationCall(evalJobCreation.mock.calls[0])),
+      sadd: jest.fn().mockResolvedValue(1),
+      srem: jest.fn().mockResolvedValue(1),
+      expire: jest.fn().mockResolvedValue(1),
+    } as unknown as Cluster;
+    const store = new RedisJobStore(redis);
+    const namespace = createCheckpointNamespace('owner', 'tenant');
+    const job = await store.createJob(
+      'checkpoint-create',
+      'owner',
+      'checkpoint-create',
+      'tenant',
+      { generationProtocolVersion: 2 },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      namespace,
+    );
+    expect(job).toMatchObject({ checkpointNamespace: namespace, generationProtocolVersion: 2 });
+    expect(jobHashFromCreationCall(evalJobCreation.mock.calls[0])).toMatchObject({
+      checkpointNamespace: namespace,
+      generationProtocolVersion: '2',
+    });
+  });
+
+  test.each(['foreign owner', 'foreign tenant', 'malformed', 'legacy protocol'])(
+    'rejects a %s namespace before any Redis operation',
+    async (reason) => {
+      const evalJobCreation = jest.fn();
+      const get = jest.fn();
+      const redis = { isCluster: true, eval: evalJobCreation, get } as unknown as Cluster;
+      const store = new RedisJobStore(redis);
+      let namespace = createCheckpointNamespace('owner', 'tenant');
+      if (reason === 'foreign owner') namespace = createCheckpointNamespace('other', 'tenant');
+      if (reason === 'foreign tenant') namespace = createCheckpointNamespace('owner', 'other');
+      if (reason === 'malformed') namespace = 'invalid-namespace';
+      await expect(
+        store.createJob(
+          'checkpoint-create',
+          'owner',
+          'checkpoint-create',
+          'tenant',
+          { generationProtocolVersion: reason === 'legacy protocol' ? 1 : 2 },
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          namespace,
+        ),
+      ).rejects.toThrow('Invalid trusted generation checkpoint namespace');
+      expect(evalJobCreation).not.toHaveBeenCalled();
+      expect(get).not.toHaveBeenCalled();
+    },
+  );
+
   test('marks only the exact provider segment drained', async () => {
     const evalDrain = jest.fn().mockResolvedValue(1);
     const redis = {

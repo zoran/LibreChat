@@ -7,6 +7,7 @@ import {
   collectModelBoundHistoricalFileIdState,
   collectModelBoundHistoricalFileIds,
   createModelBoundChatModelCallback,
+  createModelBoundInputInspector,
   createInitialModelBoundAdmissionCallback,
   hasModelBoundContentProtection,
   projectModelBoundSourceFiles,
@@ -5087,7 +5088,7 @@ describe('assertModelBoundProviderContent', () => {
               fields: ['content_part'],
               starterPatterns: [],
               customPatterns: [
-                { id: 'private', label: 'private value', regex: 'PRIVATE-GENERIC-FIELD' },
+                { id: 'private', label: 'private value', regex: 'fixture-GENERIC-FIELD' },
               ],
             },
           },
@@ -5095,7 +5096,7 @@ describe('assertModelBoundProviderContent', () => {
         providerMessages: [
           {
             role: 'human',
-            content: [{ type: 'custom', vendor: { secret: 'PRIVATE-GENERIC-FIELD' } }],
+            content: [{ type: 'custom', vendor: { secret: 'fixture-GENERIC-FIELD' } }],
           },
         ],
       }),
@@ -5103,7 +5104,7 @@ describe('assertModelBoundProviderContent', () => {
   });
 
   it('retains an own __proto__ provider field in the bounded snapshot', () => {
-    const part = JSON.parse('{"type":"custom","__proto__":{"secret":"PRIVATE-PROTO-FIELD"}}');
+    const part = JSON.parse('{"type":"custom","__proto__":{"secret":"fixture-PROTO-FIELD"}}');
 
     expect(() =>
       assertModelBoundProviderContent({
@@ -5113,7 +5114,7 @@ describe('assertModelBoundProviderContent', () => {
               fields: ['content_part'],
               starterPatterns: [],
               customPatterns: [
-                { id: 'private', label: 'private value', regex: 'PRIVATE-PROTO-FIELD' },
+                { id: 'private', label: 'private value', regex: 'fixture-PROTO-FIELD' },
               ],
             },
           },
@@ -5124,7 +5125,7 @@ describe('assertModelBoundProviderContent', () => {
   });
 
   it('retains an own __proto__ field on a nested content child', () => {
-    const nestedPart = JSON.parse('{"__proto__":{"secret":"PRIVATE-NESTED-PROTO"}}');
+    const nestedPart = JSON.parse('{"__proto__":{"secret":"fixture-NESTED-PROTO"}}');
 
     expect(() =>
       assertModelBoundProviderContent({
@@ -5134,7 +5135,7 @@ describe('assertModelBoundProviderContent', () => {
               fields: ['content_part'],
               starterPatterns: [],
               customPatterns: [
-                { id: 'private', label: 'private value', regex: 'PRIVATE-NESTED-PROTO' },
+                { id: 'private', label: 'private value', regex: 'fixture-NESTED-PROTO' },
               ],
             },
           },
@@ -6288,4 +6289,28 @@ it('awaits source admission before allowed persistence and fails closed on rejec
   await expect(pending).rejects.toThrow();
   expect(onContentAllowed).not.toHaveBeenCalled();
   expect(onContentRejected).toHaveBeenCalledTimes(1);
+});
+
+describe('pure prepared-input inspection', () => {
+  it('shares exact content policy and returns source lineage without model lifecycle effects', () => {
+    const stored = { messageId: 'current', text: 'safe current input', isCreatedByUser: true };
+    const inspect = createModelBoundInputInspector({ filters, storedMessages: [stored] });
+    const result = inspect([{ role: 'human', id: 'current', content: stored.text }]);
+    expect(result.sourceMessageIds).toEqual(['current']);
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(Object.isFrozen(result.sourceMessageIds)).toBe(true);
+    expect(() => inspect([{ role: 'human', content: 'PRIVATE-BLOCKED' }])).toThrow();
+    // Independent final input still passes through the actual callback and its own admission hook.
+    const allowed = jest.fn();
+    const callback = createModelBoundChatModelCallback({ filters }, { onContentAllowed: allowed });
+    expect(allowed).not.toHaveBeenCalled();
+    expect(() =>
+      callback.handleChatModelStart(undefined, [[{ role: 'human', content: 'PRIVATE-LATER' }]]),
+    ).toThrow();
+    expect(allowed).not.toHaveBeenCalled();
+  });
+  it('fails incomplete source projection closed even without a configured text filter', () => {
+    const inspect = createModelBoundInputInspector({ sourceFileProjectionOverflowed: true });
+    expect(() => inspect([{ role: 'human', content: 'safe' }])).toThrow();
+  });
 });

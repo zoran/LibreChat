@@ -9,17 +9,19 @@ import {
   snapshotGenerationCheckpointAdmission,
 } from '@librechat/data-schemas';
 import type {
+  IndexBuildOptions,
+  GenerationAdmissionInput,
+  FileOwnerScope,
+  CheckpointSourceBinding,
+  GenerationCheckpointSourceRecovery,
+} from '@librechat/data-schemas';
+import type {
   Checkpoint,
   CheckpointListOptions,
   CheckpointMetadata,
   CheckpointTuple,
   PendingWrite,
 } from '@langchain/langgraph-checkpoint';
-import type {
-  IndexBuildOptions,
-  GenerationAdmissionInput,
-  FileOwnerScope,
-} from '@librechat/data-schemas';
 import type { BaseMessage } from '@librechat/agents/langchain/messages';
 import type { TCheckpointerConfig } from 'librechat-data-provider';
 import type { RunnableConfig } from '@langchain/core/runnables';
@@ -44,10 +46,11 @@ import {
   LIBRECHAT_CHECKPOINT_OWNER_KEY,
   LIBRECHAT_LEGACY_CHECKPOINT_KEY,
 } from './checkpoints/saver';
+import { readCheckpointRecoverySource } from './checkpoints/source-read';
 import { checkpointOwnerNamespacePrefix } from '../stream/checkpoints';
+import { purgeCheckpointRows } from './checkpoints/source-retention';
 import { resolveCheckpointerConfig } from './checkpoints/config';
 import { checkpointStorageConfigs } from './checkpoints/storage';
-import { purgeCheckpointRows } from './checkpoints/source-retention';
 
 export {
   DurableMongoSaver,
@@ -65,7 +68,7 @@ export {
   LIBRECHAT_CHECKPOINT_OWNER_KEY,
   LIBRECHAT_LEGACY_CHECKPOINT_KEY,
 } from './checkpoints/saver';
-export { checkpointOwnerNamespacePrefix } from '../stream/checkpoints';
+export { checkpointOwnerNamespacePrefix, createCheckpointNamespace } from '../stream/checkpoints';
 
 export { resolveCheckpointerConfig } from './checkpoints/config';
 export {
@@ -580,6 +583,31 @@ export async function getAgentCheckpointer(
   return saverPromise;
 }
 
+/** Trusted storage composition for the existing transactional recovery consumer. */
+export function createCheckpointSourceRecovery(
+  cfg?: TCheckpointerConfig,
+): GenerationCheckpointSourceRecovery {
+  const resolved = Object.freeze(resolveCheckpointerConfig(cfg));
+  const names = [resolved.checkpointCollectionName, resolved.checkpointWritesCollectionName];
+  if (
+    resolved.type !== 'mongo' ||
+    names[0] === names[1] ||
+    names.some(
+      (name) => !/^[A-Za-z0-9_][A-Za-z0-9_.-]{0,119}$/.test(name) || name.startsWith('system.'),
+    )
+  )
+    throw new Error('Invalid recovery checkpoint storage');
+  return (predecessor, session) =>
+    readCheckpointRecoverySource(
+      {
+        checkpointCollectionName: resolved.checkpointCollectionName,
+        maxBsonBytes: CHECKPOINT_HARD_LIMIT_BYTES,
+        predecessor,
+      },
+      session,
+    );
+}
+
 /**
  * Scope-bound native persistence; missing Mongo or indexes is fatal. A supplied
  * admission additionally binds writes to the actual active native segment. Raw
@@ -589,6 +617,7 @@ export async function getDurableAgentCheckpointer(
   scope: DurableAgentCheckpointScope,
   cfg?: TCheckpointerConfig,
   admission?: GenerationAdmissionInput,
+  sourceBinding?: CheckpointSourceBinding,
 ): Promise<DurableMongoSaver> {
   const boundAdmission =
     admission === undefined ? undefined : snapshotGenerationCheckpointAdmission(admission);
@@ -613,6 +642,7 @@ export async function getDurableAgentCheckpointer(
   // Construction snapshots the scope synchronously, before setup can yield.
   const saver = new DurableMongoSaver({
     scope,
+    ...(sourceBinding === undefined ? {} : { sourceBinding }),
     ...(boundAdmission === undefined ? {} : { admission: boundAdmission }),
     client: mongoose.connection.getClient() as unknown as ConstructorParameters<
       typeof MongoDBSaver

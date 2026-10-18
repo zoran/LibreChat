@@ -1,5 +1,6 @@
 import type { SteerQueueItem } from '../interfaces/IJobStore';
 import { InMemoryJobStore } from '../implementations/InMemoryJobStore';
+import { createCheckpointNamespace } from '../checkpoints';
 
 type ParkedMap = Map<string, { payload: string; expiresAt: number }>;
 
@@ -17,6 +18,76 @@ describe('InMemoryJobStore createJob ownership integrity', () => {
   afterEach(async () => {
     await store.destroy();
   });
+
+  function createBoundJob(namespace: string, protocol: 1 | 2 = 2) {
+    return store.createJob(
+      'checkpoint-create',
+      'owner',
+      'checkpoint-create',
+      'tenant',
+      { generationProtocolVersion: protocol },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      namespace,
+    );
+  }
+
+  test('persists the exact trusted checkpoint namespace at native creation', async () => {
+    const namespace = createCheckpointNamespace('owner', 'tenant');
+    const job = await createBoundJob(namespace);
+    expect(job).toMatchObject({ checkpointNamespace: namespace, generationProtocolVersion: 2 });
+    await expect(store.getJob(job.streamId)).resolves.toMatchObject({
+      checkpointNamespace: namespace,
+      generationProtocolVersion: 2,
+      createdAt: job.createdAt,
+    });
+    const next = await store.createJob(job.streamId, 'owner', job.streamId, 'tenant');
+    expect(next.checkpointNamespace).not.toBe(namespace);
+    expect(next.checkpointNamespace).toMatch(/^lcg:v2:/);
+  });
+
+  test.each(['foreign owner', 'foreign tenant', 'malformed', 'legacy protocol'])(
+    'rejects a %s checkpoint namespace before replacing native state',
+    async (reason) => {
+      const original = await store.createJob(
+        'checkpoint-create',
+        'owner',
+        'checkpoint-create',
+        'tenant',
+      );
+      const steer: SteerQueueItem = {
+        steerId: 'keep-checkpoint',
+        text: 'keep',
+        userId: 'owner',
+        createdAt: Date.now(),
+      };
+      await store.enqueueSteer(original.streamId, steer, original.createdAt);
+      let namespace = createCheckpointNamespace('owner', 'tenant');
+      if (reason === 'foreign owner') namespace = createCheckpointNamespace('other', 'tenant');
+      if (reason === 'foreign tenant') namespace = createCheckpointNamespace('owner', 'other');
+      if (reason === 'malformed') namespace = 'invalid-namespace';
+      await expect(createBoundJob(namespace, reason === 'legacy protocol' ? 1 : 2)).rejects.toThrow(
+        'Invalid trusted generation checkpoint namespace',
+      );
+      await expect(store.getJob(original.streamId)).resolves.toMatchObject({
+        createdAt: original.createdAt,
+        checkpointNamespace: original.checkpointNamespace,
+        status: 'running',
+      });
+      await expect(store.peekSteers(original.streamId, original.createdAt)).resolves.toEqual([
+        steer,
+      ]);
+      await expect(store.getActiveJobIdsByUser('owner', 'tenant')).resolves.toContain(
+        original.streamId,
+      );
+    },
+  );
 
   test('refuses a cross-user replacement without disturbing the live generation', async () => {
     const streamId = 'create-owner-cross-user';

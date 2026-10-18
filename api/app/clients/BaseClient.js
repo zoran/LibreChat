@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { Types } = require('mongoose');
 const fetch = require('node-fetch');
 const { logger } = require('@librechat/data-schemas');
 const {
@@ -67,6 +68,64 @@ const db = require('~/models');
 // Private per-turn preparation state and response-object capabilities, never request metadata.
 const sourceCoverageTurns = new WeakMap();
 const sourceCoverageResponses = new WeakMap();
+// One live prepared turn belongs to one client. Tokens are capabilities, never body metadata.
+const preparedMessageInputs = new WeakMap();
+const activeMessagePreparations = new WeakMap();
+
+/** Model-neutral prepared payloads contain own JSON data, not executable/prototype state. */
+function detachPreparedValue(input) {
+  let remaining = 100_000;
+  let bytes = 16 * 1024 * 1024;
+  const ancestors = new Set();
+  const visit = (value, depth = 0) => {
+    if (--remaining < 0 || depth > 64) throw new Error('Prepared message exceeds input bounds');
+    if (value == null || typeof value === 'boolean' || typeof value === 'undefined') return value;
+    if (typeof value === 'string') {
+      bytes -= Buffer.byteLength(value);
+      if (bytes < 0) throw new Error('Prepared message exceeds input bounds');
+      return value;
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value !== 'object' || require('node:util').types.isProxy(value)) {
+      throw new Error('Prepared message requires own input data');
+    }
+    const prototype = Object.getPrototypeOf(value);
+    // Native retention dates become immutable canonical data; freezing Date itself
+    // would still permit its mutable internal time value to change after inspection.
+    if (require('node:util').types.isDate(value) && Reflect.ownKeys(value).length === 0) {
+      return Date.prototype.toISOString.call(value);
+    }
+    if (prototype === Types.ObjectId.prototype) {
+      const buffer = Object.getOwnPropertyDescriptor(value, 'buffer')?.value;
+      if (Reflect.ownKeys(value).length !== 1 || !Buffer.isBuffer(buffer) || buffer.length !== 12) {
+        throw new Error('Prepared message requires own input data');
+      }
+      return Buffer.prototype.toString.call(buffer, 'hex');
+    }
+    if (prototype !== Object.prototype && prototype !== null && prototype !== Array.prototype) {
+      throw new Error('Prepared message requires own input data');
+    }
+    if (ancestors.has(value)) throw new Error('Prepared message contains a cycle');
+    ancestors.add(value);
+    const copy = Array.isArray(value) ? [] : Object.create(prototype);
+    for (const key of Reflect.ownKeys(value)) {
+      if (Array.isArray(value) && key === 'length') continue;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (typeof key !== 'string' || !('value' in descriptor)) {
+        throw new Error('Prepared message requires own input data');
+      }
+      bytes -= Buffer.byteLength(key);
+      if (bytes < 0) throw new Error('Prepared message exceeds input bounds');
+      Object.defineProperty(copy, key, {
+        value: visit(descriptor.value, depth + 1),
+        enumerable: true,
+      });
+    }
+    ancestors.delete(value);
+    return Object.freeze(copy);
+  };
+  return visit(input);
+}
 const coverageMetadata = (metadata, sourceCoverage) => {
   const { sourceCoverage: _untrusted, ...rest } = metadata ?? {};
   if (sourceCoverage) rest.sourceCoverage = sourceCoverage;
@@ -593,7 +652,7 @@ class BaseClient {
     });
   }
 
-  async handleStartMethods(message, opts) {
+  async handleStartMethods(message, opts, deferStart = false) {
     const {
       user,
       head,
@@ -644,6 +703,24 @@ class BaseClient {
       }),
     );
 
+    const started = {
+      ...opts,
+      user,
+      head,
+      conversationId,
+      responseMessageId,
+      saveOptions,
+      userMessage,
+      requestConvoId,
+      parentMessageId,
+    };
+    if (!deferStart) this.announceMessageStart(started, opts);
+    return started;
+  }
+
+  announceMessageStart(started, opts) {
+    const { userMessage, conversationId, responseMessageId, requestConvoId, parentMessageId } =
+      started;
     if (typeof opts?.getReqData === 'function') {
       opts.getReqData({
         userMessage,
@@ -660,16 +737,6 @@ class BaseClient {
       responseMessageId,
       !requestConvoId && parentMessageId === Constants.NO_PARENT,
     );
-
-    return {
-      ...opts,
-      user,
-      head,
-      conversationId,
-      responseMessageId,
-      saveOptions,
-      userMessage,
-    };
   }
 
   /**
@@ -782,26 +849,16 @@ class BaseClient {
     );
   }
 
-  /**
-   * @param {string} message
-   * @param {Record<string, unknown>} opts
-   * @param {BalanceReservations} balanceReservations - Holds the balance reservation admitting
-   * this message; released once its usage is recorded, and by `sendMessage` on any other exit.
-   */
-  async sendReservedMessage(message, opts, balanceReservations) {
+  async buildMessageInput(message, opts, deferStart = false) {
     const coverageTurn = { entries: new Map(), disabled: false };
     sourceCoverageTurns.set(this, coverageTurn);
     const coverageRequest = this.options.req;
-    const appConfig = this.options.req?.config;
-    /** @type {Promise<TMessage>} */
-    let userMessagePromise;
-    /** @type {{ promise: Promise<unknown>, isPending: () => boolean, start: () => Promise<unknown>, cancel: () => Promise<unknown> } | undefined} */
-    let userMessagePersistence;
     this.modelBoundUserMessagePersistence = undefined;
+    const started = await this.handleStartMethods(message, opts, deferStart);
     const { user, head, isEdited, conversationId, responseMessageId, saveOptions, userMessage } =
-      await this.handleStartMethods(message, opts);
+      started;
 
-    if (opts.progressCallback) {
+    if (!deferStart && opts.progressCallback) {
       opts.onProgress = opts.progressCallback.call(null, {
         ...(opts.progressOptions ?? {}),
         parentMessageId: userMessage.messageId,
@@ -898,6 +955,25 @@ class BaseClient {
     this.assertBuiltModelBoundContent(payload);
     this.options.startupTelemetry?.mark('messages_built');
 
+    // Typed source provenance needs the unsaved current row's canonical file references.
+    // This is input annotation only; the existing admission still owns persistence.
+    if (
+      !isEdited &&
+      !this.skipSaveUserMessage &&
+      this.options.req?.body?.files &&
+      Array.isArray(this.options.attachments)
+    ) {
+      const files = buildMessageFiles(this.options.req.body.files, this.options.attachments);
+      if (files.length > 0) {
+        userMessage.files = files;
+        const currentSource = this.modelBoundStoredMessages.find(
+          (source) => source.messageId === userMessage.messageId,
+        );
+        if (currentSource) currentSource.files = files;
+      }
+      delete userMessage.image_urls;
+    }
+
     /** A compaction anchor is the persisted leaf, whose own count must stay. */
     if (tokenCountMap && tokenCountMap[userMessage.messageId] && opts.isCompaction !== true) {
       userMessage.tokenCount = tokenCountMap[userMessage.messageId];
@@ -908,15 +984,128 @@ class BaseClient {
       });
     }
 
-    if (!isEdited && !this.skipSaveUserMessage) {
-      const reqFiles = this.options.req?.body?.files;
-      if (reqFiles && Array.isArray(this.options.attachments)) {
-        const files = buildMessageFiles(reqFiles, this.options.attachments);
-        if (files.length > 0) {
-          userMessage.files = files;
-        }
-        delete userMessage.image_urls;
+    return {
+      started,
+      user,
+      isEdited,
+      conversationId,
+      responseMessageId,
+      saveOptions,
+      userMessage,
+      parentMessageId,
+      tokenCountMap,
+      promptTokens,
+      payload,
+      coverageTurn,
+      coverageRequest,
+    };
+  }
+
+  /** Prepare without Message/conversation writes, start events, balance or provider work. */
+  async prepareMessage(message, opts = {}) {
+    if (activeMessagePreparations.has(this)) throw new Error('Prepared message already exists');
+    const token = Object.freeze({});
+    activeMessagePreparations.set(this, token);
+    try {
+      const input = await this.buildMessageInput(message, opts, true);
+      input.payload = detachPreparedValue(input.payload);
+      input.userMessage = detachPreparedValue(input.userMessage);
+      input.started = { ...input.started, userMessage: input.userMessage };
+      const options = { ...opts };
+      preparedMessageInputs.set(token, { client: this, input, options, consumed: false });
+      return token;
+    } catch (error) {
+      activeMessagePreparations.delete(this);
+      throw error;
+    }
+  }
+
+  getPreparedMessageInput(token) {
+    const prepared = preparedMessageInputs.get(token);
+    if (!prepared || prepared.client !== this || prepared.consumed) {
+      throw new Error('Prepared message is unavailable');
+    }
+    return Object.freeze({
+      payload: prepared.input.payload,
+      conversationId: prepared.input.conversationId,
+      userMessageId: prepared.input.userMessage.messageId,
+      responseMessageId: prepared.input.responseMessageId,
+    });
+  }
+
+  async sendPreparedMessage(token, opts = {}) {
+    const prepared = preparedMessageInputs.get(token);
+    if (!prepared || prepared.client !== this || prepared.consumed) {
+      throw new Error('Prepared message is unavailable');
+    }
+    for (const key of [
+      'user',
+      'conversationId',
+      'parentMessageId',
+      'preallocatedUserMessageId',
+      'preallocatedResponseMessageId',
+      'isEdited',
+      'isContinued',
+      'isRegenerate',
+      'isCompaction',
+      'editedContent',
+      'overrideParentMessageId',
+      'responseMessageId',
+    ]) {
+      if (Object.hasOwn(opts, key) && opts[key] !== prepared.options[key]) {
+        throw new Error('Prepared message identity changed');
       }
+    }
+    prepared.consumed = true;
+    activeMessagePreparations.delete(this);
+    return withBalanceReservations((balanceReservations) =>
+      this.sendReservedMessage(
+        undefined,
+        { ...prepared.options, ...opts },
+        balanceReservations,
+        prepared.input,
+      ),
+    );
+  }
+
+  /**
+   * @param {string} message
+   * @param {Record<string, unknown>} opts
+   * @param {BalanceReservations} balanceReservations - Holds the balance reservation admitting
+   * this message; released once its usage is recorded, and by `sendMessage` on any other exit.
+   */
+  async sendReservedMessage(message, opts, balanceReservations, preparedInput) {
+    const input = preparedInput ?? (await this.buildMessageInput(message, opts));
+    const {
+      user,
+      isEdited,
+      conversationId,
+      responseMessageId,
+      saveOptions,
+      tokenCountMap,
+      promptTokens,
+      payload,
+      coverageTurn,
+      coverageRequest,
+    } = input;
+    // Persistence annotates its own message; the detached prepared content remains immutable.
+    const userMessage = preparedInput ? structuredClone(input.userMessage) : input.userMessage;
+    if (preparedInput) {
+      this.abortController = opts.abortController ?? this.abortController;
+      this.announceMessageStart({ ...input.started, userMessage }, opts);
+      if (opts.progressCallback) {
+        opts.onProgress = opts.progressCallback.call(null, {
+          ...(opts.progressOptions ?? {}),
+          parentMessageId: userMessage.messageId,
+          messageId: responseMessageId,
+        });
+      }
+    }
+    const appConfig = this.options.req?.config;
+    let userMessagePromise;
+    let userMessagePersistence;
+
+    if (!isEdited && !this.skipSaveUserMessage) {
       /**
        * Persist the user's manual skill picks onto the user message so the
        * frontend `SkillPills` component can render them in history

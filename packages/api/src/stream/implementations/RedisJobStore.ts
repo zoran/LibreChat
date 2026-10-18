@@ -77,12 +77,12 @@ import {
   SCHEDULE_MCP_RECEIPT_LUA,
   SCHEDULE_RETENTION_LUA,
 } from '~/stream/internal/scheduleReceipts';
+import { createCheckpointNamespace, checkpointNamespaceBelongsToOwner } from '~/stream/checkpoints';
 import { parseScheduleMCPCompletion } from '~/schedules/authorization/continuation';
 import { instrumentIORedisClient, RedisUseCases } from '~/cache/redisTelemetry';
 import { RecoveredSteerPayloadMismatchError } from '~/stream/SteerRecovery';
 import { SCHEDULE_MCP_FAILURE_PATCH_LUA } from '../scheduleFailure';
 import { sourceRetentionAvailable } from '../interfaces/IJobStore';
-import { createCheckpointNamespace } from '~/stream/checkpoints';
 import { createToolTimingTracker } from '~/agents/toolTiming';
 import { redactQuoteRetention } from '~/files/retention';
 import { evalScript } from '~/cache/redisScript';
@@ -257,6 +257,7 @@ const JOB_CAS_LUA =
   'if redis.call("HGET", KEYS[1], "status") ~= ARGV[1] then return 0 end ' +
   'if ARGV[2] ~= "" and redis.call("HGET", KEYS[1], "pendingActionId") ~= ARGV[2] then return 0 end ' +
   'if ARGV[3] ~= "" and redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[3] then return 0 end ' +
+  'if ARGV[13] ~= "" and redis.call("HGET", KEYS[1], "providerExecutionId") ~= ARGV[13] then return 0 end ' +
   'if ARGV[4] ~= "" then local now = redis.call("TIME") ' +
   'local nowMs = tonumber(now[1]) * 1000 + math.floor(tonumber(now[2]) / 1000) ' +
   'if nowMs >= tonumber(ARGV[4]) then return -1 end end ' +
@@ -300,9 +301,9 @@ const JOB_CAS_LUA =
   'or (item.recoveringCreatedAt and (type(item.recoveringCreatedAt) ~= "number" or item.recoveringCreatedAt < 0)) then return 0 end ' +
   'validatedPrior[#validatedPrior + 1] = item end end end ' +
   'local currentReceipt = redis.call("HGET", KEYS[1], "scheduleOutcomeError") ' +
-  'local clearReceipt = false local hdelCount = tonumber(ARGV[13]) ' +
-  'for i = 14, 13 + hdelCount do if ARGV[i] == "scheduleOutcome" or ARGV[i] == "scheduleOutcomeError" then clearReceipt = true end end ' +
-  'local idx = 14 ' +
+  'local clearReceipt = false local hdelCount = tonumber(ARGV[14]) ' +
+  'for i = 15, 14 + hdelCount do if ARGV[i] == "scheduleOutcome" or ARGV[i] == "scheduleOutcomeError" then clearReceipt = true end end ' +
+  'local idx = 15 ' +
   'local clear={} for i=1,hdelCount do if not string.match(ARGV[idx],"^sourceRetention") and not string.match(ARGV[idx],"^sourceReplay") then clear[#clear+1]=ARGV[idx] end idx=idx+1 end ' +
   'local hset = {} ' +
   'local sourceLive=sourceAvailable(KEYS[1]) local safe={status=true,completedAt=true,terminalPersistencePending=true,terminalPersistenceStartedAt=true,terminalHostActionPending=true,providerDrained=true,providerExecutionId=true,providerExecutionStartedId=true} ' +
@@ -2386,7 +2387,14 @@ export class RedisJobStore implements IJobStoreV2 {
     creationAttemptId?: string,
     expectedPredecessorCreatedAt?: number,
     rejectActivePredecessor?: boolean,
+    trustedCheckpointNamespace?: string,
   ): Promise<CreatedJobData> {
+    if (
+      trustedCheckpointNamespace !== undefined &&
+      (initialMetadata.generationProtocolVersion === 1 ||
+        !checkpointNamespaceBelongsToOwner(trustedCheckpointNamespace, userId, tenantId))
+    )
+      throw new Error('Invalid trusted generation checkpoint namespace');
     if (typeof userId !== 'string' || userId.length === 0) {
       throw new Error('Generation job requires a non-empty user id');
     }
@@ -2436,7 +2444,8 @@ export class RedisJobStore implements IJobStoreV2 {
       createdAt: Date.now(),
       generationProtocolVersion,
       ...(generationProtocolVersion === 2 && {
-        checkpointNamespace: createCheckpointNamespace(userId, tenantId),
+        checkpointNamespace:
+          trustedCheckpointNamespace ?? createCheckpointNamespace(userId, tenantId),
       }),
       ...(conversationId !== undefined && { conversationId }),
       ...(idempotencyClientRequestId !== undefined && {
@@ -3453,6 +3462,7 @@ export class RedisJobStore implements IJobStoreV2 {
       String(GENERATION_EPOCH_GRACE_TTL_S),
       String(args.steerReceiptTtlSeconds ?? 0),
       returnDrainedSteers ? '1' : '0',
+      args.expectProviderExecutionId ?? '',
       String(clearFields.length),
       ...clearFields,
       ...fields,

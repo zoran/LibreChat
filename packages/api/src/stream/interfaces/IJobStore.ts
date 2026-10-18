@@ -1063,6 +1063,8 @@ export interface JobStatusTransition {
    * the same stream ID.
    */
   expectCreatedAt?: number;
+  /** Fence a same-generation provider handoff before any status, queue or metadata mutation. */
+  expectProviderExecutionId?: string;
   /**
    * Additional guard: reject the transition when the store's clock has reached
    * this absolute deadline. The comparison is part of the same atomic operation
@@ -1487,6 +1489,8 @@ export interface IJobStoreV2 extends IJobStore {
     creationAttemptId?: string,
     expectedPredecessorCreatedAt?: number,
     rejectActivePredecessor?: boolean,
+    /** Private creation-only binding; protocol 2 and exact namespace owner are required. */
+    trustedCheckpointNamespace?: string,
   ): Promise<CreatedJobData>;
 
   /** Remove transaction-time predecessor receipts after their handoff was

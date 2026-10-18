@@ -980,6 +980,40 @@ describe('BaseClient', () => {
   });
 
   describe('sendMessage', () => {
+    test('prepares a one-shot turn without save, start or provider work and consumes it without rebuilding', async () => {
+      const onStart = jest.fn();
+      const getReqData = jest.fn();
+      const opts = {
+        conversationId: 'prepared-conversation',
+        preallocatedUserMessageId: 'prepared-user',
+        preallocatedResponseMessageId: 'prepared-response',
+        onStart,
+        getReqData,
+      };
+      const prepared = await TestClient.prepareMessage('Prepared exact input', opts);
+      expect(onStart).not.toHaveBeenCalled();
+      expect(getReqData).not.toHaveBeenCalled();
+      expect(saveMessage).not.toHaveBeenCalled();
+      expect(saveConvo).not.toHaveBeenCalled();
+      expect(reserveBalance).not.toHaveBeenCalled();
+      expect(TestClient.sendCompletion).not.toHaveBeenCalled();
+      expect(TestClient.buildMessages).toHaveBeenCalledTimes(1);
+      const snapshot = TestClient.getPreparedMessageInput(prepared);
+      expect(Object.isFrozen(snapshot.payload)).toBe(true);
+      const expectedPayload = JSON.parse(JSON.stringify(snapshot.payload));
+      TestClient.currentMessages[0].text = 'late mutation';
+      const response = await TestClient.sendPreparedMessage(prepared, opts);
+      expect(response.messageId).toBe('prepared-response');
+      expect(response.parentMessageId).toBe('prepared-user');
+      expect(TestClient.buildMessages).toHaveBeenCalledTimes(1);
+      expect(TestClient.sendCompletion).toHaveBeenCalledWith(expectedPayload, expect.any(Object));
+      expect(onStart).toHaveBeenCalledTimes(1);
+      await expect(TestClient.sendPreparedMessage(prepared, opts)).rejects.toThrow(
+        'Prepared message',
+      );
+      expect(TestClient.sendCompletion).toHaveBeenCalledTimes(1);
+    });
+
     test('sendMessage should return a response message', async () => {
       const expectedResult = expect.objectContaining({
         sender: TestClient.sender,
@@ -1379,7 +1413,7 @@ describe('BaseClient', () => {
     });
 
     test('blocks persisted user text selected by the built model payload', async () => {
-      const secret = 'PRIVATE-HISTORICAL-VALUE';
+      const secret = 'fixture-HISTORICAL-VALUE';
       const history = [
         {
           role: 'user',
@@ -1411,7 +1445,7 @@ describe('BaseClient', () => {
                       {
                         id: 'historical-private',
                         label: 'historical private value',
-                        regex: 'PRIVATE-HISTORICAL-[A-Z]+',
+                        regex: 'fixture-HISTORICAL-[A-Z]+',
                       },
                     ],
                   },
@@ -1447,7 +1481,7 @@ describe('BaseClient', () => {
     });
 
     test('allows persisted user text that the built model payload prunes out', async () => {
-      const secret = 'PRIVATE-PRUNED-HISTORICAL-VALUE';
+      const secret = 'fixture-PRUNED-HISTORICAL-VALUE';
       TestClient = initializeFakeClient(
         apiKey,
         {
@@ -1463,7 +1497,7 @@ describe('BaseClient', () => {
                       {
                         id: 'pruned-private',
                         label: 'pruned private value',
-                        regex: 'PRIVATE-PRUNED-HISTORICAL-[A-Z]+',
+                        regex: 'fixture-PRUNED-HISTORICAL-[A-Z]+',
                       },
                     ],
                   },

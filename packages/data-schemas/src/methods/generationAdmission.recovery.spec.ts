@@ -9,6 +9,7 @@ import type {
 import {
   createGenerationAdmissionMethods,
   snapshotGenerationCheckpointAdmission,
+  snapshotGenerationCheckpointBinding,
 } from './generationAdmission';
 
 /** Real Mongo transactions/CAS. Evidence digests are synthetic trusted-server inputs;
@@ -123,7 +124,94 @@ describe('native checkpoint generation recovery', () => {
     continuation: { ...input().continuation, sourceBindingSha256: '1'.repeat(64) },
   });
 
-  it('retains the source binding through immutable capture, real writes, reads and recovery', async () => {
+  it.each([false, true])(
+    'captures a standalone binding before native admission identities exist (source digest %s)',
+    async (withSource) => {
+      const supplied = withSource ? sourceInput() : input();
+      const binding = supplied.continuation;
+      const expected = { ...binding };
+      const snapshot = snapshotGenerationCheckpointBinding(binding);
+      expect(snapshot).toEqual(expected);
+      expect(snapshot).not.toBe(binding);
+      expect(Object.isFrozen(snapshot)).toBe(true);
+      expect(snapshotGenerationCheckpointAdmission(supplied).continuation).toEqual(snapshot);
+      expect(Object.prototype.hasOwnProperty.call(snapshot, 'sourceBindingSha256')).toBe(
+        withSource,
+      );
+      for (const field of ['ownerInstanceId', 'processBootId', 'generationEpoch', 'segmentId'])
+        expect(snapshot).not.toHaveProperty(field);
+      for (const field of Object.keys(binding))
+        Object.defineProperty(binding, field, { value: 'changed-after-capture' });
+      expect(snapshot).toEqual(expected);
+      expect(() => Object.assign(snapshot, { runId: 'mutated-result' })).toThrow(TypeError);
+      expect(await mongoose.models.GenerationAdmission.countDocuments({})).toBe(0);
+    },
+  );
+
+  it('preserves the binding projection and optional omission for null-prototype own data', () => {
+    const binding = Object.assign(Object.create(null), input().continuation, {
+      sourceBindingSha256: undefined,
+      unrelated: 'never published',
+    });
+    const snapshot = snapshotGenerationCheckpointBinding(binding);
+    expect(snapshot).toEqual(input().continuation);
+    expect(Object.getPrototypeOf(snapshot)).toBe(Object.prototype);
+    expect(Object.prototype.hasOwnProperty.call(snapshot, 'sourceBindingSha256')).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(snapshot, 'unrelated')).toBe(false);
+  });
+
+  it.each(['accessor', 'unrelated-accessor', 'prototype', 'symbol'] as const)(
+    'rejects standalone binding %s without invoking any getter',
+    (malformation) => {
+      const binding = sourceInput().continuation;
+      const getter = jest.fn(() => 'captured?');
+      if (malformation.endsWith('accessor'))
+        Object.defineProperty(binding, malformation === 'accessor' ? 'runId' : 'extra', {
+          get: getter,
+        });
+      else if (malformation === 'prototype') Object.setPrototypeOf(binding, { inherited: true });
+      else Object.defineProperty(binding, Symbol('private'), { value: true });
+      expect(() => snapshotGenerationCheckpointBinding(binding)).toThrow(
+        'Invalid generation checkpoint binding',
+      );
+      expect(getter).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ['version', 0],
+    ['mode', 'other'],
+    ['runId', ''],
+    ['threadId', ''],
+    ['checkpointNamespace', 'n'.repeat(257)],
+    ['graphFingerprint', 'invalid'],
+    ['policyFingerprint', 'A'.repeat(64)],
+  ])(
+    'rejects an invalid standalone %s through the canonical continuation validator',
+    (field, value) => {
+      const binding = input().continuation;
+      Object.defineProperty(binding, field, { value });
+      expect(() => snapshotGenerationCheckpointBinding(binding)).toThrow(
+        'Invalid generation checkpoint binding',
+      );
+    },
+  );
+
+  it.each([
+    ['ownerInstanceId', undefined],
+    ['processBootId', ''],
+    ['generationEpoch', -1],
+    ['segmentId', undefined],
+  ])('keeps full admission %s validation after standalone binding capture', (field, value) => {
+    const supplied = input();
+    const binding = snapshotGenerationCheckpointBinding(supplied.continuation);
+    Object.defineProperty(supplied, field, { value });
+    expect(() =>
+      snapshotGenerationCheckpointAdmission({ ...supplied, continuation: binding }),
+    ).toThrow('Invalid generation checkpoint admission');
+  });
+
+  it('retains source identity and requires verified metadata recovery instead of a hash-only admission', async () => {
     const supplied = sourceInput();
     const expected = sourceInput();
     const snapshot = snapshotGenerationCheckpointAdmission(supplied);
@@ -161,33 +249,16 @@ describe('native checkpoint generation recovery', () => {
         }),
       )?.continuation,
     ).toEqual(expected.continuation);
-    const recovered = unwrap(
-      await methods.recoverGenerationAdmission(expected, evidence(1), successor),
-    );
-    expect(recovered.continuation).toEqual(expected.continuation);
-    expect(unwrap(await methods.dispatchGenerationAdmission(recovered)).state).toBe('dispatching');
-    expect(
-      unwrap(
-        await methods.writeGenerationCheckpoint(recovered, async (session) => {
-          await artifacts().insertOne(
-            { _id: 'recovered-source-checkpoint', owner: 'new-segment' },
-            { session },
-          );
-          return 'resumed';
-        }),
-      ),
-    ).toBe('resumed');
-    expect(await artifacts().countDocuments({})).toBe(2);
-    const stale = jest.fn(async () => 'never');
-    expect(await methods.writeGenerationCheckpoint(expected, stale)).toEqual({
+    expect(await methods.recoverGenerationAdmission(expected, evidence(1), successor)).toEqual({
       ok: false,
       error: { code: 'HELD' },
     });
-    expect(stale).not.toHaveBeenCalled();
     expect(await read()).toMatchObject({
+      state: 'dispatching',
       continuation: expected.continuation,
-      checkpointWriteRevision: 2,
+      checkpointWriteRevision: 1,
     });
+    expect(await artifacts().countDocuments({})).toBe(1);
   });
 
   it.each(['changed', 'removed', 'added'] as const)(
@@ -251,6 +322,9 @@ describe('native checkpoint generation recovery', () => {
       const supplied = sourceInput();
       Object.defineProperty(supplied.continuation, 'sourceBindingSha256', { value: invalid });
       const callback = jest.fn(async () => 'never');
+      expect(() => snapshotGenerationCheckpointBinding(supplied.continuation)).toThrow(
+        'Invalid generation checkpoint binding',
+      );
       expect(() => snapshotGenerationCheckpointAdmission(supplied)).toThrow(
         'Invalid generation checkpoint admission',
       );
@@ -419,7 +493,7 @@ describe('native checkpoint generation recovery', () => {
     );
     const winners = outcomes.filter((outcome) => outcome.ok);
     expect(winners).toHaveLength(1);
-    const recovered = unwrap(winners[0]);
+    const recovered = unwrap(winners[0]).admission;
     expect(recovered).toMatchObject({
       state: 'admitted',
       active: true,
@@ -509,7 +583,7 @@ describe('native checkpoint generation recovery', () => {
     });
     expect(callback).not.toHaveBeenCalled();
     expect((await methods.settleGenerationAdmission(input(), terminal)).ok).toBe(false);
-    expect(recovered.checkpointWriteRevision).toBe(1);
+    expect(recovered.admission.checkpointWriteRevision).toBe(1);
     expect(await artifacts().countDocuments({})).toBe(1);
   });
 
@@ -666,7 +740,8 @@ describe('native checkpoint generation recovery', () => {
     expect((await read()).checkpointWriteRevision).toBe(1);
     expect(await artifacts().countDocuments({ _id: 'held-write' })).toBe(1);
     expect(
-      unwrap(await methods.recoverGenerationAdmission(input(), evidence(1), successor)).state,
+      unwrap(await methods.recoverGenerationAdmission(input(), evidence(1), successor)).admission
+        .state,
     ).toBe('admitted');
   });
 });

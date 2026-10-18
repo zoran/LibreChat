@@ -5,6 +5,8 @@ import {
   SYSTEM_TENANT_ID,
   createGenerationAdmissionMethods,
   snapshotGenerationCheckpointAdmission,
+  snapshotCheckpointSourceBinding,
+  createCheckpointSourceMethods,
 } from '@librechat/data-schemas';
 import type {
   Checkpoint,
@@ -13,9 +15,14 @@ import type {
   CheckpointTuple,
   PendingWrite,
 } from '@langchain/langgraph-checkpoint';
-import type { GenerationAdmissionInput, GenerationAdmissionMethods } from '@librechat/data-schemas';
+import type {
+  CheckpointSourceBinding,
+  GenerationAdmissionInput,
+  GenerationAdmissionMethods,
+} from '@librechat/data-schemas';
 import type { MongoDBSaverParams } from '@langchain/langgraph-checkpoint-mongodb';
 import type { RunnableConfig } from '@langchain/core/runnables';
+import type { Document, UpdateOneModel } from 'mongodb';
 import type { CheckpointWriteSession } from './saver';
 import {
   LIBRECHAT_CHECKPOINT_NAMESPACE_KEY,
@@ -33,6 +40,8 @@ import {
   LIBRECHAT_LEGACY_CHECKPOINT_KEY,
 } from './saver';
 import { LIBRECHAT_CHECKPOINT_STORAGE_OWNER_KEY } from './storage';
+import { writeCheckpointSourceRows } from './source-retention';
+import { readCheckpointSourceTuple } from './source-read';
 
 /**
  * MongoDB's hard per-document ceiling. A checkpoint whose serialized state pushes its
@@ -96,6 +105,8 @@ export interface DurableAgentCheckpointScope {
 export type DurableMongoSaverOptions = MongoDBSaverParams & {
   scope: DurableAgentCheckpointScope;
   admission?: GenerationAdmissionInput;
+  /** Private trusted host binding; never resolved from RunnableConfig or checkpoint payloads. */
+  sourceBinding?: CheckpointSourceBinding;
   warnBytes?: number;
   hardLimitBytes?: number;
 };
@@ -165,6 +176,8 @@ export class DurableMongoSaver extends OwnedMongoSaver {
   private readonly warnBytes: number;
   private readonly admission?: Readonly<GenerationAdmissionInput>;
   private readonly admissionMethods?: GenerationAdmissionMethods;
+  private readonly sourceBinding?: CheckpointSourceBinding;
+  private readonly sourceTtlSeconds?: number;
   private writeTail: Promise<void> = Promise.resolve();
   private writesHeld = false;
   private readonly serializationBudget = new AsyncLocalStorage<{ bytes: number } | undefined>();
@@ -176,6 +189,22 @@ export class DurableMongoSaver extends OwnedMongoSaver {
       options.admission === undefined
         ? undefined
         : snapshotGenerationCheckpointAdmission(options.admission);
+    const sourceBinding =
+      options.sourceBinding === undefined
+        ? undefined
+        : snapshotCheckpointSourceBinding(
+            { userId: scope.userId, tenantId: scope.tenantId ?? null },
+            options.sourceBinding,
+          );
+    if (
+      sourceBinding?.bindingSha256 !== admission?.continuation?.sourceBindingSha256 ||
+      (sourceBinding && !admission) ||
+      (sourceBinding &&
+        options.ttl != null &&
+        (!Number.isSafeInteger(options.ttl) || options.ttl <= 0))
+    ) {
+      throw new Error('Checkpoint source binding requires its exact native admission');
+    }
     if (admission) {
       const tenant =
         scope.tenantId && scope.tenantId !== SYSTEM_TENANT_ID
@@ -210,6 +239,8 @@ export class DurableMongoSaver extends OwnedMongoSaver {
     super(options);
     this.scope = scope;
     this.admission = admission;
+    this.sourceBinding = sourceBinding;
+    this.sourceTtlSeconds = options.ttl;
     this.admissionMethods = admission ? createGenerationAdmissionMethods(mongoose) : undefined;
     this.owner = checkpointOwnerNamespacePrefix(scope.userId, scope.tenantId);
     this.hardLimitBytes = hardLimitBytes;
@@ -242,9 +273,18 @@ export class DurableMongoSaver extends OwnedMongoSaver {
       if (this.writesHeld) throw new Error('Durable checkpoint writes are held after failure');
       try {
         // Construction verifies the same client/db despite separate driver minor types.
-        const result = await methods.writeGenerationCheckpoint(admission, (session) =>
-          write(session as unknown as CheckpointWriteSession),
-        );
+        const result = await methods.writeGenerationCheckpoint(admission, async (session) => {
+          if (this.sourceBinding)
+            await createCheckpointSourceMethods(mongoose).fenceCheckpointSources(
+              this.sourceBinding.owner,
+              this.sourceBinding,
+              session,
+            );
+          const value = await write(session as unknown as CheckpointWriteSession);
+          if (this.sourceBinding && Date.parse(this.sourceBinding.expiresAt) <= Date.now())
+            throw new Error('Checkpoint source expired during write');
+          return value;
+        });
         if (!result.ok)
           throw new Error('Durable checkpoint writer no longer holds confirmed admission');
         return result.value;
@@ -258,6 +298,30 @@ export class DurableMongoSaver extends OwnedMongoSaver {
       () => undefined,
     );
     return operation;
+  }
+
+  protected override async persistRows(
+    collectionName: string,
+    operations: readonly UpdateOneModel<Document>[],
+    session?: CheckpointWriteSession,
+  ): Promise<void> {
+    if (!this.sourceBinding) return super.persistRows(collectionName, operations, session);
+    if (!session) throw new Error('Source checkpoint writes require their generation transaction');
+    await writeCheckpointSourceRows(
+      {
+        collectionName,
+        operations,
+        binding: this.sourceBinding,
+        expiresAt: new Date(
+          Math.min(
+            Date.parse(this.sourceBinding.expiresAt),
+            this.sourceTtlSeconds == null ? Infinity : Date.now() + this.sourceTtlSeconds * 1000,
+          ),
+        ),
+        maxBsonBytes: this.hardLimitBytes,
+      },
+      session as unknown as mongoose.ClientSession,
+    );
   }
 
   private assertFits(bytes: number): void {
@@ -322,9 +386,61 @@ export class DurableMongoSaver extends OwnedMongoSaver {
     return restored;
   }
 
+  private assertSourceReadable(expiresAt: number): void {
+    if (expiresAt <= Date.now()) throw new Error('Source checkpoint tuple expired');
+  }
+
+  /** Source reads share the native database FIFO; Serde starts only after confirmed commit. */
+  private async sourceTuple(
+    config: RunnableConfig,
+    listed?: { before?: string; filter?: Record<string, unknown> },
+  ): Promise<{ tuple: CheckpointTuple; expiresAt: number } | undefined> {
+    const binding = this.sourceBinding!;
+    const key = config.configurable!;
+    const query: mongoose.mongo.Filter<mongoose.mongo.Document> = {
+      thread_id: `${this.owner}${key.thread_id}`,
+      checkpoint_ns: `${this.owner}${key.checkpoint_ns}`,
+    };
+    if (listed?.before != null) query.checkpoint_id = { $lt: listed.before };
+    if (!listed && key.checkpoint_id != null) query.checkpoint_id = key.checkpoint_id;
+    for (const [name, value] of Object.entries(listed?.filter ?? {}))
+      query[`metadata_search.${name}`] = value;
+    const raw = await this.withWriteSession(config, async (session) => {
+      if (!session) throw new Error('Source reads require native admission');
+      return readCheckpointSourceTuple(
+        {
+          checkpointCollectionName: this.checkpointCollectionName,
+          checkpointWritesCollectionName: this.checkpointWritesCollectionName,
+          query,
+          binding,
+          maxBsonBytes: this.hardLimitBytes,
+        },
+        session as unknown as mongoose.ClientSession,
+      );
+    });
+    if (!raw) return undefined;
+    const tuple = await this.decodeTuple(
+      raw.checkpoint,
+      raw.pending,
+      this.owner,
+      false,
+      listed != null,
+      () => this.assertSourceReadable(raw.expiresAt),
+    );
+    return { tuple, expiresAt: raw.expiresAt };
+  }
+
   override async getTuple(config: RunnableConfig): Promise<CheckpointTuple | undefined> {
     const bound = this.bind(config);
-    const tuple = await super.getTuple(toStorageCheckpointConfig(bound));
+    const stored = toStorageCheckpointConfig(bound);
+    if (this.sourceBinding) {
+      const result = await this.sourceTuple(stored);
+      if (!result) return undefined;
+      const tuple = this.restore(result.tuple, bound);
+      this.assertSourceReadable(result.expiresAt);
+      return tuple;
+    }
+    const tuple = await super.getTuple(stored);
     return tuple == null ? undefined : this.restore(tuple, bound);
   }
 
@@ -350,6 +466,22 @@ export class DurableMongoSaver extends OwnedMongoSaver {
       ) {
         throw new Error('Invalid checkpoint metadata filter');
       }
+    }
+    if (this.sourceBinding) {
+      let cursor = before?.configurable?.checkpoint_id as string | undefined;
+      const limit = (copy.limit as number | undefined) ?? Infinity;
+      for (let count = 0; count < limit; count++) {
+        const result = await this.sourceTuple(toStorageCheckpointConfig(bound), {
+          before: cursor,
+          filter,
+        });
+        if (!result) return;
+        const tuple = this.restore(result.tuple, bound);
+        cursor = tuple.config.configurable!.checkpoint_id as string;
+        this.assertSourceReadable(result.expiresAt);
+        yield tuple;
+      }
+      return;
     }
     for await (const tuple of super.list(toStorageCheckpointConfig(bound), {
       ...(before && { before: toStorageCheckpointConfig(before) }),
@@ -388,7 +520,8 @@ export class DurableMongoSaver extends OwnedMongoSaver {
     if (!validIdentity(bound.configurable?.checkpoint_id) || !validIdentity(taskId)) {
       throw new Error('Pending writes require checkpoint and task ids');
     }
-    if (!Array.isArray(writes)) throw new Error('Invalid pending writes');
+    if (!Array.isArray(writes) || (this.sourceBinding && writes.length > 1024))
+      throw new Error('Invalid pending writes');
     const copy = writes.map((write): PendingWrite => {
       if (!Array.isArray(write) || write.length !== 2 || !validIdentity(write[0])) {
         throw new Error('Invalid pending write');

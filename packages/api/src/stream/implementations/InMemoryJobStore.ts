@@ -63,10 +63,10 @@ import {
   deserializeQuoteRetention,
   quoteRetentionContext,
 } from '~/files/retention';
+import { createCheckpointNamespace, checkpointNamespaceBelongsToOwner } from '~/stream/checkpoints';
 import { sourceRetentionAvailable, sourceSafeJobPatch } from '../interfaces/IJobStore';
 import { retainedScheduleReceipt } from '~/stream/internal/scheduleReceipts';
 import { toPendingSteer, toRetainedSteer } from '~/stream/SteeringLifecycle';
-import { createCheckpointNamespace } from '~/stream/checkpoints';
 import { retainScheduleMCPFailure } from '../scheduleFailure';
 
 /** Recovery window for parked steers (mirrors Redis's completed-job TTL). */
@@ -354,7 +354,15 @@ export class InMemoryJobStore implements IJobStoreV2 {
     creationAttemptId?: string,
     expectedPredecessorCreatedAt?: number,
     rejectActivePredecessor?: boolean,
+    trustedCheckpointNamespace?: string,
   ): Promise<CreatedJobData> {
+    const generationProtocolVersion = initialMetadata.generationProtocolVersion === 1 ? 1 : 2;
+    if (
+      trustedCheckpointNamespace !== undefined &&
+      (generationProtocolVersion !== 2 ||
+        !checkpointNamespaceBelongsToOwner(trustedCheckpointNamespace, userId, tenantId))
+    )
+      throw new Error('Invalid trusted generation checkpoint namespace');
     if (typeof userId !== 'string' || userId.length === 0) {
       throw new Error('Generation job requires a non-empty user id');
     }
@@ -619,9 +627,10 @@ export class InMemoryJobStore implements IJobStoreV2 {
       ...(tenantId && { tenantId }),
       status: 'running',
       createdAt,
-      generationProtocolVersion: initialMetadata.generationProtocolVersion === 1 ? 1 : 2,
-      ...(initialMetadata.generationProtocolVersion !== 1 && {
-        checkpointNamespace: createCheckpointNamespace(userId, tenantId),
+      generationProtocolVersion,
+      ...(generationProtocolVersion === 2 && {
+        checkpointNamespace:
+          trustedCheckpointNamespace ?? createCheckpointNamespace(userId, tenantId),
       }),
       ...(conversationId !== undefined && { conversationId }),
       ...(idempotencyClientRequestId !== undefined && {
@@ -908,6 +917,12 @@ export class InMemoryJobStore implements IJobStoreV2 {
     if (args.expectCreatedAt != null && job.createdAt !== args.expectCreatedAt) {
       return false;
     }
+    if (
+      args.expectProviderExecutionId != null &&
+      job.providerExecutionId !== args.expectProviderExecutionId
+    ) {
+      return false;
+    }
     if (args.notAfterMs != null && Date.now() >= args.notAfterMs) {
       throw new JobStatusTransitionDeadlineError(args.notAfterMs);
     }
@@ -1001,7 +1016,9 @@ export class InMemoryJobStore implements IJobStoreV2 {
       !job ||
       job.status !== args.from ||
       (args.expectActionId != null && job.pendingActionId !== args.expectActionId) ||
-      (args.expectCreatedAt != null && job.createdAt !== args.expectCreatedAt)
+      (args.expectCreatedAt != null && job.createdAt !== args.expectCreatedAt) ||
+      (args.expectProviderExecutionId != null &&
+        job.providerExecutionId !== args.expectProviderExecutionId)
     ) {
       return null;
     }

@@ -1,4 +1,5 @@
 import type { ClientSession } from 'mongoose';
+import type { CheckpointSourceBinding } from './checkpointSource';
 
 /** Immutable native checkpoint identity, acquired before the first provider dispatch. */
 export interface GenerationCheckpointBinding {
@@ -31,6 +32,28 @@ export interface GenerationAdmissionInput extends GenerationAdmissionKey {
   segmentId: string;
   continuation?: GenerationCheckpointBinding;
 }
+
+/** Exact server attempt held before source mutation; no provider epoch exists yet. */
+export interface GenerationPreparationInput extends GenerationAdmissionKey {
+  conversationId: string;
+  requestFingerprint: string;
+  protocol: string;
+  ownerInstanceId: string;
+  processBootId: string;
+  preparationAttemptId: string;
+}
+
+/** A held preparation is never an admission receipt, including after a lost completion reply. */
+export interface GenerationPreparationRecord extends GenerationPreparationInput {
+  state: 'preparing' | 'prepared';
+  active: true;
+  createdAt: string;
+  continuation?: GenerationCheckpointBinding;
+}
+
+export type GenerationAdmissionStorageRecord =
+  | GenerationAdmissionRecord
+  | GenerationPreparationRecord;
 
 export interface GenerationAdmissionTerminal {
   outcome: 'completed' | 'failed' | 'cancelled';
@@ -91,7 +114,36 @@ export type GenerationAdmissionResult<T> =
   | { ok: true; value: T }
   | { ok: false; error: { code: GenerationAdmissionFailureCode } };
 
+/** Private metadata selection; neither this candidate nor its digest grants source access. */
+export interface GenerationCheckpointRecoverySource {
+  readonly sourceBinding: CheckpointSourceBinding;
+  readonly checkpoint: {
+    readonly threadId: string;
+    readonly checkpointId: string;
+    readonly checkpointNs: '';
+  };
+  readonly expiresAt: number;
+}
+export type GenerationCheckpointSourceRecovery = (
+  predecessor: Readonly<GenerationAdmissionInput>,
+  session: ClientSession,
+) => Promise<GenerationCheckpointRecoverySource>;
+
+/** Released only after the recovery transaction and session have completed. */
+export interface GenerationAdmissionRecoveryReceipt {
+  readonly admission: GenerationAdmissionRecord;
+  readonly source?: GenerationCheckpointRecoverySource;
+}
+
 export interface GenerationAdmissionMethods {
+  /** Optional on hosts that have not composed preparation; neither port grants dispatch. */
+  beginGenerationPreparation?(
+    input: GenerationPreparationInput,
+  ): Promise<GenerationAdmissionResult<GenerationPreparationRecord>>;
+  completeGenerationPreparation?(
+    input: GenerationPreparationInput,
+    continuation: GenerationCheckpointBinding,
+  ): Promise<GenerationAdmissionResult<GenerationPreparationRecord>>;
   ensureGenerationAdmissionIndexes(): Promise<void>;
   cancelUndispatchedGenerationAdmission(
     input: GenerationAdmissionInput,
@@ -107,6 +159,7 @@ export interface GenerationAdmissionMethods {
   ): Promise<GenerationAdmissionResult<number>>;
   acquireGenerationAdmission(
     input: GenerationAdmissionInput,
+    preparation?: GenerationPreparationInput,
   ): Promise<GenerationAdmissionResult<{ acquired: boolean; record: GenerationAdmissionRecord }>>;
   getGenerationAdmission(
     key: GenerationAdmissionKey,
@@ -120,7 +173,8 @@ export interface GenerationAdmissionMethods {
     predecessor: GenerationAdmissionInput,
     evidence: GenerationCheckpointRecoveryEvidence,
     successor: GenerationAdmissionSuccessor,
-  ): Promise<GenerationAdmissionResult<GenerationAdmissionRecord>>;
+    recoverSources?: GenerationCheckpointSourceRecovery,
+  ): Promise<GenerationAdmissionResult<GenerationAdmissionRecoveryReceipt>>;
   /** Database-only callback, using this exact session/client; external effects are forbidden. */
   writeGenerationCheckpoint<T>(
     input: GenerationAdmissionInput,
