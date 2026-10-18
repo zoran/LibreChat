@@ -1,3 +1,6 @@
 # Force LF line endings for shell scripts and git hooks (required for cross-platform compatibility)
 .husky/* text eol=lf
 *.sh text eol=lf
+
+# Unified-diff empty context lines contain a required space; preserve the qualified patch bytes.
+vendor/pdfjs/pdfjs-5.4.624-cortex.metadata.2-source.patch whitespace=-blank-at-eol

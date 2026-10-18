@@ -1,0 +1,1255 @@
+--- /dev/null
++++ b/external/dist/MODIFICATIONS.md
+@@ -0,0 +1,9 @@
++Modification notice — Cortex candidate, 2026-10-17
++
++PDF.js upstream 5.4.624, commit 384c6208b257e81fa7bcd4e59dc100e3c99d9528, remains Apache-2.0.
++Changes: strict optional catalog-metadata evidence and tests; refusal of all native Filter/F/DecodeParms/DP spellings; fixed derivative version/build identity; exact derivative-only npm@11.13.0 input pin. The TypeScript contract also corrects getMetadata().metadata to Metadata | null; strict TypeScript consumers may need a null guard. Default runtime metadata behavior remains unchanged. This candidate never claims complete PDF inspection.
++Retain upstream LICENSE, copyright headers and all distributed asset notices. Carry this modification notice with the eventual derivative source/distribution, along with the exact patch and source bindings. Source headers already identify the Cortex modifications. No upstream endorsement is asserted.
++
++Additional source candidate changes, 2026-10-18: the existing stopAtErrors option rejects invalid image dimensions and propagates asynchronous and previously cached decoding failures. The display API preserves strict worker-stream failures for current, concurrent and repeated page consumers, using its existing render cancellation lifecycle. Ordinary tolerant rendering remains unchanged. Native image/API regressions are included; no new public inspection schema or positive PDF approval is introduced. Metadata evidence remains documentComplete:false. A changed emitted distribution requires a newly assigned version/build identity; the accepted 5.4.624-cortex.metadata.1 archive is not replaced by these source changes.
++
++Assigned derivative identity, 2026-10-18: 5.4.624-cortex.metadata.2, build identity 384c6208b-cortex.metadata.2 (upstream release number 624). This combines the previously qualified catalog-metadata contract with the strict-image changes above. It is a distinct derivative; the preserved metadata.1 archive is not replaced. Native emission and package qualification are recorded separately and do not certify complete PDF inspection.
+--- a/gulpfile.mjs
++++ b/gulpfile.mjs
+@@ -12,6 +12,8 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++
++// Modified for Cortex, 2026-10-17: deterministic PDF.js derivative build identity.
+ 
+ import {
+   babelPluginPDFJSPreprocessor,
+@@ -814,48 +816,23 @@
+ });
+ 
+ function createBuildNumber(done) {
+-  console.log("\n### Getting extension build number");
+-
+-  exec(
+-    "git log --format=oneline " + config.baseVersion + "..",
+-    function (err, stdout, stderr) {
+-      let buildNumber = 0;
+-      if (!err) {
+-        // Build number is the number of commits since base version
+-        buildNumber = stdout ? stdout.match(/\n/g).length : 0;
+-      } else {
+-        console.log(
+-          "This is not a Git repository; using default build number."
+-        );
+-      }
+-
+-      console.log("Extension build number: " + buildNumber);
+-
+-      const version = config.versionPrefix + buildNumber;
+-
+-      exec('git log --format="%h" -n 1', function (err2, stdout2, stderr2) {
+-        let buildCommit = "";
+-        if (!err2) {
+-          buildCommit = stdout2.replace("\n", "");
+-        }
+-
+-        createStringSource(
+-          "version.json",
+-          JSON.stringify(
+-            {
+-              version,
+-              build: buildNumber,
+-              commit: buildCommit,
+-            },
+-            null,
+-            2
+-          )
+-        )
+-          .pipe(gulp.dest(BUILD_DIR))
+-          .on("end", done);
+-      });
+-    }
+-  );
++  // Modified for Cortex: fixed derivative identity, independent of Git discovery.
++  // Upstream source: 384c6208b257e81fa7bcd4e59dc100e3c99d9528 (PDF.js 5.4.624).
++  // `build` preserves the upstream release number; it is not local Git history.
++  createStringSource(
++    "version.json",
++    JSON.stringify(
++      {
++        version: "5.4.624-cortex.metadata.2",
++        build: 624,
++        commit: "384c6208b-cortex.metadata.2",
++      },
++      null,
++      2
++    )
++  )
++    .pipe(gulp.dest(BUILD_DIR))
++    .on("end", done);
+ }
+ 
+ function buildDefaultPreferences(defines, dir) {
+--- a/package.json
++++ b/package.json
+@@ -68,5 +68,6 @@
+   "engines": {
+     "node": ">=20.16.0 || >=22.3.0"
+   },
+-  "license": "Apache-2.0"
++  "license": "Apache-2.0",
++  "packageManager": "npm@11.13.0"
+ }
+--- a/src/core/catalog.js
++++ b/src/core/catalog.js
+@@ -12,6 +12,8 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++
++// Modified for Cortex, 2026-10-17: strict catalog metadata evidence only.
+ 
+ import {
+   _isValidExplicitDest,
+@@ -51,7 +53,7 @@
+ import { clearGlobalCaches } from "./cleanup_helper.js";
+ import { ColorSpaceUtils } from "./colorspace_utils.js";
+ import { FileSpec } from "./file_spec.js";
+-import { MetadataParser } from "./metadata_parser.js";
++import { MetadataInspectionError, MetadataParser } from "./metadata_parser.js";
+ import { StructTreeRoot } from "./struct_tree.js";
+ 
+ const isRef = v => v instanceof Ref;
+@@ -194,6 +196,93 @@
+   get acroFormRef() {
+     const value = this.#catDict.getRaw("AcroForm");
+     return shadow(this, "acroFormRef", value instanceof Ref ? value : null);
++  }
++
++  // Modified for Cortex: metadata evidence only; documentComplete is always false.
++  get metadataInspection() {
++    const finish = (status, fields = {}, metadata = null) =>
++      shadow(this, "metadataInspection", {
++        metadata,
++        evidence: {
++          version: 1,
++          scope: "catalog-metadata",
++          documentComplete: false,
++          status,
++          ...fields,
++        },
++      });
++    try {
++      if (!this.#catDict.has("Metadata")) {
++        return finish("absent");
++      }
++      const ref = this.#catDict.getRaw("Metadata");
++      if (!(ref instanceof Ref)) {
++        return finish("refused", { reason: "invalid_reference" });
++      }
++      let stream;
++      try {
++        stream = this.xref.fetch(ref, !this.xref.encrypt?.encryptMetadata);
++      } catch (ex) {
++        if (ex instanceof MissingDataException) {
++          throw ex;
++        }
++        return finish("refused", { reason: "invalid_reference" });
++      }
++      if (
++        !(stream instanceof BaseStream) ||
++        !(stream.dict instanceof Dict) ||
++        !isName(stream.dict.get("Type"), "Metadata") ||
++        !isName(stream.dict.get("Subtype"), "XML")
++      ) {
++        return finish("refused", { reason: "invalid_stream" });
++      }
++      if (
++        this.xref.encrypt ||
++        stream.dict.has("Filter") ||
++        stream.dict.has("F") ||
++        stream.dict.has("DecodeParms") ||
++        stream.dict.has("DP")
++      ) {
++        return finish("refused", { reason: "unsupported_stream" });
++      }
++      const length = stream.dict.getRaw("Length");
++      if (!Number.isSafeInteger(length) || length < 1) {
++        return finish("refused", { reason: "invalid_stream" });
++      }
++      if (length > 65536) {
++        return finish("refused", { reason: "resource_limit" });
++      }
++      const position = stream.pos;
++      let bytes;
++      try {
++        stream.reset();
++        bytes = stream.getBytes(65537);
++      } finally {
++        stream.pos = position;
++      }
++      if (bytes.length !== length) {
++        return finish("refused", { reason: "invalid_stream" });
++      }
++      let data;
++      try {
++        data = new TextDecoder("utf-8", {
++          fatal: true,
++          ignoreBOM: true,
++        }).decode(bytes);
++      } catch {
++        return finish("refused", { reason: "invalid_encoding" });
++      }
++      const metadata = new MetadataParser(data, { strict: true }).serializable;
++      return finish("validated", { decodedBytes: bytes.length }, metadata);
++    } catch (ex) {
++      if (ex instanceof MissingDataException) {
++        throw ex;
++      }
++      return finish("refused", {
++        reason:
++          ex instanceof MetadataInspectionError ? ex.reason : "invalid_stream",
++      });
++    }
+   }
+ 
+   get metadata() {
+--- a/src/core/evaluator.js
++++ b/src/core/evaluator.js
+@@ -12,6 +12,7 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++// Modified for Cortex, 2026-10-18: strict image failures propagate to pages.
+ 
+ import {
+   AbortException,
+@@ -587,6 +588,12 @@
+     const w = dict.get("W", "Width");
+     const h = dict.get("H", "Height");
+ 
++    if (
++      !ignoreErrors &&
++      (!Number.isInteger(w) || w <= 0 || !Number.isInteger(h) || h <= 0)
++    ) {
++      throw new FormatError("Invalid image dimensions.");
++    }
+     if (!(w && typeof w === "number") || !(h && typeof h === "number")) {
+       warn("Image dimensions are missing, or not numbers.");
+       return;
+@@ -781,6 +788,9 @@
+       };
+ 
+       if (this.globalImageCache.hasDecodeFailed(imageRef)) {
++        if (!ignoreErrors) {
++          throw new FormatError("Image decoding failed previously.");
++        }
+         this.globalImageCache.setData(imageRef, globalCacheData);
+ 
+         this._sendImgData(objId, /* imgData = */ null, cacheGlobally);
+@@ -805,7 +815,7 @@
+       }
+     }
+ 
+-    PDFImage.buildImage({
++    const imagePromise = PDFImage.buildImage({
+       xref: this.xref,
+       res: resources,
+       image,
+@@ -825,19 +835,29 @@
+         imgData.ref = imageRef;
+ 
+         if (cacheGlobally) {
++          if (!ignoreErrors) {
++            // Strict image data is cached only after decoding has succeeded.
++            this.globalImageCache.setData(imageRef, globalCacheData);
++          }
+           this.globalImageCache.addByteSize(imageRef, imgData.dataLen);
+         }
+         return this._sendImgData(objId, imgData, cacheGlobally);
+       })
+       .catch(reason => {
+-        warn(`Unable to decode image "${objId}": "${reason}".`);
+-
+         if (imageRef) {
+           this.globalImageCache.addDecodeFailed(imageRef);
+         }
++        if (!ignoreErrors) {
++          throw reason;
++        }
++        warn(`Unable to decode image "${objId}": "${reason}".`);
+         return this._sendImgData(objId, /* imgData = */ null, cacheGlobally);
+       });
+ 
++    if (!ignoreErrors) {
++      // The worker stream cannot complete while a strict image is undecoded.
++      await imagePromise;
++    }
+     if (cacheKey) {
+       const cacheData = { objId, fn, args, optionalContent, hasMask };
+       localImageCache.set(cacheKey, imageRef, cacheData);
+--- a/src/core/metadata_parser.js
++++ b/src/core/metadata_parser.js
+@@ -13,16 +13,200 @@
+  * limitations under the License.
+  */
+ 
++// Modified for Cortex, 2026-10-17: strict catalog metadata evidence only.
++
+ import { SimpleXMLParser } from "./xml_parser.js";
+ 
++// Modified for Cortex: conservative metadata-only XML profile; no PDF coverage claim.
++class MetadataInspectionError extends Error {
++  constructor(reason) {
++    super(`Strict metadata refused: ${reason}`);
++    this.reason = reason;
++  }
++}
++
++class StrictMetadataXMLParser extends SimpleXMLParser {
++  constructor() {
++    super({ lowerCaseName: true });
++    this._strictMetadata = true;
++    this.names = [];
++    this.namespaces = [
++      new Map([["xml", "http://www.w3.org/XML/1998/namespace"]]),
++    ];
++    this.roots = 0;
++    this.nodes = 0;
++    this.uniqueNames = new Set();
++  }
++
++  _resolveEntities(value) {
++    // Entities are outside this first bounded profile, including numeric entities.
++    if (value.includes("&") || value.includes("<") || value.includes("]]>")) {
++      throw new MetadataInspectionError("unsupported_xml");
++    }
++    return value;
++  }
++
++  onPi() {
++    throw new MetadataInspectionError("unsupported_xml");
++  }
++
++  onDoctype() {
++    throw new MetadataInspectionError("unsupported_xml");
++  }
++
++  onComment() {
++    throw new MetadataInspectionError("unsupported_xml");
++  }
++
++  onCdata() {
++    throw new MetadataInspectionError("unsupported_xml");
++  }
++
++  onBeginElement(name, attributes, isEmpty) {
++    const children = {
++      "": ["x:xmpmeta", "rdf:RDF"],
++      "x:xmpmeta": ["rdf:RDF"],
++      "rdf:RDF": ["rdf:Description"],
++      "rdf:Description": [
++        "dc:title",
++        "dc:description",
++        "dc:creator",
++        "dc:subject",
++      ],
++      "dc:title": ["rdf:Alt"],
++      "dc:description": ["rdf:Alt"],
++      "dc:creator": ["rdf:Seq"],
++      "dc:subject": ["rdf:Bag"],
++      "rdf:Alt": ["rdf:li"],
++      "rdf:Seq": ["rdf:li"],
++      "rdf:Bag": ["rdf:li"],
++      "rdf:li": [],
++    };
++    const parent = this.names.at(-1) || "";
++    if (!children[parent]?.includes(name)) {
++      throw new MetadataInspectionError("unsupported_xml");
++    }
++    // The normalized map cannot represent repeated properties or RDF roots.
++    if (name !== "rdf:li") {
++      const key = `${parent}/${name}`;
++      if (this.uniqueNames.has(key)) {
++        throw new MetadataInspectionError("unsupported_xml");
++      }
++      this.uniqueNames.add(key);
++    }
++    if (++this.nodes > 256 || this.names.length >= 16) {
++      throw new MetadataInspectionError("resource_limit");
++    }
++    if (!parent && ++this.roots !== 1) {
++      throw new MetadataInspectionError("invalid_xml");
++    }
++    const known = {
++      x: "adobe:ns:meta/",
++      rdf: "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
++      dc: "http://purl.org/dc/elements/1.1/",
++    };
++    const namespaces = new Map(this.namespaces.at(-1));
++    const seen = new Set();
++    for (const attribute of attributes) {
++      if (seen.has(attribute.name)) {
++        throw new MetadataInspectionError("invalid_xml");
++      }
++      seen.add(attribute.name);
++      if (attribute.name.startsWith("xmlns:")) {
++        const prefix = attribute.name.substring(6);
++        if (
++          !Object.hasOwn(known, prefix) ||
++          attribute.value !== known[prefix]
++        ) {
++          throw new MetadataInspectionError("unsupported_xml");
++        }
++        namespaces.set(prefix, attribute.value);
++      } else if (
++        !(
++          name === "rdf:Description" &&
++          attribute.name === "rdf:about" &&
++          attribute.value === ""
++        ) &&
++        !(
++          name === "rdf:li" &&
++          attribute.name === "xml:lang" &&
++          attribute.value === "x-default"
++        )
++      ) {
++        throw new MetadataInspectionError("unsupported_xml");
++      }
++    }
++    const prefix = name.substring(0, name.indexOf(":"));
++    if (namespaces.get(prefix) !== known[prefix]) {
++      throw new MetadataInspectionError("invalid_xml");
++    }
++    super.onBeginElement(name, attributes, isEmpty);
++    if (!isEmpty) {
++      this.names.push(name);
++      this.namespaces.push(namespaces);
++    }
++  }
++
++  onEndElement(name) {
++    if (this.names.pop() !== name) {
++      throw new MetadataInspectionError("invalid_xml");
++    }
++    this.namespaces.pop();
++    return super.onEndElement(name);
++  }
++
++  onText(text) {
++    const whitespace = [...text].every(
++      character =>
++        character === " " ||
++        character === "\n" ||
++        character === "\r" ||
++        character === "\t"
++    );
++    if (
++      !whitespace &&
++      !["dc:title", "dc:description", "rdf:li"].includes(this.names.at(-1))
++    ) {
++      throw new MetadataInspectionError("unsupported_xml");
++    }
++    super.onText(text);
++  }
++}
++
+ class MetadataParser {
+-  constructor(data) {
+-    // Ghostscript may produce invalid metadata, so try to repair that first.
+-    data = this._repair(data);
++  constructor(data, { strict = false } = {}) {
++    // Default repair remains unchanged; strict mode refuses any necessary repair.
++    const repaired = this._repair(data);
++    if (strict && repaired !== data) {
++      throw new MetadataInspectionError("repair_required");
++    }
++    data = repaired;
++    if (strict) {
++      for (const character of data) {
++        const code = character.codePointAt(0);
++        if (
++          !(
++            code === 9 ||
++            code === 10 ||
++            code === 13 ||
++            (code >= 0x20 && code <= 0xd7ff) ||
++            (code >= 0xe000 && code <= 0xfffd) ||
++            (code >= 0x10000 && code <= 0x10ffff)
++          )
++        ) {
++          throw new MetadataInspectionError("invalid_xml");
++        }
++      }
++    }
+ 
+     // Convert the string to an XML document.
+-    const parser = new SimpleXMLParser({ lowerCaseName: true });
++    const parser = strict
++      ? new StrictMetadataXMLParser()
++      : new SimpleXMLParser({ lowerCaseName: true });
+     const xmlDocument = parser.parseFromString(data);
++    if (strict && (!xmlDocument || parser.names.length || parser.roots !== 1)) {
++      throw new MetadataInspectionError("invalid_xml");
++    }
+ 
+     this._metadataMap = new Map();
+     this._data = data;
+@@ -143,4 +327,4 @@
+   }
+ }
+ 
+-export { MetadataParser };
++export { MetadataInspectionError, MetadataParser };
+--- a/src/core/worker.js
++++ b/src/core/worker.js
+@@ -12,6 +12,8 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++
++// Modified for Cortex, 2026-10-17: strict catalog metadata evidence only.
+ 
+ import {
+   AbortException,
+@@ -511,12 +513,18 @@
+       return pdfManager.ensureCatalog("permissions");
+     });
+ 
++    // Modified for Cortex: retain the existing message and default result tuple.
+     handler.on("GetMetadata", function (data) {
++      const strict = pdfManager.evaluatorOptions.strictMetadata === true;
+       return Promise.all([
+         pdfManager.ensureDoc("documentInfo"),
+-        pdfManager.ensureCatalog("metadata"),
++        pdfManager.ensureCatalog(strict ? "metadataInspection" : "metadata"),
+         pdfManager.ensureCatalog("hasStructTree"),
+-      ]);
++      ]).then(([info, metadata, hasStructTree]) =>
++        strict
++          ? [info, metadata.metadata, hasStructTree, metadata.evidence]
++          : [info, metadata, hasStructTree]
++      );
+     });
+ 
+     handler.on("GetMarkInfo", function (data) {
+--- a/src/core/xml_parser.js
++++ b/src/core/xml_parser.js
+@@ -13,6 +13,8 @@
+  * limitations under the License.
+  */
+ 
++// Modified for Cortex, 2026-10-17: strict catalog metadata evidence only.
++
+ // The code for XMLParserBase copied from
+ // https://github.com/mozilla/shumway/blob/16451d8836fa85f4b16eeda8b4bda2fa9e2b22b0/src/avm2/natives/xml.ts
+ 
+@@ -123,6 +125,16 @@
+         value: this._resolveEntities(attrValue),
+       });
+       pos = attrEndIndex + 1;
++      // Modified for Cortex: strict metadata refuses missing attribute separators.
++      if (
++        this._strictMetadata &&
++        pos < s.length &&
++        !isWhitespace(s, pos) &&
++        s[pos] !== "/" &&
++        s[pos] !== ">"
++      ) {
++        return null;
++      }
+       skipWs();
+     }
+     return {
+--- a/src/display/api.js
++++ b/src/display/api.js
+@@ -12,6 +12,9 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++
++// Modified for Cortex, 2026-10-17: strict catalog metadata evidence only.
++// Modified for Cortex, 2026-10-18: strict stream failures remain terminal.
+ 
+ /**
+  * @module pdfjsLib
+@@ -164,6 +167,8 @@
+  * @property {boolean} [useWasm] - Attempt to use WebAssembly in order to
+  *    improve e.g. image decoding performance.
+  *    The default value is `true`.
++ * @property {boolean} [strictMetadata] - Return bounded catalog metadata evidence.
++ *   Default false. This never certifies complete PDF inspection or authorizes use.
+  * @property {boolean} [stopAtErrors] - Reject certain promises, e.g.
+  *   `getOperatorList`, `getTextContent`, and `RenderTask`, when the associated
+  *   PDF data cannot be successfully parsed, instead of attempting to recover
+@@ -298,6 +303,13 @@
+     (typeof PDFJSDev !== "undefined" && PDFJSDev.test("GENERIC") && isNodeJS
+       ? NodeWasmFactory
+       : DOMWasmFactory);
++  if (
++    src.strictMetadata !== undefined &&
++    typeof src.strictMetadata !== "boolean"
++  ) {
++    throw new Error("Invalid strictMetadata option.");
++  }
++  const strictMetadata = src.strictMetadata === true;
+   const ignoreErrors = src.stopAtErrors !== true;
+   const maxImageSize =
+     Number.isInteger(src.maxImageSize) && src.maxImageSize > -1
+@@ -420,6 +432,7 @@
+     docBaseUrl,
+     enableXfa,
+     evaluatorOptions: {
++      strictMetadata,
+       maxImageSize,
+       disableFontFace,
+       ignoreErrors,
+@@ -438,6 +451,8 @@
+     },
+   };
+   const transportParams = {
++    strictMetadata,
++    ignoreErrors,
+     ownerDocument,
+     pdfBug,
+     styleElement,
+@@ -991,7 +1006,7 @@
+   }
+ 
+   /**
+-   * @returns {Promise<{ info: Object, metadata: Metadata }>} A promise that is
++   * @returns {Promise<{ info: Object, metadata: Metadata | null, metadataInspection?: MetadataInspection }>} A promise that is
+    *   resolved with an {Object} that has `info` and `metadata` properties.
+    *   `info` is an {Object} filled with anything available in the information
+    *   dictionary and similarly `metadata` is a {Metadata} object with
+@@ -1619,6 +1634,12 @@
+       optionalContentConfigPromise,
+     ])
+       .then(([transparency, optionalContentConfig]) => {
++        if (intentState.operatorListError) {
++          if (!internalRenderTask.cancelled) {
++            internalRenderTask.cancel(intentState.operatorListError);
++          }
++          return;
++        }
+         if (this.destroyed) {
+           complete();
+           return;
+@@ -1932,6 +1953,23 @@
+           if (this._transport.destroyed) {
+             return; // Ignore any pending requests if the worker was terminated.
+           }
++          if (this._transport._params.ignoreErrors === false) {
++            // Reject before completion callbacks can resolve the same result.
++            // Retain the error for later renders using this stream.
++            intentState.operatorListError = reason;
++            intentState.operatorList.lastChunk = true;
++            intentState.opListReadCapability?.reject(reason);
++            intentState.displayReadyCapability?.reject(reason);
++            for (const internalRenderTask of intentState.renderTasks) {
++              if (internalRenderTask instanceof InternalRenderTask) {
++                internalRenderTask.cancel(reason);
++              } else {
++                intentState.renderTasks.delete(internalRenderTask);
++              }
++            }
++            this.#tryCleanup();
++            return;
++          }
+           if (intentState.operatorList) {
+             // Mark operator list as complete.
+             intentState.operatorList.lastChunk = true;
+@@ -2394,6 +2432,69 @@
+  * For internal use only.
+  * @ignore
+  */
++
++/**
++ * Modified for Cortex: evidence is scoped only to catalog metadata, never a PDF approval.
++ * @typedef {(
++ *   { version: 1, scope: "catalog-metadata", documentComplete: false, status: "absent" } |
++ *   { version: 1, scope: "catalog-metadata", documentComplete: false, status: "validated", decodedBytes: number } |
++ *   { version: 1, scope: "catalog-metadata", documentComplete: false, status: "refused",
++ *     reason: "invalid_reference" | "invalid_stream" | "unsupported_stream" | "invalid_encoding" |
++ *       "invalid_xml" | "unsupported_xml" | "repair_required" | "resource_limit" }
++ * )} MetadataInspection
++ */
++
++function validMetadataInspection(value, metadata) {
++  if (
++    !value ||
++    typeof value !== "object" ||
++    Array.isArray(value) ||
++    value.version !== 1 ||
++    value.scope !== "catalog-metadata" ||
++    value.documentComplete !== false
++  ) {
++    return false;
++  }
++  const keys = ["version", "scope", "documentComplete", "status"];
++  if (value.status === "validated") {
++    keys.push("decodedBytes");
++    if (
++      !Number.isSafeInteger(value.decodedBytes) ||
++      value.decodedBytes < 1 ||
++      value.decodedBytes > 65536 ||
++      !metadata ||
++      typeof metadata.rawData !== "string" ||
++      !(metadata.parsedData instanceof Map) ||
++      new TextEncoder().encode(metadata.rawData).length !== value.decodedBytes
++    ) {
++      return false;
++    }
++  } else if (value.status === "refused") {
++    keys.push("reason");
++    if (
++      metadata !== null ||
++      ![
++        "invalid_reference",
++        "invalid_stream",
++        "unsupported_stream",
++        "invalid_encoding",
++        "invalid_xml",
++        "unsupported_xml",
++        "repair_required",
++        "resource_limit",
++      ].includes(value.reason)
++    ) {
++      return false;
++    }
++  } else if (value.status !== "absent" || metadata !== null) {
++    return false;
++  }
++  return (
++    Object.keys(value).length === keys.length &&
++    keys.every(key => Object.hasOwn(value, key))
++  );
++}
++
+ class WorkerTransport {
+   downloadInfoCapability = Promise.withResolvers();
+ 
+@@ -3104,13 +3205,24 @@
+     }
+     const promise = this.messageHandler
+       .sendWithPromise(name, null)
+-      .then(results => ({
+-        info: results[0],
+-        metadata: results[1] ? new Metadata(results[1]) : null,
+-        contentDispositionFilename: this.#fullReader?.filename ?? null,
+-        contentLength: this.#fullReader?.contentLength ?? null,
+-        hasStructTree: results[2],
+-      }));
++      .then(results => {
++        if (
++          this._params.strictMetadata &&
++          !validMetadataInspection(results[3], results[1])
++        ) {
++          throw new Error("Strict metadata evidence unavailable.");
++        }
++        return {
++          info: results[0],
++          metadata: results[1] ? new Metadata(results[1]) : null,
++          contentDispositionFilename: this.#fullReader?.filename ?? null,
++          contentLength: this.#fullReader?.contentLength ?? null,
++          hasStructTree: results[2],
++          ...(this._params.strictMetadata
++            ? { metadataInspection: results[3] }
++            : {}),
++        };
++      });
+     this.#methodPromises.set(name, promise);
+     return promise;
+   }
+--- a/test/unit/api_spec.js
++++ b/test/unit/api_spec.js
+@@ -12,6 +12,8 @@
+  * See the License for the specific language governing permissions and
+  * limitations under the License.
+  */
++
++// Modified for Cortex, 2026-10-17: strict catalog metadata evidence only.
+ 
+ import {
+   AnnotationEditorType,
+@@ -4378,14 +4380,11 @@
+ 
+         const result2 = loadingTask2.promise.then(async pdfDoc => {
+           const pdfPage = await pdfDoc.getPage(1);
+-          const opList = await pdfPage.getOperatorList();
+-
+-          expect(opList.fnArray.length).toEqual(0);
+-          expect(opList.argsArray.length).toEqual(0);
+-          expect(opList.lastChunk).toEqual(true);
+-          expect(opList.separateAnnots).toEqual(null);
+-
+-          await loadingTask2.destroy();
++          try {
++            await expectAsync(pdfPage.getOperatorList()).toBeRejected();
++          } finally {
++            await loadingTask2.destroy();
++          }
+         });
+ 
+         await Promise.all([result1, result2]);
+@@ -6017,3 +6016,317 @@
+     });
+   });
+ });
++
++// Modified for Cortex: real worker transport and the generated DocumentInitParameters contract.
++describe("strict metadata API evidence", function () {
++  function fixture(subtype, dictionary = "") {
++    const xml =
++      '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">' +
++      '<rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/">' +
++      "<dc:title>Einstufung: GEHEIM</dc:title></rdf:Description></rdf:RDF>";
++    const objects = [
++      `<< /Type /Catalog /Pages 2 0 R ${subtype ? "/Metadata 4 0 R" : ""} >>`,
++      "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
++      "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] >>",
++      ...(subtype
++        ? [
++            `<< /Type /Metadata /Subtype /${subtype} /Length ${new TextEncoder().encode(xml).length} ${dictionary} >>\nstream\n${xml}\nendstream`,
++          ]
++        : []),
++    ];
++    let data = "%PDF-1.4\n";
++    const offsets = [0];
++    for (const [index, object] of objects.entries()) {
++      offsets.push(new TextEncoder().encode(data).length);
++      data += `${index + 1} 0 obj\n${object}\nendobj\n`;
++    }
++    const xref = new TextEncoder().encode(data).length;
++    data += `xref\n0 ${offsets.length}\n0000000000 65535 f \n`;
++    data += offsets
++      .slice(1)
++      .map(value => `${String(value).padStart(10, "0")} 00000 n \n`)
++      .join("");
++    data += `trailer\n<< /Size ${offsets.length} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
++    return new TextEncoder().encode(data);
++  }
++  for (const [subtype, status] of [
++    ["XML", "validated"],
++    ["Bogus", "refused"],
++    [null, "absent"],
++  ]) {
++    it(`returns ${status} metadata evidence without whole-PDF completion`, async function () {
++      const task = getDocument({
++        data: fixture(subtype),
++        strictMetadata: true,
++      });
++      try {
++        const doc = await task.promise;
++        const result = await doc.getMetadata();
++        expect(result.metadataInspection.status).toEqual(status);
++        expect(result.metadataInspection.documentComplete).toEqual(false);
++        if (subtype === "XML") {
++          expect(result.metadata.get("dc:title")).toEqual("Einstufung: GEHEIM");
++        } else {
++          expect(result.metadata).toEqual(null);
++        }
++      } finally {
++        await task.destroy();
++      }
++    });
++  }
++  for (const dictionary of [
++    "/Filter /Bogus",
++    "/F /Bogus",
++    "/DecodeParms << /Predictor 1 >>",
++    "/DP << /Predictor 1 >>",
++  ]) {
++    it(`refuses native metadata stream dictionary ${dictionary}`, async function () {
++      for (const strictMetadata of [false, true]) {
++        const task = getDocument({
++          data: fixture("XML", dictionary),
++          strictMetadata,
++        });
++        try {
++          const result = await (await task.promise).getMetadata();
++          if (strictMetadata) {
++            expect(result.metadata).toEqual(null);
++            expect(result.metadataInspection).toEqual({
++              version: 1,
++              scope: "catalog-metadata",
++              documentComplete: false,
++              status: "refused",
++              reason: "unsupported_stream",
++            });
++          } else {
++            expect(result.metadata.get("dc:title")).toEqual(
++              "Einstufung: GEHEIM"
++            );
++            expect(Object.hasOwn(result, "metadataInspection")).toEqual(false);
++          }
++        } finally {
++          await task.destroy();
++        }
++      }
++    });
++  }
++  it("retains the exact legacy API shape when strict mode is absent", async function () {
++    const task = getDocument({ data: fixture("Bogus") });
++    try {
++      const result = await (await task.promise).getMetadata();
++      expect(result.metadata).toEqual(null);
++      expect(Object.hasOwn(result, "metadataInspection")).toEqual(false);
++    } finally {
++      await task.destroy();
++    }
++  });
++  it("refuses missing strict evidence from an incompatible worker", async function () {
++    const task = getDocument({ data: fixture(null), strictMetadata: true });
++    let sendWithPromise;
++    try {
++      const doc = await task.promise;
++      sendWithPromise = spyOn(
++        doc._transport.messageHandler,
++        "sendWithPromise"
++      ).and.resolveTo([{}, null, false]);
++      await expectAsync(doc.getMetadata()).toBeRejectedWithError(
++        "Strict metadata evidence unavailable."
++      );
++    } finally {
++      sendWithPromise?.and.callThrough();
++      await task.destroy();
++    }
++  });
++});
++
++// Modified for Cortex: native image failures must reach strict page consumers.
++describe("strict image error propagation", function () {
++  function imageFixture({
++    dimensions = "/Width 1 /Height 1",
++    corrupt = false,
++    inline = false,
++    pages = 1,
++  } = {}) {
++    const imageDictionary = `${dimensions} /ColorSpace /DeviceGray /BitsPerComponent 8${corrupt ? " /Filter /DCTDecode" : ""}`;
++    const pixels = corrupt ? "NOTAJPEG" : "A";
++    const drawing = inline
++      ? `q 20 0 0 20 0 0 cm BI ${imageDictionary} ID ${pixels} EI Q`
++      : "q 20 0 0 20 0 0 cm /Im1 Do Q";
++    const objects = [
++      "<< /Type /Catalog /Pages 2 0 R >>",
++      `<< /Type /Pages /Kids [${Array.from({ length: pages }, (_, i) => `${4 + i * 2} 0 R`).join(" ")}] /Count ${pages} >>`,
++      `<< /Type /XObject /Subtype /Image ${imageDictionary} /Length ${pixels.length} >>\nstream\n${pixels}\nendstream`,
++    ];
++    for (let i = 0; i < pages; i++) {
++      objects.push(
++        `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 20 20] /Resources << /XObject << /Im1 3 0 R >> >> /Contents ${5 + i * 2} 0 R >>`,
++        `<< /Length ${new TextEncoder().encode(drawing).length} >>\nstream\n${drawing}\nendstream`
++      );
++    }
++    let source = "%PDF-1.4\n";
++    const offsets = [0];
++    for (const [index, object] of objects.entries()) {
++      offsets.push(new TextEncoder().encode(source).length);
++      source += `${index + 1} 0 obj\n${object}\nendobj\n`;
++    }
++    const xref = new TextEncoder().encode(source).length;
++    source += `xref\n0 ${offsets.length}\n0000000000 65535 f \n`;
++    source += offsets
++      .slice(1)
++      .map(offset => `${String(offset).padStart(10, "0")} 00000 n \n`)
++      .join("");
++    source += `trailer\n<< /Size ${offsets.length} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
++    return new TextEncoder().encode(source);
++  }
++
++  async function readPages(options, stopAtErrors, operation) {
++    const task = getDocument({
++      data: imageFixture(options),
++      stopAtErrors,
++      strictMetadata: true,
++    });
++    const results = [];
++    try {
++      const doc = await task.promise;
++      expect(
++        (await doc.getMetadata()).metadataInspection.documentComplete
++      ).toEqual(false);
++      for (let i = 1; i <= doc.numPages; i++) {
++        const page = await doc.getPage(i);
++        const read = async () => {
++          let canvas;
++          try {
++            if (operation === "render") {
++              canvas = doc.canvasFactory.create(20, 20);
++              await page.render({
++                canvas: canvas.canvas,
++                viewport: page.getViewport({ scale: 1 }),
++              }).promise;
++              const rgba = canvas.context.getImageData(0, 0, 20, 20).data;
++              results.push({
++                status: "fulfilled",
++                ink: rgba.some(
++                  (value, index) => index % 4 !== 3 && value < 128
++                ),
++              });
++              rgba.fill(0);
++            } else {
++              const list = await page.getOperatorList();
++              results.push({ status: "fulfilled", lastChunk: list.lastChunk });
++            }
++          } catch (error) {
++            results.push({ status: "rejected", message: error.message });
++          } finally {
++            if (canvas) {
++              doc.canvasFactory.destroy(canvas);
++            }
++          }
++        };
++        try {
++          if (options.concurrent) {
++            await Promise.all([read(), read()]);
++          } else {
++            for (let attempt = 0; attempt < (options.repeats || 1); attempt++) {
++              await read();
++            }
++          }
++        } finally {
++          page.cleanup();
++        }
++      }
++    } finally {
++      const worker = task._worker;
++      await task.destroy();
++      expect(task.destroyed).toEqual(true);
++      expect(worker.destroyed).toEqual(true);
++    }
++    return results;
++  }
++
++  const cases = [
++    {
++      name: "zero dimensions",
++      options: { dimensions: "/Width 0 /Height 0" },
++      invalid: true,
++    },
++    {
++      name: "missing dimensions",
++      options: { dimensions: "/Height 1" },
++      invalid: true,
++    },
++    {
++      name: "nonnumeric dimensions",
++      options: { dimensions: "/Width /Bogus /Height 1" },
++      invalid: true,
++    },
++    {
++      name: "asynchronous XObject decoding",
++      options: { corrupt: true },
++      invalid: true,
++    },
++    {
++      name: "small inline decoding",
++      options: { corrupt: true, inline: true },
++      invalid: true,
++    },
++    {
++      name: "large inline decoding",
++      options: {
++        corrupt: true,
++        inline: true,
++        dimensions: "/Width 201 /Height 1",
++      },
++      invalid: true,
++    },
++    { name: "valid XObject", options: {}, invalid: false },
++    { name: "valid inline image", options: { inline: true }, invalid: false },
++    {
++      name: "cached valid image",
++      options: { pages: GlobalImageCache.NUM_PAGES_THRESHOLD + 1 },
++      invalid: false,
++    },
++    {
++      name: "cached image decoding",
++      options: {
++        corrupt: true,
++        pages: GlobalImageCache.NUM_PAGES_THRESHOLD + 1,
++      },
++      invalid: true,
++    },
++    {
++      name: "repeated image failure",
++      options: { corrupt: true, repeats: 2 },
++      invalid: true,
++    },
++    {
++      name: "concurrent image failure",
++      options: { corrupt: true, concurrent: true },
++      invalid: true,
++    },
++    {
++      name: "concurrent valid image",
++      options: { concurrent: true },
++      invalid: false,
++    },
++  ];
++  for (const { name, options, invalid } of cases) {
++    for (const operation of ["operatorList", "render"]) {
++      for (const stopAtErrors of [false, true]) {
++        it(`${operation}: ${name}, stopAtErrors=${stopAtErrors}`, async function () {
++          const results = await readPages(options, stopAtErrors, operation);
++          expect(results.length).toEqual(
++            (options.pages || 1) *
++              (options.concurrent ? 2 : options.repeats || 1)
++          );
++          for (const result of results) {
++            expect(result.status).toEqual(
++              invalid && stopAtErrors ? "rejected" : "fulfilled"
++            );
++            if (!invalid && operation === "render") {
++              expect(result.ink).toEqual(true);
++            }
++          }
++        });
++      }
++    }
++  }
++});
+--- a/test/unit/metadata_spec.js
++++ b/test/unit/metadata_spec.js
+@@ -13,8 +13,13 @@
+  * limitations under the License.
+  */
+ 
++// Modified for Cortex, 2026-10-17: strict catalog metadata evidence only.
++
++import { Catalog } from "../../src/core/catalog.js";
++import { Dict, Name, Ref } from "../../src/core/primitives.js";
+ import { Metadata } from "../../src/display/metadata.js";
+ import { MetadataParser } from "../../src/core/metadata_parser.js";
++import { Stream } from "../../src/core/stream.js";
+ 
+ function createMetadata(data) {
+   const metadataParser = new MetadataParser(data);
+@@ -247,3 +252,129 @@
+     expect([...metadata]).toEqual([["dc:title", "a&lol9;b"]]);
+   });
+ });
++
++// Modified for Cortex: native catalog/XML profile regressions; no complete-PDF assertion.
++describe("strict catalog metadata evidence", function () {
++  const text = "Einstufung: GEHEIM";
++  const xml =
++    '<x:xmpmeta xmlns:x="adobe:ns:meta/">' +
++    '<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">' +
++    '<rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/">' +
++    `<dc:description>${text}</dc:description></rdf:Description></rdf:RDF></x:xmpmeta>`;
++  function catalog(value, stream, missing = false) {
++    const root = new Dict();
++    root.set("Pages", new Dict());
++    if (!missing) {
++      root.set("Metadata", value);
++    }
++    return new Catalog(
++      {},
++      {
++        getCatalogObj: () => root,
++        fetch: ref => {
++          if (ref !== value || !stream) {
++            throw new Error("Missing synthetic reference");
++          }
++          return stream;
++        },
++      }
++    );
++  }
++  function source(data = xml, subtype = "XML") {
++    const bytes = new TextEncoder().encode(data);
++    const stream = new Stream(bytes);
++    stream.dict = new Dict();
++    stream.dict.set("Type", Name.get("Metadata"));
++    stream.dict.set("Subtype", Name.get(subtype));
++    stream.dict.set("Length", bytes.length);
++    return stream;
++  }
++  const inspect = (stream = source()) =>
++    catalog(Ref.get(6, 0), stream).metadataInspection;
++  it("distinguishes absent, present null/direct, dangling and wrong-type references", function () {
++    expect(
++      catalog(null, null, true).metadataInspection.evidence.status
++    ).toEqual("absent");
++    for (const value of [null, 7, Name.get("Metadata"), new Dict(), source()]) {
++      expect(catalog(value).metadataInspection.evidence.reason).toEqual(
++        "invalid_reference"
++      );
++    }
++    expect(catalog(Ref.get(6, 0)).metadataInspection.evidence.reason).toEqual(
++      "invalid_reference"
++    );
++    expect(inspect(new Dict()).evidence.reason).toEqual("invalid_stream");
++    expect(inspect(source(xml, "Bogus")).evidence.reason).toEqual(
++      "invalid_stream"
++    );
++    const wrongType = source();
++    wrongType.dict.set("Type", Name.get("Bogus"));
++    expect(inspect(wrongType).evidence.reason).toEqual("invalid_stream");
++  });
++  it("preserves valid original XML, parser values and stream position without a PDF certificate", function () {
++    const stream = source();
++    stream.pos = 3;
++    const result = inspect(stream);
++    expect(result.evidence).toEqual({
++      version: 1,
++      scope: "catalog-metadata",
++      documentComplete: false,
++      status: "validated",
++      decodedBytes: new TextEncoder().encode(xml).length,
++    });
++    expect(result.metadata.rawData).toEqual(xml);
++    expect(result.metadata.parsedData.get("dc:description")).toEqual(text);
++    expect(stream.pos).toEqual(3);
++  });
++  it("refuses repair, malformed XML and unsupported XML instead of silently dropping data", function () {
++    expect(inspect(source("junk" + xml)).evidence.reason).toEqual(
++      "repair_required"
++    );
++    for (const value of [
++      xml.slice(0, -12),
++      xml + xml,
++      xml.replace("</dc:description>", "</dc:title>"),
++      xml + "\u00a0",
++      xml.replace(
++        "xmlns:dc=",
++        'xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:dc='
++      ),
++      xml.replace("xmlns:dc=", 'rdf:about=""xmlns:dc='),
++      xml.replace(
++        "</rdf:Description>",
++        "<dc:description>public</dc:description></rdf:Description>"
++      ),
++    ]) {
++      expect(inspect(source(value)).evidence.status).toEqual("refused");
++    }
++    for (const value of [
++      '<?xml version="1.0"?>' + xml,
++      "<!DOCTYPE x>" + xml,
++      "<!-- synthetic -->" + xml,
++      xml.replace(text, "Einstufung: GE&#x48;EIM"),
++      xml.replace("dc:description", "dc:unknown"),
++      xml.replace(text, "<![CDATA[" + text + "]]>"),
++      xml.replace("xmlns:dc=", 'unknown="marked" xmlns:dc='),
++    ]) {
++      expect(inspect(source(value)).evidence.status).toEqual("refused");
++    }
++  });
++  it("refuses stream filters, byte mismatches, invalid UTF-8 and oversized metadata", function () {
++    const filtered = source();
++    filtered.dict.set("Filter", Name.get("FlateDecode"));
++    expect(inspect(filtered).evidence.reason).toEqual("unsupported_stream");
++    const wrongLength = source();
++    wrongLength.dict.set("Length", 1);
++    expect(inspect(wrongLength).evidence.reason).toEqual("invalid_stream");
++    const invalid = source();
++    invalid.bytes[0] = 0xff;
++    expect(inspect(invalid).evidence.reason).toEqual("invalid_encoding");
++    expect(inspect(source("x".repeat(65537))).evidence.reason).toEqual(
++      "resource_limit"
++    );
++  });
++  it("keeps the legacy repair and wrong-subtype behavior unchanged", function () {
++    expect(new MetadataParser("junk" + xml).serializable.rawData).toEqual(xml);
++    expect(catalog(Ref.get(6, 0), source(xml, "Bogus")).metadata).toEqual(null);
++  });
++});
