@@ -221,7 +221,7 @@ async function probe(bytes: Buffer) {
   }
 }
 
-it('preserves tolerant metadata observations while the strict consumer refuses omitted metadata before OCR', async () => {
+it('preserves tolerant metadata observations while strict inspection separates refused and absent metadata', async () => {
   const observations = [];
   const expectedMetadata = {
     XML: { status: 'validated', decodedBytes: Buffer.byteLength(xmp) },
@@ -257,7 +257,12 @@ it('preserves tolerant metadata observations while the strict consumer refuses o
     } else {
       expect(result.metadataRaw).toBeNull();
       expect(result.metadataDescription).toBeNull();
-      expect(result.result).toEqual({ decision: 'uninspectable', reason: 'incomplete_coverage' });
+      // Proven absence still requires complete page and OCR coverage; refusal stops before OCR.
+      expect(result.result).toEqual(
+        subtype === 'Bogus'
+          ? { decision: 'uninspectable', reason: 'incomplete_coverage' }
+          : { decision: 'clear', coverage: { complete: true, pages: 1, parts: 1 } },
+      );
     }
     observations.push({ subtype, ...result });
   }
