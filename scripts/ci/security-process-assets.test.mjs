@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
-import { compiledFiles, regular, toolHelp } from './security-process-assets.mjs';
+import { compiledFiles, regular, toolHelp, validateLibraries } from './security-process-assets.mjs';
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'security-image-'));
@@ -72,4 +72,69 @@ test('installed tool capability must actually expose every required option', (t)
   });
   toolHelp(tool, ['--landlock-access', '--landlock-rule']);
   assert.throws(() => toolHelp(tool, ['--seccomp-filter']));
+});
+
+// The musl image gate must reject the same library sets while exposing safe failure evidence.
+test('library diagnostics preserve acceptance and classify every rejected boundary', (t) => {
+  const output = [];
+  t.mock.method(console, 'error', (line) => output.push(line));
+  const loader = '/lib/ld-musl-x86_64.so.1';
+  const addon = '/app/node_modules/@napi-rs/canvas-linux-x64-musl/skia.node';
+  const valid = [loader, addon, '/usr/lib/libjemalloc.so.2'];
+  assert.doesNotThrow(() => validateLibraries(valid, addon));
+  assert.deepEqual(output, []);
+  for (const [libraries, categories] of [
+    [[addon], ['missing-loader']],
+    [[loader], ['missing-addon']],
+    [[...valid, '/opt/foreign.so'], ['unexpected-root']],
+    [['/opt/foreign.so'], ['missing-loader', 'missing-addon', 'unexpected-root']],
+  ]) {
+    assert.throws(() => validateLibraries(libraries, addon), {
+      message: 'Security process image assets unavailable',
+    });
+    assert.equal(output.length, 1);
+    const observation = JSON.parse(output.pop());
+    assert.deepEqual(observation.categories, categories);
+    assert.deepEqual(observation.libraries, libraries);
+    assert.equal(observation.canvasAddon, addon);
+    assert.equal(observation.omittedLibraryCount, 0);
+  }
+});
+
+test('failure observations bound count and path bytes without extra process data', (t) => {
+  const output = [];
+  t.mock.method(console, 'error', (line) => output.push(line));
+  const addon = '/app/canvas.node';
+  const libraries = [
+    '/lib/ld-musl-x86_64.so.1',
+    addon,
+    ...Array.from({ length: 64 }, (_, index) => '/tmp/' + index + '-"'.repeat(300) + '\n'),
+  ];
+  assert.throws(() => validateLibraries(libraries, addon), {
+    message: 'Security process image assets unavailable',
+  });
+  assert.equal(output.length, 1);
+  assert.ok(Buffer.byteLength(output[0]) < 18000);
+  assert.ok(!output[0].includes('\n'));
+  const observation = JSON.parse(output[0]);
+  assert.deepEqual(
+    Object.keys(observation).sort(),
+    [
+      'canvasAddon',
+      'categories',
+      'event',
+      'libraries',
+      'libraryCount',
+      'omittedLibraryCount',
+      'pathsTruncated',
+    ].sort(),
+  );
+  assert.deepEqual(observation.categories, ['unexpected-root']);
+  assert.equal(observation.libraryCount, 66);
+  assert.equal(observation.libraries.length, 32);
+  assert.equal(observation.omittedLibraryCount, 34);
+  assert.equal(observation.pathsTruncated, true);
+  assert.ok(
+    observation.libraries.every((file) => file.length <= 256 && /^[\x20-\x7e]*$/u.test(file)),
+  );
 });

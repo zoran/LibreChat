@@ -89,6 +89,42 @@ export function toolHelp(tool, options) {
   need(options.every((option) => help.includes(option)));
 }
 
+/** Preserve the packaging gate; report only bounded library paths when it rejects. */
+export function validateLibraries(libraries, canvasAddon) {
+  try {
+    need(
+      libraries.includes('/lib/ld-musl-x86_64.so.1') &&
+        libraries.includes(canvasAddon) &&
+        libraries.every(
+          (file) =>
+            file === canvasAddon || file.startsWith('/lib/') || file.startsWith('/usr/lib/'),
+        ),
+    );
+  } catch (error) {
+    const observed = libraries.slice(0, 32);
+    const observePath = (file) => file.replace(/[^\x20-\x7e]/gu, '?').slice(0, 256);
+    console.error(
+      JSON.stringify({
+        event: 'security-process-library-mismatch',
+        categories: [
+          !libraries.includes('/lib/ld-musl-x86_64.so.1') && 'missing-loader',
+          !libraries.includes(canvasAddon) && 'missing-addon',
+          libraries.some(
+            (file) =>
+              file !== canvasAddon && !file.startsWith('/lib/') && !file.startsWith('/usr/lib/'),
+          ) && 'unexpected-root',
+        ].filter(Boolean),
+        libraryCount: libraries.length,
+        libraries: observed.map(observePath),
+        canvasAddon: observePath(canvasAddon),
+        omittedLibraryCount: Math.max(0, libraries.length - observed.length),
+        pathsTruncated: [...observed, canvasAddon].some((file) => file.length > 256),
+      }),
+    );
+    throw error;
+  }
+}
+
 export function generate() {
   need(
     process.platform === 'linux' &&
@@ -128,13 +164,7 @@ export function generate() {
         .map((file) => fs.realpathSync(file)),
     ),
   ];
-  need(
-    libraries.includes('/lib/ld-musl-x86_64.so.1') &&
-      libraries.includes(canvasAddon) &&
-      libraries.every(
-        (file) => file === canvasAddon || file.startsWith('/lib/') || file.startsWith('/usr/lib/'),
-      ),
-  );
+  validateLibraries(libraries, canvasAddon);
   const fonts = fs
     .readdirSync(`${pdfRoot}/standard_fonts`)
     .filter((file) => /\.(pfb|ttf)$/u.test(file));
