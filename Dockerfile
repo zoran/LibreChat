@@ -6,7 +6,7 @@
 FROM node:24.16.0-alpine AS node
 
 RUN apk upgrade --no-cache
-RUN apk add --no-cache jemalloc git
+RUN apk add --no-cache jemalloc git setpriv util-linux-misc
 RUN apk add --no-cache python3 py3-pip uv
 
 # Set environment variable to use jemalloc
@@ -71,6 +71,12 @@ RUN --mount=type=bind,target=/build-context \
     fi && \
     npm prune --production && \
     npm cache clean --force
+
+# Build the actual parser assets after either workspace build path and production pruning.
+# This is packaging evidence; host/kernel qualification is a separate deployment gate.
+USER root
+RUN node scripts/ci/security-process-assets.mjs
+USER node
 
 # Optional build metadata surfaced in Settings -> About for support triage.
 # Declared here (after the heavy install/build steps) so that commit/date

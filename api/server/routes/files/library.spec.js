@@ -57,6 +57,7 @@ const express = require('express');
 const request = require('supertest');
 const methods = require('~/models');
 const { initialize } = require('./index');
+const { createManagedSourceResolver } = jest.requireActual('@librechat/api');
 
 describe('File library HTTP adapter', () => {
   const origin = 'https://library.example.test';
@@ -113,6 +114,11 @@ describe('File library HTTP adapter', () => {
       principal: jest.fn().mockResolvedValue({ ...mockOwner, authentication: 'verified-email' }),
       management: { get: jest.fn().mockImplementation(async () => operation) },
     };
+    // Use the production source authorizer for this authorization-only consumer.
+    mockRuntime.sources = createManagedSourceResolver({
+      allowedOrigins: mockRuntime.allowedOrigins,
+      principal: (req) => mockRuntime.principal(req),
+    });
     methods.getFileLibraryPage.mockResolvedValue({ files: [file], nextCursor: cursor });
     methods.updateFileLibrary.mockResolvedValue({
       kind: 'updated',

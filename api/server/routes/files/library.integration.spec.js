@@ -6,6 +6,7 @@ const { MongoMemoryReplSet } = require('mongodb-memory-server');
 const { createModels, createFileLibraryMethods } = require('@librechat/data-schemas');
 const { FileContext } = require('librechat-data-provider');
 const { createFileLibraryHandlers } = require('./library');
+const { createManagedSourceResolver } = jest.requireActual('@librechat/api');
 
 describe('File library HTTP and native Mongo composition', () => {
   const db = new mongoose.Mongoose();
@@ -58,6 +59,11 @@ describe('File library HTTP and native Mongo composition', () => {
         }),
       },
     };
+    // Use the production source authorizer for this authorization-only consumer.
+    runtime.sources = createManagedSourceResolver({
+      allowedOrigins: runtime.allowedOrigins,
+      principal: (req) => runtime.principal(req),
+    });
     const handlers = createFileLibraryHandlers({
       methods: createFileLibraryMethods(db),
       isManaged: () => true,

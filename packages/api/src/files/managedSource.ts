@@ -148,9 +148,10 @@ export function createManagedSourceResolver(options: Options): ManagedSourceReso
           result.userId !== expected.userId))
     )
       throw unavailable('unauthorized');
-    if (request.user?.id && request.user.id !== result.userId) throw unavailable('unauthorized');
+    // Authenticated scope mismatches stay concealed at resource boundaries.
+    if (request.user?.id && request.user.id !== result.userId) throw unavailable('forbidden');
     if (request.user?.tenantId !== undefined && request.user.tenantId !== result.tenantId)
-      throw unavailable('unauthorized');
+      throw unavailable('forbidden');
     return Object.freeze({ ...result });
   }
 

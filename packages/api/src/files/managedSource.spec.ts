@@ -156,7 +156,7 @@ it('uses the canonical source in normal context and preserves honest prefix cove
   expect(f.ports.storage.read).not.toHaveBeenCalled();
 });
 
-it.each(['owner', 'tenant', 'origin', 'identity'])(
+it.each(['owner', 'tenant', 'origin', 'identity', 'request-tenant'])(
   'rejects a changed %s before any source disclosure',
   async (field) => {
     const f = fixture();
@@ -166,6 +166,13 @@ it.each(['owner', 'tenant', 'origin', 'identity'])(
     if (field === 'identity') {
       if (!f.req.user) throw new Error('Missing fixture identity');
       f.req.user.id = 'other-owner';
+    }
+    if (field === 'request-tenant') {
+      if (!f.req.user) throw new Error('Missing fixture identity');
+      f.req.user.tenantId = 'other-tenant';
+    }
+    if (field === 'identity' || field === 'request-tenant') {
+      await expect(f.resolver.authorize(f.req)).rejects.toMatchObject({ code: 'forbidden' });
     }
     await expect(f.context()).rejects.toBeDefined();
     expect(f.ports.storage.read).not.toHaveBeenCalled();

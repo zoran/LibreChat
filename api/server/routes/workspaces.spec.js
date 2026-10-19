@@ -1,6 +1,7 @@
 const express = require('express');
 const request = require('supertest');
 const { createWorkspaceRouter } = require('./workspaces');
+const { createManagedSourceResolver } = jest.requireActual('@librechat/api');
 
 describe('Workspace metadata API on the native upload boundary', () => {
   const principal = {
@@ -71,6 +72,11 @@ describe('Workspace metadata API on the native upload boundary', () => {
       management: { reserveDerived: jest.fn().mockResolvedValue(operation) },
       repository: { getDerivedOperation: jest.fn().mockResolvedValue(operation) },
     };
+    // Use the production source authorizer for this authorization-only consumer.
+    runtime.sources = createManagedSourceResolver({
+      allowedOrigins: runtime.allowedOrigins,
+      principal: (req) => runtime.principal(req),
+    });
     original = {
       read: jest
         .fn()

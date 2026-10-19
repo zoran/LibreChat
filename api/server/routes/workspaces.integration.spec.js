@@ -1,4 +1,5 @@
 /** Real HTTP/Mongo/intake/scanner/parser flow; S3, login and resource admission are fixtures. */
+const assert = require('node:assert/strict');
 const path = require('node:path');
 const { tmpdir } = require('node:os');
 const { Readable } = require('node:stream');
@@ -24,6 +25,7 @@ const {
   processNextManagedUpload,
 } = require('@librechat/api');
 const { createWorkspaceRouter } = require('./workspaces');
+const { createManagedSourceResolver } = jest.requireActual('@librechat/api');
 
 describe('Workspace HTTP saves through native security and File lifecycle', () => {
   const db = new mongoose.Mongoose();
@@ -73,16 +75,16 @@ describe('Workspace HTTP saves through native security and File lifecycle', () =
       abortSignal.throwIfAborted();
       const input = command.input;
       if (command.constructor.name === 'PutObjectCommand') {
-        expect(input.IfNoneMatch).toBe('*');
-        expect(objects.has(input.Key)).toBe(false);
-        expect(await db.models.File.countDocuments({ file_id: input.Metadata.operation })).toBe(0);
+        assert.equal(input.IfNoneMatch, '*');
+        assert.equal(objects.has(input.Key), false);
+        assert.equal(await db.models.File.countDocuments({ file_id: input.Metadata.operation }), 0);
         const chunks = [];
         for await (const chunk of input.Body) {
           abortSignal.throwIfAborted();
           chunks.push(Buffer.from(chunk));
         }
         const bytes = Buffer.concat(chunks);
-        expect(bytes.length).toBe(input.ContentLength);
+        assert.equal(bytes.length, input.ContentLength);
         objectWrites++;
         objects.set(input.Key, { bytes, versionId: `fixture-${objectWrites}` });
         return { ETag: '"fixture-etag"', VersionId: `fixture-${objectWrites}` };
@@ -213,6 +215,11 @@ describe('Workspace HTTP saves through native security and File lifecycle', () =
       management,
       storage,
     };
+    // Use the production source authorizer for this authorization-only consumer.
+    runtime.sources = createManagedSourceResolver({
+      allowedOrigins: runtime.allowedOrigins,
+      principal: (req) => runtime.principal(req),
+    });
     app = application();
   });
 
@@ -224,7 +231,7 @@ describe('Workspace HTTP saves through native security and File lifecycle', () =
     try {
       await sidecar?.close();
       if (scanner)
-        expect(await scanner.close(AbortSignal.timeout(10_000))).toEqual({ complete: true });
+        assert.deepEqual(await scanner.close(AbortSignal.timeout(10_000)), { complete: true });
     } finally {
       await db.disconnect();
       await mongo?.stop();

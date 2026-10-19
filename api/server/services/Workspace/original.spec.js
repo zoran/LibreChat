@@ -15,6 +15,7 @@ jest.mock('~/server/utils/files', () => ({ getContentDisposition: () => 'unused'
 const { createManagedS3Storage, managedOriginalKey } = jest.requireActual('@librechat/api');
 const { uploadDerivedExpiresAt } = require('librechat-data-provider');
 const { createWorkspaceOriginalReader } = require('./original');
+const { createManagedSourceResolver } = jest.requireActual('@librechat/api');
 
 const epoch = Date.parse('2026-10-17T10:00:00Z');
 const policy = 'c'.repeat(64);
@@ -125,6 +126,11 @@ function fixture(options = {}) {
     repository: { cleanupForFile: jest.fn(async () => snapshot(task)) },
     storage,
   };
+  // Use the production source authorizer for this authorization-only consumer.
+  runtime.sources = createManagedSourceResolver({
+    allowedOrigins: runtime.allowedOrigins,
+    principal: (req) => runtime.principal(req),
+  });
   state.runtime = runtime;
   const reader = createWorkspaceOriginalReader({
     getRuntime: () => state.runtime,
