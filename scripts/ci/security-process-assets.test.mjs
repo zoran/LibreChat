@@ -138,3 +138,52 @@ test('failure observations bound count and path bytes without extra process data
     observation.libraries.every((file) => file.length <= 256 && /^[\x20-\x7e]*$/u.test(file)),
   );
 });
+
+// Complete sharedObjects inventory observed in the Node 24.16 musl image build.
+const observedMuslLibraries = [
+  '/usr/local/bin/node',
+  '/usr/lib/libjemalloc.so.2',
+  '/usr/lib/libstdc++.so.6.0.34',
+  '/usr/lib/libgcc_s.so.1',
+  '/lib/ld-musl-x86_64.so.1',
+  '/app/node_modules/@napi-rs/canvas-linux-x64-musl/skia.linux-x64-musl.node',
+];
+
+test('the observed musl inventory admits and retains its exact Node executable', (t) => {
+  const output = [];
+  t.mock.method(console, 'error', (line) => output.push(line));
+  const libraries = [...observedMuslLibraries];
+  const addon = observedMuslLibraries.at(-1);
+  assert.doesNotThrow(() => validateLibraries(libraries, addon));
+  assert.deepEqual(libraries, observedMuslLibraries);
+  assert.deepEqual(output, []);
+});
+
+test('Node path lookalikes and incomplete observed inventories remain rejected', (t) => {
+  const output = [];
+  t.mock.method(console, 'error', (line) => output.push(line));
+  const loader = '/lib/ld-musl-x86_64.so.1';
+  const addon = observedMuslLibraries.at(-1);
+  const foreignPaths = [
+    '/usr/local/bin/nodejs',
+    '/usr/local/bin/node.so',
+    '/usr/local/bin/node/extra.so',
+    '/usr/local/lib/foreign.so',
+    '/opt/foreign.so',
+  ];
+  for (const [libraries, categories] of [
+    ...foreignPaths.map((file) => [[...observedMuslLibraries, file], ['unexpected-root']]),
+    [observedMuslLibraries.filter((file) => file !== loader), ['missing-loader']],
+    [observedMuslLibraries.filter((file) => file !== addon), ['missing-addon']],
+  ]) {
+    assert.throws(() => validateLibraries(libraries, addon), {
+      message: 'Security process image assets unavailable',
+    });
+    assert.equal(output.length, 1);
+    const observation = JSON.parse(output.pop());
+    assert.deepEqual(observation.categories, categories);
+    assert.deepEqual(observation.libraries, libraries);
+    assert.equal(observation.omittedLibraryCount, 0);
+    assert.equal(observation.pathsTruncated, false);
+  }
+});

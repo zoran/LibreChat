@@ -89,16 +89,18 @@ export function toolHelp(tool, options) {
   need(options.every((option) => help.includes(option)));
 }
 
-/** Preserve the packaging gate; report only bounded library paths when it rejects. */
+/** Admit the fixed Node executable and expected libraries; bound rejected-path evidence. */
 export function validateLibraries(libraries, canvasAddon) {
+  const isAdmittedLibrary = (file) =>
+    file === '/usr/local/bin/node' ||
+    file === canvasAddon ||
+    file.startsWith('/lib/') ||
+    file.startsWith('/usr/lib/');
   try {
     need(
       libraries.includes('/lib/ld-musl-x86_64.so.1') &&
         libraries.includes(canvasAddon) &&
-        libraries.every(
-          (file) =>
-            file === canvasAddon || file.startsWith('/lib/') || file.startsWith('/usr/lib/'),
-        ),
+        libraries.every(isAdmittedLibrary),
     );
   } catch (error) {
     const observed = libraries.slice(0, 32);
@@ -109,10 +111,7 @@ export function validateLibraries(libraries, canvasAddon) {
         categories: [
           !libraries.includes('/lib/ld-musl-x86_64.so.1') && 'missing-loader',
           !libraries.includes(canvasAddon) && 'missing-addon',
-          libraries.some(
-            (file) =>
-              file !== canvasAddon && !file.startsWith('/lib/') && !file.startsWith('/usr/lib/'),
-          ) && 'unexpected-root',
+          libraries.some((file) => !isAdmittedLibrary(file)) && 'unexpected-root',
         ].filter(Boolean),
         libraryCount: libraries.length,
         libraries: observed.map(observePath),
