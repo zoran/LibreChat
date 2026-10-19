@@ -106,7 +106,8 @@ describe('durable upload admission pause', () => {
 
   async function completeScanner(lease: UploadLease, at: number) {
     const execution = {
-      version: 1 as const,
+      version: 2 as const,
+      custody: { kind: 'none' as const },
       attemptId: `${lease.operationId}.${lease.generation}`,
       instanceId: '11111111-1111-4111-8111-111111111111',
       executionId: '22222222-2222-4222-8222-222222222222',
@@ -510,6 +511,33 @@ describe('durable upload admission pause', () => {
       queueBytes: 0,
       originalBytes: 0,
     });
+  });
+
+  it('checks current security custody before replaying an acknowledged complete import', async () => {
+    const page = await first.exportSnapshot({ epoch: 'current-security-cutover' });
+    await target.importSnapshot(page);
+    const seal = await first.completeExport('current-security-cutover');
+    const input = { receipt: seal, baseline, lifecycleReconciled: true as const };
+    await target.completeImport(input);
+    const legacy = {
+      _id: 'legacy-fixture',
+      mediaType: 'text/plain',
+      attemptGeneration: 1,
+      securityExecution: {
+        version: 1,
+        attemptId: 'legacy-fixture.1',
+        instanceId: '11111111-1111-4111-8111-111111111111',
+        executionId: '22222222-2222-4222-8222-222222222222',
+        expiresAt: '2099-01-01T00:00:00.000Z',
+      },
+    };
+    await replacement.connection
+      .db!.collection<typeof legacy>(replacement.models.UploadOperation.collection.name)
+      .insertOne(legacy);
+    await expect(target.completeImport(input)).rejects.toMatchObject({ code: 'not_ready' });
+    expect(await replacement.models.UploadOperation.countDocuments({ _id: 'legacy-fixture' })).toBe(
+      1,
+    );
   });
 
   it('preserves pause through migration while fencing the source identity and permitting completed imports', async () => {

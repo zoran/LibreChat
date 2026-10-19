@@ -19,10 +19,10 @@ import type {
   UploadStorageReceipt,
 } from 'librechat-data-provider';
 import type { StoredUpload } from './uploadManagementStore';
+import type { IMongoFile } from '~/types';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createFileRetentionMethods } from './fileRetention';
 import { createModels } from '~/models';
-import type { IMongoFile } from '~/types';
 
 describe('private derived upload reservations', () => {
   const db = new mongoose.Mongoose();
@@ -120,7 +120,8 @@ describe('private derived upload reservations', () => {
       now: at,
     }))!;
     const execution = {
-      version: 1 as const,
+      version: 2 as const,
+      custody: { kind: 'none' as const },
       attemptId: `${id}.${lease.generation}`,
       instanceId: randomUUID(),
       executionId: randomUUID(),
@@ -642,7 +643,8 @@ describe('private derived upload reservations', () => {
     };
     expect(readUploadPromotionRecord(promotion)).not.toBeNull();
     const execution = {
-      version: 1,
+      version: 2,
+      custody: { kind: 'none' as const },
       attemptId: `${wideLease.operationId}.${wideLease.generation}`,
       instanceId: 's'.repeat(128),
       executionId: randomUUID(),

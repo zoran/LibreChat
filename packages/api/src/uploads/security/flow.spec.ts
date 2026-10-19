@@ -2,6 +2,7 @@
 import path from 'node:path';
 import mongoose from 'mongoose';
 import { PassThrough } from 'node:stream';
+import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import { UPLOAD_RETENTION_MS } from 'librechat-data-provider';
@@ -14,15 +15,19 @@ import type {
   UploadSecurityInspection,
   UploadSecurityExecution,
 } from 'librechat-data-provider';
+import type { UploadSecurityScopeReceipt } from 'librechat-data-provider';
 import type { IMongoFile } from '@librechat/data-schemas';
 import type { Request, Response } from 'express';
 import type { StoragePort, UploadSecurityPort } from '../contract';
+import type { SecurityPdfOcrProvider } from './pdf-ocr';
 import { extractManagedDocument } from '~/files/documents/managed';
 import { createSecurityTlsFixture } from './tls-fixture.helper';
 import { createRawUploadBodyHandler } from '../transport/body';
+import { observeSecurityProcess } from './process-observer';
 import { createHttpUploadSecurityPort } from './transport';
 import { createUploadManagement } from '../management';
 import { startSecurityService } from './service';
+import { createSecurityWorker } from './worker';
 
 describe('assembled scanner admission with real Mongo, mTLS and worker thread', () => {
   const db = new mongoose.Mongoose();
@@ -162,7 +167,7 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
   }, 30_000);
 
   /** Same raw/scanner path; only the ordinary storage byte effect is a local fixture. */
-  async function ingestDerivedFlow(id: string, bytes: Buffer) {
+  async function ingestDerivedFlow(id: string, bytes: Buffer, security: UploadSecurityPort = port) {
     const put = jest.fn(async (input: Parameters<StoragePort['put']>[0]) => {
       expect(input.securityApproval).toMatchObject({
         decision: 'approved',
@@ -222,7 +227,7 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
       management,
       principal: async () => principal,
       storage: { put },
-      security: port,
+      security,
       worker,
       stagingRoot,
       claimBytes: management.claimWorkBytes,
@@ -241,6 +246,179 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
     expect(await readdir(stagingRoot)).toEqual([]);
     return { response, put };
   }
+
+  function document(): Buffer {
+    const stream = 'BT /F1 10 Tf 10 50 Td (Synthetic source) Tj ET';
+    const objects = [
+      '<< /Type /Catalog /Pages 2 0 R >>',
+      '<< /Type /Pages /Kids [4 0 R] /Count 1 >>',
+      '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
+      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>',
+      `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
+    ];
+    let text = '%PDF-1.4\n';
+    const offsets = [0];
+    for (const [i, item] of objects.entries()) {
+      offsets.push(Buffer.byteLength(text));
+      text += `${i + 1} 0 obj\n${item}\nendobj\n`;
+    }
+    const offset = Buffer.byteLength(text);
+    text +=
+      `xref\n0 ${offsets.length}\n0000000000 65535 f \n` +
+      offsets
+        .slice(1)
+        .map((n) => `${String(n).padStart(10, '0')} 00000 n \n`)
+        .join('');
+    return Buffer.from(
+      text + `trailer\n<< /Size ${offsets.length} /Root 1 0 R >>\nstartxref\n${offset}\n%%EOF\n`,
+    );
+  }
+  it.each(['approved', 'lost-bind-ack', 'unknown-retirement'])(
+    'keeps native PDF %s behind original Mongo binding and full scope retirement',
+    async (mode) => {
+      const bytes = document();
+      const operation = await management.reserve(principal, {
+        idempotencyKey: randomUUID(),
+        mediaType: 'application/pdf',
+        declaredBytes: bytes.length,
+      });
+      let execution: UploadSecurityExecution | undefined;
+      let pages = 0;
+      let retired = mode !== 'unknown-retirement';
+      const receipt = (): UploadSecurityScopeReceipt | null =>
+        execution?.custody.kind === 'pdf-ocr' && retired
+          ? {
+              version: 1,
+              scope: execution.custody.scope,
+              state: 'retired',
+              writerStopped: true,
+              transientDataRemoved: true,
+              dispatchedPages: Array.from({ length: pages }, (_, index) => index + 1),
+            }
+          : null;
+      const provider: SecurityPdfOcrProvider = {
+        async prepare(input) {
+          expect(
+            await observer.models.UploadOperation.findById(operation.id).lean(),
+          ).not.toHaveProperty('securityExecution');
+          execution = {
+            ...input.execution,
+            custody: {
+              kind: 'pdf-ocr',
+              scope: {
+                version: 1,
+                scopeId: 'scope-fixture',
+                attemptId: input.execution.attemptId,
+                scannerInstanceId: input.execution.instanceId,
+                scannerExecutionId: input.execution.executionId,
+                expiresAt: input.execution.expiresAt,
+                documentSha256: input.subject.sha256,
+                pageLimit: 32,
+                requestIdScheme: 'cortex-ocr-page-sha256-v1',
+                workDeadline: input.workDeadline,
+                cleanupDeadline: input.cleanupDeadline,
+                providerBinding: {
+                  podUid: 'pod-fixture',
+                  containerId: 'a'.repeat(64),
+                  runtimeImage: 'registry.invalid/ocr@sha256:' + 'b'.repeat(64),
+                  sourceManifestSha256: 'c'.repeat(64),
+                  modelRevision: 'aaa02f3811945a91062062994c5c4a3f4c0af2b0',
+                  profileSha256: 'd'.repeat(64),
+                  apiIncarnation: 'api-fixture',
+                  engineIncarnation: 'engine-fixture',
+                  workerIncarnation: 'worker-fixture',
+                },
+              },
+            },
+          };
+          return execution;
+        },
+        open: () => ({
+          async readPage() {
+            const row = await observer.models.UploadOperation.findById(operation.id).lean();
+            expect(row).toMatchObject({ securityExecution: execution });
+            expect(row).not.toHaveProperty('original');
+            expect(await observer.models.File.countDocuments({ file_id: operation.id })).toBe(0);
+            pages++;
+            return { complete: true, readable: true, text: 'Synthetic readable text' };
+          },
+          close: async () => receipt(),
+          cancel: async () => receipt(),
+          localCopiesRemoved: () => true,
+        }),
+      };
+      const launcher = {
+        run: jest.fn(
+          async (
+            input: Parameters<
+              NonNullable<Parameters<typeof createSecurityWorker>[0]['pdf']>['launcher']['run']
+            >[0],
+          ) => {
+            const child = spawn(
+              process.execPath,
+              [path.resolve(__dirname, '../../../dist/uploads/security/pdf-child.cjs')],
+              {
+                stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
+                env: { NODE_ENV: 'test' },
+              },
+            );
+            const joined = new Promise<void>((resolve) => child.once('close', () => resolve()));
+            try {
+              return await observeSecurityProcess({ child, ...input });
+            } finally {
+              if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+              await joined;
+            }
+          },
+        ),
+      };
+      const scanner = createSecurityWorker({
+        instanceId: randomUUID(),
+        policy: JSON.parse(policyBytes.toString()),
+        policySha256,
+        threadPath: serviceOptions.threadPath,
+        pdf: { provider, launcher },
+      });
+      const bind = repository.bindSecurityExecution.bind(repository);
+      const lost =
+        mode === 'lost-bind-ack'
+          ? jest
+              .spyOn(repository, 'bindSecurityExecution')
+              .mockImplementationOnce(async (...args) => {
+                await bind(...args);
+                throw new Error('fixture-lost-bind-ack');
+              })
+          : undefined;
+      try {
+        const result = await ingestDerivedFlow(operation.id, bytes, scanner);
+        const row = await observer.models.UploadOperation.findById(operation.id).lean();
+        expect(row).toMatchObject({ securityExecution: execution });
+        if (mode === 'approved') {
+          expect(result.response.statusCode).toBe(202);
+          expect(result.put).toHaveBeenCalledTimes(1);
+          expect(row).toMatchObject({
+            securitySettlement: { providerReceipt: { state: 'retired', dispatchedPages: [1] } },
+          });
+          expect(pages).toBe(1);
+        } else {
+          expect(result.response.statusCode).toBe(422);
+          expect(result.put).not.toHaveBeenCalled();
+          expect(await observer.models.File.countDocuments({ file_id: operation.id })).toBe(0);
+          if (mode === 'lost-bind-ack') {
+            expect(pages).toBe(0);
+            expect(launcher.run).not.toHaveBeenCalled();
+          } else {
+            expect(row).not.toHaveProperty('securitySettlement');
+            expect(row).toMatchObject({ stagingHeld: true });
+          }
+        }
+      } finally {
+        lost?.mockRestore();
+        retired = true;
+        expect((await scanner.close(AbortSignal.timeout(5000))).complete).toBe(true);
+      }
+    },
+  );
 
   async function publishDerivedFlow(id: string) {
     const lease = await management.claimProcessing(worker);
@@ -339,7 +517,7 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         expect(received.put).toHaveBeenCalledTimes(1);
         expect(await readFile(path.join(ordinaryRoot, derived.id))).toEqual(bytes);
         expect(stored?.securityApproval).toMatchObject({
-          scannerVersion: 'complete-content-v3',
+          scannerVersion: 'complete-content-v4',
           subject: {
             operationId: derived.id,
             sha256: createHash('sha256').update(bytes).digest('hex'),
@@ -596,7 +774,7 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         expect(approved).toMatchObject({
           decision: 'approved',
           policySha256,
-          scannerVersion: 'complete-content-v3',
+          scannerVersion: 'complete-content-v4',
           subject: {
             tenantId: principal.tenantId,
             userId: principal.userId,

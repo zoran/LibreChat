@@ -1,12 +1,15 @@
 /** Bounded local scanner execution; receipts are volatile, durable ownership belongs to Upload. */
 import { isAbsolute } from 'node:path';
 import { Worker } from 'node:worker_threads';
+import { performance } from 'node:perf_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   readUploadSecurityExecution,
   matchesUploadSecurityExecution,
   readUploadSecuritySubject,
-  readUploadSecurityInspection,
+  isUploadSecurityDecision,
+  isCompleteUploadSecuritySettlement,
+  readUploadSecurityScopeReceipt,
 } from 'librechat-data-provider';
 import type {
   UploadSecurityExecution,
@@ -15,12 +18,16 @@ import type {
   UploadSecurityInspection,
   UploadSecurityDecision,
   UploadSecurityReason,
+  UploadSecurityScopeReceipt,
 } from 'librechat-data-provider';
+import type { SecurityPdfOcrProvider, SecurityPdfOcrSession } from './pdf-ocr';
+import type { createSecurityProcessLauncher } from './process-launcher';
 import type { SecurityMarkingPolicy } from './markings';
 import type { UploadSecurityPort } from '../contract';
 import type { ApplicationWorkPort } from '~/app';
-import { inspectSecurityMarkings } from './markings';
+import { encodeSecurityProcessRequest } from './process-wire';
 import { SECURITY_INSPECTION_VERSION } from './inspection';
+import { inspectSecurityMarkings } from './markings';
 
 export type SecurityWorker = UploadSecurityPort & {
   maintenance: ApplicationWorkPort;
@@ -35,6 +42,10 @@ type Options = {
   now?: () => number;
   maxActive?: number;
   ttlMs?: number;
+  pdf?: {
+    provider: SecurityPdfOcrProvider;
+    launcher: ReturnType<typeof createSecurityProcessLauncher>;
+  };
 };
 type RecordState = {
   execution: UploadSecurityExecution;
@@ -47,6 +58,12 @@ type RecordState = {
   threadStopped: boolean;
   bytesRemoved: boolean;
   thread?: Worker;
+  preparation?: { workDeadline: number; cleanupDeadline: number; flight?: Promise<void> };
+  provider?: SecurityPdfOcrSession;
+  providerReceipt?: UploadSecurityScopeReceipt | null;
+  retirement?: Promise<void>;
+  processCopiesRemoved: boolean;
+  localDeadline: number;
 };
 const unavailable = () => new Error('Security worker unavailable');
 class ScanFailure extends Error {
@@ -97,18 +114,29 @@ export function createSecurityWorker(options: Options): SecurityWorker {
   let closed = false;
   let pausedBy: string | null = null;
   function snapshot(record: RecordState) {
-    return { ...record.execution };
+    return readUploadSecurityExecution(record.execution)!;
   }
   function settlement(
     execution: UploadSecurityExecution,
     record?: RecordState,
   ): UploadSecuritySettlement {
     const stopped =
-      !!record && record.state === 'finished' && record.inputStopped && record.threadStopped;
+      !!record &&
+      record.state === 'finished' &&
+      record.inputStopped &&
+      record.threadStopped &&
+      (!record.preparation || !!record.provider);
     return {
-      execution: { ...execution },
+      execution: readUploadSecurityExecution(execution)!,
       writerStopped: stopped,
-      transientDataRemoved: stopped && !!record?.bytesRemoved,
+      transientDataRemoved:
+        stopped &&
+        !!record?.bytesRemoved &&
+        !!record.processCopiesRemoved &&
+        (!record.provider || record.provider.localCopiesRemoved()),
+      ...(execution.custody.kind === 'pdf-ocr'
+        ? { providerReceipt: record?.providerReceipt ?? null }
+        : {}),
     };
   }
   function find(value: UploadSecurityExecution) {
@@ -126,6 +154,73 @@ export function createSecurityWorker(options: Options): SecurityWorker {
     record.controller.abort();
     if (record.state === 'prepared') record.state = 'finished';
     if (record.thread) void record.thread.terminate().catch(() => {});
+    if (record.preparation && !record.active) void retire(record, true);
+  }
+  async function retire(record: RecordState, cancel: boolean): Promise<void> {
+    if (!record.preparation) return;
+    if (record.retirement) return record.retirement;
+    record.retirement = (async () => {
+      try {
+        await record.preparation!.flight;
+      } catch {
+        /* Original prepare remains unresolved. */
+      }
+      if (!record.provider || record.execution.custody.kind !== 'pdf-ocr') return;
+      const remaining = Math.floor(record.execution.custody.scope.cleanupDeadline * 1000 - now());
+      if (remaining <= 0) return;
+      try {
+        const signal = AbortSignal.timeout(Math.min(31_000, remaining));
+        const receipt = await (cancel
+          ? record.provider.cancel(signal)
+          : record.provider.close(signal));
+        record.providerReceipt = readUploadSecurityScopeReceipt(receipt, record.execution);
+      } catch {
+        /* The original scope stays held; no replacement or renewed cutoff. */
+      }
+    })().finally(() => {
+      record.retirement = undefined;
+    });
+    return record.retirement;
+  }
+  async function preparePdf(record: RecordState, signal: AbortSignal): Promise<void> {
+    if (!record.preparation || record.provider) return;
+    if (!record.preparation.flight) {
+      const preparation = record.preparation;
+      preparation.flight = (async () => {
+        const execution = readUploadSecurityExecution(
+          await options.pdf!.provider.prepare({
+            execution: snapshot(record),
+            subject: { ...record.subject },
+            workDeadline: preparation.workDeadline,
+            cleanupDeadline: preparation.cleanupDeadline,
+            signal,
+          }),
+        );
+        if (
+          !execution ||
+          execution.custody.kind !== 'pdf-ocr' ||
+          execution.attemptId !== record.execution.attemptId ||
+          execution.instanceId !== record.execution.instanceId ||
+          execution.executionId !== record.execution.executionId ||
+          execution.expiresAt !== record.execution.expiresAt ||
+          execution.custody.scope.documentSha256 !== record.subject.sha256 ||
+          execution.custody.scope.workDeadline !== preparation.workDeadline ||
+          execution.custody.scope.cleanupDeadline !== preparation.cleanupDeadline
+        )
+          throw unavailable();
+        record.execution = execution;
+        record.provider = options.pdf!.provider.open(execution);
+      })().finally(() => {
+        preparation.flight = undefined;
+      });
+    }
+    const flight = record.preparation.flight;
+    if (!flight) throw unavailable();
+    await wait(flight, signal);
+    if (record.controller.signal.aborted) {
+      await retire(record, true);
+      throw unavailable();
+    }
   }
   function census() {
     let queuedContinuations = 0;
@@ -134,7 +229,11 @@ export function createSecurityWorker(options: Options): SecurityWorker {
       if (record.state === 'prepared' && now() >= Date.parse(record.execution.expiresAt))
         stop(record);
       if (record.state === 'prepared') queuedContinuations++;
-      else if (record.active || !settlement(record.execution, record).transientDataRemoved)
+      else if (
+        record.active ||
+        record.retirement ||
+        !isCompleteUploadSecuritySettlement(settlement(record.execution, record), record.execution)
+      )
         pendingWrites++;
     }
     return { queuedContinuations, pendingWrites };
@@ -168,7 +267,14 @@ export function createSecurityWorker(options: Options): SecurityWorker {
     },
   };
   function live(record: RecordState) {
-    if (record.controller.signal.aborted || now() >= Date.parse(record.execution.expiresAt)) {
+    if (
+      record.controller.signal.aborted ||
+      performance.now() >= record.localDeadline ||
+      now() >=
+        (record.preparation
+          ? record.preparation.workDeadline * 1000
+          : Date.parse(record.execution.expiresAt))
+    ) {
       stop(record);
       throw unavailable();
     }
@@ -238,12 +344,21 @@ export function createSecurityWorker(options: Options): SecurityWorker {
     };
     const timer = setTimeout(
       () => stop(record),
-      Math.max(1, Date.parse(record.execution.expiresAt) - now()),
+      Math.max(
+        1,
+        Math.min(
+          record.localDeadline - performance.now(),
+          (record.preparation
+            ? record.preparation.workDeadline * 1000
+            : Date.parse(record.execution.expiresAt)) - now(),
+        ),
+      ),
     );
     timer.unref();
     try {
       iterator = body[Symbol.asyncIterator]();
-      if (record.subject.bytes > 65_536) throw new ScanFailure('resource_limit');
+      if (record.subject.bytes > (record.preparation ? 4 * 1024 * 1024 : 65_536))
+        throw new ScanFailure('resource_limit');
       bytes = new Uint8Array(record.subject.bytes);
       record.bytesRemoved = false;
       const hash = createHash('sha256');
@@ -272,7 +387,44 @@ export function createSecurityWorker(options: Options): SecurityWorker {
       live(record);
       if (length !== record.subject.bytes || hash.digest('hex') !== record.subject.sha256)
         throw new ScanFailure('invalid_content');
-      const result = await launch(record, bytes);
+      let result: unknown;
+      if (record.preparation) {
+        if (!record.provider || !options.pdf) throw unavailable();
+        const request = encodeSecurityProcessRequest({
+          mediaType: 'application/pdf',
+          policy,
+          bytes,
+        });
+        record.threadStopped = false;
+        record.processCopiesRemoved = false;
+        try {
+          const observed = await options.pdf.launcher.run({
+            request,
+            signal: record.controller.signal,
+            timeoutMs: Math.max(
+              1,
+              Math.floor(
+                Math.min(
+                  record.localDeadline - performance.now(),
+                  record.preparation.workDeadline * 1000 - now(),
+                ),
+              ),
+            ),
+            ocr: record.provider,
+          });
+          record.threadStopped = observed.directChildStopped;
+          record.processCopiesRemoved = observed.localCopiesRemoved;
+          if (
+            observed.transportComplete &&
+            !observed.diagnostics &&
+            observed.directChildStopped &&
+            observed.localCopiesRemoved
+          )
+            result = observed.result;
+        } finally {
+          request.fill(0);
+        }
+      } else result = await launch(record, bytes);
       live(record);
       if (
         result &&
@@ -282,25 +434,21 @@ export function createSecurityWorker(options: Options): SecurityWorker {
         result.decision === 'clear' &&
         'coverage' in result
       ) {
-        const inspection = readUploadSecurityInspection({
-          decision: {
-            version: 1,
-            decision: 'approved',
-            subject: { ...record.subject },
-            policySha256,
-            scannerVersion: SECURITY_INSPECTION_VERSION,
-            checkedAt: new Date(now()).toISOString(),
-            coverage: result.coverage,
-          },
-          cleanup: { writerStopped: true, transientDataRemoved: true },
-        });
-        if (inspection?.decision.decision === 'approved') decision = inspection.decision;
+        const candidate = {
+          version: 1,
+          decision: 'approved',
+          subject: { ...record.subject },
+          policySha256,
+          scannerVersion: SECURITY_INSPECTION_VERSION,
+          checkedAt: new Date(now()).toISOString(),
+          coverage: result.coverage,
+        };
+        if (isUploadSecurityDecision(candidate) && candidate.decision === 'approved')
+          decision = candidate;
       } else {
-        const parsed = readUploadSecurityInspection({
-          decision: result && typeof result === 'object' ? { version: 1, ...result } : null,
-          cleanup: { writerStopped: true, transientDataRemoved: true },
-        });
-        if (parsed && parsed.decision.decision !== 'approved') decision = parsed.decision;
+        const candidate = result && typeof result === 'object' ? { version: 1, ...result } : null;
+        if (isUploadSecurityDecision(candidate) && candidate.decision !== 'approved')
+          decision = candidate;
       }
     } catch (error) {
       if (error instanceof ScanFailure)
@@ -318,11 +466,15 @@ export function createSecurityWorker(options: Options): SecurityWorker {
       }
       clearTimeout(timer);
       record.state = 'finished';
+      await retire(record, record.controller.signal.aborted);
     }
     const proof = settlement(record.execution, record);
-    if (!proof.writerStopped || !proof.transientDataRemoved || record.controller.signal.aborted)
+    if (
+      !isCompleteUploadSecuritySettlement(proof, record.execution) ||
+      record.controller.signal.aborted
+    )
       throw unavailable();
-    return { decision, cleanup: { writerStopped: true, transientDataRemoved: true } };
+    return { decision, settlement: proof };
   }
   return {
     policySha256,
@@ -341,7 +493,10 @@ export function createSecurityWorker(options: Options): SecurityWorker {
         if (record.state === 'prepared' && now() >= Date.parse(record.execution.expiresAt))
           stop(record);
         if (
-          settlement(record.execution, record).transientDataRemoved &&
+          isCompleteUploadSecuritySettlement(
+            settlement(record.execution, record),
+            record.execution,
+          ) &&
           now() >= Date.parse(record.execution.expiresAt)
         )
           records.delete(key);
@@ -354,15 +509,23 @@ export function createSecurityWorker(options: Options): SecurityWorker {
           JSON.stringify(previous.subject) !== JSON.stringify(subject)
         )
           throw unavailable();
+        await preparePdf(previous, input.signal);
+        live(previous);
         return snapshot(previous);
       }
-      if (records.size >= 256) throw unavailable();
+      if (
+        records.size >= 256 ||
+        (subject.mediaType === 'application/pdf' && (!options.pdf || ttlMs <= 1000))
+      )
+        throw unavailable();
+      const started = now();
       const execution = readUploadSecurityExecution({
-        version: 1,
+        version: 2,
+        custody: { kind: 'none' as const },
         attemptId: input.attemptId,
         instanceId,
         executionId: randomUUID(),
-        expiresAt: new Date(now() + ttlMs).toISOString(),
+        expiresAt: new Date(started + ttlMs).toISOString(),
       });
       if (!execution) throw unavailable();
       const record: RecordState = {
@@ -375,8 +538,23 @@ export function createSecurityWorker(options: Options): SecurityWorker {
         inputStopped: true,
         threadStopped: true,
         bytesRemoved: true,
+        processCopiesRemoved: true,
+        localDeadline:
+          performance.now() +
+          (subject.mediaType === 'application/pdf' ? Math.min(30_000, ttlMs - 1000) : ttlMs),
+        ...(subject.mediaType === 'application/pdf'
+          ? {
+              preparation: {
+                workDeadline: Math.min(started + 30_000, started + ttlMs - 1000) / 1000,
+                cleanupDeadline: Math.min(started + 31_000, started + ttlMs) / 1000,
+              },
+              providerReceipt: null,
+            }
+          : {}),
       };
       records.set(input.attemptId, record);
+      await preparePdf(record, input.signal);
+      live(record);
       return snapshot(record);
     },
     async inspect(input: {
@@ -391,6 +569,7 @@ export function createSecurityWorker(options: Options): SecurityWorker {
         closed ||
         input.signal.aborted ||
         !record ||
+        (record.preparation && !record.provider) ||
         record.state !== 'prepared' ||
         !subject ||
         JSON.stringify(subject) !== JSON.stringify(record.subject) ||
@@ -425,6 +604,20 @@ export function createSecurityWorker(options: Options): SecurityWorker {
           /* no stop inference */
         }
       }
+      if (record) await retire(record, true);
+      // A replacement scanner may retire the original provider but cannot attest old local copies.
+      if (!record && execution.custody.kind === 'pdf-ocr' && options.pdf) {
+        const proof = settlement(execution);
+        try {
+          proof.providerReceipt = readUploadSecurityScopeReceipt(
+            await options.pdf.provider.open(execution).cancel(input.signal),
+            execution,
+          );
+        } catch {
+          /* held */
+        }
+        return proof;
+      }
       return settlement(execution, record);
     },
     async close(signal: AbortSignal): Promise<{ complete: boolean }> {
@@ -433,13 +626,24 @@ export function createSecurityWorker(options: Options): SecurityWorker {
         for (const record of records.values()) stop(record);
       }
       try {
-        await wait(Promise.all([...records.values()].map((record) => record.done)), signal);
+        await wait(
+          Promise.all(
+            [...records.values()].map(async (record) => {
+              await record.done;
+              await retire(record, true);
+            }),
+          ),
+          signal,
+        );
       } catch {
         return { complete: false };
       }
       return {
-        complete: [...records.values()].every(
-          (record) => settlement(record.execution, record).transientDataRemoved,
+        complete: [...records.values()].every((record) =>
+          isCompleteUploadSecuritySettlement(
+            settlement(record.execution, record),
+            record.execution,
+          ),
         ),
       };
     },

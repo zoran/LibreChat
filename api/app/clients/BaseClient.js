@@ -64,6 +64,7 @@ const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { logViolation } = require('~/cache');
 const TextStream = require('./TextStream');
 const db = require('~/models');
+const { getManagedContextSources } = require('~/server/services/Uploads');
 
 // Private per-turn preparation state and response-object capabilities, never request metadata.
 const sourceCoverageTurns = new WeakMap();
@@ -2051,6 +2052,7 @@ class BaseClient {
     const textAttachments = this.getTextContextAttachments(attachments, fileConsumers);
     const fileContext = await extractFileContext({
       attachments: textAttachments,
+      sources: getManagedContextSources(this.options?.req),
       req: this.options?.req,
       tokenCountFn: (text) => countTokens(text),
       onSourceCoverage: (entries) => {

@@ -215,7 +215,7 @@ export function createUploadAttemptJournal(
               delete record.proof.securityExecution;
             } else {
               record.securityExecution = execution;
-              record.proof.securityExecution = { ...execution };
+              record.proof.securityExecution = readUploadSecurityExecution(execution)!;
             }
           }
           record.revision++;
@@ -293,7 +293,7 @@ export function createUploadAttemptJournal(
       const proof = Object.freeze({
         ...record.proof,
         ...(record.securityExecution
-          ? { securityExecution: Object.freeze({ ...record.securityExecution }) }
+          ? { securityExecution: readUploadSecurityExecution(record.securityExecution)! }
           : {}),
       });
       const recover = record.recover;
@@ -334,7 +334,10 @@ export function createUploadAttemptJournal(
           if (view.securityExecution) {
             if (view.securityExecution.attemptId !== key) return;
             record.securityExecution = view.securityExecution;
-            record.proof = { ...record.proof!, securityExecution: { ...view.securityExecution } };
+            record.proof = {
+              ...record.proof!,
+              securityExecution: readUploadSecurityExecution(view.securityExecution)!,
+            };
           }
           const current = record.proof!;
           if (view.storageOutcome === 'unknown') return;

@@ -1,11 +1,11 @@
 /** Real, fixed, harmless local children. These tests do not certify sandbox or descendant cleanup. */
-import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { appendFileSync, readFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { getEventListeners } from 'node:events';
+import { appendFileSync, readFileSync } from 'node:fs';
 import type { ChildProcess, SpawnOptions } from 'node:child_process';
-import { observeSecurityProcess } from './process-observer';
 import { encodeSecurityProcessRequest, SECURITY_PROCESS_LIMITS } from './process-wire';
+import { observeSecurityProcess } from './process-observer';
 
 const negative = { decision: 'uninspectable', reason: 'incomplete_coverage' } as const;
 const request = encodeSecurityProcessRequest({
@@ -13,7 +13,14 @@ const request = encodeSecurityProcessRequest({
   policy: { version: 1, markings: ['GEHEIM'], labels: ['Einstufung'] },
   bytes: Buffer.from('%PDF- synthetic observer fixture only'),
 });
-const write = (value: string) => `fs.writeSync(3, ${JSON.stringify(value)});`;
+const write = (value: string) => {
+  const header = Buffer.from(
+    JSON.stringify({ version: 2, kind: 'result', bytes: Buffer.byteLength(value) }),
+  );
+  const prefix = Buffer.alloc(4);
+  prefix.writeUInt32BE(header.length);
+  return `fs.writeSync(3, Buffer.from('${Buffer.concat([prefix, header, Buffer.from(value)]).toString('base64')}', 'base64'));`;
+};
 const requestSha256 = createHash('sha256').update(request).digest('hex');
 type Owned = { child: ChildProcess; joined: Promise<void>; pid?: number; startTicks?: string };
 const owned: Owned[] = [];
@@ -68,7 +75,7 @@ function track(child: ChildProcess, command: string[]) {
         repository: process.cwd(),
         session: process.env.SECURITY_PROCESS_SESSION,
         lease: process.env.SECURITY_PROCESS_LEASE,
-        owner: '/root/workspace_sources',
+        owner: process.env.SECURITY_PROCESS_OWNER ?? '/root/document_integration',
         scope: 'security-process-observer',
         bootId: readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(),
         ...actor,
@@ -127,6 +134,8 @@ describe('bounded private security process observer', () => {
     const original = Buffer.from(request);
     expect(await observe(child, { signal: controller.signal })).toEqual({
       result: negative,
+      pages: 0,
+      localCopiesRemoved: true,
       diagnostics: false,
       directChildStopped: true,
       transportComplete: true,
@@ -155,6 +164,8 @@ describe('bounded private security process observer', () => {
     const result = await observe(fixture(write(text) + 'process.exit(0);'));
     expect(result).toEqual({
       result: null,
+      pages: 0,
+      localCopiesRemoved: true,
       diagnostics: false,
       directChildStopped: true,
       transportComplete: false,
@@ -173,6 +184,8 @@ describe('bounded private security process observer', () => {
     );
     expect(result).toEqual({
       result: null,
+      pages: 0,
+      localCopiesRemoved: true,
       diagnostics: true,
       directChildStopped: true,
       transportComplete: false,
@@ -202,6 +215,8 @@ describe('bounded private security process observer', () => {
     );
     expect(result).toEqual({
       result: null,
+      pages: 0,
+      localCopiesRemoved: true,
       diagnostics: false,
       directChildStopped: true,
       transportComplete: false,
@@ -224,6 +239,8 @@ describe('bounded private security process observer', () => {
     });
     expect(result).toEqual({
       result: null,
+      pages: 0,
+      localCopiesRemoved: true,
       diagnostics: false,
       directChildStopped: true,
       transportComplete: false,
@@ -240,6 +257,8 @@ describe('bounded private security process observer', () => {
     expect(kill).toHaveBeenCalledWith('SIGKILL');
     expect(result).toEqual({
       result: null,
+      pages: 0,
+      localCopiesRemoved: true,
       diagnostics: false,
       directChildStopped: true,
       transportComplete: false,
@@ -252,6 +271,8 @@ describe('bounded private security process observer', () => {
     const result = await observe(child, { timeoutMs: 20, cleanupMs: 10 });
     expect(result).toEqual({
       result: null,
+      pages: 0,
+      localCopiesRemoved: false,
       diagnostics: false,
       directChildStopped: false,
       transportComplete: false,
@@ -265,6 +286,8 @@ describe('bounded private security process observer', () => {
     track(child, [command]);
     expect(await observe(child)).toEqual({
       result: null,
+      pages: 0,
+      localCopiesRemoved: true,
       diagnostics: false,
       directChildStopped: false,
       transportComplete: false,
@@ -309,6 +332,8 @@ describe('bounded private security process observer', () => {
     expect(stderr.readableDidRead).toBe(true);
     expect(await observe(child)).toMatchObject({
       result: null,
+      pages: 0,
+      localCopiesRemoved: true,
       transportComplete: false,
       diagnostics: true,
     });
@@ -332,6 +357,8 @@ describe('bounded private security process observer', () => {
     const result = await observe(fixture('setInterval(()=>{},100);'), extra);
     expect(result).toEqual({
       result: null,
+      pages: 0,
+      localCopiesRemoved: true,
       diagnostics: false,
       directChildStopped: true,
       transportComplete: false,

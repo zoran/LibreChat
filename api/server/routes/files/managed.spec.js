@@ -2,7 +2,10 @@ const { EventEmitter } = require('node:events');
 const { createHash } = require('node:crypto');
 const { Readable } = require('node:stream');
 
-jest.mock('@librechat/api', () => ({ getAuthMode: () => 'transition' }));
+jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
+  getAuthMode: () => 'transition',
+}));
 jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
   runAsSystem: (work) => work(),
@@ -14,7 +17,8 @@ jest.mock('~/server/utils/files', () => ({
 const { createManagedFileHandlers } = require('./managed');
 // Exercise the public built storage owner used by the application. Primary must
 // rebuild @librechat/api before GREEN; no replacement integrity implementation.
-const { createManagedS3Storage } = jest.requireActual('@librechat/api');
+const { createManagedS3Storage, createManagedSourceResolver, MANAGED_SOURCE_FILE_FIELDS } =
+  jest.requireActual('@librechat/api');
 
 const user = { tenantId: 'tenant-a', userId: 'user-a', authentication: 'verified-email' };
 const epoch = Date.parse('2026-10-13T00:00:00Z');
@@ -139,6 +143,29 @@ function fixture(options = {}) {
     },
   };
   const getFiles = jest.fn(async () => [file]);
+  owner.sources = createManagedSourceResolver({
+    allowedOrigins: owner.allowedOrigins,
+    principal: (req) => owner.principal(req),
+    operation: (principal, id) => owner.management.get(principal, id),
+    file: async (principal, id, text) =>
+      (
+        await getFiles(
+          {
+            tenantId: principal.tenantId,
+            user: principal.userId,
+            file_id: id,
+            uploadOperationId: id,
+          },
+          null,
+          `${MANAGED_SOURCE_FILE_FIELDS}${text ? ' text textFormat +documentStructure +securityApproval' : ''}`,
+          1,
+        )
+      )?.[0] ?? null,
+    original: (principal, id) => owner.repository.cleanupForFile(principal, id),
+    policySha256: () => process.env.UPLOAD_SECURITY_POLICY_SHA256,
+    storage: { read: (...args) => owner.storage.read(...args) },
+    now: () => wall,
+  });
   const getRuntime = jest.fn(() => owner);
   const req = Object.assign(new EventEmitter(), {
     method: 'GET',
@@ -399,7 +426,9 @@ describe('authorized managed source preview', () => {
   );
   it('keeps a detached valid representation while the final native revalidation awaits', async () => {
     const f = structuredFixture();
-    const expected = JSON.parse(JSON.stringify(f.file.documentStructure));
+    const stored = JSON.parse(JSON.stringify(f.file));
+    f.getFiles.mockImplementation(async () => [JSON.parse(JSON.stringify(stored))]);
+    const expected = JSON.parse(JSON.stringify(stored.documentStructure));
     f.owner.principal.mockResolvedValueOnce(user).mockImplementationOnce(async () => {
       f.file.documentStructure.elements[0].end = 999;
       f.file.text = 'changed';
@@ -408,6 +437,16 @@ describe('authorized managed source preview', () => {
     await f.handlers.preview(f.req, f.res);
     expect(f.res.body.documentStructure).toEqual(expected);
     expect(f.res.body.text).toBe('useful text');
+  });
+  it('denies an actual stored representation change during final source revalidation', async () => {
+    const f = structuredFixture();
+    f.owner.principal.mockResolvedValueOnce(user).mockImplementationOnce(async () => {
+      f.file.text = 'changed';
+      return user;
+    });
+    await f.handlers.preview(f.req, f.res);
+    expect(f.res.statusCode).toBe(404);
+    expect(f.res.body).toEqual({ code: 'not_found' });
   });
   test.each(['list', 'download', 'downloadURL'])(
     'keeps private fields out of %s projections and metadata',

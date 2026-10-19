@@ -3,6 +3,9 @@ const { mkdir, lstat, readFile } = require('node:fs/promises');
 const { isAbsolute } = require('node:path');
 const {
   createUploadManagement,
+  createManagedSourceResolver,
+  bindManagedContextSources,
+  MANAGED_SOURCE_FILE_FIELDS,
   createUploadRuntime,
   createUploadLiveHub,
   createUploadHttpRouter,
@@ -31,6 +34,13 @@ const { createUploadTicketIssuer, managedIntakeControlConfig } = require('./Uplo
 
 let current;
 const getUploadRuntime = () => current;
+/** The server composition, never request metadata, selects managed source access. */
+const getManagedContextSources = (req) =>
+  bindManagedContextSources(
+    req,
+    current?.sources,
+    process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED === 'true',
+  );
 
 /** Operator-owned mTLS identity; no request can choose hosts, credentials or policy. */
 async function managedSecurityClient() {
@@ -296,8 +306,26 @@ async function createUploadComposition({
     projectAttachments: attachmentProjection(models),
     issueIntake: createUploadTicketIssuer({ repository, identityRepository: models, management }),
   });
+  const sources = createManagedSourceResolver({
+    allowedOrigins,
+    principal,
+    operation: (user, id) => management.get(user, id),
+    file: (user, id, text) =>
+      runAsSystem(() =>
+        models.getFiles(
+          { tenantId: user.tenantId, user: user.userId, file_id: id, uploadOperationId: id },
+          null,
+          `${MANAGED_SOURCE_FILE_FIELDS}${text ? ' text textFormat +documentStructure +securityApproval' : ''}`,
+          1,
+        ),
+      ).then((files) => files?.[0] ?? null),
+    original: (user, id) => runAsSystem(() => repository.cleanupForFile(user, id)),
+    policySha256: () => security.policySha256,
+    storage,
+  });
   let started = false;
   return {
+    sources,
     management,
     repository,
     cleanup,
@@ -416,6 +444,7 @@ async function initializeUploads({ registry, identity }) {
 
 module.exports = {
   getUploadRuntime,
+  getManagedContextSources,
   initializeUploads,
   createUploadComposition,
   uploadPrincipal,

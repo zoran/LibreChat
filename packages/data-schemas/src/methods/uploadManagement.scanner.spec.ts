@@ -2,6 +2,7 @@
 import mongoose from 'mongoose';
 import { createHash } from 'node:crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import { UPLOAD_RECORD_BYTES, UPLOAD_DERIVED_MAX_ORIGIN_BYTES } from 'librechat-data-provider';
 import type { UploadLease, UploadSecurityExecution } from 'librechat-data-provider';
 import type { StoredUpload } from './uploadManagementStore';
 import { createUploadManagementRepository } from './uploadManagement';
@@ -52,7 +53,8 @@ describe('durable scanner execution', () => {
     },
   });
   const execution = (lease: UploadLease): UploadSecurityExecution => ({
-    version: 1,
+    version: 2,
+    custody: { kind: 'none' as const },
     attemptId: `${lease.operationId}.${lease.generation}`,
     instanceId: '11111111-1111-4111-8111-111111111111',
     executionId: '22222222-2222-4222-8222-222222222222',
@@ -139,15 +141,15 @@ describe('durable scanner execution', () => {
     await Promise.all([a.disconnect(), b.disconnect(), replacement.disconnect()]);
     await mongo?.stop();
   });
-  async function transfer() {
+  async function transfer(mediaType = 'text/plain') {
     await first.reserve(
       user,
       {
         operationId: 'scan',
         idempotencyKey: fixtureKey('scan'),
-        mediaType: 'text/plain',
+        mediaType,
         declaredBytes: 8,
-        fingerprint: JSON.stringify([{ kind: 'personal' }, 'text/plain', 8]),
+        fingerprint: JSON.stringify([{ kind: 'personal' }, mediaType, 8]),
       },
       now,
     );
@@ -168,6 +170,87 @@ describe('durable scanner execution', () => {
   }
   const accept = (lease: UploadLease) =>
     first.accept(user, lease, receipt(lease), approval(lease), { filename: 'note.txt' }, now);
+
+  function pdfExecution(lease: UploadLease): UploadSecurityExecution {
+    const value = execution(lease);
+    return {
+      ...value,
+      custody: {
+        kind: 'pdf-ocr',
+        scope: {
+          version: 1,
+          scopeId: 'scope-fixture',
+          attemptId: value.attemptId,
+          scannerInstanceId: value.instanceId,
+          scannerExecutionId: value.executionId,
+          expiresAt: value.expiresAt,
+          documentSha256: sha256,
+          pageLimit: 32,
+          requestIdScheme: 'cortex-ocr-page-sha256-v1',
+          workDeadline: (now + 30_000) / 1000,
+          cleanupDeadline: (now + 31_000) / 1000,
+          providerBinding: {
+            podUid: 'pod-fixture',
+            containerId: 'a'.repeat(64),
+            runtimeImage: 'registry.invalid/ocr@sha256:' + 'b'.repeat(64),
+            sourceManifestSha256: 'c'.repeat(64),
+            modelRevision: 'aaa02f3811945a91062062994c5c4a3f4c0af2b0',
+            profileSha256: 'd'.repeat(64),
+            apiIncarnation: 'api-fixture',
+            engineIncarnation: 'engine-fixture',
+            workerIncarnation: 'worker-fixture',
+          },
+        },
+      },
+    };
+  }
+  it('binds the entire PDF scope before await, retains unknown retirement, and fits the original document record budget', async () => {
+    const lease = await transfer('application/pdf');
+    const value = pdfExecution(lease);
+    const expected = JSON.parse(JSON.stringify(value));
+    const binding = first.bindSecurityExecution(lease, value, now);
+    if (value.custody.kind !== 'pdf-ocr') throw new Error('Invalid fixture');
+    value.custody.scope.providerBinding.workerIncarnation = 'replacement';
+    await binding;
+    expect((await row())!.securityExecution).toEqual(expected);
+    await first.settleSecurityExecution(
+      lease,
+      { ...settlement(expected), providerReceipt: null },
+      now,
+    );
+    expect((await row())!.securitySettlement).toBeUndefined();
+    const providerReceipt = {
+      version: 1 as const,
+      scope: expected.custody.scope,
+      state: 'retired' as const,
+      writerStopped: true,
+      transientDataRemoved: true,
+      dispatchedPages: Array.from({ length: 32 }, (_, index) => index + 1),
+    };
+    await second.settleSecurityExecution(lease, { ...settlement(expected), providerReceipt }, now);
+    expect((await row())!.securitySettlement).toMatchObject({
+      execution: expected,
+      providerReceipt,
+    });
+    // Reserve the entire existing maximum lineage budget in addition to the actual full receipt row.
+    expect(
+      mongoose.mongo.BSON.calculateObjectSize((await row())!) + UPLOAD_DERIVED_MAX_ORIGIN_BYTES,
+    ).toBeLessThan(UPLOAD_RECORD_BYTES);
+  });
+  it.each(['text/plain', 'application/pdf'])(
+    'rejects the opposite custody variant for %s before durable binding',
+    async (mediaType) => {
+      const lease = await transfer(mediaType);
+      await expect(
+        first.bindSecurityExecution(
+          lease,
+          mediaType === 'text/plain' ? pdfExecution(lease) : execution(lease),
+          now,
+        ),
+      ).rejects.toMatchObject({ code: 'invalid_request' });
+      expect((await row())!.securityExecution).toBeUndefined();
+    },
+  );
 
   it('binds one immutable execution across racing replicas and replays only the winner', async () => {
     const lease = await transfer();

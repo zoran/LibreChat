@@ -169,7 +169,8 @@ describe('bound technical Intake recovery using actual Mongo transactions', () =
     const lease = (await claim())!;
     if (scanned) {
       const execution = {
-        version: 1 as const,
+        version: 2 as const,
+        custody: { kind: 'none' as const },
         attemptId: `intake.${lease.generation}`,
         instanceId: '11111111-1111-4111-8111-111111111111',
         executionId: '22222222-2222-4222-8222-222222222222',
@@ -440,7 +441,8 @@ describe('bound technical Intake recovery using actual Mongo transactions', () =
   it('does not combine partial scanner receipts and can acknowledge the exact complete late scanner join', async () => {
     const lease = await transfer(false);
     const execution = {
-      version: 1 as const,
+      version: 2 as const,
+      custody: { kind: 'none' as const },
       attemptId: `intake.${lease.generation}`,
       instanceId: '11111111-1111-4111-8111-111111111111',
       executionId: '22222222-2222-4222-8222-222222222222',

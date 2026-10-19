@@ -46,7 +46,8 @@ function accessor(value: object, key: string, get: () => unknown): object {
 }
 
 const execution = (): UploadSecurityExecution => ({
-  version: 1,
+  version: 2,
+  custody: { kind: 'none' as const },
   attemptId: 'operation-1.1',
   instanceId: '12345678-9abc-4def-8123-456789abcdef',
   executionId: 'abcdef01-2345-4678-9abc-def012345678',
@@ -59,6 +60,143 @@ const settlement = (): UploadSecuritySettlement => ({
 });
 
 describe('scanner execution contract', () => {
+  const pdfExecution = () => ({
+    ...execution(),
+    custody: {
+      kind: 'pdf-ocr' as const,
+      scope: {
+        version: 1 as const,
+        scopeId: 'original-document-scope',
+        attemptId: execution().attemptId,
+        scannerInstanceId: execution().instanceId,
+        scannerExecutionId: execution().executionId,
+        expiresAt: execution().expiresAt,
+        providerBinding: {
+          podUid: 'original-pod',
+          containerId: 'c'.repeat(64),
+          apiIncarnation: 'original-api',
+          engineIncarnation: 'original-engine',
+          workerIncarnation: 'original-worker',
+          runtimeImage: `registry.invalid/ocr@sha256:${'a'.repeat(64)}`,
+          sourceManifestSha256: 'b'.repeat(64),
+          modelRevision: 'd'.repeat(40),
+          profileSha256: 'e'.repeat(64),
+        },
+        documentSha256: subject().sha256,
+        pageLimit: 32 as const,
+        requestIdScheme: 'cortex-ocr-page-sha256-v1' as const,
+        workDeadline: now / 1000 + 30,
+        cleanupDeadline: now / 1000 + 31,
+      },
+    },
+  });
+
+  it('detaches and freezes the entire original PDF scope before an awaited consumer', async () => {
+    const supplied = pdfExecution();
+    const snapshot = readUploadSecurityExecution(supplied)!;
+    expect(snapshot).toEqual(supplied);
+    await Promise.resolve();
+    supplied.custody.scope.providerBinding.engineIncarnation = 'replacement-engine';
+    supplied.custody.scope.workDeadline++;
+    expect(snapshot).toEqual(pdfExecution());
+    expect(matchesUploadSecurityExecution(snapshot, supplied)).toBe(false);
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    expect(Object.isFrozen(snapshot.custody)).toBe(true);
+    if (snapshot.custody.kind !== 'pdf-ocr') throw new Error('Missing PDF custody');
+    expect(Object.isFrozen(snapshot.custody.scope)).toBe(true);
+    expect(Object.isFrozen(snapshot.custody.scope.providerBinding)).toBe(true);
+  });
+
+  it('rejects missing or forged nested custody without evaluating accessors', () => {
+    const get = jest.fn(() => {
+      throw new Error('Untrusted getter');
+    });
+    const original = pdfExecution();
+    for (const custody of [
+      { kind: 'none', scope: original.custody.scope },
+      { kind: 'pdf-ocr' },
+      { ...original.custody, scope: accessor(original.custody.scope, 'scopeId', get) },
+      {
+        ...original.custody,
+        scope: {
+          ...original.custody.scope,
+          providerBinding: accessor(
+            original.custody.scope.providerBinding,
+            'engineIncarnation',
+            get,
+          ),
+        },
+      },
+      Object.create(original.custody),
+    ])
+      expect(readUploadSecurityExecution({ ...original, custody })).toBeNull();
+    expect(get).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { pageLimit: 33 },
+    { requestIdScheme: 'unknown-v2' },
+    { workDeadline: now / 1000 + 32 },
+    { cleanupDeadline: now / 1000 + 31.001 },
+    { workDeadline: 0 },
+    { workDeadline: NaN },
+    { documentSha256: 'missing-original' },
+  ])('rejects a changed original PDF bound %j', (change) => {
+    const value = pdfExecution();
+    expect(
+      readUploadSecurityExecution({
+        ...value,
+        custody: { ...value.custody, scope: { ...value.custody.scope, ...change } },
+      }),
+    ).toBeNull();
+  });
+
+  it('does not treat two local cleanup booleans as PDF provider retirement', () => {
+    const original = pdfExecution();
+    expect(
+      isCompleteUploadSecuritySettlement(
+        {
+          execution: original,
+          writerStopped: true,
+          transientDataRemoved: true,
+        },
+        original,
+      ),
+    ).toBe(false);
+  });
+
+  it('requires the full original document retirement, not an engine-only receipt', () => {
+    const original = pdfExecution();
+    const providerReceipt = {
+      version: 1 as const,
+      scope: original.custody.scope,
+      state: 'retired' as const,
+      writerStopped: true,
+      transientDataRemoved: true,
+      dispatchedPages: [1, 2],
+    };
+    const proof = {
+      execution: original,
+      writerStopped: true,
+      transientDataRemoved: true,
+      providerReceipt,
+    };
+    expect(isCompleteUploadSecuritySettlement(proof, original)).toBe(true);
+    for (const receipt of [
+      null,
+      { ...providerReceipt, state: 'unknown' },
+      { ...providerReceipt, transientDataRemoved: false },
+      { ...providerReceipt, dispatchedPages: [1, 3] },
+      { ...providerReceipt, engine_retired: true },
+      { ...providerReceipt, scope: { ...providerReceipt.scope, scopeId: 'replacement' } },
+    ]) {
+      expect(
+        isCompleteUploadSecuritySettlement({ ...proof, providerReceipt: receipt }, original),
+      ).toBe(false);
+    }
+    expect(readUploadSecuritySettlement({ ...settlement(), providerReceipt })).toBeNull();
+  });
+
   it('returns detached plain records from frozen or null-prototype input without a clock policy', () => {
     for (const attemptId of ['a.1', `${'a'.repeat(128)}.999999999999999`]) {
       const input = Object.freeze(Object.assign(Object.create(null), execution(), { attemptId }));
@@ -73,7 +211,8 @@ describe('scanner execution contract', () => {
   });
 
   it.each([
-    ['future version', { version: 2 }],
+    ['legacy version', { version: 1 }],
+    ['future version', { version: 3 }],
     ['coerced version', { version: '1' }],
     ['empty attempt', { attemptId: '' }],
     ['missing generation', { attemptId: 'operation-1' }],
@@ -164,7 +303,7 @@ describe('scanner execution contract', () => {
     expect(get).not.toHaveBeenCalled();
   });
 
-  it('binds all five fields and never uses ordinary property access on supplied records', () => {
+  it('binds every identity field and never uses ordinary property access on supplied records', () => {
     const get = jest.fn(() => {
       throw new Error('Do not reread data');
     });
@@ -172,7 +311,7 @@ describe('scanner execution contract', () => {
     expect(readUploadSecurityExecution(value)).toEqual(execution());
     expect(matchesUploadSecurityExecution(value, execution())).toBe(true);
     for (const change of [
-      { version: 2 },
+      { version: 1 },
       { attemptId: 'operation-1.2' },
       { attemptId: 'operation-2.1' },
       { instanceId: execution().executionId },
@@ -541,11 +680,11 @@ describe('approval binding to the actual received original and current policy', 
   });
 });
 
-describe('closed scanner decision and explicit cleanup inspection', () => {
+describe('closed scanner decision and explicit settlement inspection', () => {
   const rejected = () => ({ version: 1, decision: 'rejected', reason: 'classification_marking' });
   const inspection = (decision: unknown = approval()) => ({
     decision,
-    cleanup: { writerStopped: true, transientDataRemoved: true },
+    settlement: settlement(),
   });
 
   it.each([
@@ -558,7 +697,7 @@ describe('closed scanner decision and explicit cleanup inspection', () => {
     'resource_limit',
     'scanner_unavailable',
     'ambiguous_marking',
-  ])('accepts an explicit uninspectable decision for %s with confirmed cleanup', (reason) => {
+  ])('accepts an explicit uninspectable decision for %s with confirmed settlement', (reason) => {
     const decision = { version: 1, decision: 'uninspectable', reason };
     expect(isUploadSecurityDecision(decision)).toBe(true);
     expect(isUploadSecurityInspection(inspection(decision))).toBe(true);
@@ -572,7 +711,7 @@ describe('closed scanner decision and explicit cleanup inspection', () => {
     const value = Object.freeze(
       Object.assign(Object.create(null), {
         decision: Object.freeze(Object.assign(Object.create(null), rejected())),
-        cleanup: Object.freeze(Object.assign(Object.create(null), inspection().cleanup)),
+        settlement: Object.freeze(Object.assign(Object.create(null), inspection().settlement)),
       }),
     );
     expect(isUploadSecurityInspection(value)).toBe(true);
@@ -598,41 +737,50 @@ describe('closed scanner decision and explicit cleanup inspection', () => {
     ['unknown decision', { version: 1, decision: 'unknown', reason: 'encrypted' }],
     ['extra content', { ...rejected(), content: 'private' }],
     ['invalid approval', { ...approval(), coverage: { complete: false, pages: 1, parts: 1 } }],
-  ])('refuses %s even when cleanup is claimed', (_name, decision) => {
+  ])('refuses %s even when settlement is claimed', (_name, decision) => {
     expect(isUploadSecurityDecision(decision)).toBe(false);
     expect(isUploadSecurityInspection(inspection(decision))).toBe(false);
     expect(readUploadSecurityInspection(inspection(decision))).toBeNull();
   });
 
   it.each([
-    ['missing cleanup', { decision: rejected() }],
-    ['missing decision', { cleanup: inspection().cleanup }],
+    ['missing settlement', { decision: rejected() }],
+    ['missing decision', { settlement: inspection().settlement }],
     ['bare legacy decision', rejected()],
     ['bare legacy approval', approval()],
-    ['null cleanup', { ...inspection(), cleanup: null }],
+    ['null settlement', { ...inspection(), settlement: null }],
     [
       'missing writer acknowledgement',
-      { ...inspection(), cleanup: { transientDataRemoved: true } },
+      { ...inspection(), settlement: { transientDataRemoved: true } },
     ],
-    ['missing removal acknowledgement', { ...inspection(), cleanup: { writerStopped: true } }],
+    ['missing removal acknowledgement', { ...inspection(), settlement: { writerStopped: true } }],
     [
       'writer not stopped',
-      { ...inspection(), cleanup: { writerStopped: false, transientDataRemoved: true } },
+      {
+        ...inspection(),
+        settlement: { ...settlement(), writerStopped: false, transientDataRemoved: true },
+      },
     ],
     [
       'transient copies remain',
-      { ...inspection(), cleanup: { writerStopped: true, transientDataRemoved: false } },
+      {
+        ...inspection(),
+        settlement: { ...settlement(), writerStopped: true, transientDataRemoved: false },
+      },
     ],
     [
-      'truthy cleanup strings',
-      { ...inspection(), cleanup: { writerStopped: 'true', transientDataRemoved: 'true' } },
+      'truthy settlement strings',
+      {
+        ...inspection(),
+        settlement: { ...settlement(), writerStopped: 'true', transientDataRemoved: 'true' },
+      },
     ],
     [
-      'extra cleanup field',
-      { ...inspection(), cleanup: { ...inspection().cleanup, detail: 'private' } },
+      'extra settlement field',
+      { ...inspection(), settlement: { ...inspection().settlement, detail: 'private' } },
     ],
     ['extra envelope field', { ...inspection(), version: 1 }],
-  ])('refuses %s rather than infer cleanup from settlement', (_name, value) => {
+  ])('refuses %s without inventing an execution settlement', (_name, value) => {
     expect(isUploadSecurityInspection(value)).toBe(false);
     expect(readUploadSecurityInspection(value)).toBeNull();
   });
@@ -645,8 +793,8 @@ describe('closed scanner decision and explicit cleanup inspection', () => {
       [rejected(), isUploadSecurityDecision],
       [inspection(), isUploadSecurityInspection],
       [
-        inspection().cleanup,
-        (cleanup: unknown) => isUploadSecurityInspection({ ...inspection(), cleanup }),
+        inspection().settlement,
+        (settlement: unknown) => isUploadSecurityInspection({ ...inspection(), settlement }),
       ],
     ] as const) {
       expect(validate(Object.create(record))).toBe(false);
@@ -677,7 +825,7 @@ describe('closed scanner decision and explicit cleanup inspection', () => {
       new Proxy(
         {
           decision: new Proxy(decision, { get }),
-          cleanup: new Proxy(value.cleanup, { get }),
+          settlement: new Proxy(value.settlement, { get }),
         },
         { get },
       ),
@@ -687,7 +835,7 @@ describe('closed scanner decision and explicit cleanup inspection', () => {
     expect(snapshot?.decision).not.toBe(decision);
     decision.subject.sha256 = 'c'.repeat(64);
     decision.coverage.pages = 0;
-    value.cleanup.transientDataRemoved = false;
+    value.settlement.transientDataRemoved = false;
     expect(snapshot).toEqual(inspection(approval()));
     expect(get).not.toHaveBeenCalled();
   });
@@ -713,7 +861,7 @@ describe('closed scanner decision and explicit cleanup inspection', () => {
       inspection(new Proxy(rejected(), { ownKeys: fail })),
       {
         ...inspection(),
-        cleanup: new Proxy(inspection().cleanup, { getOwnPropertyDescriptor: fail }),
+        settlement: new Proxy(inspection().settlement, { getOwnPropertyDescriptor: fail }),
       },
     ]) {
       expect(isUploadSecurityInspection(value)).toBe(false);

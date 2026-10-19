@@ -167,7 +167,8 @@ describe('private Intake and App-promotion transaction fences', () => {
     const lease = (await claim())!;
     if (scanned) {
       const execution = {
-        version: 1 as const,
+        version: 2 as const,
+        custody: { kind: 'none' as const },
         attemptId: `intake.${lease.generation}`,
         instanceId: '11111111-1111-4111-8111-111111111111',
         executionId: '22222222-2222-4222-8222-222222222222',

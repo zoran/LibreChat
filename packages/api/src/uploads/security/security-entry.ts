@@ -26,6 +26,40 @@ async function main() {
     material('UPLOAD_SECURITY_POLICY_FILE'),
     material('UPLOAD_SECURITY_PEERS_FILE'),
   ]);
+  // Only deployment-mounted configuration can provide the private OCR origin/assets. Absence
+  // keeps PDF preparation closed; no upload, browser or ordinary model configuration can opt in.
+  let pdf: Parameters<typeof startSecurityService>[0]['pdf'];
+  if (process.env.UPLOAD_SECURITY_PDF_PROFILE_FILE) {
+    const [profileBytes, providerCa, providerCert, providerKey, apiKeyBytes] = await Promise.all([
+      material('UPLOAD_SECURITY_PDF_PROFILE_FILE'),
+      material('UPLOAD_SECURITY_OCR_CA_FILE'),
+      material('UPLOAD_SECURITY_OCR_CERT_FILE'),
+      material('UPLOAD_SECURITY_OCR_KEY_FILE'),
+      material('UPLOAD_SECURITY_OCR_API_KEY_FILE'),
+    ]);
+    try {
+      const profile = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(profileBytes));
+      if (
+        !profile ||
+        Object.keys(profile).sort().join(',') !== 'process,provider' ||
+        !profile.provider ||
+        Object.keys(profile.provider).sort().join(',') !==
+          'allowedHosts,binding,certificateSha256,endpoint'
+      )
+        throw new Error('Security configuration unavailable');
+      pdf = {
+        process: profile.process,
+        provider: {
+          ...profile.provider,
+          tls: { ca: providerCa, cert: providerCert, key: providerKey },
+          apiKey: new TextDecoder('utf-8', { fatal: true }).decode(apiKeyBytes).trimEnd(),
+        },
+      };
+    } finally {
+      profileBytes.fill(0);
+      apiKeyBytes.fill(0);
+    }
+  }
   const service = await startSecurityService({
     instanceId: identity.incarnation,
     port,
@@ -34,6 +68,7 @@ async function main() {
     peers: JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(peerBytes)),
     tls: { ca, cert, key },
     threadPath: path.join(__dirname, 'worker-thread.cjs'),
+    pdf,
   });
   let closing = false;
   let maintenance: AppMaintenance | undefined;

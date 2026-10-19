@@ -2,10 +2,14 @@
 import { createHash } from 'node:crypto';
 import { createServer } from 'node:https';
 import type { AddressInfo } from 'node:net';
+import type { SecurityProcessProfile } from './process-launcher';
+import type { SecurityPdfOcrConfiguration } from './pdf-ocr';
 import type { UploadSecurityClientPeer } from './transport';
 import type { ApplicationWorkPort } from '~/app';
+import { createSecurityProcessLauncher } from './process-launcher';
 import { createSecurityRequestHandler } from './transport';
 import { waitForSecurityResponse } from './cancellation';
+import { createSecurityPdfOcrProvider } from './pdf-ocr';
 import { inspectSecurityMarkings } from './markings';
 import { createSecurityWorker } from './worker';
 
@@ -16,6 +20,7 @@ export async function startSecurityService(options: {
   tls: { ca: Buffer; cert: Buffer; key: Buffer };
   peers: readonly UploadSecurityClientPeer[];
   threadPath: string;
+  pdf?: { provider: SecurityPdfOcrConfiguration; process: SecurityProcessProfile };
   host?: string;
   port?: number;
 }): Promise<{
@@ -48,6 +53,14 @@ export async function startSecurityService(options: {
     policy,
     policySha256: options.policySha256,
     threadPath: options.threadPath,
+    ...(options.pdf
+      ? {
+          pdf: {
+            provider: createSecurityPdfOcrProvider(options.pdf.provider),
+            launcher: createSecurityProcessLauncher(options.pdf.process),
+          },
+        }
+      : {}),
   });
   const active = new Set<Promise<void>>();
   let stopped = false;

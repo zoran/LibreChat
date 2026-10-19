@@ -9,6 +9,7 @@ import {
   readUploadFilenameHeader,
   readUploadSecurityInspection,
   readUploadSecurityExecution,
+  isCompleteUploadSecuritySettlement,
   matchesUploadSecurityApproval,
 } from 'librechat-data-provider';
 import type {
@@ -429,13 +430,13 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
           const result = await Promise.race([inspection, aborted]);
           signal.throwIfAborted();
           const inspected = readUploadSecurityInspection(result);
-          if (!inspected) throw new UploadManagementError('security_uninspectable');
+          if (
+            !inspected ||
+            !isCompleteUploadSecuritySettlement(inspected.settlement, securityExecution)
+          )
+            throw new UploadManagementError('security_uninspectable');
           scannerSettled = true;
-          securitySettlement = {
-            execution: securityExecution,
-            writerStopped: true,
-            transientDataRemoved: true,
-          };
+          securitySettlement = inspected.settlement;
           await deps.management.settleSecurityExecution(lease, securitySettlement);
           const { decision } = inspected;
           if (decision.decision !== 'approved') {

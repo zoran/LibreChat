@@ -1,12 +1,12 @@
 /** Internal scanner evidence. Byte binding, execution isolation and approval remain with the worker. */
-import { inspectSecurityMarkings } from './markings';
 import type {
   SecurityMarkingEvidence,
   SecurityMarkingPolicy,
   SecurityMarkingResult,
 } from './markings';
+import { inspectSecurityMarkings } from './markings';
 
-export const SECURITY_INSPECTION_VERSION = 'complete-content-v3';
+export const SECURITY_INSPECTION_VERSION = 'complete-content-v4';
 export type SecurityInspectionResult =
   | Exclude<SecurityMarkingResult, { decision: 'clear' }>
   | { decision: 'clear'; coverage: { complete: true; pages: number; parts: number } };

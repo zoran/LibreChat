@@ -83,12 +83,12 @@ import {
   hasStoppedUploadPromotion,
   readStoredUploadPromotion,
 } from './uploadManagementIntake';
-import { createUploadAdmissionMethods, readUploadAdmission } from './uploadManagementAdmission';
 import {
   createFileRetentionMethods,
   FileSourceCapacityError,
   FileSourceUnavailableError,
 } from './fileRetention';
+import { createUploadAdmissionMethods, readUploadAdmission } from './uploadManagementAdmission';
 import { createUploadMigrationMethods } from './uploadManagementMigration';
 import { createUploadControlMethods } from './uploadManagementControl';
 import { touchActiveUserPrincipal } from './userPrincipal';
@@ -738,6 +738,13 @@ export function createUploadManagementRepository(
           .lean<StoredUpload>();
         assertLease(row, lease, now);
         if (row.state !== 'transferring' || row.slot !== 'transfer') reject('lease_lost');
+        if (
+          (row.mediaType === 'application/pdf') !== (execution.custody.kind === 'pdf-ocr') ||
+          (execution.custody.kind === 'pdf-ocr' &&
+            (execution.custody.scope.workDeadline * 1000 <= now ||
+              execution.custody.scope.workDeadline * 1000 > now + 30_000))
+        )
+          reject('invalid_request');
         if (row.securityExecution) {
           if (!matchesUploadSecurityExecution(row.securityExecution, execution))
             reject('lease_lost');

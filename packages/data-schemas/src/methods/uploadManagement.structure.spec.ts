@@ -93,7 +93,8 @@ describe('original-bound managed document structure', () => {
       now,
     }))!;
     const execution = {
-      version: 1 as const,
+      version: 2 as const,
+      custody: { kind: 'none' as const },
       attemptId: `structure.${transfer.generation}`,
       instanceId: randomUUID(),
       executionId: randomUUID(),

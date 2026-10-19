@@ -1,13 +1,15 @@
 /** Private child entry only; the launcher must isolate credentials, resources and diagnostics. */
-import { closeSync, fstatSync, writeSync } from 'node:fs';
-import { inspectPdfSecurity, PDF_SECURITY_LIMITS } from './pdf';
+import { closeSync, fstatSync, readSync, writeSync } from 'node:fs';
+import type { SecurityProcessResult } from './process-wire';
 import type { PdfSecurityOcr } from './pdf';
 import {
   readSecurityProcessRequest,
   readSecurityProcessResult,
   SECURITY_PROCESS_LIMITS,
+  encodeSecurityProcessFrameHeader,
+  readSecurityProcessFrameHeader,
 } from './process-wire';
-import type { NegativeSecurityProcessResult } from './process-wire';
+import { inspectPdfSecurity, PDF_SECURITY_LIMITS } from './pdf';
 
 class InputFailure extends Error {
   constructor(readonly reason: 'invalid_content' | 'resource_limit') {
@@ -16,14 +18,76 @@ class InputFailure extends Error {
 }
 
 /**
- * One bounded stdin frame and one negative fd3 result. stdout/stderr remain private diagnostics,
- * never application logs. OCR is supplied only by trusted composition; the real main has none.
+ * One bounded stdin frame and bounded fd3 page/result frames. stdout/stderr remain private
+ * diagnostics. The actual child asks its trusted parent for OCR through its inherited fd3 only.
  * This entry provides neither OS isolation nor an approval/cleanup attestation.
  */
 export async function runPdfSecurityChild(ocr?: PdfSecurityOcr): Promise<void> {
+  const write = (bytes: Uint8Array) => {
+    let offset = 0;
+    while (offset < bytes.length) {
+      const count = writeSync(3, bytes, offset, Math.min(65536, bytes.length - offset));
+      if (count <= 0) throw new InputFailure('invalid_content');
+      offset += count;
+    }
+  };
+  const read = (length: number) => {
+    const bytes = Buffer.alloc(length);
+    try {
+      let offset = 0;
+      while (offset < length) {
+        const count = readSync(3, bytes, offset, length - offset, null);
+        if (count <= 0) throw new InputFailure('invalid_content');
+        offset += count;
+      }
+      return bytes;
+    } catch (error) {
+      bytes.fill(0);
+      throw error;
+    }
+  };
+  const broker: PdfSecurityOcr = {
+    async readPage({ page, width, height, rgba, signal }) {
+      signal.throwIfAborted();
+      const header = encodeSecurityProcessFrameHeader({
+        version: 2,
+        kind: 'page',
+        page,
+        width,
+        height,
+        bytes: rgba.length,
+      });
+      let prefix: Buffer | undefined;
+      let encoded: Buffer | undefined;
+      let text: Buffer | undefined;
+      try {
+        write(header);
+        write(new Uint8Array(rgba.buffer, rgba.byteOffset, rgba.byteLength));
+        prefix = read(4);
+        const size = prefix.readUInt32BE();
+        if (size < 1 || size > 1024) throw new InputFailure('invalid_content');
+        encoded = read(size);
+        const response = readSecurityProcessFrameHeader(encoded);
+        if (!response || response.kind !== 'ocr' || response.page !== page)
+          throw new InputFailure('invalid_content');
+        text = read(response.bytes);
+        signal.throwIfAborted();
+        return {
+          complete: response.complete,
+          readable: response.readable,
+          text: new TextDecoder('utf-8', { fatal: true }).decode(text),
+        };
+      } finally {
+        header.fill(0);
+        prefix?.fill(0);
+        encoded?.fill(0);
+        text?.fill(0);
+      }
+    },
+  };
   let frame: Buffer | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  let result: NegativeSecurityProcessResult = {
+  let result: SecurityProcessResult = {
     decision: 'uninspectable',
     reason: 'invalid_content',
   };
@@ -48,7 +112,7 @@ export async function runPdfSecurityChild(ocr?: PdfSecurityOcr): Promise<void> {
     clearTimeout(timer);
     const request = readSecurityProcessRequest(frame.subarray(0, length));
     if (!request) throw new InputFailure('invalid_content');
-    result = await inspectPdfSecurity({ ...request, ocr });
+    result = await inspectPdfSecurity({ ...request, ocr: ocr ?? broker });
     process.exitCode = 0;
   } catch (error) {
     result = {
@@ -73,11 +137,16 @@ export async function runPdfSecurityChild(ocr?: PdfSecurityOcr): Promise<void> {
     const descriptor = fstatSync(3);
     resultPipe = descriptor.isFIFO() || descriptor.isSocket();
     if (!resultPipe) throw new Error();
-    let offset = 0;
-    while (offset < output.length) {
-      const written = writeSync(3, output, offset, output.length - offset);
-      if (written <= 0) throw new Error();
-      offset += written;
+    const header = encodeSecurityProcessFrameHeader({
+      version: 2,
+      kind: 'result',
+      bytes: output.length,
+    });
+    try {
+      write(header);
+      write(output);
+    } finally {
+      header.fill(0);
     }
   } catch {
     process.exitCode = 2;

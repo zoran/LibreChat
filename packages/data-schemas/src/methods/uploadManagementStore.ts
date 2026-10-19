@@ -2,7 +2,12 @@
 import { performance } from 'perf_hooks';
 import { setTimeout as delay } from 'timers/promises';
 import { createHash, randomInt, randomUUID } from 'crypto';
-import { isUploadPrincipal } from 'librechat-data-provider';
+import {
+  isUploadPrincipal,
+  readUploadSecurityExecution,
+  isCompleteUploadSecuritySettlement,
+  UPLOAD_RECORD_BYTES,
+} from 'librechat-data-provider';
 import type {
   UploadPrincipal,
   UploadDerivedOrigin,
@@ -353,6 +358,7 @@ export type UploadStore = {
     migration?: boolean,
   ): Promise<T>;
   save(row: StoredUpload, session: ClientSession): Promise<void>;
+  assertCurrentSecurityState(session: ClientSession): Promise<void>;
   touchPrincipal(
     principal: UploadPrincipal,
     session: ClientSession,
@@ -526,8 +532,46 @@ export function createUploadStore(
     }
   }
   async function save(row: StoredUpload, session: ClientSession): Promise<void> {
+    if (mongoose.mongo.BSON.calculateObjectSize(row) > UPLOAD_RECORD_BYTES)
+      reject('capacity_exceeded');
     row.revision++;
     await Operation.replaceOne({ _id: row._id }, row, { session });
+  }
+  /** Activation cannot reinterpret old receipts or hide unresolved external custody. */
+  async function assertCurrentSecurityState(session: ClientSession): Promise<void> {
+    const deadline = performance.now() + 4000;
+    let count = 0;
+    const cursor = Operation.find({
+      $or: [
+        { securityExecution: { $exists: true } },
+        { securitySettlement: { $exists: true } },
+        { securityApproval: { $exists: true } },
+      ],
+    })
+      .session(session)
+      .maxTimeMS(4000)
+      .lean<StoredUpload>()
+      .cursor({ batchSize: 64 });
+    try {
+      for await (const row of cursor) {
+        const execution = readUploadSecurityExecution(row.securityExecution);
+        if (
+          ++count > RESOURCE_MAX.bundles ||
+          performance.now() >= deadline ||
+          !execution ||
+          execution.attemptId !== `${row._id}.${row.attemptGeneration}` ||
+          (row.mediaType === 'application/pdf') !== (execution.custody.kind === 'pdf-ocr') ||
+          !isCompleteUploadSecuritySettlement(row.securitySettlement, execution) ||
+          (execution.custody.kind === 'pdf-ocr' &&
+            row.original?.integrity &&
+            execution.custody.scope.documentSha256 !== row.original.integrity.sha256) ||
+          mongoose.mongo.BSON.calculateObjectSize(row) > UPLOAD_RECORD_BYTES
+        )
+          reject('not_ready');
+      }
+    } finally {
+      await cursor.close();
+    }
   }
   async function touchPrincipal(
     principal: UploadPrincipal,
@@ -599,6 +643,7 @@ export function createUploadStore(
     initialize,
     transaction,
     save,
+    assertCurrentSecurityState,
     touchPrincipal,
     releaseQueue,
     chargeQueue,
@@ -803,6 +848,7 @@ export function createUploadActivationMethods(store: UploadStore): UploadActivat
       return store.transaction(async (session, global) => {
         if (typeof global.storeId !== 'string' || !global.storeId) reject('not_ready');
         await quiescent(global, session);
+        await store.assertCurrentSecurityState(session);
         const totals = await store.totals(session);
         if (
           !global.baseline ||
@@ -824,6 +870,8 @@ export function createUploadActivationMethods(store: UploadStore): UploadActivat
     },
     async activateReconciled(proof, now) {
       await store.transaction(async (session, global) => {
+        // Also check an idempotent replay: a historical activation receipt is not a v2 inventory.
+        await store.assertCurrentSecurityState(session);
         if (
           typeof global.storeId !== 'string' ||
           !global.storeId ||

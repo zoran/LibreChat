@@ -26,6 +26,9 @@ export function hasCompleteUploadSecurityExecution(row: StoredUpload): boolean {
   return (
     execution !== null &&
     execution.attemptId === `${row._id}.${row.attemptGeneration}` &&
+    (row.mediaType === 'application/pdf'
+      ? execution.custody.kind === 'pdf-ocr'
+      : execution.custody.kind === 'none') &&
     isCompleteUploadSecuritySettlement(row.securitySettlement, execution)
   );
 }
@@ -59,6 +62,13 @@ function hasBoundUploadSecurityApproval(
     original.source !== 's3' ||
     original.storageKey !==
       `${row.tenantId === null ? '' : `t/${row.tenantId}/`}managed-uploads/${row.userId}/${row._id}.${row.attemptGeneration}__original`
+  )
+    return false;
+  const execution = readUploadSecurityExecution(row.securityExecution);
+  if (
+    !execution ||
+    (execution.custody.kind === 'pdf-ocr' &&
+      execution.custody.scope.documentSha256 !== original.integrity.sha256)
   )
     return false;
   return matchesUploadSecurityApproval(

@@ -16,6 +16,8 @@ export default defineConfig({
     'src/uploads/processing/parser-child.ts',
     'src/uploads/security/worker-thread.ts',
     'src/uploads/security/pdf-child.ts',
+    'src/uploads/security/process-launcher.ts',
+    'src/uploads/security/process-policy.ts',
     'src/uploads/security/security-entry.ts',
     'src/uploads/intake/intake-entry.ts',
   ],

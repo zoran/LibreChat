@@ -325,7 +325,7 @@ describe('built standalone scanner entry', () => {
         await client.inspect({ execution: old, subject, body: body(), signal: signal() }),
       ).toMatchObject({
         decision: { decision: 'approved', subject, policySha256 },
-        cleanup: { writerStopped: true, transientDataRemoved: true },
+        settlement: { writerStopped: true, transientDataRemoved: true },
       });
       expect(await client.cancel({ execution: old, signal: signal() })).toEqual({
         execution: old,
@@ -397,7 +397,7 @@ describe('built standalone scanner entry', () => {
         await client.inspect({ execution: current, subject, body: body(), signal: signal() }),
       ).toMatchObject({
         decision: { decision: 'approved', subject, policySha256 },
-        cleanup: { writerStopped: true, transientDataRemoved: true },
+        settlement: { writerStopped: true, transientDataRemoved: true },
       });
       expect(await client.cancel({ execution: current, signal: signal() })).toEqual({
         execution: current,

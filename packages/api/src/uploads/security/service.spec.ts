@@ -148,7 +148,8 @@ describe('scanner service maintenance', () => {
         complete: true,
       });
       const missing = {
-        version: 1 as const,
+        version: 2 as const,
+        custody: { kind: 'none' as const },
         attemptId: 'upload.1',
         instanceId: randomUUID(),
         executionId: randomUUID(),

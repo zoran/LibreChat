@@ -118,13 +118,14 @@ describe('remote intake adapters with the real Raw lifecycle and controlled App/
     const security: UploadSecurityPort = {
       policySha256: 'a'.repeat(64),
       prepare: async ({ attemptId }) => ({
-        version: 1,
+        version: 2,
+        custody: { kind: 'none' as const },
         attemptId,
         instanceId: firstId,
         executionId: secondId,
         expiresAt,
       }),
-      inspect: async ({ subject, body }) => {
+      inspect: async ({ execution, subject, body }) => {
         for await (const _chunk of body) {
           /* Controlled scanner consumes every staged byte. */
         }
@@ -138,7 +139,7 @@ describe('remote intake adapters with the real Raw lifecycle and controlled App/
             checkedAt: new Date(now).toISOString(),
             coverage: { complete: true, pages: 1, parts: 1 },
           },
-          cleanup: { writerStopped: true, transientDataRemoved: true },
+          settlement: { execution, writerStopped: true, transientDataRemoved: true },
         };
       },
       cancel: async ({ execution }) => ({

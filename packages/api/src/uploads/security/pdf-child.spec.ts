@@ -8,12 +8,12 @@ import {
   encodeSecurityProcessRequest,
   readSecurityProcessResult,
   SECURITY_PROCESS_LIMITS,
+  SecurityProcessFrameReader,
 } from './process-wire';
 
 const entry = resolve(__dirname, '../../../dist/uploads/security/pdf-child.cjs');
 const maximum = 4 + SECURITY_PROCESS_LIMITS.headerBytes + SECURITY_PROCESS_LIMITS.documentBytes;
 const policy = { version: 1 as const, markings: ['VS-NfD', 'GEHEIM'], labels: ['Einstufung'] };
-const incomplete = { decision: 'uninspectable', reason: 'incomplete_coverage' };
 
 function pdf(text = 'Synthetic source', malformedImage = false): Buffer {
   const drawing = malformedImage ? 'q 20 0 0 20 50 50 cm /Im1 Do Q' : '';
@@ -103,7 +103,7 @@ async function run(input: Buffer, fakeOcr = false, missingResultFd = false, expe
   for (const [index, stream] of streams.entries()) {
     stream?.on('data', (chunk: Buffer) => {
       sizes[index] += chunk.length;
-      if (sizes[index] > (index === 2 ? 512 : 65_536)) {
+      if (sizes[index] > (index === 2 ? 1600 : 65_536)) {
         excessiveOutput = true;
         child.kill('SIGKILL');
       } else outputs[index].push(chunk);
@@ -115,11 +115,19 @@ async function run(input: Buffer, fakeOcr = false, missingResultFd = false, expe
     child.stdin?.end(input);
     const [code, signal] = await completion;
     if (timedOut || excessiveOutput || signal) throw new Error('Synthetic child exceeded bounds');
+    const reader = new SecurityProcessFrameReader();
+    let result: ReturnType<typeof readSecurityProcessResult> = null;
+    reader.push(Buffer.concat(outputs[2]), (frame) => {
+      if (frame.header.kind === 'result') result = readSecurityProcessResult(frame.bytes);
+      frame.bytes.fill(0);
+    });
+    if (!reader.complete) result = null;
+    reader.clear();
     return {
       code,
       stdout: Buffer.concat(outputs[0]).toString('utf8'),
       stderr: Buffer.concat(outputs[1]).toString('utf8'),
-      result: readSecurityProcessResult(Buffer.concat(outputs[2])),
+      result,
     };
   } finally {
     clearTimeout(timer);
@@ -136,10 +144,6 @@ describe('actual built private PDF child', () => {
   beforeAll(() => {
     if (!existsSync(entry))
       throw new Error('Build @librechat/api before its child integration tests');
-  });
-
-  it('keeps the real main closed without OCR and emits only a negative fd3 result', async () => {
-    expect(await run(request())).toEqual({ code: 0, stdout: '', stderr: '', result: incomplete });
   });
 
   it.each(['empty', 'malformed', 'truncated', 'duplicate'] as const)(
@@ -191,13 +195,13 @@ describe('actual built private PDF child', () => {
     });
   });
 
-  it('keeps real raster work closed and erases owned frames, chunks and pixel buffers', async () => {
+  it('emits parser evidence and erases owned frames, chunks and pixel buffers', async () => {
     const result = await run(request(), true);
     expect(result).toEqual({
       code: 0,
       stdout: 'SYNTHETIC_FIXTURE_CLEANUP_OK\n',
       stderr: '',
-      result: incomplete,
+      result: { decision: 'clear', coverage: { complete: true, pages: 1, parts: 1 } },
     });
   });
 

@@ -519,7 +519,8 @@ export function createUploadMigrationMethods(
       }, true);
     },
     async completeImport({ receipt, baseline, lifecycleReconciled }) {
-      await store.transaction(async (_session, global) => {
+      await store.transaction(async (session, global) => {
+        await store.assertCurrentSecurityState(session);
         const state = global.migration;
         validateTotals(baseline);
         if (

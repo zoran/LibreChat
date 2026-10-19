@@ -7,14 +7,13 @@ import { observeSecurityProcess } from './process-observer';
 
 const entry = resolve(__dirname, '../../../dist/uploads/security/pdf-child.cjs');
 const policy = { version: 1 as const, markings: ['VS-NfD', 'GEHEIM'], labels: ['Einstufung'] };
-const incomplete = { decision: 'uninspectable', reason: 'incomplete_coverage' };
 
 // Same one-page synthetic PDF construction as the existing child tests; no test-module imports.
-function pdf(text = 'Synthetic source', malformedImage = false): Buffer {
+function pdf(text = 'Synthetic source', malformedImage = false, metadata?: string): Buffer {
   const drawing = malformedImage ? 'q 20 0 0 20 50 50 cm /Im1 Do Q' : '';
   const stream = `BT /F1 10 Tf 10 50 Td (${text}) Tj ET ${drawing}`;
   const objects = [
-    '<< /Type /Catalog /Pages 2 0 R >>',
+    `<< /Type /Catalog /Pages 2 0 R ${metadata ? '/Metadata 6 0 R' : ''} >>`,
     '<< /Type /Pages /Kids [4 0 R] /Count 1 >>',
     '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
     `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 3 0 R >> ${malformedImage ? '/XObject << /Im1 6 0 R >>' : ''} >> /Contents 5 0 R >>`,
@@ -25,6 +24,10 @@ function pdf(text = 'Synthetic source', malformedImage = false): Buffer {
         ]
       : []),
   ];
+  if (metadata)
+    objects.push(
+      `<< /Type /Metadata /Subtype /XML /Length ${Buffer.byteLength(metadata)} >>\nstream\n${metadata}\nendstream`,
+    );
   let content = '%PDF-1.4\n';
   const offsets = [0];
   for (const [index, object] of objects.entries()) {
@@ -41,24 +44,6 @@ function pdf(text = 'Synthetic source', malformedImage = false): Buffer {
   return Buffer.from(content);
 }
 
-// Fixed test-only adapter. The caller requires one rendered page or an explicit pre-OCR refusal.
-// No command, path, OCR selection or expected result comes from the request.
-const fakeOcrFixture = `
-setTimeout(()=>process.exit(90),7000).unref();
-const { runPdfSecurityChild } = require(process.argv[1]);
-const expectedPages = Number(process.argv[2]);
-if (expectedPages !== 0 && expectedPages !== 1) throw new Error('Invalid fixture page count');
-let calls = 0, rendered = false;
-runPdfSecurityChild({ readPage: async ({ page, width, height, rgba }) => {
-  calls++;
-  rendered = page === 1 && width === 400 && height === 200 && rgba.length === 320000 &&
-    rgba.some((value,index)=>index % 4 !== 3 && value < 128);
-  return { complete: true, readable: true, text: '' };
-}}).then(() => {
-  if (calls !== expectedPages || rendered !== (expectedPages === 1)) process.exitCode = 91;
-}, () => { process.exitCode = 92; });
-`;
-
 function identity(pid: number) {
   const fields = readFileSync(`/proc/${pid}/stat`, 'utf8')
     .split(')')
@@ -71,7 +56,26 @@ function identity(pid: number) {
 
 async function run(bytes: Buffer, fakeOcr = false, expectedPages = 1) {
   const request = encodeSecurityProcessRequest({ mediaType: 'application/pdf', policy, bytes });
-  const args = fakeOcr ? ['-e', fakeOcrFixture, entry, String(expectedPages)] : [entry];
+  const args = [entry];
+  const pages: Uint8ClampedArray[] = [];
+  const ocr = {
+    readPage: jest.fn(
+      async ({
+        page,
+        width,
+        height,
+        rgba,
+      }: Parameters<import('./pdf').PdfSecurityOcr['readPage']>[0]) => {
+        expect(page).toBe(1);
+        expect(width).toBe(400);
+        expect(height).toBe(200);
+        expect(rgba.length).toBe(320000);
+        expect(rgba.some((value, index) => index % 4 !== 3 && value < 128)).toBe(true);
+        pages.push(rgba);
+        return { complete: true, readable: true, text: '' };
+      },
+    ),
+  };
   const child = spawn(process.execPath, args, {
     stdio: ['pipe', 'pipe', 'pipe', 'pipe'],
     env: { NODE_ENV: 'test', LANG: 'C.UTF-8' },
@@ -117,6 +121,7 @@ async function run(bytes: Buffer, fakeOcr = false, expectedPages = 1) {
       request,
       signal: new AbortController().signal,
       timeoutMs: 6000,
+      ...(fakeOcr ? { ocr } : {}),
     });
     await joined;
   } finally {
@@ -139,6 +144,8 @@ async function run(bytes: Buffer, fakeOcr = false, expectedPages = 1) {
     }
   }
   if (deadlineExceeded) throw new Error('Synthetic PDF child exceeded its parent deadline');
+  if (fakeOcr) expect(ocr.readPage).toHaveBeenCalledTimes(expectedPages);
+  expect(pages.every((bytes) => bytes.every((byte) => byte === 0))).toBe(true);
   return result;
 }
 
@@ -148,18 +155,22 @@ describe('actual private PDF child and observer composition', () => {
       throw new Error('Build @librechat/api before its process integration tests');
   });
 
-  it('keeps the product main negative when no real OCR is installed', async () => {
+  it('refuses the actual page frame when no trusted OCR broker is supplied', async () => {
     expect(await run(pdf())).toEqual({
-      result: incomplete,
+      result: null,
+      pages: 0,
+      localCopiesRemoved: true,
       diagnostics: false,
       directChildStopped: true,
-      transportComplete: true,
+      transportComplete: false,
     });
   });
 
   it('observes real PDF parsing and rendering with a fixed quiet synthetic OCR adapter', async () => {
     expect(await run(pdf(), true)).toEqual({
-      result: incomplete,
+      result: { decision: 'clear', coverage: { complete: true, pages: 1, parts: 1 } },
+      pages: 1,
+      localCopiesRemoved: true,
       diagnostics: false,
       directChildStopped: true,
       transportComplete: true,
@@ -169,15 +180,40 @@ describe('actual private PDF child and observer composition', () => {
   it('delivers a quiet strict-image rejection through the actual observer after the child stops', async () => {
     expect(await run(pdf('Synthetic source', true), true, 0)).toEqual({
       result: { decision: 'uninspectable', reason: 'invalid_content' },
+      pages: 0,
+      localCopiesRemoved: true,
       diagnostics: false,
       directChildStopped: true,
       transportComplete: true,
     });
   });
 
+  it.each(['Synthetic title', 'GEHEIM'])(
+    'checks validated native catalog metadata including %s through the built process',
+    async (title) => {
+      const metadata =
+        '<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"><rdf:Description rdf:about="" xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>' +
+        title +
+        '</dc:title></rdf:Description></rdf:RDF></x:xmpmeta>';
+      expect(await run(pdf('Synthetic source', false, metadata), true)).toEqual({
+        result:
+          title === 'GEHEIM'
+            ? { decision: 'uninspectable', reason: 'ambiguous_marking' }
+            : { decision: 'clear', coverage: { complete: true, pages: 1, parts: 1 } },
+        pages: 1,
+        localCopiesRemoved: true,
+        diagnostics: false,
+        directChildStopped: true,
+        transportComplete: true,
+      });
+    },
+  );
+
   it('preserves a real native synthetic classification rejection', async () => {
     expect(await run(pdf('Einstufung: GEHEIM'), true)).toEqual({
       result: { decision: 'rejected', reason: 'classification_marking' },
+      pages: 1,
+      localCopiesRemoved: true,
       diagnostics: false,
       directChildStopped: true,
       transportComplete: true,

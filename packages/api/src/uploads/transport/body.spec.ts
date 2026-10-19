@@ -10,6 +10,7 @@ import type {
   UploadSecurityApproval,
   UploadSecurityDecision,
   UploadSecuritySubject,
+  UploadSecurityExecution,
 } from 'librechat-data-provider';
 import type { Request, Response } from 'express';
 import type {
@@ -34,8 +35,9 @@ const lease = {
 };
 const policySha256 = 'a'.repeat(64);
 const now = Date.parse('2026-10-17T02:00:00.000Z');
-const execution = {
-  version: 1 as const,
+const execution: UploadSecurityExecution = {
+  version: 2 as const,
+  custody: { kind: 'none' as const },
   attemptId: 'operation.1',
   instanceId: '11111111-1111-4111-8111-111111111111',
   executionId: '22222222-2222-4222-8222-222222222222',
@@ -57,7 +59,7 @@ function approval(subject: UploadSecuritySubject): UploadSecurityApproval {
 function inspection<T extends UploadSecurityDecision>(decision: T) {
   return {
     decision,
-    cleanup: { writerStopped: true as const, transientDataRemoved: true as const },
+    settlement: { execution, writerStopped: true as const, transientDataRemoved: true as const },
   };
 }
 
@@ -587,17 +589,17 @@ describe('raw upload body admission and streaming', () => {
     [
       'wrong operation',
       (value) => ({ ...value, subject: { ...value.subject, operationId: 'other' } }),
-      true,
+      false,
     ],
     [
       'wrong transfer generation',
       (value) => ({ ...value, subject: { ...value.subject, transferGeneration: 2 } }),
-      true,
+      false,
     ],
     [
       'wrong media type',
       (value) => ({ ...value, subject: { ...value.subject, mediaType: 'application/pdf' } }),
-      true,
+      false,
     ],
     ['wrong size', (value) => ({ ...value, subject: { ...value.subject, bytes: 4 } }), true],
     [
@@ -645,23 +647,35 @@ describe('raw upload body admission and streaming', () => {
       () => ({ version: 1, decision: 'rejected', reason: 'classification_marking' }),
     ],
     ['missing cleanup', (value) => ({ decision: value.decision })],
-    ['null cleanup', (value) => ({ ...value, cleanup: null })],
+    ['null cleanup', (value) => ({ ...value, settlement: null })],
     [
       'writer not confirmed',
-      (value) => ({ ...value, cleanup: { writerStopped: false, transientDataRemoved: true } }),
+      (value) => ({
+        ...value,
+        settlement: { ...value.settlement, writerStopped: false, transientDataRemoved: true },
+      }),
     ],
     [
       'copies not confirmed',
-      (value) => ({ ...value, cleanup: { writerStopped: true, transientDataRemoved: false } }),
+      (value) => ({
+        ...value,
+        settlement: { ...value.settlement, writerStopped: true, transientDataRemoved: false },
+      }),
     ],
-    ['missing copy acknowledgement', (value) => ({ ...value, cleanup: { writerStopped: true } })],
+    [
+      'missing copy acknowledgement',
+      (value) => ({ ...value, settlement: { writerStopped: true } }),
+    ],
     [
       'truthy acknowledgement',
-      (value) => ({ ...value, cleanup: { writerStopped: 'true', transientDataRemoved: true } }),
+      (value) => ({
+        ...value,
+        settlement: { ...value.settlement, writerStopped: 'true', transientDataRemoved: true },
+      }),
     ],
     [
       'extra cleanup detail',
-      (value) => ({ ...value, cleanup: { ...value.cleanup, detail: 'private' } }),
+      (value) => ({ ...value, settlement: { ...value.settlement, detail: 'private' } }),
     ],
     ['extra envelope version', (value) => ({ ...value, version: 1 })],
   ])('does not infer stopped remote work from a resolved %s', async (_name, change) => {

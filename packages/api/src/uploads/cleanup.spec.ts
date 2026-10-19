@@ -6,7 +6,8 @@ import { createManagedUploadCleanup } from './cleanup';
 const worker = { hostId: 'host', instanceId: 'instance' };
 const principal = { tenantId: 'tenant', userId: 'user', authentication: 'verified-email' as const };
 const securityExecution = {
-  version: 1 as const,
+  version: 2 as const,
+  custody: { kind: 'none' as const },
   attemptId: 'op.1',
   instanceId: '11111111-1111-4111-8111-111111111111',
   executionId: '22222222-2222-4222-8222-222222222222',

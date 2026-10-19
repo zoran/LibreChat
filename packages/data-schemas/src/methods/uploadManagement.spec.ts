@@ -116,7 +116,8 @@ describe('durable upload management', () => {
 
   async function completeScanner(lease: UploadLease, at: number) {
     const execution = {
-      version: 1 as const,
+      version: 2 as const,
+      custody: { kind: 'none' as const },
       attemptId: `${lease.operationId}.${lease.generation}`,
       instanceId: '11111111-1111-4111-8111-111111111111',
       executionId: '22222222-2222-4222-8222-222222222222',
@@ -929,6 +930,49 @@ describe('durable upload management', () => {
         code: 'not_ready',
       });
     });
+
+    it.each(['legacy', 'unsettled', 'rebound'] as const)(
+      'rejects %s security custody both at activation and committed-proof replay',
+      async (kind) => {
+        const proof = await initialProof();
+        const current = {
+          version: 2,
+          custody: { kind: 'none' },
+          attemptId: 'cutover-fixture.1',
+          instanceId: '11111111-1111-4111-8111-111111111111',
+          executionId: '22222222-2222-4222-8222-222222222222',
+          expiresAt: new Date(now + 60_000).toISOString(),
+        };
+        for (const replay of [false, true]) {
+          if (replay) await target.activateReconciled(proof, now);
+          const value = kind === 'legacy' ? { ...current, version: 1 } : current;
+          const fixture = {
+            _id: 'cutover-fixture',
+            mediaType: 'text/plain',
+            attemptGeneration: 1,
+            securityExecution: value,
+            securitySettlement: {
+              execution:
+                kind === 'rebound'
+                  ? { ...value, executionId: '33333333-3333-4333-8333-333333333333' }
+                  : value,
+              writerStopped: true,
+              transientDataRemoved: kind !== 'unsettled',
+            },
+          };
+          const collection = replacement.connection.db!.collection<typeof fixture>(
+            replacement.models.UploadOperation.collection.name,
+          );
+          await collection.insertOne(fixture);
+          const before = await replacement.models.UploadCounter.findById('global').lean();
+          await expect(target.activateReconciled(proof, now)).rejects.toMatchObject({
+            code: 'not_ready',
+          });
+          expect(await replacement.models.UploadCounter.findById('global').lean()).toEqual(before);
+          await collection.deleteOne({ _id: 'cutover-fixture' });
+        }
+      },
+    );
 
     it('replays only the exact committed active proof after its original deadline without resetting later usage', async () => {
       const proof = await initialProof();

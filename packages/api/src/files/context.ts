@@ -1,6 +1,7 @@
 /** Native attachment context preparation; source access and final prompt budgets remain caller-owned. */
 import { FileSources, mergeFileConfig } from 'librechat-data-provider';
 import type { TFile, ExtractedTextCoverage, PreparedFileCoverage } from 'librechat-data-provider';
+import type { ManagedContextSources, ManagedSourceAccess } from './managedSource';
 import type { TokenCountFn } from '~/utils/text';
 import type { ServerRequest } from '~/types';
 import { processTextWithTokenLimit } from '~/utils/text';
@@ -51,6 +52,7 @@ export async function extractFileContext({
   req,
   tokenCountFn,
   onSourceCoverage,
+  sources,
 }: {
   attachments: readonly (Pick<TFile, 'text' | 'filename'> & {
     file_id?: string;
@@ -58,6 +60,8 @@ export async function extractFileContext({
     llmDeliveryPath?: string;
   })[];
   req?: ServerRequest;
+  /** Capability injected by server composition; browser-supplied file bodies are never authority. */
+  sources?: ManagedContextSources;
   tokenCountFn: TokenCountFn;
   /** Identified prepared sources only; no names, text or claim of final model consumption. */
   onSourceCoverage?: (entries: PreparedFileCoverage[]) => void;
@@ -81,8 +85,17 @@ export async function extractFileContext({
   if (fileTokenLimit === 0) return undefined;
 
   const documents: ContextDocument[] = [];
+  const resolved: ManagedSourceAccess[] = [];
 
-  for (const file of attachments) {
+  for (const attachment of attachments) {
+    let file = attachment;
+    if (sources) {
+      if (!file.file_id) throw new Error('Managed source unavailable');
+      const access = await sources.resolve(file.file_id);
+      if (access.file.file_id !== file.file_id) throw new Error('Managed source unavailable');
+      resolved.push(access);
+      file = access.file;
+    }
     const source = file.source ?? FileSources.local;
     if (file.llmDeliveryPath === 'none') {
       continue;
@@ -112,6 +125,9 @@ export async function extractFileContext({
     }
   }
 
+  // Tokenization can yield. Revalidate every original snapshot after all preparation awaits,
+  // before exposing text or even preparation metadata to the next model/checkpoint owner.
+  if (sources) for (const access of resolved) await sources.revalidate(access);
   if (!documents.length) return undefined;
   // Keep every source value inside JSON, including hostile fences and Unicode line separators.
   // This receipt describes preparation only; the native whole-prompt owner may shorten it later.

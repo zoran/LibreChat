@@ -326,7 +326,8 @@ export function createHttpUploadSecurityPort(options: {
         if (
           result.version !== 1 ||
           !matchesUploadSecurityExecution(result.execution, execution) ||
-          !inspection
+          !inspection ||
+          !matchesUploadSecurityExecution(inspection.settlement.execution, execution)
         )
           throw failure();
         return inspection;
@@ -456,7 +457,11 @@ export function createSecurityRequestHandler(
           const inspection = readUploadSecurityInspection(
             await worker.inspect({ execution, subject, body, signal: clock.signal }),
           );
-          if (!inspection || (inspection.decision.decision === 'approved' && !complete))
+          if (
+            !inspection ||
+            !matchesUploadSecurityExecution(inspection.settlement.execution, execution) ||
+            (inspection.decision.decision === 'approved' && !complete)
+          )
             throw failure();
           reply(res, 200, { version: 1, execution, inspection });
           return;

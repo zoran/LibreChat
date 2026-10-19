@@ -21,7 +21,8 @@ const subject = {
   sha256: createHash('sha256').update('hello').digest('hex'),
 };
 const execution = {
-  version: 1 as const,
+  version: 2 as const,
+  custody: { kind: 'none' as const },
   attemptId: 'operation.1',
   instanceId: '11111111-1111-4111-8111-111111111111',
   executionId: '22222222-2222-4222-8222-222222222222',
@@ -46,7 +47,7 @@ const inspection = () => ({
     checkedAt: '2026-10-17T00:00:00.000Z',
     coverage: { complete: true as const, pages: 1, parts: 1 },
   },
-  cleanup: { writerStopped: true as const, transientDataRemoved: true as const },
+  settlement: { execution, writerStopped: true as const, transientDataRemoved: true as const },
 });
 const settlement = () => ({
   execution: { ...execution },

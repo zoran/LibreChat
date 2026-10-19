@@ -4,6 +4,9 @@ import {
   readSecurityProcessRequest,
   readSecurityProcessResult,
   SECURITY_PROCESS_LIMITS,
+  SecurityProcessFrameReader,
+  encodeSecurityProcessFrameHeader,
+  readSecurityProcessFrameHeader,
 } from './process-wire';
 
 const policy = { version: 1 as const, markings: ['VS-NfD', 'GEHEIM'], labels: ['Einstufung'] };
@@ -18,7 +21,7 @@ function frame(value: unknown, bytes = source) {
   bytes.copy(result, 4 + header.length);
   return result;
 }
-const header = () => ({ version: 1, mediaType: 'application/pdf', policy, bytes: source.length });
+const header = () => ({ version: 2, mediaType: 'application/pdf', policy, bytes: source.length });
 
 describe('private security process request', () => {
   it('round-trips a framed copy without mutating the source and erases the decoded view with its owner', () => {
@@ -35,7 +38,8 @@ describe('private security process request', () => {
 
   it.each([
     {},
-    { ...header(), version: 2 },
+    { ...header(), version: 1 },
+    { ...header(), version: 3 },
     { ...header(), mediaType: 'text/plain' },
     { ...header(), bytes: 0 },
     { ...header(), bytes: source.length - 1 },
@@ -110,18 +114,19 @@ describe('private security process request', () => {
   });
 });
 
-describe('negative-only private security process result', () => {
+describe('bounded private security process evidence', () => {
   it.each([
+    { decision: 'clear', coverage: { complete: true, pages: 32, parts: 1 } },
     { decision: 'rejected', reason: 'classification_marking' },
     ...['invalid_content', 'incomplete_coverage', 'resource_limit', 'ambiguous_marking'].map(
       (reason) => ({ decision: 'uninspectable', reason }),
     ),
-  ])('accepts only closed negative evidence %#', (value) => {
+  ])('accepts only closed parser evidence %#', (value) => {
     expect(readSecurityProcessResult(Buffer.from(JSON.stringify(value)))).toEqual(value);
   });
 
   it.each([
-    { decision: 'clear', coverage: { complete: true, pages: 1, parts: 1 } },
+    { decision: 'clear', coverage: { complete: true, pages: 33, parts: 1 } },
     { decision: 'approved', coverage: { complete: true, pages: 1, parts: 1 } },
     { decision: 'uninspectable', reason: 'scanner_unavailable' },
     { decision: 'rejected', reason: 'invalid_content' },
@@ -129,7 +134,7 @@ describe('negative-only private security process result', () => {
     { decision: 'uninspectable', reason: 'incomplete_coverage', cleanup: true },
     null,
     [],
-  ])('refuses positive claims, content and non-contract results %#', (value) => {
+  ])('refuses approvals, content and non-contract results %#', (value) => {
     expect(readSecurityProcessResult(Buffer.from(JSON.stringify(value)))).toBeNull();
   });
 
@@ -139,5 +144,62 @@ describe('negative-only private security process result', () => {
     expect(readSecurityProcessResult(Buffer.concat([valid, valid]))).toBeNull();
     expect(readSecurityProcessResult(Buffer.from([0xff]))).toBeNull();
     expect(readSecurityProcessResult(Buffer.alloc(513, 0x20))).toBeNull();
+  });
+});
+
+describe('bounded duplex page framing', () => {
+  it('joins every possible split without losing the original raster or allocating a second frame', () => {
+    const raster = Buffer.alloc(32, 7);
+    const prefix = encodeSecurityProcessFrameHeader({
+      version: 2,
+      kind: 'page',
+      page: 1,
+      width: 4,
+      height: 2,
+      bytes: 32,
+    });
+    const wire = Buffer.concat([prefix, raster]);
+    for (let split = 0; split <= wire.length; split++) {
+      const reader = new SecurityProcessFrameReader();
+      const consume = jest.fn(({ header, bytes }) => {
+        expect(header).toMatchObject({ kind: 'page', page: 1, width: 4, height: 2 });
+        expect(bytes).toEqual(raster);
+        bytes.fill(0);
+      });
+      reader.push(wire.subarray(0, split), consume);
+      reader.push(wire.subarray(split), consume);
+      expect(consume).toHaveBeenCalledTimes(1);
+      expect(reader.complete).toBe(true);
+      reader.clear();
+    }
+  });
+  it.each([
+    { version: 1, kind: 'page', page: 1, width: 1, height: 1, bytes: 4 },
+    { version: 2, kind: 'page', page: 33, width: 1, height: 1, bytes: 4 },
+    { version: 2, kind: 'page', page: 1, width: 8_000_001, height: 1, bytes: 32_000_004 },
+    { version: 2, kind: 'page', page: 1, width: 1, height: 1, bytes: 3 },
+    { version: 2, kind: 'ocr', page: 1, complete: true, readable: true, bytes: 65_537 },
+    { version: 2, kind: 'result', bytes: 513 },
+  ])('rejects invalid declared allocation before body buffering %#', (header) => {
+    expect(readSecurityProcessFrameHeader(Buffer.from(JSON.stringify(header)))).toBeNull();
+  });
+  it('rejects excessive prefix and treats a truncated body as incomplete', () => {
+    const reader = new SecurityProcessFrameReader();
+    const excessive = Buffer.alloc(4);
+    excessive.writeUInt32BE(1025);
+    expect(() => reader.push(excessive, jest.fn())).toThrow();
+    reader.clear();
+    const prefix = encodeSecurityProcessFrameHeader({
+      version: 2,
+      kind: 'page',
+      page: 1,
+      width: 1,
+      height: 1,
+      bytes: 4,
+    });
+    reader.push(Buffer.concat([prefix, Buffer.alloc(3)]), jest.fn());
+    expect(reader.complete).toBe(false);
+    reader.clear();
+    expect(reader.complete).toBe(true);
   });
 });

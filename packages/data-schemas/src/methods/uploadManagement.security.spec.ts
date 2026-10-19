@@ -92,7 +92,8 @@ describe('durable upload security approval', () => {
   });
   async function completeScanner(lease: UploadLease, at: number) {
     const execution = {
-      version: 1 as const,
+      version: 2 as const,
+      custody: { kind: 'none' as const },
       attemptId: `${lease.operationId}.${lease.generation}`,
       instanceId: '11111111-1111-4111-8111-111111111111',
       executionId: '22222222-2222-4222-8222-222222222222',

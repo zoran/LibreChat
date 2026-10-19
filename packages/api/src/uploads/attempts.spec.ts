@@ -392,7 +392,8 @@ describe('bound technical recovery in the existing journal', () => {
     acknowledgementPending: true,
   };
   const execution: UploadSecurityExecution = {
-    version: 1,
+    version: 2,
+    custody: { kind: 'none' as const },
     attemptId: 'operation.1',
     instanceId: '11111111-1111-4111-8111-111111111111',
     executionId: '22222222-2222-4222-8222-222222222222',
@@ -593,7 +594,9 @@ describe('bound technical recovery in the existing journal', () => {
     });
     expected.executionId = changed.executionId;
     const returned = await journal.attempts.stopAndJoin(task, signal());
-    returned.securityExecution!.executionId = changed.executionId;
+    expect(() => {
+      returned.securityExecution!.executionId = changed.executionId;
+    }).toThrow(TypeError);
     expect((await journal.recoverPending(signal())).settled).toBe(0);
     expect(handler.mock.calls[0][0].securityExecution).toEqual(execution);
     expect(Object.isFrozen(handler.mock.calls[0][0])).toBe(true);

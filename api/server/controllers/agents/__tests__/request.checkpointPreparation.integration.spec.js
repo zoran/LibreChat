@@ -1,5 +1,6 @@
 /** Real HTTP consumer, initializer, input owner, native admission, saver and SDK. */
 const { EventEmitter } = require('node:events');
+const { createHash, randomUUID } = require('node:crypto');
 const mongoose = require('mongoose');
 const { MongoMemoryReplSet } = require('mongodb-memory-server');
 const { BaseChatModel } = require('@langchain/core/language_models/chat_models');
@@ -17,6 +18,8 @@ const {
   InMemoryEventTransport,
   DurableMongoSaver,
   createPrivateTextIngress,
+  createManagedSourceResolver,
+  MANAGED_SOURCE_FILE_FIELDS,
 } = require('@librechat/api');
 const { Constants } = require('librechat-data-provider');
 
@@ -34,6 +37,12 @@ jest.mock('~/models', () => {
   const actual = jest.requireActual('~/models');
   return { ...actual, saveMessage: jest.fn((...args) => actual.saveMessage(...args)) };
 });
+// Replace only deployment bootstrap. All source reads and lifecycle decisions use real owners.
+jest.mock('~/server/services/Uploads', () => ({
+  ...jest.requireActual('~/server/services/Uploads'),
+  getManagedContextSources: (req) =>
+    jest.requireActual('@librechat/api').bindManagedContextSources(req, mockManagedResolver, true),
+}));
 
 const db = require('~/models');
 const { User, File, Message } = require('~/db/models');
@@ -56,6 +65,7 @@ let generationStarted;
 let generationDone;
 let requests;
 let gates;
+let mockManagedResolver;
 const previous = {
   UPLOAD_SECURITY_POLICY_SHA256: process.env.UPLOAD_SECURITY_POLICY_SHA256,
   CORTEX_UPLOAD_MANAGEMENT_ENABLED: process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED,
@@ -147,7 +157,11 @@ function response() {
 function request(overrides = {}) {
   const req = new EventEmitter();
   req.user = { id: owner.userId, tenantId: owner.tenantId, role: 'USER', name: 'Synthetic owner' };
-  req.headers = { 'x-librechat-generation-protocol': '2' };
+  req.method = 'POST';
+  req.headers = {
+    'x-librechat-generation-protocol': '2',
+    origin: 'https://consumer.fixture.invalid',
+  };
   req.get = (name) => req.headers[name.toLowerCase()];
   req.path = '/';
   req.body = {
@@ -208,10 +222,13 @@ beforeEach(async () => {
   db.saveMessage.mockClear();
   process.env.UPLOAD_SECURITY_POLICY_SHA256 = policy;
   process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = 'true';
-  await createUploadManagementRepository(mongoose, {
+  const uploads = createUploadManagementRepository(mongoose, {
     enabled: true,
     reconciled: true,
-  }).initialize();
+    securityPolicySha256: policy,
+    baseline: { originalBytes: 0, objectBytes: 0, textBytes: 0, recordBytes: 0, bundles: 0 },
+  });
+  await uploads.initialize();
   await User.create({
     _id: owner.userId,
     tenantId: owner.tenantId,
@@ -221,39 +238,147 @@ beforeEach(async () => {
     role: 'USER',
   });
   const now = Date.now();
-  // Explicit synthetic approved original; this fixture does not qualify a scanner or OCR runtime.
-  await File.collection.insertOne({
-    file_id: fileId,
-    uploadOperationId: fileId,
-    user: new mongoose.Types.ObjectId(owner.userId),
-    tenantId: owner.tenantId,
-    status: 'ready',
-    source: 's3',
-    type: 'text/plain',
-    bytes: 8,
-    filename: 'synthetic.txt',
-    text: 'The synthetic document says hello.',
-    llmDeliveryPath: 'text',
-    filepath: `/api/files/managed/${fileId}`,
-    storageKey: `t/${owner.tenantId}/managed-uploads/${owner.userId}/${fileId}.1__original`,
-    retentionAcceptedAt: new Date(now),
-    expiredAt: new Date(now + 600000),
-    retainedDerivativeBytes: 0,
-    securityApproval: {
+  const principal = { ...owner, authentication: 'verified-email' };
+  const worker = { hostId: 'consumer-fixture', instanceId: 'consumer-fixture' };
+  const bytes = Buffer.from('original');
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  // Real native upload lifecycle with an explicit synthetic scanner receipt, not OCR qualification.
+  await uploads.reserve(
+    principal,
+    {
+      operationId: fileId,
+      idempotencyKey: randomUUID(),
+      mediaType: 'text/plain',
+      declaredBytes: bytes.length,
+      fingerprint: JSON.stringify([{ kind: 'personal' }, 'text/plain', bytes.length]),
+    },
+    now,
+  );
+  const transfer = await uploads.claim({
+    kind: 'transfer',
+    principal,
+    operationId: fileId,
+    worker,
+    now,
+  });
+  const execution = {
+    version: 2,
+    custody: { kind: 'none' },
+    attemptId: `${fileId}.${transfer.generation}`,
+    instanceId: randomUUID(),
+    executionId: randomUUID(),
+    expiresAt: new Date(now + 60000).toISOString(),
+  };
+  await uploads.bindSecurityExecution(transfer, execution, now);
+  await uploads.settleSecurityExecution(
+    transfer,
+    {
+      execution,
+      writerStopped: true,
+      transientDataRemoved: true,
+    },
+    now,
+  );
+  await uploads.accept(
+    principal,
+    transfer,
+    {
+      outcome: 'durable',
+      bytes: bytes.length,
+      source: 's3',
+      filepath: `/api/files/managed/${fileId}`,
+      storageKey: `t/${owner.tenantId}/managed-uploads/${owner.userId}/${fileId}.${transfer.generation}__original`,
+      integrity: {
+        version: 1,
+        algorithm: 'sha256',
+        sha256,
+        chunkBytes: 262144,
+        chunkSha256: [sha256],
+      },
+    },
+    {
       version: 1,
       decision: 'approved',
       policySha256: policy,
       subject: {
         ...owner,
         operationId: fileId,
-        transferGeneration: 1,
+        transferGeneration: transfer.generation,
         mediaType: 'text/plain',
-        bytes: 8,
-        sha256: 'a'.repeat(64),
+        bytes: bytes.length,
+        sha256,
       },
       scannerVersion: 'explicit-synthetic/v1',
       checkedAt: new Date(now).toISOString(),
       coverage: { complete: true, pages: 1, parts: 1 },
+    },
+    { filename: 'synthetic.txt' },
+    now,
+  );
+  await uploads.confirmCleanup(
+    {
+      operationId: fileId,
+      generation: transfer.generation,
+      writerStopped: true,
+      localCopiesAbsent: true,
+      originalAbsent: false,
+      textAndHistoryRemoved: false,
+    },
+    now,
+  );
+  const processing = await uploads.claim({ kind: 'processing', worker, now });
+  await uploads.bindProcessingExecution(
+    processing,
+    {
+      attemptId: `${fileId}.${processing.generation}`,
+      instanceId: 'fixture-parser',
+      expiresAt: new Date(now + 60000).toISOString(),
+    },
+    now,
+  );
+  const text = 'The synthetic document says hello.';
+  await uploads.publish(
+    processing,
+    {
+      text,
+      writerStopped: true,
+      structure: {
+        version: 1,
+        source: { sha256, bytes: bytes.length, mediaType: 'text/plain' },
+        extractor: { name: 'explicit-synthetic', version: '1' },
+        pages: [],
+        elements: [
+          { id: 'e1', kind: 'paragraph', start: 0, end: text.length, page: null, parentId: null },
+        ],
+        quality: { status: 'complete', warnings: [] },
+      },
+    },
+    now,
+  );
+  mockManagedResolver = createManagedSourceResolver({
+    allowedOrigins: ['https://consumer.fixture.invalid'],
+    principal: async () => principal,
+    operation: (user, id) => uploads.get(user, id, Date.now()),
+    file: async (user, id, includeText) =>
+      (
+        await db.getFiles(
+          {
+            tenantId: user.tenantId,
+            user: user.userId,
+            file_id: id,
+            uploadOperationId: id,
+          },
+          null,
+          `${MANAGED_SOURCE_FILE_FIELDS}${includeText ? ' text +documentStructure +securityApproval' : ''}`,
+          1,
+        )
+      )[0] ?? null,
+    original: (user, id) => uploads.cleanupForFile(user, id),
+    policySha256: () => policy,
+    storage: {
+      read: () => {
+        throw new Error('Original download is not normal text context');
+      },
     },
   });
   methods = createGenerationAdmissionMethods(mongoose);
@@ -402,6 +527,8 @@ it.each(['plain', 'private', 'history-quotes'])(
       }
       const res = response();
       const title = jest.fn();
+      const sourceRead = jest.spyOn(mockManagedResolver, 'resolve');
+      const sourceRevalidation = jest.spyOn(mockManagedResolver, 'revalidate');
       const errors = jest.spyOn(logger, 'error');
       const captureEntered = deferred();
       const captureRelease = deferred();
@@ -485,6 +612,8 @@ it.each(['plain', 'private', 'history-quotes'])(
       expect(title).not.toHaveBeenCalled();
       expect(prepareSpy).toHaveBeenCalledTimes(1);
       expect(captureSpy).toHaveBeenCalledTimes(1);
+      expect(sourceRead).toHaveBeenCalledTimes(mode === 'plain' ? 1 : 0);
+      expect(sourceRevalidation).toHaveBeenCalledTimes(mode === 'plain' ? 1 : 0);
       expect(await Message.countDocuments({ user: owner.userId, isCreatedByUser: true })).toBe(1);
       if (mode === 'private') {
         const saved = await Message.findOne({ isCreatedByUser: true })
@@ -515,6 +644,27 @@ it.each(['plain', 'private', 'history-quotes'])(
       expect(modelCalls).toBe(1);
     }),
 );
+
+it('rejects a source revoked during preparation before capture, checkpoint or model', async () =>
+  tenantStorage.run({ tenantId: owner.tenantId }, async () => {
+    const revalidate = mockManagedResolver.revalidate;
+    const sourceRevalidation = jest
+      .spyOn(mockManagedResolver, 'revalidate')
+      .mockImplementation(async (...args) => {
+        await File.updateOne({ file_id: fileId }, { $set: { deletionRequestedAt: new Date() } });
+        return revalidate(...args);
+      });
+    const capture = jest.spyOn(db, 'captureCheckpointSources');
+    const res = response();
+    await submit(request(), res);
+    expect(res.statusCode).toBeGreaterThanOrEqual(400);
+    expect(sourceRevalidation).toHaveBeenCalledTimes(1);
+    expect(capture).not.toHaveBeenCalled();
+    expect(GenerationJobManager.beginProviderExecution).not.toHaveBeenCalled();
+    expect(await mongoose.connection.db.collection(names[0]).countDocuments()).toBe(0);
+    expect(await Message.countDocuments()).toBe(0);
+    expect(modelCalls).toBe(0);
+  }));
 
 it.each(['begin', 'capture', 'complete'])(
   'holds lost %s acknowledgment through cleanup, grace retry and process replacement',

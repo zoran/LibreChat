@@ -18,7 +18,8 @@ const scope = () => ({
   worker: { hostId: 'intake-host', instanceId: 'intake-pod' },
 });
 const execution = () => ({
-  version: 1 as const,
+  version: 2 as const,
+  custody: { kind: 'none' as const },
   attemptId: `${operationId}.7`,
   instanceId: '22222222-2222-4222-8222-222222222222',
   executionId: '33333333-3333-4333-8333-333333333333',
@@ -159,7 +160,9 @@ describe('private intake recovery contract', () => {
     input.securitySettlement!.execution.attemptId = 'changed.1';
     input.securitySettlement!.writerStopped = false;
     expect(result).toEqual(recovery());
-    result.securitySettlement!.execution.executionId = '55555555-5555-4555-8555-555555555555';
+    expect(() => {
+      result.securitySettlement!.execution.executionId = '55555555-5555-4555-8555-555555555555';
+    }).toThrow(TypeError);
     expect(result.securityExecution).toEqual(execution());
     expect(input.securitySettlement!.execution.executionId).toBe(execution().executionId);
     const localInput = local();

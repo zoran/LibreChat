@@ -1,9 +1,4 @@
-const {
-  isUploadPrincipal,
-  isUploadOriginalIntegrity,
-  readManagedDocumentResult,
-  matchesUploadSecurityApproval,
-} = require('librechat-data-provider');
+const { managedSourceExpiry, MANAGED_SOURCE_FILE_FIELDS } = require('@librechat/api');
 const { once } = require('node:events');
 const { performance } = require('node:perf_hooks');
 const {
@@ -13,10 +8,8 @@ const {
 const { runAsSystem } = require('@librechat/data-schemas');
 const { getContentDisposition } = require('~/server/utils/files');
 
-const MAX_BYTES = 30 * 1024 * 1024;
 const MAX_CHUNK = 64 * 1024;
-const FILE_FIELDS =
-  'file_id uploadOperationId tenantId user filename type source bytes embedded llmDeliveryPath status expiredAt retentionAcceptedAt deletionRequestedAt deletionCompletedAt storageKey';
+const FILE_FIELDS = MANAGED_SOURCE_FILE_FIELDS;
 const unavailable = (code = 'not_found') => Object.assign(new Error(code), { code });
 const runtime = () => require('~/server/services/Uploads').getUploadRuntime();
 
@@ -71,156 +64,14 @@ function createManagedFileHandlers(options = {}) {
   if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 120_000)
     throw new Error('Invalid managed download deadline');
 
-  async function principal(req, owner, expected) {
-    if (!owner || !Array.isArray(owner.allowedOrigins) || !owner.allowedOrigins.length)
-      throw unavailable();
-    const origin = req.headers.origin;
-    // Same GET rule as the upload HTTP adapter; normal same-origin fetch omits Origin.
-    if (
-      origin
-        ? !owner.allowedOrigins.includes(origin)
-        : req.method !== 'GET' || req.headers['sec-fetch-site'] !== 'same-origin'
-    ) {
-      throw unavailable('forbidden');
-    }
-    const result = await owner.principal(req);
-    if (
-      !isUploadPrincipal(result) ||
-      (expected &&
-        (result.authentication !== expected.authentication ||
-          result.tenantId !== expected.tenantId ||
-          result.userId !== expected.userId))
-    ) {
-      throw unavailable('unauthorized');
-    }
-    return result;
-  }
-
-  function eligible(operation, id) {
-    const expiry = Date.parse(operation?.expiresAt);
-    if (
-      operation?.id !== id ||
-      operation.fileId !== id ||
-      operation.scope?.kind !== 'personal' ||
-      operation.state !== 'ready' ||
-      operation.canUseInComposer !== true ||
-      !Number.isFinite(expiry) ||
-      expiry <= now()
-    )
-      throw unavailable();
-    return expiry;
-  }
-
-  async function lookup(req, id, { text = false, original = false } = {}) {
-    if (typeof id !== 'string' || !/^[A-Za-z0-9-]{1,128}$/.test(id)) throw unavailable();
-    const owner = getRuntime();
-    const user = await principal(req, owner);
-    const operation = await owner.management.get(user, id);
-    const operationExpiry = eligible(operation, id);
-    const [file] =
-      (await system(() =>
-        getFiles(
-          {
-            tenantId: user.tenantId,
-            user: user.userId,
-            file_id: id,
-            uploadOperationId: id,
-          },
-          null,
-          `${FILE_FIELDS}${text ? ' text textFormat +documentStructure +securityApproval' : ''}`,
-          1,
-        ),
-      )) ?? [];
-    const fileExpiry = new Date(file?.expiredAt).getTime();
-    if (
-      !file ||
-      file.file_id !== id ||
-      file.uploadOperationId !== id ||
-      file.user?.toString() !== user.userId ||
-      file.tenantId !== user.tenantId ||
-      file.status !== 'ready' ||
-      file.embedded !== true ||
-      !file.retentionAcceptedAt ||
-      file.deletionRequestedAt ||
-      file.deletionCompletedAt ||
-      !Number.isFinite(fileExpiry) ||
-      fileExpiry <= now() ||
-      !Number.isSafeInteger(file.bytes) ||
-      file.bytes < 1 ||
-      file.bytes > MAX_BYTES
-    ) {
-      throw unavailable();
-    }
-    // These private fields are deliberately selected only for an authorized preview. A present
-    // malformed representation must never downgrade to a legacy text-only success.
-    let document;
-    if (text && Object.prototype.hasOwnProperty.call(file, 'documentStructure')) {
-      document = readManagedDocumentResult({ text: file.text, structure: file.documentStructure });
-      if (!document) throw unavailable();
-    }
-    let receipt;
-    if (original || document) {
-      const task = await system(() => owner.repository.cleanupForFile(user, id));
-      receipt = task?.original;
-      if (
-        task?.operationId !== id ||
-        task.fileId !== id ||
-        task.state !== 'ready' ||
-        task.principal?.tenantId !== user.tenantId ||
-        task.principal?.userId !== user.userId ||
-        receipt?.outcome !== 'durable' ||
-        receipt.source !== 's3' ||
-        !receipt.storageKey ||
-        receipt.storageKey !== file.storageKey ||
-        receipt.bytes !== file.bytes ||
-        operation.actualBytes !== file.bytes
-      )
-        throw unavailable();
-      if (document) {
-        const source = document.structure.source;
-        if (
-          !isUploadOriginalIntegrity(receipt.integrity, receipt.bytes) ||
-          source.sha256 !== receipt.integrity.sha256 ||
-          source.bytes !== file.bytes ||
-          source.mediaType !== file.type ||
-          !matchesUploadSecurityApproval(
-            file.securityApproval,
-            {
-              tenantId: user.tenantId,
-              userId: user.userId,
-              operationId: id,
-              transferGeneration: task.attemptGeneration,
-              mediaType: file.type,
-              bytes: file.bytes,
-              sha256: source.sha256,
-            },
-            process.env.UPLOAD_SECURITY_POLICY_SHA256,
-            now(),
-          )
-        )
-          throw unavailable();
-      }
-    }
-    return {
-      owner,
-      user,
-      operation,
-      file,
-      receipt,
-      document,
-      expiresAt: Math.min(operationExpiry, fileExpiry),
-    };
-  }
-
-  async function revalidate(req, access) {
-    const user = await principal(req, access.owner, access.user);
-    // get() includes the existing exact-owner File lifecycle availability query.
-    const operation = await access.owner.management.get(user, access.file.file_id);
-    const expiry = eligible(operation, access.file.file_id);
-    if (operation.actualBytes !== access.operation.actualBytes) throw unavailable();
-    access.expiresAt = Math.min(access.expiresAt, expiry);
-    if (access.expiresAt <= now()) throw unavailable();
-  }
+  const sources = (owner) => {
+    if (!owner?.sources) throw unavailable();
+    return owner.sources;
+  };
+  const principal = (req, owner, expected) => sources(owner).authorize(req, expected);
+  const eligible = (operation, id) => managedSourceExpiry(operation, id, now());
+  const lookup = (req, id, input) => sources(getRuntime()).resolve(req, id, input);
+  const revalidate = (req, access) => sources(getRuntime()).revalidate(req, access);
 
   async function download(req, res) {
     const controller = new AbortController();
@@ -254,7 +105,7 @@ function createManagedFileHandlers(options = {}) {
       res.setHeader('Content-Length', access.file.bytes);
       let bytes = 0;
       let recheckAt = -Infinity;
-      for await (const value of access.owner.storage.read({
+      for await (const value of access.storage.read({
         original: access.receipt,
         signal: controller.signal,
       })) {

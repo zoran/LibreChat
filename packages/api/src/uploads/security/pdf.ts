@@ -63,7 +63,7 @@ function fail(reason: Reason): never {
  */
 export async function inspectPdfSecurity(
   input: PdfSecurityInput,
-): Promise<Exclude<SecurityInspectionResult, { decision: 'clear' }>> {
+): Promise<SecurityInspectionResult> {
   let loading: PDFDocumentLoadingTask | undefined;
   let rendering: RenderTask | undefined;
   let parserBytes: Uint8Array | undefined;
@@ -358,7 +358,5 @@ export async function inspectPdfSecurity(
     clearTimeout(timer);
     input.signal?.removeEventListener('abort', abort);
   }
-  return result.decision === 'clear'
-    ? { decision: 'uninspectable', reason: 'incomplete_coverage' }
-    : result;
+  return result;
 }
