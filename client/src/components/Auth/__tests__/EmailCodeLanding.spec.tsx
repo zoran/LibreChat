@@ -153,7 +153,11 @@ it('offers recovery without redeeming an absent link even when startup configura
   mockStartup.data = undefined;
   mockStartup.error = new Error('configuration unavailable');
   render(view());
-  expect(landingAlert()).toHaveTextContent('com_auth_email_link_invalid');
+  expect(
+    within(screen.getByRole('main')).getByText('com_auth_email_link_invalid', {
+      selector: '[role="alert"]',
+    }),
+  ).toBeVisible();
   expect(recoveryLink()).toHaveAttribute('href', '/login');
   expect(mockRequest).not.toHaveBeenCalled();
   expect(mockAuth.completeAuthentication).not.toHaveBeenCalled();

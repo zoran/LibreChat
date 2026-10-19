@@ -89,6 +89,42 @@ describe('bounded approved SMTP submission', () => {
     jest.useRealTimers();
   });
 
+  it('shares the exact-mailbox policy and rejects new sends after its absolute expiry', async () => {
+    const until = Math.floor(Date.now() / 1000) + 120;
+    const email = 'qualification@outside.example.test';
+    const settings = getEmailCodeMailConfig(
+      environment({
+        EMAIL_CODE_QUALIFICATION_MAILBOX: email,
+        EMAIL_CODE_QUALIFICATION_NOT_AFTER: String(until),
+      }),
+      config.allowedDomains,
+    )!;
+    const f = fixture(settings);
+    await expect(
+      f.sender.sendCode({ ...input, email: 'neighbor@outside.example.test' }),
+    ).rejects.toThrow();
+    const pending = f.sender.sendCode({ ...input, email });
+    f.sockets[0].emit('connect');
+    f.callbacks[0](null, { accepted: [email], response: '250 queued' });
+    await pending;
+    jest.setSystemTime(until * 1000);
+    await expect(f.sender.sendCode({ ...input, email })).rejects.toThrow();
+    expect(f.options).toHaveLength(1);
+  });
+
+  it('destroys a pending qualification socket at expiry without replaying late acceptance', async () => {
+    const until = Math.floor(Date.now() / 1000) * 1000 + 2000;
+    const email = 'qualification@outside.example.test';
+    const f = fixture({ ...config, qualification: { email, notAfter: until } });
+    const pending = f.sender.sendCode({ ...input, email });
+    const failure = pending.catch((error) => error);
+    jest.advanceTimersByTime(2000);
+    expect(await failure).toMatchObject({ code: 'EMAIL_CODE_UNAVAILABLE' });
+    expect(f.sockets.every((socket) => socket.destroyed)).toBe(true);
+    f.callbacks[0](null, { accepted: [email], response: '250 queued' });
+    expect(f.options).toHaveLength(1);
+  });
+
   it('copies a bounded PNG into an inline CID attachment with all external access disabled', async () => {
     const png = Buffer.from(
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aOBsAAAAASUVORK5CYII=',

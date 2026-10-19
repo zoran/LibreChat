@@ -2,6 +2,7 @@
 import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import {
+  readUploadOcrDispatchObservation,
   UPLOAD_ERROR_CODES,
   UPLOAD_MAX_FILE_BYTES,
   isUploadPrincipal,
@@ -227,7 +228,10 @@ export function createRemoteIntakeBodyHandler(
       options.channel.control({
         operationId,
         capability,
-        command,
+        command: {
+          ...(command as Record<string, unknown>),
+          dispatch: readUploadOcrDispatchObservation(options.security.dispatchObservation?.()),
+        },
         signal: signal ?? (cleanup ? AbortSignal.timeout(5000) : controller.signal),
       });
     const readLease = (value: unknown): UploadLease => {

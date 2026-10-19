@@ -1,0 +1,1212 @@
+{
+  "version": 1,
+  "generatedAt": 1792411344.229926,
+  "selectedObserverId": "cpu2",
+  "sources": [
+    {
+      "id": "inventory",
+      "kind": "inventory",
+      "observerId": "inventory-v1",
+      "capturedAt": 1792411344.229926
+    },
+    {
+      "id": "runtime",
+      "kind": "runtime",
+      "observerId": "placement-v1",
+      "capturedAt": 1792411344.229926
+    },
+    {
+      "id": "cpu2",
+      "kind": "prometheus",
+      "observerId": "cpu2",
+      "capturedAt": 1792411344.229926
+    },
+    {
+      "id": "cpu3",
+      "kind": "prometheus",
+      "observerId": "cpu3",
+      "capturedAt": 1792411344.229926
+    },
+    {
+      "id": "acceptance",
+      "kind": "acceptance",
+      "observerId": "acceptance-v1",
+      "capturedAt": 1792411344.229926
+    },
+    {
+      "id": "profile-config",
+      "kind": "inventory",
+      "observerId": "profile-config-source",
+      "capturedAt": 1792411324.229926
+    },
+    {
+      "id": "profile-decision",
+      "kind": "decision",
+      "observerId": "profile-source-review",
+      "capturedAt": 1792411324.229926
+    },
+    {
+      "id": "rag-decision",
+      "kind": "decision",
+      "observerId": "rag-design-source",
+      "capturedAt": 1792411324.229926
+    }
+  ],
+  "nodes": [
+    {
+      "id": "physical:host:gpu-a",
+      "identity": {
+        "scope": "physical",
+        "kind": "host",
+        "key": "gpu-a"
+      },
+      "label": "GPU-Server A",
+      "layer": "hardware",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ]
+    },
+    {
+      "id": "physical:host:gpu-b",
+      "identity": {
+        "scope": "physical",
+        "kind": "host",
+        "key": "gpu-b"
+      },
+      "label": "GPU-Server B",
+      "layer": "hardware",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ]
+    },
+    {
+      "id": "physical:gpu:GPU-00000000-0000-0000-0000-000000000001",
+      "identity": {
+        "scope": "physical",
+        "kind": "gpu",
+        "key": "GPU-00000000-0000-0000-0000-000000000001"
+      },
+      "label": "GPU 1",
+      "layer": "hardware",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ]
+    },
+    {
+      "id": "physical:gpu:GPU-00000000-0000-0000-0000-000000000002",
+      "identity": {
+        "scope": "physical",
+        "kind": "gpu",
+        "key": "GPU-00000000-0000-0000-0000-000000000002"
+      },
+      "label": "GPU 2",
+      "layer": "hardware",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ]
+    },
+    {
+      "id": "physical:gpu:GPU-00000000-0000-0000-0000-000000000003",
+      "identity": {
+        "scope": "physical",
+        "kind": "gpu",
+        "key": "GPU-00000000-0000-0000-0000-000000000003"
+      },
+      "label": "GPU 3",
+      "layer": "hardware",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ]
+    },
+    {
+      "id": "logical:service:cortex",
+      "identity": {
+        "scope": "logical",
+        "kind": "service",
+        "key": "cortex"
+      },
+      "label": "Cortex",
+      "layer": "application",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ]
+    },
+    {
+      "id": "logical:service:deepseek",
+      "identity": {
+        "scope": "logical",
+        "kind": "service",
+        "key": "deepseek"
+      },
+      "label": "DeepSeek 1017",
+      "layer": "inference",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ]
+    },
+    {
+      "id": "logical:service:ocr",
+      "identity": {
+        "scope": "logical",
+        "kind": "service",
+        "key": "ocr"
+      },
+      "label": "OCR 2",
+      "layer": "documents",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ]
+    },
+    {
+      "id": "logical:service:embedder",
+      "identity": {
+        "scope": "logical",
+        "kind": "service",
+        "key": "embedder"
+      },
+      "label": "Gemma Embedder 2",
+      "layer": "inference",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ]
+    },
+    {
+      "id": "logical:service:reranker",
+      "identity": {
+        "scope": "logical",
+        "kind": "service",
+        "key": "reranker"
+      },
+      "label": "Reranker",
+      "layer": "inference",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ]
+    },
+    {
+      "id": "runtime:pod:app-1",
+      "identity": {
+        "scope": "runtime",
+        "kind": "pod",
+        "key": "app-1"
+      },
+      "label": "Cortex Instanz",
+      "layer": "application",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ]
+    },
+    {
+      "id": "runtime:pod:ds-a",
+      "identity": {
+        "scope": "runtime",
+        "kind": "pod",
+        "key": "ds-a"
+      },
+      "label": "DeepSeek A",
+      "layer": "inference",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ]
+    },
+    {
+      "id": "runtime:pod:ds-b",
+      "identity": {
+        "scope": "runtime",
+        "kind": "pod",
+        "key": "ds-b"
+      },
+      "label": "DeepSeek B",
+      "layer": "inference",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ]
+    },
+    {
+      "id": "runtime:pod:ocr-1",
+      "identity": {
+        "scope": "runtime",
+        "kind": "pod",
+        "key": "ocr-1"
+      },
+      "label": "OCR Instanz",
+      "layer": "inference",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ]
+    },
+    {
+      "id": "runtime:pod:embedder-1",
+      "identity": {
+        "scope": "runtime",
+        "kind": "pod",
+        "key": "embedder-1"
+      },
+      "label": "Embedder Instanz",
+      "layer": "inference",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ]
+    },
+    {
+      "id": "runtime:pod:reranker-1",
+      "identity": {
+        "scope": "runtime",
+        "kind": "pod",
+        "key": "reranker-1"
+      },
+      "label": "Reranker Instanz",
+      "layer": "inference",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ]
+    }
+  ],
+  "edges": [
+    {
+      "id": "edge-1",
+      "from": "physical:host:gpu-a",
+      "to": "physical:gpu:GPU-00000000-0000-0000-0000-000000000001",
+      "kind": "contains",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "physical_containment"
+    },
+    {
+      "id": "edge-2",
+      "from": "physical:host:gpu-b",
+      "to": "physical:gpu:GPU-00000000-0000-0000-0000-000000000002",
+      "kind": "contains",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "physical_containment"
+    },
+    {
+      "id": "edge-3",
+      "from": "physical:host:gpu-b",
+      "to": "physical:gpu:GPU-00000000-0000-0000-0000-000000000003",
+      "kind": "contains",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "physical_containment"
+    },
+    {
+      "id": "edge-4",
+      "from": "runtime:pod:app-1",
+      "to": "logical:service:cortex",
+      "kind": "deployment",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "workload_binding"
+    },
+    {
+      "id": "edge-5",
+      "from": "runtime:pod:app-1",
+      "to": "physical:host:gpu-a",
+      "kind": "deployment",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "runtime_placement"
+    },
+    {
+      "id": "edge-6",
+      "from": "runtime:pod:ds-a",
+      "to": "logical:service:deepseek",
+      "kind": "deployment",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "workload_binding"
+    },
+    {
+      "id": "edge-7",
+      "from": "runtime:pod:ds-a",
+      "to": "physical:host:gpu-a",
+      "kind": "deployment",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "runtime_placement"
+    },
+    {
+      "id": "edge-8",
+      "from": "runtime:pod:ds-b",
+      "to": "logical:service:deepseek",
+      "kind": "deployment",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "workload_binding"
+    },
+    {
+      "id": "edge-9",
+      "from": "runtime:pod:ds-b",
+      "to": "physical:host:gpu-b",
+      "kind": "deployment",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "runtime_placement"
+    },
+    {
+      "id": "edge-10",
+      "from": "runtime:pod:ocr-1",
+      "to": "logical:service:ocr",
+      "kind": "deployment",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "workload_binding"
+    },
+    {
+      "id": "edge-11",
+      "from": "runtime:pod:ocr-1",
+      "to": "physical:host:gpu-b",
+      "kind": "deployment",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "runtime_placement"
+    },
+    {
+      "id": "edge-12",
+      "from": "runtime:pod:embedder-1",
+      "to": "logical:service:embedder",
+      "kind": "deployment",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "workload_binding"
+    },
+    {
+      "id": "edge-13",
+      "from": "runtime:pod:embedder-1",
+      "to": "physical:host:gpu-b",
+      "kind": "deployment",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "runtime_placement"
+    },
+    {
+      "id": "edge-14",
+      "from": "runtime:pod:reranker-1",
+      "to": "logical:service:reranker",
+      "kind": "deployment",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "workload_binding"
+    },
+    {
+      "id": "edge-15",
+      "from": "runtime:pod:reranker-1",
+      "to": "physical:host:gpu-b",
+      "kind": "deployment",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "runtime_placement"
+    },
+    {
+      "id": "edge-16",
+      "from": "runtime:pod:ds-a",
+      "to": "physical:gpu:GPU-00000000-0000-0000-0000-000000000001",
+      "kind": "allocation",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "gpu_allocation"
+    },
+    {
+      "id": "edge-17",
+      "from": "runtime:pod:ds-b",
+      "to": "physical:gpu:GPU-00000000-0000-0000-0000-000000000002",
+      "kind": "allocation",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "gpu_allocation"
+    },
+    {
+      "id": "edge-18",
+      "from": "runtime:pod:ds-b",
+      "to": "physical:gpu:GPU-00000000-0000-0000-0000-000000000003",
+      "kind": "allocation",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "gpu_allocation"
+    },
+    {
+      "id": "edge-19",
+      "from": "runtime:pod:ocr-1",
+      "to": "physical:gpu:GPU-00000000-0000-0000-0000-000000000002",
+      "kind": "allocation",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "gpu_allocation"
+    },
+    {
+      "id": "edge-20",
+      "from": "runtime:pod:embedder-1",
+      "to": "physical:gpu:GPU-00000000-0000-0000-0000-000000000002",
+      "kind": "allocation",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "gpu_allocation"
+    },
+    {
+      "id": "edge-21",
+      "from": "runtime:pod:reranker-1",
+      "to": "physical:gpu:GPU-00000000-0000-0000-0000-000000000002",
+      "kind": "allocation",
+      "basis": "observed",
+      "state": "healthy",
+      "reason": "observed",
+      "evidence": [
+        {
+          "sourceId": "runtime",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 90
+        }
+      ],
+      "purpose": "gpu_allocation"
+    },
+    {
+      "id": "edge-22",
+      "from": "logical:service:cortex",
+      "to": "logical:service:deepseek",
+      "kind": "request",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 86400
+        }
+      ],
+      "purpose": "model_request"
+    },
+    {
+      "id": "edge-23",
+      "from": "logical:service:cortex",
+      "to": "logical:service:ocr",
+      "kind": "request",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 86400
+        }
+      ],
+      "purpose": "document_extraction"
+    },
+    {
+      "id": "edge-24",
+      "from": "logical:service:cortex",
+      "to": "logical:service:embedder",
+      "kind": "dependency",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411334.229926,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          },
+          "maxAgeSeconds": 86400
+        }
+      ],
+      "purpose": "embedding"
+    }
+  ],
+  "measurements": [
+    {
+      "id": "measurement-1",
+      "target": {
+        "kind": "node",
+        "id": "physical:host:gpu-a"
+      },
+      "key": "cpu.utilization",
+      "unit": "ratio",
+      "scope": {
+        "kind": "cpu",
+        "cpuId": "0"
+      },
+      "state": "fresh",
+      "reason": "observed",
+      "value": 0.25,
+      "selectedSourceId": "cpu2",
+      "samples": [
+        {
+          "sourceId": "cpu2",
+          "observedAt": 1792411334.229926,
+          "value": 0.25,
+          "windowSeconds": 120,
+          "sampleCount": 4,
+          "resetCount": 0,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "measurement-2",
+      "target": {
+        "kind": "node",
+        "id": "physical:host:gpu-a"
+      },
+      "key": "memory.available",
+      "unit": "bytes",
+      "scope": {
+        "kind": "host"
+      },
+      "state": "fresh",
+      "reason": "observed",
+      "value": 64000000000,
+      "selectedSourceId": "cpu2",
+      "samples": [
+        {
+          "sourceId": "cpu2",
+          "observedAt": 1792411334.229926,
+          "value": 64000000000,
+          "windowSeconds": 0,
+          "sampleCount": 1,
+          "resetCount": 0,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "measurement-3",
+      "target": {
+        "kind": "node",
+        "id": "physical:host:gpu-a"
+      },
+      "key": "network.rx",
+      "unit": "bytes_per_second",
+      "scope": {
+        "kind": "interface",
+        "interfaceId": "eno1"
+      },
+      "state": "fresh",
+      "reason": "observed",
+      "value": 0,
+      "selectedSourceId": "cpu2",
+      "samples": [
+        {
+          "sourceId": "cpu2",
+          "observedAt": 1792411334.229926,
+          "value": 0,
+          "windowSeconds": 120,
+          "sampleCount": 4,
+          "resetCount": 0,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "measurement-4",
+      "target": {
+        "kind": "node",
+        "id": "physical:gpu:GPU-00000000-0000-0000-0000-000000000001"
+      },
+      "key": "gpu.utilization",
+      "unit": "ratio",
+      "scope": {
+        "kind": "gpu"
+      },
+      "state": "fresh",
+      "reason": "observed",
+      "value": 0.3,
+      "selectedSourceId": "cpu2",
+      "samples": [
+        {
+          "sourceId": "cpu2",
+          "observedAt": 1792411334.229926,
+          "value": 0.3,
+          "windowSeconds": 0,
+          "sampleCount": 1,
+          "resetCount": 0,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "measurement-5",
+      "target": {
+        "kind": "node",
+        "id": "physical:gpu:GPU-00000000-0000-0000-0000-000000000002"
+      },
+      "key": "gpu.utilization",
+      "unit": "ratio",
+      "scope": {
+        "kind": "gpu"
+      },
+      "state": "fresh",
+      "reason": "observed",
+      "value": 0.3,
+      "selectedSourceId": "cpu2",
+      "samples": [
+        {
+          "sourceId": "cpu2",
+          "observedAt": 1792411334.229926,
+          "value": 0.3,
+          "windowSeconds": 0,
+          "sampleCount": 1,
+          "resetCount": 0,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "measurement-6",
+      "target": {
+        "kind": "node",
+        "id": "physical:gpu:GPU-00000000-0000-0000-0000-000000000003"
+      },
+      "key": "gpu.utilization",
+      "unit": "ratio",
+      "scope": {
+        "kind": "gpu"
+      },
+      "state": "fresh",
+      "reason": "observed",
+      "value": 0.3,
+      "selectedSourceId": "cpu2",
+      "samples": [
+        {
+          "sourceId": "cpu2",
+          "observedAt": 1792411334.229926,
+          "value": 0.3,
+          "windowSeconds": 0,
+          "sampleCount": 1,
+          "resetCount": 0,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "measurement-7",
+      "target": {
+        "kind": "node",
+        "id": "runtime:pod:app-1"
+      },
+      "key": "http.request_rate",
+      "unit": "requests_per_second",
+      "scope": {
+        "kind": "http",
+        "method": "POST",
+        "routeKey": "ask",
+        "statusCode": 200,
+        "instanceId": "app-1"
+      },
+      "state": "fresh",
+      "reason": "observed",
+      "value": 2.5,
+      "selectedSourceId": "cpu2",
+      "samples": [
+        {
+          "sourceId": "cpu2",
+          "observedAt": 1792411334.229926,
+          "value": 2.5,
+          "windowSeconds": 120,
+          "sampleCount": 4,
+          "resetCount": 0,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "measurement-8",
+      "target": {
+        "kind": "node",
+        "id": "runtime:pod:embedder-1"
+      },
+      "key": "http.request_rate",
+      "unit": "requests_per_second",
+      "scope": {
+        "kind": "http",
+        "method": "POST",
+        "routeKey": "embeddings",
+        "statusCode": 200,
+        "instanceId": "embedder-1"
+      },
+      "state": "unknown",
+      "reason": "not_measured",
+      "value": null,
+      "selectedSourceId": null,
+      "samples": []
+    }
+  ],
+  "parameters": [
+    {
+      "nodeId": "logical:service:deepseek",
+      "key": "inference.context_tokens",
+      "label": "Kontextfenster",
+      "unit": "tokens",
+      "stage": "configured",
+      "state": "known",
+      "value": 393216,
+      "evidence": [
+        {
+          "sourceId": "profile-config",
+          "observedAt": 1792411324.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ],
+      "reason": {
+        "state": "known",
+        "text": "Erster DS1017-Kontrollfall: Einzelanfrage und Eager-Ausführung; Auswahl ist keine gemessene optimale Betriebseinstellung.",
+        "evidenceIds": ["context-main-chat-ds1017"]
+      }
+    },
+    {
+      "nodeId": "logical:service:ocr",
+      "key": "inference.context_tokens",
+      "label": "Kontextfenster",
+      "unit": "tokens",
+      "stage": "proposed",
+      "state": "known",
+      "value": 8192,
+      "evidence": [],
+      "reason": {
+        "state": "known",
+        "text": "Reproduzierbarer OCR2-Vergleich; der gepinnte N-Gram-Processor benötigt den vLLM-V1-Runner. Qualitäts- und Kapazitätsabnahme bleibt offen.",
+        "evidenceIds": ["context-ocr2-candidate"]
+      }
+    },
+    {
+      "nodeId": "runtime:pod:ds-a",
+      "key": "inference.context_tokens",
+      "label": "Kontextfenster",
+      "unit": "tokens",
+      "stage": "effective",
+      "state": "unknown",
+      "value": null,
+      "evidence": [],
+      "reason": {
+        "state": "unknown",
+        "text": null,
+        "evidenceIds": []
+      }
+    },
+    {
+      "nodeId": "logical:service:deepseek",
+      "key": "inference.weight_quantization",
+      "label": "Gewichtsquantisierung",
+      "unit": "none",
+      "stage": "configured",
+      "state": "unknown",
+      "value": null,
+      "evidence": [],
+      "reason": {
+        "state": "unknown",
+        "text": null,
+        "evidenceIds": []
+      }
+    },
+    {
+      "nodeId": "logical:service:embedder",
+      "key": "embedding.dimension",
+      "label": "Embeddingdimension",
+      "unit": "count",
+      "stage": "proposed",
+      "state": "known",
+      "value": 768,
+      "evidence": [],
+      "reason": {
+        "state": "known",
+        "text": "Veröffentlichte volle Embeddingdimension; reduzierte MRL-Dimensionen benötigen einen getrennt gebundenen Indexvertrag.",
+        "evidenceIds": ["embedding-dimension-decision"]
+      }
+    }
+  ],
+  "parameterEvidence": [
+    {
+      "id": "context-main-chat-ds1017",
+      "kind": "decision",
+      "sourceId": "profile-decision",
+      "nodeId": "logical:service:deepseek",
+      "parameterKey": "inference.context_tokens",
+      "sha256": "77151447560660c706d907024bafe153483f7bab981ed881c7195cc5148b48d7",
+      "recordedAt": 1792411324.229926,
+      "timeBasis": "source_capture",
+      "summary": "Reproduzierbare Vergleichsprofile; keine finale Produktions- oder Laufzeitabnahme."
+    },
+    {
+      "id": "context-ocr2-candidate",
+      "kind": "decision",
+      "sourceId": "profile-decision",
+      "nodeId": "logical:service:ocr",
+      "parameterKey": "inference.context_tokens",
+      "sha256": "77151447560660c706d907024bafe153483f7bab981ed881c7195cc5148b48d7",
+      "recordedAt": 1792411324.229926,
+      "timeBasis": "source_capture",
+      "summary": "Reproduzierbare Vergleichsprofile; keine finale Produktions- oder Laufzeitabnahme."
+    },
+    {
+      "id": "embedding-dimension-decision",
+      "kind": "decision",
+      "sourceId": "rag-decision",
+      "nodeId": "logical:service:embedder",
+      "parameterKey": "embedding.dimension",
+      "sha256": "dd278d2c82af1ab5833e3fd4e72b78c74d8f504f718cb79c28bdde9eb2fc46de",
+      "recordedAt": 1792411324.229926,
+      "timeBasis": "source_capture",
+      "summary": "Architekturentscheidung mit ausdrücklich experimentellen Retrieval- und Chunkbudgets."
+    }
+  ]
+}

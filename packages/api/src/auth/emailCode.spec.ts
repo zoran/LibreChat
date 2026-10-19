@@ -6,14 +6,9 @@ jest.mock('librechat-data-provider', () => ({
   ...jest.requireActual('librechat-data-provider'),
   ...jest.requireActual('../../../data-provider/src/upload-intake'),
 }));
-import express from 'express';
 import jwt from 'jsonwebtoken';
 import request from 'supertest';
-import type {
-  EmailCodeChallenge,
-  EmailCodeIdentity,
-  EmailCodeRepository,
-} from '@librechat/data-schemas';
+import type { EmailCodeIdentity } from '@librechat/data-schemas';
 import {
   EMAIL_CODE_IDLE_MS,
   EMAIL_CODE_ABSOLUTE_MS,
@@ -27,141 +22,19 @@ import {
   setAuthSelection,
 } from './authMode';
 import {
-  createEmailCodeAuth,
   validateEmailCodeBearer,
   validateEmailCodeRefresh,
   createEmailCodeUploadGrant,
   validateEmailCodeUploadGrant,
 } from './emailCode';
 
-const parseCookies: (value: string) => Record<string, string> = jest.requireActual('cookie').parse;
-const error = (code: string) => Object.assign(new Error(code), { code });
-const copy = <T>(value: T): T => structuredClone(value);
-
-/** A deterministic port fixture proves HTTP/crypto composition, not Mongo transaction isolation. */
-function fixture(sendFails = false) {
-  const challenges = new Map<string, EmailCodeChallenge>();
-  let identity: EmailCodeIdentity | undefined;
-  let refreshHash = '';
-  let sentCode = '';
-  const repository: EmailCodeRepository = {
-    consumeEmailCodeNetwork: jest.fn(async () => undefined),
-    reserveEmailCodeAttempt: jest.fn(async ({ challenge, previousGeneration }) => {
-      const old = challenges.get(challenge._id);
-      if (old && old.generation !== previousGeneration) throw error('EMAIL_CODE_INVALID');
-      challenges.set(challenge._id, copy(challenge));
-    }),
-    finishEmailCodeSend: jest.fn(async (id, generation, accepted) => {
-      const current = challenges.get(id);
-      if (current?.generation === generation) current.accepted = accepted;
-    }),
-    getEmailCodeChallenge: jest.fn(async (id, tenant) => {
-      const current = challenges.get(id);
-      return current?.tenantId === tenant ? copy(current) : null;
-    }),
-    redeemEmailCode: jest.fn(async (input) => {
-      const c = challenges.get(input.attemptId);
-      if (
-        !c ||
-        !c.accepted ||
-        c.consumedAt ||
-        c.nonceHash !== input.nonceHash ||
-        c.verifier !== input.verifier ||
-        c.generation !== input.generation ||
-        c.expiresAt <= input.now
-      ) {
-        throw error('EMAIL_CODE_INVALID');
-      }
-      c.consumedAt = input.now;
-      refreshHash = input.refreshTokenHash;
-      identity = {
-        user: {
-          id: '1'.repeat(24),
-          _id: '1'.repeat(24),
-          email: c.email,
-          emailVerified: true,
-          name: '',
-          username: '',
-          provider: 'email_code',
-          role: 'USER',
-          tenantId: c.tenantId,
-        },
-        grant: {
-          userId: '1'.repeat(24),
-          sessionId: input.sessionId,
-          tenantId: c.tenantId,
-          authVersion: 0,
-          policyVersion: input.policyVersion,
-          refreshGeneration: 0,
-          createdAt: Date.now(),
-          absoluteExpiresAt: Date.now() + 43_200_000,
-          idleExpiresAt: Date.now() + 3_600_000,
-        },
-      };
-      return copy(identity);
-    }),
-    readEmailCodeIdentity: jest.fn(async (sid, tenant, currentRefresh) =>
-      identity?.grant.sessionId === sid &&
-      identity.grant.tenantId === tenant &&
-      (!currentRefresh ||
-        (currentRefresh.refreshTokenHash === refreshHash &&
-          currentRefresh.refreshGeneration === identity.grant.refreshGeneration))
-        ? copy(identity)
-        : null,
-    ),
-    rotateEmailCodeRefresh: jest.fn(async ({ grant, oldHash, newHash }) => {
-      if (
-        !identity ||
-        refreshHash !== oldHash ||
-        identity.grant.refreshGeneration !== grant.refreshGeneration
-      ) {
-        throw error('REFRESH_REPLACED');
-      }
-      refreshHash = newHash;
-      identity.grant.refreshGeneration++;
-    }),
-    revokeEmailCodeSession: jest.fn(async () => {
-      identity = undefined;
-    }),
-    revokeEmailCodeAccount: jest.fn(async () => {
-      identity = undefined;
-    }),
-    touchEmailCodeSession: jest.fn(async () => undefined),
-  };
-  const sender = {
-    sendCode: jest.fn(async ({ code }: { code: string }) => {
-      sentCode = code;
-      if (sendFails) throw new Error('private transport detail must not escape');
-    }),
-  };
-  const clearAuxiliaryCookies = jest.fn();
-  const auth = createEmailCodeAuth({
-    repository,
-    sender,
-    clearAuxiliaryCookies,
-    write: (action) => action(),
-  });
-  const app = express();
-  app.use(express.json({ limit: '4kb' }));
-  app.use((req, _res, next) => {
-    req.cookies = parseCookies(req.headers.cookie ?? '');
-    next();
-  });
-  app.post('/request', auth.requestCode);
-  app.post('/verify', auth.verifyCode);
-  app.post('/refresh', auth.refresh);
-  app.post('/logout', auth.logout);
-  return { app, repository, sender, clearAuxiliaryCookies, challenges, code: () => sentCode };
-}
-
-const cookies = (response: request.Response) => {
-  const values = response.headers['set-cookie'] as unknown as string[] | undefined;
-  return (values ?? []).map((value) => value.split(';')[0]).join('; ');
-};
+import { fixture, cookies, parseCookies } from './emailCode.helper';
 
 describe('email-code authentication composition', () => {
   const original = { ...process.env };
   beforeEach(() => {
+    delete process.env.EMAIL_CODE_QUALIFICATION_MAILBOX;
+    delete process.env.EMAIL_CODE_QUALIFICATION_NOT_AFTER;
     process.env.AUTH_MODE = 'transition';
     process.env.EMAIL_CODE_TENANT_ID = 'cortex-bwi';
     process.env.EMAIL_CODE_ALLOWED_DOMAINS = 'employees.example.test,partners.example.test';
@@ -188,6 +61,87 @@ describe('email-code authentication composition', () => {
     const payload = jwt.verify(response.body.token, process.env.JWT_SECRET!) as jwt.JwtPayload;
     return { ...f, response, payload, token: parseCookies(cookies(response)).refreshToken };
   }
+
+  describe('finite exact qualification mailbox', () => {
+    const email = 'qualification@outside.example.test';
+    function exception() {
+      const until = Math.floor(Date.now() / 1000) + 120;
+      process.env.EMAIL_CODE_QUALIFICATION_MAILBOX = email;
+      process.env.EMAIL_CODE_QUALIFICATION_NOT_AFTER = String(until);
+      return until * 1000;
+    }
+    async function challenge(f: ReturnType<typeof fixture>) {
+      const reply = await request(f.app).post('/request').send({ email });
+      expect(reply.status).toBe(202);
+      return reply;
+    }
+    it('admits only the exact mailbox, keeps public domains unchanged and rejects after expiry', async () => {
+      const expiry = exception();
+      const f = fixture();
+      expect(
+        (await request(f.app).post('/request').send({ email: 'other@outside.example.test' }))
+          .status,
+      ).not.toBe(202);
+      const pending = await challenge(f);
+      expect(getEmailCodeConfig(true).emailCodeDomains).toEqual([
+        'employees.example.test',
+        'partners.example.test',
+      ]);
+      const verified = await request(f.app)
+        .post('/verify')
+        .set('Cookie', cookies(pending))
+        .send({ attemptId: pending.body.attemptId, code: f.code() });
+      expect(verified.status).toBe(200);
+      jest.spyOn(Date, 'now').mockReturnValue(expiry);
+      expect(
+        (await request(f.app).post('/refresh').set('Cookie', cookies(verified))).status,
+      ).not.toBe(200);
+      expect((await request(f.app).post('/logout').set('Cookie', cookies(verified))).status).toBe(
+        200,
+      );
+      expect(f.repository.revokeEmailCodeSession).toHaveBeenCalledTimes(1);
+    });
+    it('does not issue credentials when redemption crosses the expiry boundary', async () => {
+      const expiry = exception();
+      const f = fixture();
+      const pending = await challenge(f);
+      const original = f.repository.redeemEmailCode;
+      jest.spyOn(f.repository, 'redeemEmailCode').mockImplementation(async (input) => {
+        const value = await original(input);
+        jest.spyOn(Date, 'now').mockReturnValue(expiry);
+        return value;
+      });
+      const reply = await request(f.app)
+        .post('/verify')
+        .set('Cookie', cookies(pending))
+        .send({ attemptId: pending.body.attemptId, code: f.code() });
+      expect(reply.status).not.toBe(200);
+      expect(reply.body.token).toBeUndefined();
+      expect(cookies(reply)).not.toContain('refreshToken=');
+    });
+    it('does not issue credentials when refresh persistence crosses the expiry boundary', async () => {
+      const expiry = exception();
+      const f = fixture();
+      const pending = await challenge(f);
+      const verified = await request(f.app)
+        .post('/verify')
+        .set('Cookie', cookies(pending))
+        .send({ attemptId: pending.body.attemptId, code: f.code() });
+      expect(verified.status).toBe(200);
+      const original = f.repository.rotateEmailCodeRefresh;
+      jest.spyOn(f.repository, 'rotateEmailCodeRefresh').mockImplementation(async (input) => {
+        await original(input);
+        jest.spyOn(Date, 'now').mockReturnValue(expiry);
+      });
+      const reply = await request(f.app).post('/refresh').set('Cookie', cookies(verified));
+      expect(reply.status).not.toBe(200);
+      expect(reply.body.token).toBeUndefined();
+      expect(cookies(reply)).not.toContain('refreshToken=');
+      expect((await request(f.app).post('/logout').set('Cookie', cookies(verified))).status).toBe(
+        200,
+      );
+    });
+  });
 
   describe('private native upload grants', () => {
     it('keeps only private identity bounds, survives normal refresh and follows native logout', async () => {

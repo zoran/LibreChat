@@ -78,6 +78,8 @@ export interface StoragePort {
 }
 /** Isolated intake only. A normal parser or successful storage write cannot grant this approval. */
 export interface UploadSecurityPort {
+  /** Null/absent means the original process observation is unavailable, never zero. */
+  dispatchObservation?(): import('librechat-data-provider').UploadOcrDispatchObservation | null;
   readonly policySha256: string;
   /** Inert reservation; persist its receipt before sending any input bytes. */
   prepare(input: {

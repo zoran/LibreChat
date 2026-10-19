@@ -220,7 +220,8 @@ describe('remote intake adapters with the real Raw lifecycle and controlled App/
     expect(prepared.input).toHaveProperty('approval.decision', 'approved');
     expect(prepared.input).toHaveProperty('metadata.filename', 'note.txt');
     const accepted = commands.find((command) => command.action === 'accept')!;
-    expect(Object.keys(accepted).sort()).toEqual(['action', 'lease', 'promotionId']);
+    expect(Object.keys(accepted).sort()).toEqual(['action', 'dispatch', 'lease', 'promotionId']);
+    expect(accepted.dispatch).toBeNull();
     expect(accepted.promotionId).toBe(f.records.get(firstId)?.promotionId);
     expect(await readdir(root)).toEqual([]);
     expect(await f.journal.close()).toEqual({ complete: true });
@@ -344,6 +345,33 @@ describe('remote intake adapters with the real Raw lifecycle and controlled App/
     await expect(pending).rejects.toBeDefined();
     expect(f.promote).not.toHaveBeenCalled();
     test.req.destroy();
+    expect(await f.journal.close()).toEqual({ complete: true });
+  });
+  it('piggybacks the last real process observation on existing App commands without another request', async () => {
+    const f = fixture();
+    const { createUploadOcrDispatchCounts } = await import('librechat-data-provider');
+    const observation = {
+      version: 1 as const,
+      source: { instanceId: firstId, pid: 10, startedAt: now - 1000 },
+      observedAt: now,
+      counts: createUploadOcrDispatchCounts(),
+    };
+    f.security.dispatchObservation = () => observation;
+    const test = f.request();
+    const pending = test.run();
+    test.req.end('hello');
+    await pending;
+    expect(test.response.statusCode).toBe(202);
+    expect(
+      f.control.mock.calls.every(
+        ([input]) =>
+          typeof input.command === 'object' &&
+          input.command !== null &&
+          'dispatch' in input.command &&
+          JSON.stringify(input.command.dispatch) === JSON.stringify(observation),
+      ),
+    ).toBe(true);
+    expect(f.events).not.toContain('security-dispatch');
     expect(await f.journal.close()).toEqual({ complete: true });
   });
 });

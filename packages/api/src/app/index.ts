@@ -16,3 +16,4 @@ export * from './maintenance';
 export { createMaintenanceIdentity } from './identity';
 export type { MaintenanceIdentity } from './identity';
 export { buildPreLoginInterface } from './interface';
+export * from './statusMetrics';

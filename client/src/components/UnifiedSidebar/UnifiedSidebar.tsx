@@ -74,7 +74,9 @@ function UnifiedSidebar({
   const resizeHandlers = useRef<{ move: (e: MouseEvent) => void; up: () => void } | null>(null);
 
   const links = useUnifiedSidebarLinks();
-  const isInsightsRoute = location.pathname.startsWith('/insights');
+  const insightActiveId = location.pathname.startsWith('/insights') ? 'insights' : undefined;
+  const routeActiveId = location.pathname.startsWith('/status') ? 'status' : insightActiveId;
+  const isInsightsRoute = routeActiveId !== undefined;
   const panelExpanded = expanded && !isInsightsRoute;
 
   /** The aside's max width is a viewport percentage, so the announced range has to track
@@ -263,7 +265,7 @@ function UnifiedSidebar({
             onNewChat={handleCollapse}
             switchToHistory={switchToHistory}
             onLeaveInsights={handleLeaveInsights}
-            routeActiveId={isInsightsRoute ? 'insights' : undefined}
+            routeActiveId={routeActiveId}
           />
           {/* Above the panel rather than inside it: the marketplace is a
               destination like the panels themselves, not a row of whichever
@@ -281,7 +283,7 @@ function UnifiedSidebar({
           <MobileShortcutTargets
             links={links}
             onLeaveInsights={handleLeaveInsights}
-            routeActiveId={isInsightsRoute ? 'insights' : undefined}
+            routeActiveId={routeActiveId}
           />
           <MobileBottomBar links={links} />
         </ActivePanelProvider>

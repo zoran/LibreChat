@@ -1,5 +1,10 @@
 import { performance } from 'node:perf_hooks';
 import { Counter, Gauge, Histogram } from 'prom-client';
+import {
+  readUploadOcrDispatchObservation,
+  UPLOAD_OCR_DISPATCH_STAGES,
+  UPLOAD_OCR_DISPATCH_OUTCOMES,
+} from 'librechat-data-provider';
 import type { UploadMetricsSnapshot, UploadState } from 'librechat-data-provider';
 import type { Registry } from 'prom-client';
 import type { UploadControlDecision, UploadLocalResources } from '../control';
@@ -10,9 +15,15 @@ export interface UploadBackendObservation {
   durationSeconds: number;
   observedAtMs: number;
 }
-type Stage = 'wait' | 'transfer' | 'processing' | 'request' | 'total';
+type Stage = 'wait' | 'transfer' | 'processing' | 'request' | 'total' | 'extract';
+type DurationObservation =
+  | { stage: Stage; outcome: 'success' | 'failure' | 'cancelled'; seconds: number }
+  | { stage: 'extract'; outcome: 'unknown' };
 type LocalPool = 'staging' | 'parser';
 export interface UploadMetricObserver {
+  observeSecurityDispatch(
+    observation: import('librechat-data-provider').UploadOcrDispatchObservation,
+  ): void;
   transition(state: UploadState): void;
   observeBackend(input: UploadBackendObservation): void;
   observeBackendService(input: {
@@ -29,11 +40,7 @@ export interface UploadMetricObserver {
     bytes: number;
     oldestSeconds: number;
   }): void;
-  observeDuration(input: {
-    stage: Stage;
-    outcome: 'success' | 'failure' | 'cancelled';
-    seconds: number;
-  }): void;
+  observeDuration(input: DurationObservation): void;
   received(count: number): void;
   fileSize(count: number): void;
   retry(reason: 'transport' | 'storage' | 'processing' | 'lease' | 'unavailable'): void;
@@ -68,7 +75,7 @@ const states: readonly UploadState[] = [
   'deleted',
   'expired',
 ];
-const stages: readonly Stage[] = ['wait', 'transfer', 'processing', 'request', 'total'];
+const stages: readonly Stage[] = ['wait', 'transfer', 'processing', 'request', 'total', 'extract'];
 const reasons = [
   'startup',
   'healthy',
@@ -93,6 +100,10 @@ function member(value: string, allowed: readonly string[]): void {
 export function createUploadMetrics(
   registry: Registry,
   slots: readonly string[],
+  directSecurity?: {
+    slot: string;
+    snapshot(): import('librechat-data-provider').UploadOcrDispatchObservation | null;
+  },
 ): { bind(slot: string): UploadMetricObserver } {
   if (
     !slots.length ||
@@ -102,6 +113,73 @@ export function createUploadMetrics(
   )
     throw new Error('invalid_upload_metric_slots');
   const registers = [registry];
+  // Global scanner counters are mirrored, never added across app replicas or replayed replies.
+  const ocrSources = new Map<
+    string,
+    import('librechat-data-provider').UploadOcrDispatchObservation
+  >();
+  const freshOcr = () => {
+    if (directSecurity) {
+      try {
+        const value = directSecurity.snapshot();
+        if (value) bindSlot(directSecurity.slot).observeSecurityDispatch(value);
+      } catch {
+        /* Missing direct response is unknown; never mint a zero baseline. */
+      }
+    }
+    return [...ocrSources].filter(([, value]) => {
+      const age = Date.now() - value.observedAt;
+      return age >= -5000 && age <= 120_000;
+    });
+  };
+  new Counter({
+    name: 'cortex_upload_ocr_dispatch_total',
+    help: 'Original scanner process cumulative dispatch outcomes mirrored by App; do not sum replicas. Absence is unknown.',
+    labelNames: ['slot', 'stage', 'outcome'],
+    registers,
+    collect() {
+      this.reset();
+      for (const [slot, value] of freshOcr())
+        for (const stage of UPLOAD_OCR_DISPATCH_STAGES)
+          for (const outcome of UPLOAD_OCR_DISPATCH_OUTCOMES)
+            this.labels(slot, stage, outcome).inc(value.counts[stage][outcome]);
+    },
+  });
+  for (const [name, help, read] of [
+    [
+      'observed_at_seconds',
+      'Original scanner observation time; never scrape time.',
+      (value: import('librechat-data-provider').UploadOcrDispatchObservation) =>
+        value.observedAt / 1000,
+    ],
+    [
+      'source_start_time_seconds',
+      'Original scanner process start, not the App process.',
+      (value: import('librechat-data-provider').UploadOcrDispatchObservation) =>
+        value.source.startedAt / 1000,
+    ],
+    [
+      'source_pid',
+      'Original scanner process PID; identity stays out of labels.',
+      (value: import('librechat-data-provider').UploadOcrDispatchObservation) => value.source.pid,
+    ],
+  ] as const)
+    new Gauge({
+      name: 'cortex_upload_ocr_dispatch_' + name,
+      help,
+      labelNames: ['slot'],
+      registers,
+      collect() {
+        this.reset();
+        for (const [slot, value] of freshOcr()) this.labels(slot).set(read(value));
+      },
+    });
+  const ocrSourceChanges = new Counter({
+    name: 'cortex_upload_ocr_dispatch_source_changes_total',
+    help: 'Observed original scanner identity changes; before/after comparison must reject a change.',
+    labelNames: ['slot'],
+    registers,
+  });
   const admissionObservations = new Map<
     string,
     { paused: boolean; observedAt: number; receivedAt: number; monotonicMs: number }
@@ -266,9 +344,15 @@ export function createUploadMetrics(
   });
   const duration = new Histogram({
     name: 'cortex_upload_duration_seconds',
-    help: 'Observed request and processing attempt durations; total is creation to acknowledged ready publication.',
+    help: 'Observed request and processing attempt durations; extract is the settled parser call, total is creation to acknowledged ready publication.',
     labelNames: ['slot', 'stage', 'outcome'],
     buckets: [0.1, 0.5, 1, 5, 15, 30, 60, 120, 300, 600, 1800, 3600],
+    registers,
+  });
+  const documentStageOutcomes = new Counter({
+    name: 'cortex_upload_document_stage_outcomes_total',
+    help: 'Observed extraction call outcomes after writer settlement; attempts, not unique documents or model quality. Unknown has no duration.',
+    labelNames: ['slot', 'stage', 'outcome'],
     registers,
   });
   const received = new Counter({
@@ -382,6 +466,34 @@ export function createUploadMetrics(
     backendErrors.labels(slot).inc(0);
     serviceErrors.labels(slot).inc(0);
     const observers = {
+      observeSecurityDispatch(
+        input: import('librechat-data-provider').UploadOcrDispatchObservation,
+      ): void {
+        const value = readUploadOcrDispatchObservation(input);
+        if (
+          !value ||
+          value.observedAt > Date.now() + 5000 ||
+          Date.now() - value.observedAt > 120_000
+        )
+          throw new Error('invalid_upload_metric');
+        const previous = ocrSources.get(slot);
+        if (previous && value.observedAt < previous.observedAt) return;
+        const same = previous && JSON.stringify(value.source) === JSON.stringify(previous.source);
+        if (
+          same &&
+          UPLOAD_OCR_DISPATCH_STAGES.some((stage) =>
+            UPLOAD_OCR_DISPATCH_OUTCOMES.some(
+              (outcome) => value.counts[stage][outcome] < previous!.counts[stage][outcome],
+            ),
+          )
+        )
+          throw new Error('invalid_upload_metric');
+        if (previous && !same && value.source.startedAt <= previous.source.startedAt)
+          throw new Error('invalid_upload_metric');
+        if (previous && !same) ocrSourceChanges.labels(slot).inc();
+        else ocrSourceChanges.labels(slot).inc(0);
+        ocrSources.set(slot, value);
+      },
       transition(state: UploadState): void {
         member(state, states);
         transitions.labels(slot, state).inc();
@@ -486,14 +598,18 @@ export function createUploadMetrics(
         queueBytes.labels(slot, input.stage).set(input.bytes);
         queueAge.labels(slot, input.stage).set(input.oldestSeconds);
       },
-      observeDuration(input: {
-        stage: Stage;
-        outcome: 'success' | 'failure' | 'cancelled';
-        seconds: number;
-      }): void {
+      observeDuration(input: DurationObservation): void {
         member(input.stage, stages);
+        if (input.outcome === 'unknown') {
+          member(input.stage, ['extract']);
+          if ('seconds' in input) throw new Error('invalid_upload_metric');
+          documentStageOutcomes.labels(slot, 'extract', 'unknown').inc();
+          return;
+        }
         member(input.outcome, ['success', 'failure', 'cancelled']);
         finite(input.seconds);
+        if (input.stage === 'extract')
+          documentStageOutcomes.labels(slot, 'extract', input.outcome).inc();
         duration.labels(slot, input.stage, input.outcome).observe(input.seconds);
       },
       received(count: number): void {

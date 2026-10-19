@@ -1,12 +1,17 @@
 import { useMemo } from 'react';
 import { useRecoilValue } from 'recoil';
-import { BarChart3, MessagesSquare } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
+import { BarChart3, MessagesSquare, Network } from 'lucide-react';
 import { useUserKeyQuery } from 'librechat-data-provider/react-query';
 import { getConfigDefaults, getEndpointField } from 'librechat-data-provider';
 import type { TEndpointsConfig } from 'librechat-data-provider';
 import type { NavLink } from '~/common';
-import { useGetEndpointsQuery, useGetStartupConfig, useInsightsAccessQuery } from '~/data-provider';
+import {
+  useGetEndpointsQuery,
+  useGetStartupConfig,
+  useInsightsAccessQuery,
+  useStatusAccessQuery,
+} from '~/data-provider';
 import ConversationsSection from '~/components/UnifiedSidebar/ConversationsSection';
 import useSideNavLinks from '~/hooks/Nav/useSideNavLinks';
 import { useAuthContext } from '~/hooks';
@@ -17,7 +22,8 @@ const defaultInterface = getConfigDefaults().interface;
 export default function useUnifiedSidebarLinks() {
   const navigate = useNavigate();
   const location = useLocation();
-  const { user } = useAuthContext();
+  const { user, isAuthenticated } = useAuthContext();
+  const statusAccess = useStatusAccessQuery(user?.id, isAuthenticated);
   /** Selector instead of the full conversation atom: the links only depend on
    * the endpoint, so parameter edits and other conversation writes stay out. */
   const endpoint = useRecoilValue(store.conversationEndpointByIndex(0)) ?? undefined;
@@ -64,6 +70,18 @@ export default function useUnifiedSidebarLinks() {
   });
 
   const links = useMemo(() => {
+    const statusLinks: NavLink[] =
+      statusAccess.data?.allowed === true
+        ? [
+            {
+              title: 'com_status_title',
+              label: '',
+              icon: Network,
+              id: 'status',
+              onClick: () => navigate('/status'),
+            },
+          ]
+        : [];
     const conversationLink: NavLink = {
       title: 'com_ui_chat_history',
       label: '',
@@ -76,7 +94,7 @@ export default function useUnifiedSidebarLinks() {
       !insightsFeatureEnabled ||
       (!isInsightsRoute && !isInsightsAccessLoading && insightsAccess?.access !== true)
     ) {
-      return [conversationLink, ...sideNavLinks];
+      return [conversationLink, ...sideNavLinks, ...statusLinks];
     }
 
     const insightsLink: NavLink = {
@@ -95,8 +113,9 @@ export default function useUnifiedSidebarLinks() {
     const nextLinks = [...sideNavLinks];
     nextLinks.splice(mcpIndex >= 0 ? mcpIndex + 1 : nextLinks.length, 0, insightsLink);
 
-    return [conversationLink, ...nextLinks];
+    return [conversationLink, ...nextLinks, ...statusLinks];
   }, [
+    statusAccess.data?.allowed,
     insightsAccess?.access,
     insightsFeatureEnabled,
     isInsightsAccessLoading,

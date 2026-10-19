@@ -9,6 +9,7 @@ import {
   TwoFactorSetupScreen,
   RequestPasswordReset,
 } from '~/components/Auth';
+import EmailCodeLanding from '~/components/Auth/EmailCodeLanding';
 import { OAuthSuccess, OAuthError } from '~/components/OAuth';
 import { AuthContextProvider } from '~/hooks/AuthContext';
 import { importWithRecovery } from '~/lib/assets/lazy';
@@ -19,7 +20,6 @@ import LoginLayout from './Layouts/Login';
 import dashboardRoutes from './Dashboard';
 import WithRum from '~/lib/rum/WithRum';
 import ShareRoute from './ShareRoute';
-import EmailCodeLanding from '~/components/Auth/EmailCodeLanding';
 import ChatRoute from './ChatRoute';
 import Search from './Search';
 import Root from './Root';
@@ -56,6 +56,11 @@ const loadProjectsView = () =>
 const loadProjectWorkspace = () =>
   importWithRecovery(() => import('~/components/Projects')).then((m) => ({
     Component: m.ProjectWorkspace,
+  }));
+
+const loadStatusView = () =>
+  importWithRecovery(() => import('~/components/Status/StatusView')).then((m) => ({
+    Component: m.default,
   }));
 
 const baseEl = document.querySelector('base');
@@ -177,6 +182,7 @@ export const router = createBrowserRouter(
                   path: 'insights',
                   lazy: loadInsightsView,
                 },
+                { path: 'status', lazy: loadStatusView },
                 {
                   path: 'skills/new',
                   lazy: loadSkillsView,

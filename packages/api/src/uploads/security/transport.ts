@@ -3,6 +3,7 @@ import { request } from 'node:https';
 import { TLSSocket } from 'node:tls';
 import { createHash } from 'node:crypto';
 import {
+  readUploadOcrDispatchObservation,
   readUploadSecuritySubject,
   readUploadSecurityExecution,
   readUploadSecurityInspection,
@@ -14,6 +15,10 @@ import type { UploadSecurityPort } from '../contract';
 import { createPinnedServiceEndpoint } from '../intake/endpoint';
 
 const JSON_LIMIT = 8192;
+// Preserve the existing request/header budget. A complete v2 response also carries
+// the fixed dispatch table: 60 safe-integer counts, bounded identity and timestamps.
+// Its envelope fits within 4 KiB in addition to the previously supported 8 KiB payload.
+const RESPONSE_JSON_LIMIT = JSON_LIMIT + 4096;
 const CONTEXT_LIMIT = 4096;
 const DEADLINE_MS = 60_000;
 const failure = () => new Error('security_uninspectable');
@@ -83,9 +88,9 @@ function closed(value: unknown, keys: string[]): Record<string, unknown> {
 function json(bytes: Buffer): unknown {
   return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
 }
-function encode(value: unknown): Buffer {
+function encode(value: unknown, maximum = JSON_LIMIT): Buffer {
   const bytes = Buffer.from(JSON.stringify(value));
-  if (bytes.length > JSON_LIMIT) throw failure();
+  if (bytes.length > maximum) throw failure();
   return bytes;
 }
 function header(message: IncomingMessage, name: string): string | undefined {
@@ -105,7 +110,11 @@ function profile(message: IncomingMessage, contentType: string) {
   )
     throw failure();
 }
-function readJson(message: IncomingMessage, signal: AbortSignal): Promise<unknown> {
+function readJson(
+  message: IncomingMessage,
+  signal: AbortSignal,
+  maximum = JSON_LIMIT,
+): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let bytes = 0;
@@ -129,7 +138,7 @@ function readJson(message: IncomingMessage, signal: AbortSignal): Promise<unknow
     const failed = () => finish(failure());
     const data = (chunk: Buffer) => {
       bytes += chunk.length;
-      if (bytes > JSON_LIMIT) finish(failure());
+      if (bytes > maximum) finish(failure());
       else chunks.push(chunk);
     };
     const end = () => finish();
@@ -193,6 +202,7 @@ export function createHttpUploadSecurityPort(options: {
   } catch {
     throw failure();
   }
+  let observed: import('librechat-data-provider').UploadOcrDispatchObservation | null = null;
   const tls = {
     ca: Buffer.from(options.tls.ca),
     cert: Buffer.from(options.tls.cert),
@@ -229,9 +239,21 @@ export function createHttpUploadSecurityPort(options: {
       req.once('response', (res) => {
         void (async () => {
           try {
-            if (res.statusCode !== 200) throw failure();
             profile(res, 'application/json');
-            resolve(await readJson(res, clock.signal));
+            const envelope = closed(await readJson(res, clock.signal, RESPONSE_JSON_LIMIT), [
+              'version',
+              'payload',
+              'dispatch',
+            ]);
+            if (envelope.version !== 2) throw failure();
+            const dispatch =
+              envelope.dispatch === null
+                ? null
+                : readUploadOcrDispatchObservation(envelope.dispatch);
+            if (envelope.dispatch !== null && !dispatch) throw failure();
+            observed = dispatch;
+            if (res.statusCode !== 200) throw failure();
+            resolve(envelope.payload);
           } catch {
             reject(failure());
           } finally {
@@ -280,6 +302,7 @@ export function createHttpUploadSecurityPort(options: {
     }
   }
   return {
+    dispatchObservation: () => readUploadOcrDispatchObservation(observed),
     policySha256: options.policySha256,
     async prepare(input) {
       try {
@@ -369,7 +392,7 @@ export function createHttpUploadSecurityPort(options: {
 
 function reply(res: ServerResponse, status: number, value: unknown) {
   if (res.destroyed || res.writableEnded) return;
-  const payload = encode(value);
+  const payload = encode(value, RESPONSE_JSON_LIMIT);
   res.writeHead(status, {
     'content-type': 'application/json',
     'content-length': payload.length,
@@ -412,6 +435,12 @@ export function createSecurityRequestHandler(
       reply(res, 403, { code: 'security_uninspectable' });
       return;
     }
+    const respond = (status: number, payload: unknown) =>
+      reply(res, status, {
+        version: 2,
+        payload,
+        dispatch: readUploadOcrDispatchObservation(worker.dispatchObservation?.()),
+      });
     const clock = deadline();
     const disconnect = () => {
       if (!res.writableEnded) clock.abort();
@@ -421,7 +450,7 @@ export function createSecurityRequestHandler(
     void bounded(() => {
       const work = (async () => {
         if (req.url === '/healthz' && req.method === 'GET') {
-          reply(res, 200, { version: 1 });
+          respond(200, { version: 1 });
           return;
         }
         if (req.url === '/v1/inspect' && req.method === 'PUT') {
@@ -463,7 +492,7 @@ export function createSecurityRequestHandler(
             (inspection.decision.decision === 'approved' && !complete)
           )
             throw failure();
-          reply(res, 200, { version: 1, execution, inspection });
+          respond(200, { version: 1, execution, inspection });
           return;
         }
         if (req.method !== 'POST' || (req.url !== '/v1/prepare' && req.url !== '/v1/cancel'))
@@ -481,7 +510,7 @@ export function createSecurityRequestHandler(
             }),
           );
           if (!execution || execution.attemptId !== record.attemptId) throw failure();
-          reply(res, 200, { version: 1, execution });
+          respond(200, { version: 1, execution });
         } else {
           const record = closed(value, ['execution']);
           const execution = readUploadSecurityExecution(record.execution);
@@ -491,14 +520,14 @@ export function createSecurityRequestHandler(
           );
           if (!settlement || !matchesUploadSecurityExecution(settlement.execution, execution))
             throw failure();
-          reply(res, 200, { version: 1, execution, settlement });
+          respond(200, { version: 1, execution, settlement });
         }
       })();
       // Track the actual handler, not the deadline race or HTTP response lifetime.
       track?.(work);
       return work;
     }, clock.signal)
-      .catch(() => reply(res, 400, { code: 'security_uninspectable' }))
+      .catch(() => respond(400, { code: 'security_uninspectable' }))
       .finally(() => {
         clock.close();
         req.off('aborted', clock.abort);

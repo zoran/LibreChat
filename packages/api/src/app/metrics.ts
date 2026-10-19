@@ -7,6 +7,7 @@ import type { Mongoose } from 'mongoose';
 import type { AgentStartupMilestone, AgentStartupResult } from '~/agents/phases';
 import type { LocatorTraversalFailure } from '../protection/diagnostics';
 import { agentStartupMilestones, agentStartupResults } from '~/agents/phases';
+import { attachStatusMetrics } from './statusMetrics';
 
 const PATH_NORMALIZATIONS: [RegExp, string][] = [
   [/^\/api\/uploads\/operations\/[^/]+(?=\/|$)/, '/api/uploads/operations/#id'],
@@ -542,6 +543,7 @@ export function instrumentMongooseQueryMetrics(mongoose: Mongoose): void {
 export function createMetrics(options: MetricsOptions = {}): PrometheusMetrics {
   if (!isMetricsConfigured()) {
     resetMetricRecorders();
+    attachStatusMetrics();
     return {
       registry: new Registry(),
       metricsMiddleware: (_req: Request, _res: Response, next: NextFunction) => next(),
@@ -550,6 +552,7 @@ export function createMetrics(options: MetricsOptions = {}): PrometheusMetrics {
   }
 
   const registry = new Registry();
+  attachStatusMetrics(registry);
   collectDefaultMetrics({ register: registry });
 
   observeLocatorTraversal = () => undefined;

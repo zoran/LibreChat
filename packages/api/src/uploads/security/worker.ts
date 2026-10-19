@@ -4,6 +4,7 @@ import { Worker } from 'node:worker_threads';
 import { performance } from 'node:perf_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 import {
+  readUploadOcrDispatchObservation,
   readUploadSecurityExecution,
   matchesUploadSecurityExecution,
   readUploadSecuritySubject,
@@ -477,6 +478,17 @@ export function createSecurityWorker(options: Options): SecurityWorker {
     return { decision, settlement: proof };
   }
   return {
+    dispatchObservation() {
+      const counts = options.pdf?.provider.dispatchCounts?.();
+      return counts
+        ? readUploadOcrDispatchObservation({
+            version: 1,
+            source: { instanceId, pid: process.pid, startedAt: performance.timeOrigin },
+            observedAt: now(),
+            counts,
+          })
+        : null;
+    },
     policySha256,
     maintenance,
     async prepare(input: {

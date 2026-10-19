@@ -482,6 +482,8 @@ describe('bounded authenticated scanner transport', () => {
     'wrong execution',
     'wrong settlement',
     'wrong version',
+    'old envelope',
+    'wrong envelope version',
     'extra field',
     'oversized response',
     'wrong MIME',
@@ -507,7 +509,15 @@ describe('bounded authenticated scanner transport', () => {
       res.end(
         kind === 'oversized response'
           ? 'private'.repeat(2000)
-          : JSON.stringify(kind === 'extra field' ? { ...result, content: 'private' } : result),
+          : JSON.stringify(
+              kind === 'old envelope'
+                ? result
+                : {
+                    version: kind === 'wrong envelope version' ? 1 : 2,
+                    dispatch: null,
+                    payload: kind === 'extra field' ? { ...result, content: 'private' } : result,
+                  },
+            ),
       );
     });
     await expect(client(endpoint).cancel({ execution, signal: signal() })).rejects.toThrow(

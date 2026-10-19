@@ -91,17 +91,17 @@ function AuthLayout({
   return (
     <div className="bg-surface-primary text-text-primary relative flex min-h-screen flex-col">
       <Banner />
-      <BlinkAnimation active={isFetching}>
-        <div className="mt-6 flex w-full justify-center px-6">
-          <AppLogo startupConfig={startupConfig} fallbackSrc="assets/logo.svg" />
-        </div>
-      </BlinkAnimation>
-      <DisplayError />
       <div className="absolute bottom-0 left-0 md:m-4">
         <ThemeSelector />
       </div>
 
-      <main className="flex grow items-center justify-center">
+      <main className="flex grow flex-col items-center justify-center gap-6 py-8 sm:py-12">
+        <BlinkAnimation active={isFetching}>
+          <div className="flex w-full justify-center px-6">
+            <AppLogo startupConfig={startupConfig} fallbackSrc="assets/logo.svg" />
+          </div>
+        </BlinkAnimation>
+        <DisplayError />
         <div
           className={cn(
             'bg-surface-primary overflow-hidden px-6 py-4 sm:rounded-lg',

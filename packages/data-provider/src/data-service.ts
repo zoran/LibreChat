@@ -9,9 +9,11 @@ import type {
 import type { TInsightsAccessResponse, TInsightsParams, TInsightsResponse } from './types/insights';
 import type { ScheduleMCPConsentView, ConfirmScheduleMCPConsent } from './types/scheduleConsent';
 import type { TFileConfig } from './file-config';
+import type { StatusSnapshot } from './status';
 import type * as tl from './types/tools';
 import type * as t from './types';
 import { TOOL_CALL_PREVIEWS_PARAM, TOOL_CALL_PREVIEWS_VERSION } from './previews';
+import { readStatusSnapshot, STATUS_LIMITS } from './status';
 import * as permissions from './accessPermissions';
 import * as endpoints from './api-endpoints';
 import { uploadEventStream } from './upload';
@@ -1867,4 +1869,29 @@ export function revokeScheduleMCPConsent(id: string, expectedRevision: string): 
   return request.deleteWithOptions(endpoints.scheduleMCPConsent(id), {
     data: { expectedRevision },
   });
+}
+
+/** Exactly one bounded snapshot is shared by all Status zoom levels. */
+export async function getStatusSnapshot({
+  signal,
+}: { signal?: AbortSignal } = {}): Promise<StatusSnapshot> {
+  const raw = await request.get<string>(endpoints.statusSnapshot(), {
+    signal,
+    responseType: 'text',
+    transformResponse: [(value: string) => value],
+  });
+  if (typeof raw !== 'string' || new TextEncoder().encode(raw).byteLength > STATUS_LIMITS.maxBytes)
+    throw new Error('STATUS_RESPONSE_BOUND');
+  const result = readStatusSnapshot(JSON.parse(raw));
+  if (!result) throw new Error('STATUS_RESPONSE_INVALID');
+  signal?.throwIfAborted();
+  return result;
+}
+export async function getStatusAccess({ signal }: { signal?: AbortSignal } = {}): Promise<{
+  allowed: boolean;
+}> {
+  const result = await request.get<{ allowed: boolean }>(endpoints.statusAccess(), { signal });
+  signal?.throwIfAborted();
+  if (typeof result?.allowed !== 'boolean') throw new Error('STATUS_ACCESS_INVALID');
+  return result;
 }

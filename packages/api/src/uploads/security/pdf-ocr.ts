@@ -5,10 +5,14 @@ import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { createCanvas, ImageData } from '@napi-rs/canvas';
 import {
+  createUploadOcrDispatchCounts,
+  readUploadOcrDispatchCounts,
   readUploadSecurityExecution,
   readUploadSecurityScopeReceipt,
 } from 'librechat-data-provider';
 import type {
+  UploadOcrDispatchCounts,
+  UploadOcrDispatchOutcome,
   UploadSecurityExecution,
   UploadSecurityProviderBinding,
   UploadSecurityProviderScope,
@@ -31,6 +35,7 @@ export type SecurityPdfOcrSession = PdfSecurityOcr & {
   localCopiesRemoved(): boolean;
 };
 export type SecurityPdfOcrProvider = {
+  dispatchCounts?(): UploadOcrDispatchCounts | null;
   prepare(input: Prepared): Promise<UploadSecurityExecution>;
   open(execution: UploadSecurityExecution): SecurityPdfOcrSession;
 };
@@ -290,6 +295,7 @@ export function createSecurityPdfOcrProvider(
   options: SecurityPdfOcrConfiguration,
 ): SecurityPdfOcrProvider {
   const endpoint = createPinnedServiceEndpoint(options);
+  const counts = createUploadOcrDispatchCounts();
   const binding = { ...options.binding };
   const fixedKeys = [
     'podUid',
@@ -344,10 +350,21 @@ export function createSecurityPdfOcrProvider(
     let req: ReturnType<typeof request> | undefined;
     let requestClosed: Promise<void> = Promise.resolve();
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let outcome: UploadOcrDispatchOutcome = 'error';
+    const terminal = () => ['timeout', 'aborted', 'tls_error'].includes(outcome);
+    const requestError = (error: unknown) => {
+      if (terminal()) return;
+      const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
+      outcome = /^(ERR_TLS|ERR_SSL|CERT_|DEPTH_|SELF_SIGNED|UNABLE_TO_|ERR_OSSL)/.test(code)
+        ? 'tls_error'
+        : 'connection_error';
+    };
     const abort = () => {
+      if (signal.aborted) outcome = 'aborted';
       req?.destroy(failure());
       response?.destroy(failure());
     };
+    counts[route].started++;
     try {
       req = request(new URL('/v1/cortex/ocr/' + route, endpoint.url), {
         method: 'POST',
@@ -363,11 +380,16 @@ export function createSecurityPdfOcrProvider(
           'content-length': String(payload.length),
         },
       });
+      req.on('error', requestError);
       requestClosed = new Promise((resolve) => req!.once('close', resolve));
       const complete = new Promise<void>((resolve, reject) => {
         req!.on('error', () => reject(failure()));
         req!.once('response', (res) => {
           response = res;
+          if (Number.isInteger(res.statusCode) && res.statusCode! >= 100 && res.statusCode! <= 599)
+            counts[route][
+              ('http_' + Math.floor(res.statusCode! / 100) + 'xx') as UploadOcrDispatchOutcome
+            ]++;
           responseClosed = new Promise((joined) => res.once('close', joined));
           const type = route === 'page' ? 'text/event-stream' : 'application/json';
           if (
@@ -403,13 +425,17 @@ export function createSecurityPdfOcrProvider(
         });
       });
       void complete.catch(() => undefined);
-      timer = setTimeout(abort, remaining);
+      timer = setTimeout(() => {
+        outcome = 'timeout';
+        abort();
+      }, remaining);
       timer.unref();
       signal.addEventListener('abort', abort, { once: true });
       await new Promise<void>((resolve, reject) => {
         req!.once('error', () => reject(failure()));
         req!.once('socket', (socket) => {
           if (!(socket instanceof TLSSocket)) {
+            outcome = 'tls_error';
             reject(failure());
             return;
           }
@@ -418,6 +444,7 @@ export function createSecurityPdfOcrProvider(
             if (socket.authorized && peer.raw && sha(peer.raw) === certificateSha256) {
               resolve();
             } else {
+              outcome = 'tls_error';
               reject(failure());
             }
           });
@@ -427,6 +454,7 @@ export function createSecurityPdfOcrProvider(
       req.end(payload);
       await complete;
       if (signal.aborted || performance.now() >= end) throw failure();
+      outcome = 'completed';
       return Buffer.from(received.subarray(0, length));
     } finally {
       clearTimeout(timer);
@@ -434,6 +462,8 @@ export function createSecurityPdfOcrProvider(
       req?.destroy();
       response?.destroy();
       await Promise.all([requestClosed, responseClosed]);
+      if (signal.aborted) outcome = 'aborted';
+      counts[route][outcome]++;
       payload.fill(0);
       received.fill(0);
     }
@@ -453,6 +483,7 @@ export function createSecurityPdfOcrProvider(
     }
   }
   return {
+    dispatchCounts: () => readUploadOcrDispatchCounts(counts),
     async prepare(input) {
       const original = readUploadSecurityExecution(input.execution);
       if (

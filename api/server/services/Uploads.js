@@ -221,7 +221,10 @@ async function createUploadComposition({
     typeof security.cancel !== 'function'
   )
     throw new Error('Invalid upload composition');
-  const metrics = createUploadMetrics(registry, [worker.hostId]).bind(worker.hostId);
+  const metrics = createUploadMetrics(registry, [worker.hostId], {
+    slot: worker.hostId,
+    snapshot: () => security.dispatchObservation?.() ?? null,
+  }).bind(worker.hostId);
   const tenant = getEmailCodeSettings().tenantId;
   const management = createUploadManagement({
     repository,
@@ -289,6 +292,7 @@ async function createUploadComposition({
   });
   platform.bindMetrics?.(metrics);
   const intakeHandlers = createIntakeControlHandlers({
+    observeSecurityDispatch: (observation) => metrics.observeSecurityDispatch(observation),
     repository,
     identityRepository: models,
     management,

@@ -2,6 +2,11 @@ import { URL } from 'node:url';
 import { Socket, isIP } from 'node:net';
 import { X509Certificate } from 'node:crypto';
 import type { EmailCodeSender } from './emailCode.types';
+import {
+  qualificationMailbox,
+  recipientAllowed,
+  type EmailCodeQualificationMailbox,
+} from './emailRecipientPolicy';
 import { emailCodeLink, mailClientUrl } from './emailCodeLink';
 import { emailCodeMessage } from './emailCodeMessage';
 
@@ -17,6 +22,7 @@ export interface EmailCodeMailConfig {
   from: string;
   appTitle: string;
   allowedDomains: readonly string[];
+  qualification?: EmailCodeQualificationMailbox;
   clientUrl?: string;
   /** Optional deployment help: one trimmed paragraph of at most 240 characters, rendered as text. */
   supportText?: string;
@@ -185,6 +191,21 @@ function snapshotMailConfig(value: unknown): EmailCodeMailConfig {
   if (!Array.isArray(input.allowedDomains) || input.allowedDomains.length === 0)
     return invalidMailConfig();
   const allowedDomains = input.allowedDomains.map(dnsName);
+  let qualification: EmailCodeQualificationMailbox | undefined;
+  if (input.qualification !== undefined) {
+    const row = input.qualification as EmailCodeQualificationMailbox;
+    if (
+      !row ||
+      typeof row.email !== 'string' ||
+      !Number.isSafeInteger(row.notAfter) ||
+      row.notAfter % 1000 !== 0
+    )
+      return invalidMailConfig();
+    qualification = qualificationMailbox({
+      EMAIL_CODE_QUALIFICATION_MAILBOX: row.email,
+      EMAIL_CODE_QUALIFICATION_NOT_AFTER: String(row.notAfter / 1000),
+    });
+  }
   let supportText: string | undefined;
   if (input.supportText !== undefined) {
     if (
@@ -225,6 +246,7 @@ function snapshotMailConfig(value: unknown): EmailCodeMailConfig {
     from,
     appTitle: title.trim(),
     allowedDomains: Object.freeze(allowedDomains),
+    ...(qualification ? { qualification } : {}),
     ...(supportText === undefined ? {} : { supportText }),
     ...(logo === undefined ? {} : { logoPng: Buffer.from(logo as Buffer) }),
     ...(input.clientUrl === undefined ? {} : { clientUrl: mailClientUrl(input.clientUrl) }),
@@ -265,6 +287,7 @@ export function getEmailCodeMailConfig(
     from: env.EMAIL_CODE_SMTP_FROM,
     appTitle: env.APP_TITLE == null || env.APP_TITLE === '' ? 'LibreChat' : env.APP_TITLE,
     allowedDomains,
+    qualification: qualificationMailbox(env),
     supportText: env.EMAIL_CODE_SUPPORT_TEXT,
     ...(env.DOMAIN_CLIENT ? { clientUrl: env.DOMAIN_CLIENT } : {}),
   });
@@ -278,11 +301,10 @@ export function createBoundedEmailCodeSender(
   const config = snapshotMailConfig(inputConfig);
   return {
     async sendCode(input) {
-      const domain = input.email.slice(input.email.lastIndexOf('@') + 1);
       if (
         !/^[^\s@<>]+@[^\s@<>]+$/.test(input.email) ||
         input.email.length > 254 ||
-        !config.allowedDomains.includes(domain) ||
+        !recipientAllowed(input.email, config.allowedDomains, config.qualification) ||
         !/^\d{8}$/.test(input.code) ||
         input.expiresInMinutes !== 10
       ) {
@@ -341,13 +363,26 @@ export function createBoundedEmailCodeSender(
           if (finished) return;
           finished = true;
           cleanup();
-          if (accepted) resolve();
+          if (
+            accepted &&
+            recipientAllowed(input.email, config.allowedDomains, config.qualification)
+          )
+            resolve();
           else reject(new SubmissionUnavailable());
         };
-        const deadline = setTimeout(() => finish(false), DEADLINE_MS);
+        const qualifiedOnly = !config.allowedDomains.includes(
+          input.email.slice(input.email.lastIndexOf('@') + 1),
+        );
+        const remaining = qualifiedOnly ? config.qualification!.notAfter - Date.now() : DEADLINE_MS;
+        const deadline = setTimeout(
+          () => finish(false),
+          Math.min(DEADLINE_MS, Math.max(0, remaining)),
+        );
         deadline.unref?.();
         const attempt = (index: number) => {
           if (finished) return;
+          if (!recipientAllowed(input.email, config.allowedDomains, config.qualification))
+            return finish(false);
           let attemptDone = false;
           let handedOff = false;
           let socket: Socket | undefined;
@@ -408,7 +443,12 @@ export function createBoundedEmailCodeSender(
                   connectTimers.delete(timer);
                   socket!.removeListener('error', onError);
                   socket!.removeListener('connect', onConnect);
-                  if (finished || attemptDone || error) {
+                  if (
+                    finished ||
+                    attemptDone ||
+                    error ||
+                    !recipientAllowed(input.email, config.allowedDomains, config.qualification)
+                  ) {
                     socket!.destroy();
                     callback(error ?? new SubmissionUnavailable());
                   } else {

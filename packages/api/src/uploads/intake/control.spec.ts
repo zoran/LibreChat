@@ -6,7 +6,11 @@ jest.mock('librechat-data-provider', () => ({
   ...jest.requireActual('../../../../data-provider/src/upload-intake-recovery'),
 }));
 import { createHash } from 'node:crypto';
-import { UPLOAD_MAX_FILE_BYTES, UPLOAD_INTEGRITY_CHUNK_BYTES } from 'librechat-data-provider';
+import {
+  createUploadOcrDispatchCounts,
+  UPLOAD_MAX_FILE_BYTES,
+  UPLOAD_INTEGRITY_CHUNK_BYTES,
+} from 'librechat-data-provider';
 import type { EmailCodeIdentity } from '@librechat/data-schemas';
 import type {
   UploadIntakeGrant,
@@ -97,7 +101,7 @@ const stream = (value = body) =>
   })();
 
 /** DB/storage are observed ports; native auth, provider readers, integrity and writer journal are real. */
-function fixture() {
+function fixture(observeSecurityDispatch?: IntakeControlOptions['observeSecurityDispatch']) {
   let bound = true,
     native = true;
   let record: UploadPromotionRecord | null = null;
@@ -188,6 +192,7 @@ function fixture() {
     readEmailCodeIdentity: jest.fn(async () => (native ? copy(identity) : null)),
   };
   const handlers = createIntakeControlHandlers({
+    observeSecurityDispatch,
     repository,
     management,
     identityRepository,
@@ -625,6 +630,34 @@ describe('application intake control', () => {
     });
     await f.command({ action: 'confirm-cleanup', proof: { ...proof, originalAbsent: false } });
     expect(f.management.confirmCleanup).toHaveBeenCalledTimes(1);
+    expect(await f.journal.close()).toEqual({ complete: true });
+  });
+  it('piggybacks real dispatch observations only after the original intake authorization', async () => {
+    const observe = jest.fn();
+    const f = fixture(observe);
+    const dispatch = {
+      version: 1,
+      source: { instanceId: operationId, pid: 10, startedAt: now - 1000 },
+      observedAt: now,
+      counts: createUploadOcrDispatchCounts(),
+    };
+    await f.command({ action: 'authorize', dispatch });
+    expect(observe).toHaveBeenCalledWith(dispatch);
+    f.revoke();
+    observe.mockClear();
+    await expect(f.command({ action: 'authorize', dispatch })).rejects.toBeInstanceOf(
+      UploadManagementError,
+    );
+    expect(observe).not.toHaveBeenCalled();
+    expect(await f.journal.close()).toEqual({ complete: true });
+  });
+  it('invalid dispatch metadata cannot reach metrics or alter approval', async () => {
+    const observe = jest.fn();
+    const f = fixture(observe);
+    await expect(
+      f.command({ action: 'authorize', dispatch: { counts: {} } }),
+    ).rejects.toBeInstanceOf(UploadManagementError);
+    expect(observe).not.toHaveBeenCalled();
     expect(await f.journal.close()).toEqual({ complete: true });
   });
 });

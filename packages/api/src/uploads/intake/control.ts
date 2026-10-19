@@ -1,6 +1,7 @@
 /** App-owned capability control and approved-only promotion; existing owners retain all state. */
 import { createHash } from 'node:crypto';
 import {
+  readUploadOcrDispatchObservation,
   UPLOAD_ERROR_CODES,
   UPLOAD_INTEGRITY_CHUNK_BYTES,
   UPLOAD_MAX_FILE_BYTES,
@@ -65,6 +66,9 @@ export type IntakeControlOptions = {
   attempts: UploadAttemptPort;
   worker: UploadWorker;
   now?: () => number;
+  observeSecurityDispatch?(
+    observation: import('librechat-data-provider').UploadOcrDispatchObservation,
+  ): void;
 };
 
 const IDENTIFIER = /^[a-zA-Z0-9_.-]{1,128}$/;
@@ -281,7 +285,21 @@ export function createIntakeControlHandlers(options: IntakeControlOptions): Inta
       'confirm-recovery': ['settlement'],
     };
     if (!Object.prototype.hasOwnProperty.call(shapes, command.action)) fail();
-    fields(command, ['action', ...shapes[command.action]]);
+    fields(command, ['action', ...shapes[command.action]], ['dispatch']);
+    const dispatch =
+      command.dispatch === null || command.dispatch === undefined
+        ? null
+        : readUploadOcrDispatchObservation(command.dispatch);
+    if (command.dispatch !== undefined && command.dispatch !== null && !dispatch) fail();
+    const observeDispatch = () => {
+      if (!dispatch || dispatch.observedAt > now() + 5000 || now() - dispatch.observedAt > 120_000)
+        return;
+      try {
+        options.observeSecurityDispatch?.(dispatch);
+      } catch {
+        /* Telemetry cannot grant or hide work. */
+      }
+    };
     if (command.action === 'seal-recovery' || command.action === 'confirm-recovery') {
       signal.throwIfAborted();
       const settlement =
@@ -317,11 +335,13 @@ export function createIntakeControlHandlers(options: IntakeControlOptions): Inta
         !sameWorker(recovered.worker, ctx.worker)
       )
         fail('lease_lost');
+      observeDispatch();
       return recovered;
     }
     const held = command.lease === undefined ? undefined : lease(command.lease);
     const auth = await authorize(ctx, signal);
     if (held) bound(held, ctx, auth);
+    observeDispatch();
     switch (command.action) {
       case 'authorize':
         return auth.principal;

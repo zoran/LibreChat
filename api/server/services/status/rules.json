@@ -1,0 +1,1178 @@
+{
+  "rulesSha256": "348d7a37ed00528cf1b300012bf0deebca05b1808c1898625714749960f55a9a",
+  "catalogSha256": "a9285aa6c3a232e058ee8d68157c2591f1fb10baab4d698f7b18ea67a6fa81e7",
+  "ruleFile": "/etc/prometheus/rules/cortex-status.yml",
+  "groups": [
+    {
+      "name": "cortex-status-cpu_utilization_ratio",
+      "intervalSeconds": 30,
+      "limit": 4096,
+      "rules": [
+        "cortex_status_cpu_utilization_ratio",
+        "cortex_status_cpu_utilization_ratio_source_time_seconds",
+        "cortex_status_cpu_utilization_ratio_sample_count",
+        "cortex_status_cpu_utilization_ratio_resets"
+      ],
+      "expressions": {
+        "cortex_status_cpu_utilization_ratio": {
+          "query": "max by (job, node, instance, cpu) (1 - rate(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[2m])) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"cpu\",job=\"node\"} == 1)) and on (job, node, instance, cpu) ((time() - timestamp(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"cpu\",job=\"node\"}) <= 90)) and on (job, node, instance, cpu) ((count_over_time(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[2m]) >= 4)) and on (job, node, instance, cpu) ((resets(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[2m]) == 0)) and on (job, node, instance, cpu) (count by (job, node, instance, cpu) (node_cpu_seconds_total{job=\"node\",mode=\"idle\"}) == 1) and on (job, node, instance, cpu) (max by (job, node, instance, cpu) (1 - rate(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[2m])) >= 0) and on (job, node, instance, cpu) (max by (job, node, instance, cpu) (1 - rate(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[2m])) <= 1)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,cpu) (1 - rate(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[2m])) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"cpu\"} == 1)) and on(job,node,instance,cpu) ((time() - timestamp(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"cpu\"}) <= 90)) and on(job,node,instance,cpu) ((count_over_time(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[2m]) >= 4)) and on(job,node,instance,cpu) ((resets(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[2m]) == 0)) and on(job,node,instance,cpu) (count by (job,node,instance,cpu) (node_cpu_seconds_total{job=\"node\",mode=\"idle\"}) == 1) and on(job,node,instance,cpu) (max by (job,node,instance,cpu) (1 - rate(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[2m])) >= 0) and on(job,node,instance,cpu) (max by (job,node,instance,cpu) (1 - rate(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[2m])) <= 1)"
+        },
+        "cortex_status_cpu_utilization_ratio_source_time_seconds": {
+          "query": "min by (job, node, instance, cpu) (label_replace((min by (job, node, instance, cpu) (timestamp(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(up{job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, cpu) (node_cpu_seconds_total{job=\"node\",mode=\"idle\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"cpu\",job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, cpu) (node_cpu_seconds_total{job=\"node\",mode=\"idle\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on (job, node, instance, cpu) (count by (job, node, instance, cpu) (node_cpu_seconds_total{job=\"node\",mode=\"idle\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,cpu) (label_replace((min by (job,node,instance,cpu) (timestamp(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(up{job=\"node\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,cpu) (node_cpu_seconds_total{job=\"node\",mode=\"idle\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"cpu\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,cpu) (node_cpu_seconds_total{job=\"node\",mode=\"idle\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on(job,node,instance,cpu) (count by (job,node,instance,cpu) (node_cpu_seconds_total{job=\"node\",mode=\"idle\"}) == 1)"
+        },
+        "cortex_status_cpu_utilization_ratio_sample_count": {
+          "query": "min by (job, node, instance, cpu) (label_replace((min by (job, node, instance, cpu) (count_over_time(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (count_over_time(up{job=\"node\"}[2m]))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, cpu) (node_cpu_seconds_total{job=\"node\",mode=\"idle\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (count_over_time(node_scrape_collector_success{collector=\"cpu\",job=\"node\"}[2m]))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, cpu) (node_cpu_seconds_total{job=\"node\",mode=\"idle\"}) + 1)), \"source_part\", \"s2\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,cpu) (label_replace((min by (job,node,instance,cpu) (count_over_time(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (count_over_time(up{job=\"node\"}[2m]))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,cpu) (node_cpu_seconds_total{job=\"node\",mode=\"idle\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (count_over_time(node_scrape_collector_success{job=\"node\",collector=\"cpu\"}[2m]))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,cpu) (node_cpu_seconds_total{job=\"node\",mode=\"idle\"}) + 1)), \"source_part\", \"s2\", \"\", \"\"))"
+        },
+        "cortex_status_cpu_utilization_ratio_resets": {
+          "query": "max by (job, node, instance, cpu) (label_replace((resets(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[2m])), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,cpu) (label_replace((resets(node_cpu_seconds_total{job=\"node\",mode=\"idle\"}[2m])),\"source_part\",\"s0\",\"\",\"\"))"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-memory_available_bytes",
+      "intervalSeconds": 30,
+      "limit": 64,
+      "rules": [
+        "cortex_status_memory_available_bytes",
+        "cortex_status_memory_available_bytes_source_time_seconds",
+        "cortex_status_memory_available_bytes_sample_count",
+        "cortex_status_memory_available_bytes_resets"
+      ],
+      "expressions": {
+        "cortex_status_memory_available_bytes": {
+          "query": "max by (job, node, instance) (node_memory_MemAvailable_bytes{job=\"node\"}) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"meminfo\",job=\"node\"} == 1)) and on (job, node, instance) ((time() - timestamp(node_memory_MemAvailable_bytes{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"meminfo\",job=\"node\"}) <= 90)) and on (job, node, instance) (count by (job, node, instance) (node_memory_MemAvailable_bytes{job=\"node\"}) == 1) and on (job, node, instance) (max by (job, node, instance) (node_memory_MemAvailable_bytes{job=\"node\"}) >= 0)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance) (node_memory_MemAvailable_bytes{job=\"node\"}) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"meminfo\"} == 1)) and on(job,node,instance) ((time() - timestamp(node_memory_MemAvailable_bytes{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"meminfo\"}) <= 90)) and on(job,node,instance) (count by (job,node,instance) (node_memory_MemAvailable_bytes{job=\"node\"}) == 1) and on(job,node,instance) (max by (job,node,instance) (node_memory_MemAvailable_bytes{job=\"node\"}) >= 0)"
+        },
+        "cortex_status_memory_available_bytes_source_time_seconds": {
+          "query": "min by (job, node, instance) (label_replace((min by (job, node, instance) (timestamp(node_memory_MemAvailable_bytes{job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job, node, instance) (timestamp(up{job=\"node\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"meminfo\",job=\"node\"}))), \"source_part\", \"s2\", \"\", \"\")) and on (job, node, instance) (count by (job, node, instance) (node_memory_MemAvailable_bytes{job=\"node\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance) (label_replace((min by (job,node,instance) (timestamp(node_memory_MemAvailable_bytes{job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job,node,instance) (timestamp(up{job=\"node\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"meminfo\"}))), \"source_part\", \"s2\", \"\", \"\")) and on(job,node,instance) (count by (job,node,instance) (node_memory_MemAvailable_bytes{job=\"node\"}) == 1)"
+        },
+        "cortex_status_memory_available_bytes_sample_count": {
+          "query": "min by (job, node, instance) (label_replace((count by (job, node, instance) (node_memory_MemAvailable_bytes{job=\"node\"})), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance) (label_replace((count by (job,node,instance) (node_memory_MemAvailable_bytes{job=\"node\"})), \"source_part\", \"s0\", \"\", \"\"))"
+        },
+        "cortex_status_memory_available_bytes_resets": {
+          "query": "0 * count by (job, node, instance) (node_memory_MemAvailable_bytes{job=\"node\"})",
+          "labels": {},
+          "sourceQuery": "0 * count by (job,node,instance) (node_memory_MemAvailable_bytes{job=\"node\"})"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-memory_available_ratio",
+      "intervalSeconds": 30,
+      "limit": 64,
+      "rules": [
+        "cortex_status_memory_available_ratio",
+        "cortex_status_memory_available_ratio_source_time_seconds",
+        "cortex_status_memory_available_ratio_sample_count",
+        "cortex_status_memory_available_ratio_resets"
+      ],
+      "expressions": {
+        "cortex_status_memory_available_ratio": {
+          "query": "max by (job, node, instance) (node_memory_MemAvailable_bytes{job=\"node\"} / node_memory_MemTotal_bytes{job=\"node\"}) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"meminfo\",job=\"node\"} == 1)) and on (job, node, instance) ((time() - timestamp(node_memory_MemAvailable_bytes{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_memory_MemTotal_bytes{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"meminfo\",job=\"node\"}) <= 90)) and on (job, node, instance) (node_memory_MemTotal_bytes{job=\"node\"} > 0) and on (job, node, instance) (count by (job, node, instance) (node_memory_MemAvailable_bytes{job=\"node\"}) == 1) and on (job, node, instance) (max by (job, node, instance) (node_memory_MemAvailable_bytes{job=\"node\"} / node_memory_MemTotal_bytes{job=\"node\"}) >= 0) and on (job, node, instance) (max by (job, node, instance) (node_memory_MemAvailable_bytes{job=\"node\"} / node_memory_MemTotal_bytes{job=\"node\"}) <= 1)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance) (node_memory_MemAvailable_bytes{job=\"node\"} / node_memory_MemTotal_bytes{job=\"node\"}) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"meminfo\"} == 1)) and on(job,node,instance) ((time() - timestamp(node_memory_MemAvailable_bytes{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_memory_MemTotal_bytes{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"meminfo\"}) <= 90)) and on(job,node,instance) (node_memory_MemTotal_bytes{job=\"node\"} > 0) and on(job,node,instance) (count by (job,node,instance) (node_memory_MemAvailable_bytes{job=\"node\"}) == 1) and on(job,node,instance) (max by (job,node,instance) (node_memory_MemAvailable_bytes{job=\"node\"} / node_memory_MemTotal_bytes{job=\"node\"}) >= 0) and on(job,node,instance) (max by (job,node,instance) (node_memory_MemAvailable_bytes{job=\"node\"} / node_memory_MemTotal_bytes{job=\"node\"}) <= 1)"
+        },
+        "cortex_status_memory_available_ratio_source_time_seconds": {
+          "query": "min by (job, node, instance) (label_replace((min by (job, node, instance) (timestamp(node_memory_MemAvailable_bytes{job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job, node, instance) (timestamp(node_memory_MemTotal_bytes{job=\"node\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job, node, instance) (timestamp(up{job=\"node\"}))), \"source_part\", \"s2\", \"\", \"\") or label_replace((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"meminfo\",job=\"node\"}))), \"source_part\", \"s3\", \"\", \"\")) and on (job, node, instance) (count by (job, node, instance) (node_memory_MemAvailable_bytes{job=\"node\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance) (label_replace((min by (job,node,instance) (timestamp(node_memory_MemAvailable_bytes{job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job,node,instance) (timestamp(node_memory_MemTotal_bytes{job=\"node\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job,node,instance) (timestamp(up{job=\"node\"}))), \"source_part\", \"s2\", \"\", \"\") or label_replace((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"meminfo\"}))), \"source_part\", \"s3\", \"\", \"\")) and on(job,node,instance) (count by (job,node,instance) (node_memory_MemAvailable_bytes{job=\"node\"}) == 1)"
+        },
+        "cortex_status_memory_available_ratio_sample_count": {
+          "query": "min by (job, node, instance) (label_replace((count by (job, node, instance) (node_memory_MemAvailable_bytes{job=\"node\"})), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance) (label_replace((count by (job,node,instance) (node_memory_MemAvailable_bytes{job=\"node\"})), \"source_part\", \"s0\", \"\", \"\"))"
+        },
+        "cortex_status_memory_available_ratio_resets": {
+          "query": "0 * count by (job, node, instance) (node_memory_MemAvailable_bytes{job=\"node\"})",
+          "labels": {},
+          "sourceQuery": "0 * count by (job,node,instance) (node_memory_MemAvailable_bytes{job=\"node\"})"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-pressure_cpu_waiting_ratio",
+      "intervalSeconds": 30,
+      "limit": 64,
+      "rules": [
+        "cortex_status_pressure_cpu_waiting_ratio",
+        "cortex_status_pressure_cpu_waiting_ratio_source_time_seconds",
+        "cortex_status_pressure_cpu_waiting_ratio_sample_count",
+        "cortex_status_pressure_cpu_waiting_ratio_resets"
+      ],
+      "expressions": {
+        "cortex_status_pressure_cpu_waiting_ratio": {
+          "query": "max by (job, node, instance) (rate(node_pressure_cpu_waiting_seconds_total{job=\"node\"}[2m])) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"pressure\",job=\"node\"} == 1)) and on (job, node, instance) ((time() - timestamp(node_pressure_cpu_waiting_seconds_total{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"pressure\",job=\"node\"}) <= 90)) and on (job, node, instance) ((count_over_time(node_pressure_cpu_waiting_seconds_total{job=\"node\"}[2m]) >= 4)) and on (job, node, instance) ((resets(node_pressure_cpu_waiting_seconds_total{job=\"node\"}[2m]) == 0)) and on (job, node, instance) (count by (job, node, instance) (node_pressure_cpu_waiting_seconds_total{job=\"node\"}) == 1) and on (job, node, instance) (max by (job, node, instance) (rate(node_pressure_cpu_waiting_seconds_total{job=\"node\"}[2m])) >= 0) and on (job, node, instance) (max by (job, node, instance) (rate(node_pressure_cpu_waiting_seconds_total{job=\"node\"}[2m])) <= 1)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance) (rate(node_pressure_cpu_waiting_seconds_total{job=\"node\"}[2m])) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"pressure\"} == 1)) and on(job,node,instance) ((time() - timestamp(node_pressure_cpu_waiting_seconds_total{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"pressure\"}) <= 90)) and on(job,node,instance) ((count_over_time(node_pressure_cpu_waiting_seconds_total{job=\"node\"}[2m]) >= 4)) and on(job,node,instance) ((resets(node_pressure_cpu_waiting_seconds_total{job=\"node\"}[2m]) == 0)) and on(job,node,instance) (count by (job,node,instance) (node_pressure_cpu_waiting_seconds_total{job=\"node\"}) == 1) and on(job,node,instance) (max by (job,node,instance) (rate(node_pressure_cpu_waiting_seconds_total{job=\"node\"}[2m])) >= 0) and on(job,node,instance) (max by (job,node,instance) (rate(node_pressure_cpu_waiting_seconds_total{job=\"node\"}[2m])) <= 1)"
+        },
+        "cortex_status_pressure_cpu_waiting_ratio_source_time_seconds": {
+          "query": "min by (job, node, instance) (label_replace((min by (job, node, instance) (timestamp(node_pressure_cpu_waiting_seconds_total{job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job, node, instance) (timestamp(up{job=\"node\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"pressure\",job=\"node\"}))), \"source_part\", \"s2\", \"\", \"\")) and on (job, node, instance) (count by (job, node, instance) (node_pressure_cpu_waiting_seconds_total{job=\"node\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance) (label_replace((min by (job,node,instance) (timestamp(node_pressure_cpu_waiting_seconds_total{job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job,node,instance) (timestamp(up{job=\"node\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"pressure\"}))), \"source_part\", \"s2\", \"\", \"\")) and on(job,node,instance) (count by (job,node,instance) (node_pressure_cpu_waiting_seconds_total{job=\"node\"}) == 1)"
+        },
+        "cortex_status_pressure_cpu_waiting_ratio_sample_count": {
+          "query": "min by (job, node, instance) (label_replace((min by (job, node, instance) (count_over_time(node_pressure_cpu_waiting_seconds_total{job=\"node\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job, node, instance) (count_over_time(up{job=\"node\"}[2m]))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job, node, instance) (count_over_time(node_scrape_collector_success{collector=\"pressure\",job=\"node\"}[2m]))), \"source_part\", \"s2\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance) (label_replace((min by (job,node,instance) (count_over_time(node_pressure_cpu_waiting_seconds_total{job=\"node\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job,node,instance) (count_over_time(up{job=\"node\"}[2m]))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job,node,instance) (count_over_time(node_scrape_collector_success{job=\"node\",collector=\"pressure\"}[2m]))), \"source_part\", \"s2\", \"\", \"\"))"
+        },
+        "cortex_status_pressure_cpu_waiting_ratio_resets": {
+          "query": "max by (job, node, instance) (label_replace((resets(node_pressure_cpu_waiting_seconds_total{job=\"node\"}[2m])), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance) (label_replace((resets(node_pressure_cpu_waiting_seconds_total{job=\"node\"}[2m])),\"source_part\",\"s0\",\"\",\"\"))"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-pressure_io_waiting_ratio",
+      "intervalSeconds": 30,
+      "limit": 64,
+      "rules": [
+        "cortex_status_pressure_io_waiting_ratio",
+        "cortex_status_pressure_io_waiting_ratio_source_time_seconds",
+        "cortex_status_pressure_io_waiting_ratio_sample_count",
+        "cortex_status_pressure_io_waiting_ratio_resets"
+      ],
+      "expressions": {
+        "cortex_status_pressure_io_waiting_ratio": {
+          "query": "max by (job, node, instance) (rate(node_pressure_io_waiting_seconds_total{job=\"node\"}[2m])) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"pressure\",job=\"node\"} == 1)) and on (job, node, instance) ((time() - timestamp(node_pressure_io_waiting_seconds_total{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"pressure\",job=\"node\"}) <= 90)) and on (job, node, instance) ((count_over_time(node_pressure_io_waiting_seconds_total{job=\"node\"}[2m]) >= 4)) and on (job, node, instance) ((resets(node_pressure_io_waiting_seconds_total{job=\"node\"}[2m]) == 0)) and on (job, node, instance) (count by (job, node, instance) (node_pressure_io_waiting_seconds_total{job=\"node\"}) == 1) and on (job, node, instance) (max by (job, node, instance) (rate(node_pressure_io_waiting_seconds_total{job=\"node\"}[2m])) >= 0) and on (job, node, instance) (max by (job, node, instance) (rate(node_pressure_io_waiting_seconds_total{job=\"node\"}[2m])) <= 1)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance) (rate(node_pressure_io_waiting_seconds_total{job=\"node\"}[2m])) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"pressure\"} == 1)) and on(job,node,instance) ((time() - timestamp(node_pressure_io_waiting_seconds_total{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"pressure\"}) <= 90)) and on(job,node,instance) ((count_over_time(node_pressure_io_waiting_seconds_total{job=\"node\"}[2m]) >= 4)) and on(job,node,instance) ((resets(node_pressure_io_waiting_seconds_total{job=\"node\"}[2m]) == 0)) and on(job,node,instance) (count by (job,node,instance) (node_pressure_io_waiting_seconds_total{job=\"node\"}) == 1) and on(job,node,instance) (max by (job,node,instance) (rate(node_pressure_io_waiting_seconds_total{job=\"node\"}[2m])) >= 0) and on(job,node,instance) (max by (job,node,instance) (rate(node_pressure_io_waiting_seconds_total{job=\"node\"}[2m])) <= 1)"
+        },
+        "cortex_status_pressure_io_waiting_ratio_source_time_seconds": {
+          "query": "min by (job, node, instance) (label_replace((min by (job, node, instance) (timestamp(node_pressure_io_waiting_seconds_total{job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job, node, instance) (timestamp(up{job=\"node\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"pressure\",job=\"node\"}))), \"source_part\", \"s2\", \"\", \"\")) and on (job, node, instance) (count by (job, node, instance) (node_pressure_io_waiting_seconds_total{job=\"node\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance) (label_replace((min by (job,node,instance) (timestamp(node_pressure_io_waiting_seconds_total{job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job,node,instance) (timestamp(up{job=\"node\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"pressure\"}))), \"source_part\", \"s2\", \"\", \"\")) and on(job,node,instance) (count by (job,node,instance) (node_pressure_io_waiting_seconds_total{job=\"node\"}) == 1)"
+        },
+        "cortex_status_pressure_io_waiting_ratio_sample_count": {
+          "query": "min by (job, node, instance) (label_replace((min by (job, node, instance) (count_over_time(node_pressure_io_waiting_seconds_total{job=\"node\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job, node, instance) (count_over_time(up{job=\"node\"}[2m]))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job, node, instance) (count_over_time(node_scrape_collector_success{collector=\"pressure\",job=\"node\"}[2m]))), \"source_part\", \"s2\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance) (label_replace((min by (job,node,instance) (count_over_time(node_pressure_io_waiting_seconds_total{job=\"node\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job,node,instance) (count_over_time(up{job=\"node\"}[2m]))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job,node,instance) (count_over_time(node_scrape_collector_success{job=\"node\",collector=\"pressure\"}[2m]))), \"source_part\", \"s2\", \"\", \"\"))"
+        },
+        "cortex_status_pressure_io_waiting_ratio_resets": {
+          "query": "max by (job, node, instance) (label_replace((resets(node_pressure_io_waiting_seconds_total{job=\"node\"}[2m])), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance) (label_replace((resets(node_pressure_io_waiting_seconds_total{job=\"node\"}[2m])),\"source_part\",\"s0\",\"\",\"\"))"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-pressure_io_stalled_ratio",
+      "intervalSeconds": 30,
+      "limit": 64,
+      "rules": [
+        "cortex_status_pressure_io_stalled_ratio",
+        "cortex_status_pressure_io_stalled_ratio_source_time_seconds",
+        "cortex_status_pressure_io_stalled_ratio_sample_count",
+        "cortex_status_pressure_io_stalled_ratio_resets"
+      ],
+      "expressions": {
+        "cortex_status_pressure_io_stalled_ratio": {
+          "query": "max by (job, node, instance) (rate(node_pressure_io_stalled_seconds_total{job=\"node\"}[2m])) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"pressure\",job=\"node\"} == 1)) and on (job, node, instance) ((time() - timestamp(node_pressure_io_stalled_seconds_total{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"pressure\",job=\"node\"}) <= 90)) and on (job, node, instance) ((count_over_time(node_pressure_io_stalled_seconds_total{job=\"node\"}[2m]) >= 4)) and on (job, node, instance) ((resets(node_pressure_io_stalled_seconds_total{job=\"node\"}[2m]) == 0)) and on (job, node, instance) (count by (job, node, instance) (node_pressure_io_stalled_seconds_total{job=\"node\"}) == 1) and on (job, node, instance) (max by (job, node, instance) (rate(node_pressure_io_stalled_seconds_total{job=\"node\"}[2m])) >= 0) and on (job, node, instance) (max by (job, node, instance) (rate(node_pressure_io_stalled_seconds_total{job=\"node\"}[2m])) <= 1)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance) (rate(node_pressure_io_stalled_seconds_total{job=\"node\"}[2m])) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"pressure\"} == 1)) and on(job,node,instance) ((time() - timestamp(node_pressure_io_stalled_seconds_total{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"pressure\"}) <= 90)) and on(job,node,instance) ((count_over_time(node_pressure_io_stalled_seconds_total{job=\"node\"}[2m]) >= 4)) and on(job,node,instance) ((resets(node_pressure_io_stalled_seconds_total{job=\"node\"}[2m]) == 0)) and on(job,node,instance) (count by (job,node,instance) (node_pressure_io_stalled_seconds_total{job=\"node\"}) == 1) and on(job,node,instance) (max by (job,node,instance) (rate(node_pressure_io_stalled_seconds_total{job=\"node\"}[2m])) >= 0) and on(job,node,instance) (max by (job,node,instance) (rate(node_pressure_io_stalled_seconds_total{job=\"node\"}[2m])) <= 1)"
+        },
+        "cortex_status_pressure_io_stalled_ratio_source_time_seconds": {
+          "query": "min by (job, node, instance) (label_replace((min by (job, node, instance) (timestamp(node_pressure_io_stalled_seconds_total{job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job, node, instance) (timestamp(up{job=\"node\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"pressure\",job=\"node\"}))), \"source_part\", \"s2\", \"\", \"\")) and on (job, node, instance) (count by (job, node, instance) (node_pressure_io_stalled_seconds_total{job=\"node\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance) (label_replace((min by (job,node,instance) (timestamp(node_pressure_io_stalled_seconds_total{job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job,node,instance) (timestamp(up{job=\"node\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"pressure\"}))), \"source_part\", \"s2\", \"\", \"\")) and on(job,node,instance) (count by (job,node,instance) (node_pressure_io_stalled_seconds_total{job=\"node\"}) == 1)"
+        },
+        "cortex_status_pressure_io_stalled_ratio_sample_count": {
+          "query": "min by (job, node, instance) (label_replace((min by (job, node, instance) (count_over_time(node_pressure_io_stalled_seconds_total{job=\"node\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job, node, instance) (count_over_time(up{job=\"node\"}[2m]))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job, node, instance) (count_over_time(node_scrape_collector_success{collector=\"pressure\",job=\"node\"}[2m]))), \"source_part\", \"s2\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance) (label_replace((min by (job,node,instance) (count_over_time(node_pressure_io_stalled_seconds_total{job=\"node\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job,node,instance) (count_over_time(up{job=\"node\"}[2m]))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job,node,instance) (count_over_time(node_scrape_collector_success{job=\"node\",collector=\"pressure\"}[2m]))), \"source_part\", \"s2\", \"\", \"\"))"
+        },
+        "cortex_status_pressure_io_stalled_ratio_resets": {
+          "query": "max by (job, node, instance) (label_replace((resets(node_pressure_io_stalled_seconds_total{job=\"node\"}[2m])), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance) (label_replace((resets(node_pressure_io_stalled_seconds_total{job=\"node\"}[2m])),\"source_part\",\"s0\",\"\",\"\"))"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-pressure_memory_waiting_ratio",
+      "intervalSeconds": 30,
+      "limit": 64,
+      "rules": [
+        "cortex_status_pressure_memory_waiting_ratio",
+        "cortex_status_pressure_memory_waiting_ratio_source_time_seconds",
+        "cortex_status_pressure_memory_waiting_ratio_sample_count",
+        "cortex_status_pressure_memory_waiting_ratio_resets"
+      ],
+      "expressions": {
+        "cortex_status_pressure_memory_waiting_ratio": {
+          "query": "max by (job, node, instance) (rate(node_pressure_memory_waiting_seconds_total{job=\"node\"}[2m])) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"pressure\",job=\"node\"} == 1)) and on (job, node, instance) ((time() - timestamp(node_pressure_memory_waiting_seconds_total{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"pressure\",job=\"node\"}) <= 90)) and on (job, node, instance) ((count_over_time(node_pressure_memory_waiting_seconds_total{job=\"node\"}[2m]) >= 4)) and on (job, node, instance) ((resets(node_pressure_memory_waiting_seconds_total{job=\"node\"}[2m]) == 0)) and on (job, node, instance) (count by (job, node, instance) (node_pressure_memory_waiting_seconds_total{job=\"node\"}) == 1) and on (job, node, instance) (max by (job, node, instance) (rate(node_pressure_memory_waiting_seconds_total{job=\"node\"}[2m])) >= 0) and on (job, node, instance) (max by (job, node, instance) (rate(node_pressure_memory_waiting_seconds_total{job=\"node\"}[2m])) <= 1)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance) (rate(node_pressure_memory_waiting_seconds_total{job=\"node\"}[2m])) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"pressure\"} == 1)) and on(job,node,instance) ((time() - timestamp(node_pressure_memory_waiting_seconds_total{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"pressure\"}) <= 90)) and on(job,node,instance) ((count_over_time(node_pressure_memory_waiting_seconds_total{job=\"node\"}[2m]) >= 4)) and on(job,node,instance) ((resets(node_pressure_memory_waiting_seconds_total{job=\"node\"}[2m]) == 0)) and on(job,node,instance) (count by (job,node,instance) (node_pressure_memory_waiting_seconds_total{job=\"node\"}) == 1) and on(job,node,instance) (max by (job,node,instance) (rate(node_pressure_memory_waiting_seconds_total{job=\"node\"}[2m])) >= 0) and on(job,node,instance) (max by (job,node,instance) (rate(node_pressure_memory_waiting_seconds_total{job=\"node\"}[2m])) <= 1)"
+        },
+        "cortex_status_pressure_memory_waiting_ratio_source_time_seconds": {
+          "query": "min by (job, node, instance) (label_replace((min by (job, node, instance) (timestamp(node_pressure_memory_waiting_seconds_total{job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job, node, instance) (timestamp(up{job=\"node\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"pressure\",job=\"node\"}))), \"source_part\", \"s2\", \"\", \"\")) and on (job, node, instance) (count by (job, node, instance) (node_pressure_memory_waiting_seconds_total{job=\"node\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance) (label_replace((min by (job,node,instance) (timestamp(node_pressure_memory_waiting_seconds_total{job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job,node,instance) (timestamp(up{job=\"node\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"pressure\"}))), \"source_part\", \"s2\", \"\", \"\")) and on(job,node,instance) (count by (job,node,instance) (node_pressure_memory_waiting_seconds_total{job=\"node\"}) == 1)"
+        },
+        "cortex_status_pressure_memory_waiting_ratio_sample_count": {
+          "query": "min by (job, node, instance) (label_replace((min by (job, node, instance) (count_over_time(node_pressure_memory_waiting_seconds_total{job=\"node\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job, node, instance) (count_over_time(up{job=\"node\"}[2m]))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job, node, instance) (count_over_time(node_scrape_collector_success{collector=\"pressure\",job=\"node\"}[2m]))), \"source_part\", \"s2\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance) (label_replace((min by (job,node,instance) (count_over_time(node_pressure_memory_waiting_seconds_total{job=\"node\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job,node,instance) (count_over_time(up{job=\"node\"}[2m]))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job,node,instance) (count_over_time(node_scrape_collector_success{job=\"node\",collector=\"pressure\"}[2m]))), \"source_part\", \"s2\", \"\", \"\"))"
+        },
+        "cortex_status_pressure_memory_waiting_ratio_resets": {
+          "query": "max by (job, node, instance) (label_replace((resets(node_pressure_memory_waiting_seconds_total{job=\"node\"}[2m])), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance) (label_replace((resets(node_pressure_memory_waiting_seconds_total{job=\"node\"}[2m])),\"source_part\",\"s0\",\"\",\"\"))"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-pressure_memory_stalled_ratio",
+      "intervalSeconds": 30,
+      "limit": 64,
+      "rules": [
+        "cortex_status_pressure_memory_stalled_ratio",
+        "cortex_status_pressure_memory_stalled_ratio_source_time_seconds",
+        "cortex_status_pressure_memory_stalled_ratio_sample_count",
+        "cortex_status_pressure_memory_stalled_ratio_resets"
+      ],
+      "expressions": {
+        "cortex_status_pressure_memory_stalled_ratio": {
+          "query": "max by (job, node, instance) (rate(node_pressure_memory_stalled_seconds_total{job=\"node\"}[2m])) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"pressure\",job=\"node\"} == 1)) and on (job, node, instance) ((time() - timestamp(node_pressure_memory_stalled_seconds_total{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"pressure\",job=\"node\"}) <= 90)) and on (job, node, instance) ((count_over_time(node_pressure_memory_stalled_seconds_total{job=\"node\"}[2m]) >= 4)) and on (job, node, instance) ((resets(node_pressure_memory_stalled_seconds_total{job=\"node\"}[2m]) == 0)) and on (job, node, instance) (count by (job, node, instance) (node_pressure_memory_stalled_seconds_total{job=\"node\"}) == 1) and on (job, node, instance) (max by (job, node, instance) (rate(node_pressure_memory_stalled_seconds_total{job=\"node\"}[2m])) >= 0) and on (job, node, instance) (max by (job, node, instance) (rate(node_pressure_memory_stalled_seconds_total{job=\"node\"}[2m])) <= 1)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance) (rate(node_pressure_memory_stalled_seconds_total{job=\"node\"}[2m])) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"pressure\"} == 1)) and on(job,node,instance) ((time() - timestamp(node_pressure_memory_stalled_seconds_total{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"pressure\"}) <= 90)) and on(job,node,instance) ((count_over_time(node_pressure_memory_stalled_seconds_total{job=\"node\"}[2m]) >= 4)) and on(job,node,instance) ((resets(node_pressure_memory_stalled_seconds_total{job=\"node\"}[2m]) == 0)) and on(job,node,instance) (count by (job,node,instance) (node_pressure_memory_stalled_seconds_total{job=\"node\"}) == 1) and on(job,node,instance) (max by (job,node,instance) (rate(node_pressure_memory_stalled_seconds_total{job=\"node\"}[2m])) >= 0) and on(job,node,instance) (max by (job,node,instance) (rate(node_pressure_memory_stalled_seconds_total{job=\"node\"}[2m])) <= 1)"
+        },
+        "cortex_status_pressure_memory_stalled_ratio_source_time_seconds": {
+          "query": "min by (job, node, instance) (label_replace((min by (job, node, instance) (timestamp(node_pressure_memory_stalled_seconds_total{job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job, node, instance) (timestamp(up{job=\"node\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"pressure\",job=\"node\"}))), \"source_part\", \"s2\", \"\", \"\")) and on (job, node, instance) (count by (job, node, instance) (node_pressure_memory_stalled_seconds_total{job=\"node\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance) (label_replace((min by (job,node,instance) (timestamp(node_pressure_memory_stalled_seconds_total{job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job,node,instance) (timestamp(up{job=\"node\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"pressure\"}))), \"source_part\", \"s2\", \"\", \"\")) and on(job,node,instance) (count by (job,node,instance) (node_pressure_memory_stalled_seconds_total{job=\"node\"}) == 1)"
+        },
+        "cortex_status_pressure_memory_stalled_ratio_sample_count": {
+          "query": "min by (job, node, instance) (label_replace((min by (job, node, instance) (count_over_time(node_pressure_memory_stalled_seconds_total{job=\"node\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job, node, instance) (count_over_time(up{job=\"node\"}[2m]))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job, node, instance) (count_over_time(node_scrape_collector_success{collector=\"pressure\",job=\"node\"}[2m]))), \"source_part\", \"s2\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance) (label_replace((min by (job,node,instance) (count_over_time(node_pressure_memory_stalled_seconds_total{job=\"node\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job,node,instance) (count_over_time(up{job=\"node\"}[2m]))), \"source_part\", \"s1\", \"\", \"\") or label_replace((min by (job,node,instance) (count_over_time(node_scrape_collector_success{job=\"node\",collector=\"pressure\"}[2m]))), \"source_part\", \"s2\", \"\", \"\"))"
+        },
+        "cortex_status_pressure_memory_stalled_ratio_resets": {
+          "query": "max by (job, node, instance) (label_replace((resets(node_pressure_memory_stalled_seconds_total{job=\"node\"}[2m])), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance) (label_replace((resets(node_pressure_memory_stalled_seconds_total{job=\"node\"}[2m])),\"source_part\",\"s0\",\"\",\"\"))"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-filesystem_available_bytes",
+      "intervalSeconds": 30,
+      "limit": 512,
+      "rules": [
+        "cortex_status_filesystem_available_bytes",
+        "cortex_status_filesystem_available_bytes_source_time_seconds",
+        "cortex_status_filesystem_available_bytes_sample_count",
+        "cortex_status_filesystem_available_bytes_resets"
+      ],
+      "expressions": {
+        "cortex_status_filesystem_available_bytes": {
+          "query": "max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"filesystem\",job=\"node\"} == 1)) and on (job, node, instance, device, mountpoint, fstype) ((time() - timestamp(node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"filesystem\",job=\"node\"}) <= 90)) and on (job, node, instance, device, mountpoint, fstype) (count by (job, node, instance, device, mountpoint, fstype) (node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) == 1) and on (job, node, instance, device, mountpoint, fstype) (max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) >= 0)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"filesystem\"} == 1)) and on(job,node,instance,device,mountpoint,fstype) ((time() - timestamp(node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"filesystem\"}) <= 90)) and on(job,node,instance,device,mountpoint,fstype) (count by (job,node,instance,device,mountpoint,fstype) (node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) == 1) and on(job,node,instance,device,mountpoint,fstype) (max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) >= 0)"
+        },
+        "cortex_status_filesystem_available_bytes_source_time_seconds": {
+          "query": "min by (job, node, instance, device, mountpoint, fstype) (label_replace((min by (job, node, instance, device, mountpoint, fstype) (timestamp(node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(up{job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"filesystem\",job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on (job, node, instance, device, mountpoint, fstype) (count by (job, node, instance, device, mountpoint, fstype) (node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device,mountpoint,fstype) (label_replace((min by (job,node,instance,device,mountpoint,fstype) (timestamp(node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(up{job=\"node\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"filesystem\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on(job,node,instance,device,mountpoint,fstype) (count by (job,node,instance,device,mountpoint,fstype) (node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) == 1)"
+        },
+        "cortex_status_filesystem_available_bytes_sample_count": {
+          "query": "min by (job, node, instance, device, mountpoint, fstype) (label_replace((count by (job, node, instance, device, mountpoint, fstype) (node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"})), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device,mountpoint,fstype) (label_replace((count by (job,node,instance,device,mountpoint,fstype) (node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"})), \"source_part\", \"s0\", \"\", \"\"))"
+        },
+        "cortex_status_filesystem_available_bytes_resets": {
+          "query": "0 * count by (job, node, instance, device, mountpoint, fstype) (node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"})",
+          "labels": {},
+          "sourceQuery": "0 * count by (job,node,instance,device,mountpoint,fstype) (node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"})"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-filesystem_available_ratio",
+      "intervalSeconds": 30,
+      "limit": 512,
+      "rules": [
+        "cortex_status_filesystem_available_ratio",
+        "cortex_status_filesystem_available_ratio_source_time_seconds",
+        "cortex_status_filesystem_available_ratio_sample_count",
+        "cortex_status_filesystem_available_ratio_resets"
+      ],
+      "expressions": {
+        "cortex_status_filesystem_available_ratio": {
+          "query": "max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"} / node_filesystem_size_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"filesystem\",job=\"node\"} == 1)) and on (job, node, instance, device, mountpoint, fstype) ((time() - timestamp(node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) <= 90)) and on (job, node, instance, device, mountpoint, fstype) ((time() - timestamp(node_filesystem_size_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"filesystem\",job=\"node\"}) <= 90)) and on (job, node, instance, device, mountpoint, fstype) (node_filesystem_size_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"} > 0) and on (job, node, instance, device, mountpoint, fstype) (count by (job, node, instance, device, mountpoint, fstype) (node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) == 1) and on (job, node, instance, device, mountpoint, fstype) (max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"} / node_filesystem_size_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) >= 0) and on (job, node, instance, device, mountpoint, fstype) (max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"} / node_filesystem_size_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) <= 1)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"} / node_filesystem_size_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"filesystem\"} == 1)) and on(job,node,instance,device,mountpoint,fstype) ((time() - timestamp(node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) <= 90)) and on(job,node,instance,device,mountpoint,fstype) ((time() - timestamp(node_filesystem_size_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"filesystem\"}) <= 90)) and on(job,node,instance,device,mountpoint,fstype) (node_filesystem_size_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"} > 0) and on(job,node,instance,device,mountpoint,fstype) (count by (job,node,instance,device,mountpoint,fstype) (node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) == 1) and on(job,node,instance,device,mountpoint,fstype) (max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"} / node_filesystem_size_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) >= 0) and on(job,node,instance,device,mountpoint,fstype) (max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"} / node_filesystem_size_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) <= 1)"
+        },
+        "cortex_status_filesystem_available_ratio_source_time_seconds": {
+          "query": "min by (job, node, instance, device, mountpoint, fstype) (label_replace((min by (job, node, instance, device, mountpoint, fstype) (timestamp(node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job, node, instance, device, mountpoint, fstype) (timestamp(node_filesystem_size_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(up{job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) + 1)), \"source_part\", \"s2\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"filesystem\",job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) + 1)), \"source_part\", \"s3\", \"\", \"\")) and on (job, node, instance, device, mountpoint, fstype) (count by (job, node, instance, device, mountpoint, fstype) (node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device,mountpoint,fstype) (label_replace((min by (job,node,instance,device,mountpoint,fstype) (timestamp(node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job,node,instance,device,mountpoint,fstype) (timestamp(node_filesystem_size_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(up{job=\"node\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) + 1)), \"source_part\", \"s2\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"filesystem\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) + 1)), \"source_part\", \"s3\", \"\", \"\")) and on(job,node,instance,device,mountpoint,fstype) (count by (job,node,instance,device,mountpoint,fstype) (node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) == 1)"
+        },
+        "cortex_status_filesystem_available_ratio_sample_count": {
+          "query": "min by (job, node, instance, device, mountpoint, fstype) (label_replace((count by (job, node, instance, device, mountpoint, fstype) (node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"})), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device,mountpoint,fstype) (label_replace((count by (job,node,instance,device,mountpoint,fstype) (node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"})), \"source_part\", \"s0\", \"\", \"\"))"
+        },
+        "cortex_status_filesystem_available_ratio_resets": {
+          "query": "0 * count by (job, node, instance, device, mountpoint, fstype) (node_filesystem_avail_bytes{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"})",
+          "labels": {},
+          "sourceQuery": "0 * count by (job,node,instance,device,mountpoint,fstype) (node_filesystem_avail_bytes{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"})"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-filesystem_inodes_free",
+      "intervalSeconds": 30,
+      "limit": 512,
+      "rules": [
+        "cortex_status_filesystem_inodes_free",
+        "cortex_status_filesystem_inodes_free_source_time_seconds",
+        "cortex_status_filesystem_inodes_free_sample_count",
+        "cortex_status_filesystem_inodes_free_resets"
+      ],
+      "expressions": {
+        "cortex_status_filesystem_inodes_free": {
+          "query": "max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"filesystem\",job=\"node\"} == 1)) and on (job, node, instance, device, mountpoint, fstype) ((time() - timestamp(node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"filesystem\",job=\"node\"}) <= 90)) and on (job, node, instance, device, mountpoint, fstype) (count by (job, node, instance, device, mountpoint, fstype) (node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) == 1) and on (job, node, instance, device, mountpoint, fstype) (max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) >= 0)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"filesystem\"} == 1)) and on(job,node,instance,device,mountpoint,fstype) ((time() - timestamp(node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"filesystem\"}) <= 90)) and on(job,node,instance,device,mountpoint,fstype) (count by (job,node,instance,device,mountpoint,fstype) (node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) == 1) and on(job,node,instance,device,mountpoint,fstype) (max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) >= 0)"
+        },
+        "cortex_status_filesystem_inodes_free_source_time_seconds": {
+          "query": "min by (job, node, instance, device, mountpoint, fstype) (label_replace((min by (job, node, instance, device, mountpoint, fstype) (timestamp(node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(up{job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"filesystem\",job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on (job, node, instance, device, mountpoint, fstype) (count by (job, node, instance, device, mountpoint, fstype) (node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device,mountpoint,fstype) (label_replace((min by (job,node,instance,device,mountpoint,fstype) (timestamp(node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(up{job=\"node\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"filesystem\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on(job,node,instance,device,mountpoint,fstype) (count by (job,node,instance,device,mountpoint,fstype) (node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) == 1)"
+        },
+        "cortex_status_filesystem_inodes_free_sample_count": {
+          "query": "min by (job, node, instance, device, mountpoint, fstype) (label_replace((count by (job, node, instance, device, mountpoint, fstype) (node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"})), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device,mountpoint,fstype) (label_replace((count by (job,node,instance,device,mountpoint,fstype) (node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"})), \"source_part\", \"s0\", \"\", \"\"))"
+        },
+        "cortex_status_filesystem_inodes_free_resets": {
+          "query": "0 * count by (job, node, instance, device, mountpoint, fstype) (node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"})",
+          "labels": {},
+          "sourceQuery": "0 * count by (job,node,instance,device,mountpoint,fstype) (node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"})"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-filesystem_inodes_free_ratio",
+      "intervalSeconds": 30,
+      "limit": 512,
+      "rules": [
+        "cortex_status_filesystem_inodes_free_ratio",
+        "cortex_status_filesystem_inodes_free_ratio_source_time_seconds",
+        "cortex_status_filesystem_inodes_free_ratio_sample_count",
+        "cortex_status_filesystem_inodes_free_ratio_resets"
+      ],
+      "expressions": {
+        "cortex_status_filesystem_inodes_free_ratio": {
+          "query": "max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"} / node_filesystem_files{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"filesystem\",job=\"node\"} == 1)) and on (job, node, instance, device, mountpoint, fstype) ((time() - timestamp(node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) <= 90)) and on (job, node, instance, device, mountpoint, fstype) ((time() - timestamp(node_filesystem_files{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"filesystem\",job=\"node\"}) <= 90)) and on (job, node, instance, device, mountpoint, fstype) (node_filesystem_files{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"} > 0) and on (job, node, instance, device, mountpoint, fstype) (count by (job, node, instance, device, mountpoint, fstype) (node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) == 1) and on (job, node, instance, device, mountpoint, fstype) (max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"} / node_filesystem_files{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) >= 0) and on (job, node, instance, device, mountpoint, fstype) (max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"} / node_filesystem_files{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) <= 1)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"} / node_filesystem_files{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"filesystem\"} == 1)) and on(job,node,instance,device,mountpoint,fstype) ((time() - timestamp(node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) <= 90)) and on(job,node,instance,device,mountpoint,fstype) ((time() - timestamp(node_filesystem_files{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"filesystem\"}) <= 90)) and on(job,node,instance,device,mountpoint,fstype) (node_filesystem_files{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"} > 0) and on(job,node,instance,device,mountpoint,fstype) (count by (job,node,instance,device,mountpoint,fstype) (node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) == 1) and on(job,node,instance,device,mountpoint,fstype) (max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"} / node_filesystem_files{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) >= 0) and on(job,node,instance,device,mountpoint,fstype) (max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"} / node_filesystem_files{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) <= 1)"
+        },
+        "cortex_status_filesystem_inodes_free_ratio_source_time_seconds": {
+          "query": "min by (job, node, instance, device, mountpoint, fstype) (label_replace((min by (job, node, instance, device, mountpoint, fstype) (timestamp(node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job, node, instance, device, mountpoint, fstype) (timestamp(node_filesystem_files{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(up{job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) + 1)), \"source_part\", \"s2\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"filesystem\",job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device, mountpoint, fstype) (node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) + 1)), \"source_part\", \"s3\", \"\", \"\")) and on (job, node, instance, device, mountpoint, fstype) (count by (job, node, instance, device, mountpoint, fstype) (node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device,mountpoint,fstype) (label_replace((min by (job,node,instance,device,mountpoint,fstype) (timestamp(node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace((min by (job,node,instance,device,mountpoint,fstype) (timestamp(node_filesystem_files{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}))), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(up{job=\"node\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) + 1)), \"source_part\", \"s2\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"filesystem\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device,mountpoint,fstype) (node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) + 1)), \"source_part\", \"s3\", \"\", \"\")) and on(job,node,instance,device,mountpoint,fstype) (count by (job,node,instance,device,mountpoint,fstype) (node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"}) == 1)"
+        },
+        "cortex_status_filesystem_inodes_free_ratio_sample_count": {
+          "query": "min by (job, node, instance, device, mountpoint, fstype) (label_replace((count by (job, node, instance, device, mountpoint, fstype) (node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"})), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device,mountpoint,fstype) (label_replace((count by (job,node,instance,device,mountpoint,fstype) (node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"})), \"source_part\", \"s0\", \"\", \"\"))"
+        },
+        "cortex_status_filesystem_inodes_free_ratio_resets": {
+          "query": "0 * count by (job, node, instance, device, mountpoint, fstype) (node_filesystem_files_free{fstype!~\"tmpfs|devtmpfs|squashfs|overlay\",job=\"node\"})",
+          "labels": {},
+          "sourceQuery": "0 * count by (job,node,instance,device,mountpoint,fstype) (node_filesystem_files_free{job=\"node\",fstype!~\"tmpfs|devtmpfs|squashfs|overlay\"})"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-network_receive_bytes_rate",
+      "intervalSeconds": 30,
+      "limit": 512,
+      "rules": [
+        "cortex_status_network_receive_bytes_rate",
+        "cortex_status_network_receive_bytes_rate_source_time_seconds",
+        "cortex_status_network_receive_bytes_rate_sample_count",
+        "cortex_status_network_receive_bytes_rate_resets"
+      ],
+      "expressions": {
+        "cortex_status_network_receive_bytes_rate": {
+          "query": "max by (job, node, instance, device) (rate(node_network_receive_bytes_total{device!=\"lo\",job=\"node\"}[2m])) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"netdev\",job=\"node\"} == 1)) and on (job, node, instance, device) ((time() - timestamp(node_network_receive_bytes_total{device!=\"lo\",job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}) <= 90)) and on (job, node, instance, device) ((count_over_time(node_network_receive_bytes_total{device!=\"lo\",job=\"node\"}[2m]) >= 4)) and on (job, node, instance, device) ((resets(node_network_receive_bytes_total{device!=\"lo\",job=\"node\"}[2m]) == 0)) and on (job, node, instance, device) (count by (job, node, instance, device) (node_network_receive_bytes_total{device!=\"lo\",job=\"node\"}) == 1) and on (job, node, instance, device) (max by (job, node, instance, device) (rate(node_network_receive_bytes_total{device!=\"lo\",job=\"node\"}[2m])) >= 0)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,device) (rate(node_network_receive_bytes_total{job=\"node\",device!=\"lo\"}[2m])) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"netdev\"} == 1)) and on(job,node,instance,device) ((time() - timestamp(node_network_receive_bytes_total{job=\"node\",device!=\"lo\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}) <= 90)) and on(job,node,instance,device) ((count_over_time(node_network_receive_bytes_total{job=\"node\",device!=\"lo\"}[2m]) >= 4)) and on(job,node,instance,device) ((resets(node_network_receive_bytes_total{job=\"node\",device!=\"lo\"}[2m]) == 0)) and on(job,node,instance,device) (count by (job,node,instance,device) (node_network_receive_bytes_total{job=\"node\",device!=\"lo\"}) == 1) and on(job,node,instance,device) (max by (job,node,instance,device) (rate(node_network_receive_bytes_total{job=\"node\",device!=\"lo\"}[2m])) >= 0)"
+        },
+        "cortex_status_network_receive_bytes_rate_source_time_seconds": {
+          "query": "min by (job, node, instance, device) (label_replace((min by (job, node, instance, device) (timestamp(node_network_receive_bytes_total{device!=\"lo\",job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(up{job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_receive_bytes_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_receive_bytes_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on (job, node, instance, device) (count by (job, node, instance, device) (node_network_receive_bytes_total{device!=\"lo\",job=\"node\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device) (label_replace((min by (job,node,instance,device) (timestamp(node_network_receive_bytes_total{job=\"node\",device!=\"lo\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(up{job=\"node\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_receive_bytes_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_receive_bytes_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on(job,node,instance,device) (count by (job,node,instance,device) (node_network_receive_bytes_total{job=\"node\",device!=\"lo\"}) == 1)"
+        },
+        "cortex_status_network_receive_bytes_rate_sample_count": {
+          "query": "min by (job, node, instance, device) (label_replace((min by (job, node, instance, device) (count_over_time(node_network_receive_bytes_total{device!=\"lo\",job=\"node\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (count_over_time(up{job=\"node\"}[2m]))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_receive_bytes_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (count_over_time(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}[2m]))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_receive_bytes_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s2\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device) (label_replace((min by (job,node,instance,device) (count_over_time(node_network_receive_bytes_total{job=\"node\",device!=\"lo\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (count_over_time(up{job=\"node\"}[2m]))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_receive_bytes_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (count_over_time(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}[2m]))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_receive_bytes_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s2\", \"\", \"\"))"
+        },
+        "cortex_status_network_receive_bytes_rate_resets": {
+          "query": "max by (job, node, instance, device) (label_replace((resets(node_network_receive_bytes_total{device!=\"lo\",job=\"node\"}[2m])), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,device) (label_replace((resets(node_network_receive_bytes_total{job=\"node\",device!=\"lo\"}[2m])),\"source_part\",\"s0\",\"\",\"\"))"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-network_receive_drop_rate",
+      "intervalSeconds": 30,
+      "limit": 512,
+      "rules": [
+        "cortex_status_network_receive_drop_rate",
+        "cortex_status_network_receive_drop_rate_source_time_seconds",
+        "cortex_status_network_receive_drop_rate_sample_count",
+        "cortex_status_network_receive_drop_rate_resets"
+      ],
+      "expressions": {
+        "cortex_status_network_receive_drop_rate": {
+          "query": "max by (job, node, instance, device) (rate(node_network_receive_drop_total{device!=\"lo\",job=\"node\"}[2m])) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"netdev\",job=\"node\"} == 1)) and on (job, node, instance, device) ((time() - timestamp(node_network_receive_drop_total{device!=\"lo\",job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}) <= 90)) and on (job, node, instance, device) ((count_over_time(node_network_receive_drop_total{device!=\"lo\",job=\"node\"}[2m]) >= 4)) and on (job, node, instance, device) ((resets(node_network_receive_drop_total{device!=\"lo\",job=\"node\"}[2m]) == 0)) and on (job, node, instance, device) (count by (job, node, instance, device) (node_network_receive_drop_total{device!=\"lo\",job=\"node\"}) == 1) and on (job, node, instance, device) (max by (job, node, instance, device) (rate(node_network_receive_drop_total{device!=\"lo\",job=\"node\"}[2m])) >= 0)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,device) (rate(node_network_receive_drop_total{job=\"node\",device!=\"lo\"}[2m])) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"netdev\"} == 1)) and on(job,node,instance,device) ((time() - timestamp(node_network_receive_drop_total{job=\"node\",device!=\"lo\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}) <= 90)) and on(job,node,instance,device) ((count_over_time(node_network_receive_drop_total{job=\"node\",device!=\"lo\"}[2m]) >= 4)) and on(job,node,instance,device) ((resets(node_network_receive_drop_total{job=\"node\",device!=\"lo\"}[2m]) == 0)) and on(job,node,instance,device) (count by (job,node,instance,device) (node_network_receive_drop_total{job=\"node\",device!=\"lo\"}) == 1) and on(job,node,instance,device) (max by (job,node,instance,device) (rate(node_network_receive_drop_total{job=\"node\",device!=\"lo\"}[2m])) >= 0)"
+        },
+        "cortex_status_network_receive_drop_rate_source_time_seconds": {
+          "query": "min by (job, node, instance, device) (label_replace((min by (job, node, instance, device) (timestamp(node_network_receive_drop_total{device!=\"lo\",job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(up{job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_receive_drop_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_receive_drop_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on (job, node, instance, device) (count by (job, node, instance, device) (node_network_receive_drop_total{device!=\"lo\",job=\"node\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device) (label_replace((min by (job,node,instance,device) (timestamp(node_network_receive_drop_total{job=\"node\",device!=\"lo\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(up{job=\"node\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_receive_drop_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_receive_drop_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on(job,node,instance,device) (count by (job,node,instance,device) (node_network_receive_drop_total{job=\"node\",device!=\"lo\"}) == 1)"
+        },
+        "cortex_status_network_receive_drop_rate_sample_count": {
+          "query": "min by (job, node, instance, device) (label_replace((min by (job, node, instance, device) (count_over_time(node_network_receive_drop_total{device!=\"lo\",job=\"node\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (count_over_time(up{job=\"node\"}[2m]))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_receive_drop_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (count_over_time(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}[2m]))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_receive_drop_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s2\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device) (label_replace((min by (job,node,instance,device) (count_over_time(node_network_receive_drop_total{job=\"node\",device!=\"lo\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (count_over_time(up{job=\"node\"}[2m]))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_receive_drop_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (count_over_time(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}[2m]))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_receive_drop_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s2\", \"\", \"\"))"
+        },
+        "cortex_status_network_receive_drop_rate_resets": {
+          "query": "max by (job, node, instance, device) (label_replace((resets(node_network_receive_drop_total{device!=\"lo\",job=\"node\"}[2m])), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,device) (label_replace((resets(node_network_receive_drop_total{job=\"node\",device!=\"lo\"}[2m])),\"source_part\",\"s0\",\"\",\"\"))"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-network_receive_errs_rate",
+      "intervalSeconds": 30,
+      "limit": 512,
+      "rules": [
+        "cortex_status_network_receive_errs_rate",
+        "cortex_status_network_receive_errs_rate_source_time_seconds",
+        "cortex_status_network_receive_errs_rate_sample_count",
+        "cortex_status_network_receive_errs_rate_resets"
+      ],
+      "expressions": {
+        "cortex_status_network_receive_errs_rate": {
+          "query": "max by (job, node, instance, device) (rate(node_network_receive_errs_total{device!=\"lo\",job=\"node\"}[2m])) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"netdev\",job=\"node\"} == 1)) and on (job, node, instance, device) ((time() - timestamp(node_network_receive_errs_total{device!=\"lo\",job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}) <= 90)) and on (job, node, instance, device) ((count_over_time(node_network_receive_errs_total{device!=\"lo\",job=\"node\"}[2m]) >= 4)) and on (job, node, instance, device) ((resets(node_network_receive_errs_total{device!=\"lo\",job=\"node\"}[2m]) == 0)) and on (job, node, instance, device) (count by (job, node, instance, device) (node_network_receive_errs_total{device!=\"lo\",job=\"node\"}) == 1) and on (job, node, instance, device) (max by (job, node, instance, device) (rate(node_network_receive_errs_total{device!=\"lo\",job=\"node\"}[2m])) >= 0)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,device) (rate(node_network_receive_errs_total{job=\"node\",device!=\"lo\"}[2m])) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"netdev\"} == 1)) and on(job,node,instance,device) ((time() - timestamp(node_network_receive_errs_total{job=\"node\",device!=\"lo\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}) <= 90)) and on(job,node,instance,device) ((count_over_time(node_network_receive_errs_total{job=\"node\",device!=\"lo\"}[2m]) >= 4)) and on(job,node,instance,device) ((resets(node_network_receive_errs_total{job=\"node\",device!=\"lo\"}[2m]) == 0)) and on(job,node,instance,device) (count by (job,node,instance,device) (node_network_receive_errs_total{job=\"node\",device!=\"lo\"}) == 1) and on(job,node,instance,device) (max by (job,node,instance,device) (rate(node_network_receive_errs_total{job=\"node\",device!=\"lo\"}[2m])) >= 0)"
+        },
+        "cortex_status_network_receive_errs_rate_source_time_seconds": {
+          "query": "min by (job, node, instance, device) (label_replace((min by (job, node, instance, device) (timestamp(node_network_receive_errs_total{device!=\"lo\",job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(up{job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_receive_errs_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_receive_errs_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on (job, node, instance, device) (count by (job, node, instance, device) (node_network_receive_errs_total{device!=\"lo\",job=\"node\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device) (label_replace((min by (job,node,instance,device) (timestamp(node_network_receive_errs_total{job=\"node\",device!=\"lo\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(up{job=\"node\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_receive_errs_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_receive_errs_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on(job,node,instance,device) (count by (job,node,instance,device) (node_network_receive_errs_total{job=\"node\",device!=\"lo\"}) == 1)"
+        },
+        "cortex_status_network_receive_errs_rate_sample_count": {
+          "query": "min by (job, node, instance, device) (label_replace((min by (job, node, instance, device) (count_over_time(node_network_receive_errs_total{device!=\"lo\",job=\"node\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (count_over_time(up{job=\"node\"}[2m]))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_receive_errs_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (count_over_time(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}[2m]))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_receive_errs_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s2\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device) (label_replace((min by (job,node,instance,device) (count_over_time(node_network_receive_errs_total{job=\"node\",device!=\"lo\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (count_over_time(up{job=\"node\"}[2m]))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_receive_errs_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (count_over_time(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}[2m]))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_receive_errs_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s2\", \"\", \"\"))"
+        },
+        "cortex_status_network_receive_errs_rate_resets": {
+          "query": "max by (job, node, instance, device) (label_replace((resets(node_network_receive_errs_total{device!=\"lo\",job=\"node\"}[2m])), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,device) (label_replace((resets(node_network_receive_errs_total{job=\"node\",device!=\"lo\"}[2m])),\"source_part\",\"s0\",\"\",\"\"))"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-network_transmit_bytes_rate",
+      "intervalSeconds": 30,
+      "limit": 512,
+      "rules": [
+        "cortex_status_network_transmit_bytes_rate",
+        "cortex_status_network_transmit_bytes_rate_source_time_seconds",
+        "cortex_status_network_transmit_bytes_rate_sample_count",
+        "cortex_status_network_transmit_bytes_rate_resets"
+      ],
+      "expressions": {
+        "cortex_status_network_transmit_bytes_rate": {
+          "query": "max by (job, node, instance, device) (rate(node_network_transmit_bytes_total{device!=\"lo\",job=\"node\"}[2m])) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"netdev\",job=\"node\"} == 1)) and on (job, node, instance, device) ((time() - timestamp(node_network_transmit_bytes_total{device!=\"lo\",job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}) <= 90)) and on (job, node, instance, device) ((count_over_time(node_network_transmit_bytes_total{device!=\"lo\",job=\"node\"}[2m]) >= 4)) and on (job, node, instance, device) ((resets(node_network_transmit_bytes_total{device!=\"lo\",job=\"node\"}[2m]) == 0)) and on (job, node, instance, device) (count by (job, node, instance, device) (node_network_transmit_bytes_total{device!=\"lo\",job=\"node\"}) == 1) and on (job, node, instance, device) (max by (job, node, instance, device) (rate(node_network_transmit_bytes_total{device!=\"lo\",job=\"node\"}[2m])) >= 0)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,device) (rate(node_network_transmit_bytes_total{job=\"node\",device!=\"lo\"}[2m])) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"netdev\"} == 1)) and on(job,node,instance,device) ((time() - timestamp(node_network_transmit_bytes_total{job=\"node\",device!=\"lo\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}) <= 90)) and on(job,node,instance,device) ((count_over_time(node_network_transmit_bytes_total{job=\"node\",device!=\"lo\"}[2m]) >= 4)) and on(job,node,instance,device) ((resets(node_network_transmit_bytes_total{job=\"node\",device!=\"lo\"}[2m]) == 0)) and on(job,node,instance,device) (count by (job,node,instance,device) (node_network_transmit_bytes_total{job=\"node\",device!=\"lo\"}) == 1) and on(job,node,instance,device) (max by (job,node,instance,device) (rate(node_network_transmit_bytes_total{job=\"node\",device!=\"lo\"}[2m])) >= 0)"
+        },
+        "cortex_status_network_transmit_bytes_rate_source_time_seconds": {
+          "query": "min by (job, node, instance, device) (label_replace((min by (job, node, instance, device) (timestamp(node_network_transmit_bytes_total{device!=\"lo\",job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(up{job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_transmit_bytes_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_transmit_bytes_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on (job, node, instance, device) (count by (job, node, instance, device) (node_network_transmit_bytes_total{device!=\"lo\",job=\"node\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device) (label_replace((min by (job,node,instance,device) (timestamp(node_network_transmit_bytes_total{job=\"node\",device!=\"lo\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(up{job=\"node\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_transmit_bytes_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_transmit_bytes_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on(job,node,instance,device) (count by (job,node,instance,device) (node_network_transmit_bytes_total{job=\"node\",device!=\"lo\"}) == 1)"
+        },
+        "cortex_status_network_transmit_bytes_rate_sample_count": {
+          "query": "min by (job, node, instance, device) (label_replace((min by (job, node, instance, device) (count_over_time(node_network_transmit_bytes_total{device!=\"lo\",job=\"node\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (count_over_time(up{job=\"node\"}[2m]))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_transmit_bytes_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (count_over_time(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}[2m]))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_transmit_bytes_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s2\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device) (label_replace((min by (job,node,instance,device) (count_over_time(node_network_transmit_bytes_total{job=\"node\",device!=\"lo\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (count_over_time(up{job=\"node\"}[2m]))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_transmit_bytes_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (count_over_time(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}[2m]))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_transmit_bytes_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s2\", \"\", \"\"))"
+        },
+        "cortex_status_network_transmit_bytes_rate_resets": {
+          "query": "max by (job, node, instance, device) (label_replace((resets(node_network_transmit_bytes_total{device!=\"lo\",job=\"node\"}[2m])), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,device) (label_replace((resets(node_network_transmit_bytes_total{job=\"node\",device!=\"lo\"}[2m])),\"source_part\",\"s0\",\"\",\"\"))"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-network_transmit_drop_rate",
+      "intervalSeconds": 30,
+      "limit": 512,
+      "rules": [
+        "cortex_status_network_transmit_drop_rate",
+        "cortex_status_network_transmit_drop_rate_source_time_seconds",
+        "cortex_status_network_transmit_drop_rate_sample_count",
+        "cortex_status_network_transmit_drop_rate_resets"
+      ],
+      "expressions": {
+        "cortex_status_network_transmit_drop_rate": {
+          "query": "max by (job, node, instance, device) (rate(node_network_transmit_drop_total{device!=\"lo\",job=\"node\"}[2m])) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"netdev\",job=\"node\"} == 1)) and on (job, node, instance, device) ((time() - timestamp(node_network_transmit_drop_total{device!=\"lo\",job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}) <= 90)) and on (job, node, instance, device) ((count_over_time(node_network_transmit_drop_total{device!=\"lo\",job=\"node\"}[2m]) >= 4)) and on (job, node, instance, device) ((resets(node_network_transmit_drop_total{device!=\"lo\",job=\"node\"}[2m]) == 0)) and on (job, node, instance, device) (count by (job, node, instance, device) (node_network_transmit_drop_total{device!=\"lo\",job=\"node\"}) == 1) and on (job, node, instance, device) (max by (job, node, instance, device) (rate(node_network_transmit_drop_total{device!=\"lo\",job=\"node\"}[2m])) >= 0)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,device) (rate(node_network_transmit_drop_total{job=\"node\",device!=\"lo\"}[2m])) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"netdev\"} == 1)) and on(job,node,instance,device) ((time() - timestamp(node_network_transmit_drop_total{job=\"node\",device!=\"lo\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}) <= 90)) and on(job,node,instance,device) ((count_over_time(node_network_transmit_drop_total{job=\"node\",device!=\"lo\"}[2m]) >= 4)) and on(job,node,instance,device) ((resets(node_network_transmit_drop_total{job=\"node\",device!=\"lo\"}[2m]) == 0)) and on(job,node,instance,device) (count by (job,node,instance,device) (node_network_transmit_drop_total{job=\"node\",device!=\"lo\"}) == 1) and on(job,node,instance,device) (max by (job,node,instance,device) (rate(node_network_transmit_drop_total{job=\"node\",device!=\"lo\"}[2m])) >= 0)"
+        },
+        "cortex_status_network_transmit_drop_rate_source_time_seconds": {
+          "query": "min by (job, node, instance, device) (label_replace((min by (job, node, instance, device) (timestamp(node_network_transmit_drop_total{device!=\"lo\",job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(up{job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_transmit_drop_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_transmit_drop_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on (job, node, instance, device) (count by (job, node, instance, device) (node_network_transmit_drop_total{device!=\"lo\",job=\"node\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device) (label_replace((min by (job,node,instance,device) (timestamp(node_network_transmit_drop_total{job=\"node\",device!=\"lo\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(up{job=\"node\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_transmit_drop_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_transmit_drop_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on(job,node,instance,device) (count by (job,node,instance,device) (node_network_transmit_drop_total{job=\"node\",device!=\"lo\"}) == 1)"
+        },
+        "cortex_status_network_transmit_drop_rate_sample_count": {
+          "query": "min by (job, node, instance, device) (label_replace((min by (job, node, instance, device) (count_over_time(node_network_transmit_drop_total{device!=\"lo\",job=\"node\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (count_over_time(up{job=\"node\"}[2m]))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_transmit_drop_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (count_over_time(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}[2m]))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_transmit_drop_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s2\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device) (label_replace((min by (job,node,instance,device) (count_over_time(node_network_transmit_drop_total{job=\"node\",device!=\"lo\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (count_over_time(up{job=\"node\"}[2m]))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_transmit_drop_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (count_over_time(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}[2m]))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_transmit_drop_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s2\", \"\", \"\"))"
+        },
+        "cortex_status_network_transmit_drop_rate_resets": {
+          "query": "max by (job, node, instance, device) (label_replace((resets(node_network_transmit_drop_total{device!=\"lo\",job=\"node\"}[2m])), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,device) (label_replace((resets(node_network_transmit_drop_total{job=\"node\",device!=\"lo\"}[2m])),\"source_part\",\"s0\",\"\",\"\"))"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-network_transmit_errs_rate",
+      "intervalSeconds": 30,
+      "limit": 512,
+      "rules": [
+        "cortex_status_network_transmit_errs_rate",
+        "cortex_status_network_transmit_errs_rate_source_time_seconds",
+        "cortex_status_network_transmit_errs_rate_sample_count",
+        "cortex_status_network_transmit_errs_rate_resets"
+      ],
+      "expressions": {
+        "cortex_status_network_transmit_errs_rate": {
+          "query": "max by (job, node, instance, device) (rate(node_network_transmit_errs_total{device!=\"lo\",job=\"node\"}[2m])) and on (job, node, instance) ((up{job=\"node\"} == 1)) and on (job, node, instance) ((node_scrape_collector_success{collector=\"netdev\",job=\"node\"} == 1)) and on (job, node, instance, device) ((time() - timestamp(node_network_transmit_errs_total{device!=\"lo\",job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}) <= 90)) and on (job, node, instance, device) ((count_over_time(node_network_transmit_errs_total{device!=\"lo\",job=\"node\"}[2m]) >= 4)) and on (job, node, instance, device) ((resets(node_network_transmit_errs_total{device!=\"lo\",job=\"node\"}[2m]) == 0)) and on (job, node, instance, device) (count by (job, node, instance, device) (node_network_transmit_errs_total{device!=\"lo\",job=\"node\"}) == 1) and on (job, node, instance, device) (max by (job, node, instance, device) (rate(node_network_transmit_errs_total{device!=\"lo\",job=\"node\"}[2m])) >= 0)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,device) (rate(node_network_transmit_errs_total{job=\"node\",device!=\"lo\"}[2m])) and on(job,node,instance) ((up{job=\"node\"} == 1)) and on(job,node,instance) ((node_scrape_collector_success{job=\"node\",collector=\"netdev\"} == 1)) and on(job,node,instance,device) ((time() - timestamp(node_network_transmit_errs_total{job=\"node\",device!=\"lo\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"node\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}) <= 90)) and on(job,node,instance,device) ((count_over_time(node_network_transmit_errs_total{job=\"node\",device!=\"lo\"}[2m]) >= 4)) and on(job,node,instance,device) ((resets(node_network_transmit_errs_total{job=\"node\",device!=\"lo\"}[2m]) == 0)) and on(job,node,instance,device) (count by (job,node,instance,device) (node_network_transmit_errs_total{job=\"node\",device!=\"lo\"}) == 1) and on(job,node,instance,device) (max by (job,node,instance,device) (rate(node_network_transmit_errs_total{job=\"node\",device!=\"lo\"}[2m])) >= 0)"
+        },
+        "cortex_status_network_transmit_errs_rate_source_time_seconds": {
+          "query": "min by (job, node, instance, device) (label_replace((min by (job, node, instance, device) (timestamp(node_network_transmit_errs_total{device!=\"lo\",job=\"node\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(up{job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_transmit_errs_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_transmit_errs_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on (job, node, instance, device) (count by (job, node, instance, device) (node_network_transmit_errs_total{device!=\"lo\",job=\"node\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device) (label_replace((min by (job,node,instance,device) (timestamp(node_network_transmit_errs_total{job=\"node\",device!=\"lo\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(up{job=\"node\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_transmit_errs_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_transmit_errs_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s2\", \"\", \"\")) and on(job,node,instance,device) (count by (job,node,instance,device) (node_network_transmit_errs_total{job=\"node\",device!=\"lo\"}) == 1)"
+        },
+        "cortex_status_network_transmit_errs_rate_sample_count": {
+          "query": "min by (job, node, instance, device) (label_replace((min by (job, node, instance, device) (count_over_time(node_network_transmit_errs_total{device!=\"lo\",job=\"node\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (count_over_time(up{job=\"node\"}[2m]))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_transmit_errs_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job, node, instance) (count_over_time(node_scrape_collector_success{collector=\"netdev\",job=\"node\"}[2m]))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, device) (node_network_transmit_errs_total{device!=\"lo\",job=\"node\"}) + 1)), \"source_part\", \"s2\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,device) (label_replace((min by (job,node,instance,device) (count_over_time(node_network_transmit_errs_total{job=\"node\",device!=\"lo\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (count_over_time(up{job=\"node\"}[2m]))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_transmit_errs_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s1\", \"\", \"\") or label_replace(((min by (job,node,instance) (count_over_time(node_scrape_collector_success{job=\"node\",collector=\"netdev\"}[2m]))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,device) (node_network_transmit_errs_total{job=\"node\",device!=\"lo\"}) + 1)), \"source_part\", \"s2\", \"\", \"\"))"
+        },
+        "cortex_status_network_transmit_errs_rate_resets": {
+          "query": "max by (job, node, instance, device) (label_replace((resets(node_network_transmit_errs_total{device!=\"lo\",job=\"node\"}[2m])), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,device) (label_replace((resets(node_network_transmit_errs_total{job=\"node\",device!=\"lo\"}[2m])),\"source_part\",\"s0\",\"\",\"\"))"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-gpu_utilization_ratio",
+      "intervalSeconds": 30,
+      "limit": 256,
+      "rules": [
+        "cortex_status_gpu_utilization_ratio",
+        "cortex_status_gpu_utilization_ratio_source_time_seconds",
+        "cortex_status_gpu_utilization_ratio_sample_count",
+        "cortex_status_gpu_utilization_ratio_resets"
+      ],
+      "expressions": {
+        "cortex_status_gpu_utilization_ratio": {
+          "query": "max by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"} / 100) and on (job, node, instance) ((up{job=\"gpu\"} == 1)) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) ((time() - timestamp(DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"}) <= 60)) and on (job, node, instance) ((time() - timestamp(up{job=\"gpu\"}) <= 60)) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"} >= 0) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"} <= 100) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (count by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"}) == 1) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (max by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"} / 100) >= 0) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (max by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"} / 100) <= 1)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"} / 100) and on(job,node,instance) ((up{job=\"gpu\"} == 1)) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) ((time() - timestamp(DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"}) <= 60)) and on(job,node,instance) ((time() - timestamp(up{job=\"gpu\"}) <= 60)) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"} >= 0) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"} <= 100) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (count by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"}) == 1) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (max by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"} / 100) >= 0) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (max by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"} / 100) <= 1)"
+        },
+        "cortex_status_gpu_utilization_ratio_source_time_seconds": {
+          "query": "min by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (label_replace((min by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (timestamp(DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(up{job=\"gpu\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"}) + 1)), \"source_part\", \"s1\", \"\", \"\")) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (count by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (label_replace((min by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (timestamp(DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(up{job=\"gpu\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"}) + 1)), \"source_part\", \"s1\", \"\", \"\")) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (count by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"}) == 1)"
+        },
+        "cortex_status_gpu_utilization_ratio_sample_count": {
+          "query": "min by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (label_replace((count by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"})), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (label_replace((count by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"})), \"source_part\", \"s0\", \"\", \"\"))"
+        },
+        "cortex_status_gpu_utilization_ratio_resets": {
+          "query": "0 * count by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"})",
+          "labels": {},
+          "sourceQuery": "0 * count by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_GPU_UTIL{job=\"gpu\"})"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-gpu_memory_used_bytes",
+      "intervalSeconds": 30,
+      "limit": 256,
+      "rules": [
+        "cortex_status_gpu_memory_used_bytes",
+        "cortex_status_gpu_memory_used_bytes_source_time_seconds",
+        "cortex_status_gpu_memory_used_bytes_sample_count",
+        "cortex_status_gpu_memory_used_bytes_resets"
+      ],
+      "expressions": {
+        "cortex_status_gpu_memory_used_bytes": {
+          "query": "max by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"} * 1048576) and on (job, node, instance) ((up{job=\"gpu\"} == 1)) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) ((time() - timestamp(DCGM_FI_DEV_FB_USED{job=\"gpu\"}) <= 60)) and on (job, node, instance) ((time() - timestamp(up{job=\"gpu\"}) <= 60)) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"} >= 0) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"} < 9223372036854776000) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (count by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"}) == 1) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (max by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"} * 1048576) >= 0)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"} * 1048576) and on(job,node,instance) ((up{job=\"gpu\"} == 1)) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) ((time() - timestamp(DCGM_FI_DEV_FB_USED{job=\"gpu\"}) <= 60)) and on(job,node,instance) ((time() - timestamp(up{job=\"gpu\"}) <= 60)) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"} >= 0) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"} < 9223372036854775792) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (count by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"}) == 1) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (max by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"} * 1048576) >= 0)"
+        },
+        "cortex_status_gpu_memory_used_bytes_source_time_seconds": {
+          "query": "min by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (label_replace((min by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (timestamp(DCGM_FI_DEV_FB_USED{job=\"gpu\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(up{job=\"gpu\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"}) + 1)), \"source_part\", \"s1\", \"\", \"\")) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (count by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (label_replace((min by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (timestamp(DCGM_FI_DEV_FB_USED{job=\"gpu\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(up{job=\"gpu\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"}) + 1)), \"source_part\", \"s1\", \"\", \"\")) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (count by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"}) == 1)"
+        },
+        "cortex_status_gpu_memory_used_bytes_sample_count": {
+          "query": "min by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (label_replace((count by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"})), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (label_replace((count by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"})), \"source_part\", \"s0\", \"\", \"\"))"
+        },
+        "cortex_status_gpu_memory_used_bytes_resets": {
+          "query": "0 * count by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"})",
+          "labels": {},
+          "sourceQuery": "0 * count by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_FB_USED{job=\"gpu\"})"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-gpu_power_watts",
+      "intervalSeconds": 30,
+      "limit": 256,
+      "rules": [
+        "cortex_status_gpu_power_watts",
+        "cortex_status_gpu_power_watts_source_time_seconds",
+        "cortex_status_gpu_power_watts_sample_count",
+        "cortex_status_gpu_power_watts_resets"
+      ],
+      "expressions": {
+        "cortex_status_gpu_power_watts": {
+          "query": "max by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"}) and on (job, node, instance) ((up{job=\"gpu\"} == 1)) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) ((time() - timestamp(DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"}) <= 60)) and on (job, node, instance) ((time() - timestamp(up{job=\"gpu\"}) <= 60)) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"} >= 0) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"} < 140737488355328) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (count by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"}) == 1) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (max by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"}) >= 0)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"}) and on(job,node,instance) ((up{job=\"gpu\"} == 1)) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) ((time() - timestamp(DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"}) <= 60)) and on(job,node,instance) ((time() - timestamp(up{job=\"gpu\"}) <= 60)) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"} >= 0) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"} < 140737488355328) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (count by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"}) == 1) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (max by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"}) >= 0)"
+        },
+        "cortex_status_gpu_power_watts_source_time_seconds": {
+          "query": "min by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (label_replace((min by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (timestamp(DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(up{job=\"gpu\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"}) + 1)), \"source_part\", \"s1\", \"\", \"\")) and on (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (count by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (label_replace((min by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (timestamp(DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(up{job=\"gpu\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"}) + 1)), \"source_part\", \"s1\", \"\", \"\")) and on(job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (count by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"}) == 1)"
+        },
+        "cortex_status_gpu_power_watts_sample_count": {
+          "query": "min by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (label_replace((count by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"})), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (label_replace((count by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"})), \"source_part\", \"s0\", \"\", \"\"))"
+        },
+        "cortex_status_gpu_power_watts_resets": {
+          "query": "0 * count by (job, node, instance, UUID, gpu, device, pci_bus_id, namespace, pod, container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"})",
+          "labels": {},
+          "sourceQuery": "0 * count by (job,node,instance,UUID,gpu,device,pci_bus_id,namespace,pod,container) (DCGM_FI_DEV_POWER_USAGE{job=\"gpu\"})"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-http_requests_rate",
+      "intervalSeconds": 30,
+      "limit": 1024,
+      "rules": [
+        "cortex_status_http_requests_rate",
+        "cortex_status_http_requests_rate_source_time_seconds",
+        "cortex_status_http_requests_rate_sample_count",
+        "cortex_status_http_requests_rate_resets"
+      ],
+      "expressions": {
+        "cortex_status_http_requests_rate": {
+          "query": "max by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (rate(http_requests_total{job=\"librechat\"}[2m])) and on (job, node, instance) ((up{job=\"librechat\"} == 1)) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) ((time() - timestamp(http_requests_total{job=\"librechat\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"librechat\"}) <= 90)) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) ((count_over_time(http_requests_total{job=\"librechat\"}[2m]) >= 4)) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) ((resets(http_requests_total{job=\"librechat\"}[2m]) == 0)) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (count by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (http_requests_total{job=\"librechat\"}) == 1) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (max by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (rate(http_requests_total{job=\"librechat\"}[2m])) >= 0)",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (rate(http_requests_total{job=\"librechat\"}[2m])) and on(job,node,instance) ((up{job=\"librechat\"} == 1)) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) ((time() - timestamp(http_requests_total{job=\"librechat\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"librechat\"}) <= 90)) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) ((count_over_time(http_requests_total{job=\"librechat\"}[2m]) >= 4)) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) ((resets(http_requests_total{job=\"librechat\"}[2m]) == 0)) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (count by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (http_requests_total{job=\"librechat\"}) == 1) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (max by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (rate(http_requests_total{job=\"librechat\"}[2m])) >= 0)"
+        },
+        "cortex_status_http_requests_rate_source_time_seconds": {
+          "query": "min by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (label_replace((min by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (timestamp(http_requests_total{job=\"librechat\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(up{job=\"librechat\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (http_requests_total{job=\"librechat\"}) + 1)), \"source_part\", \"s1\", \"\", \"\")) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (count by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (http_requests_total{job=\"librechat\"}) == 1)",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (label_replace((min by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (timestamp(http_requests_total{job=\"librechat\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(up{job=\"librechat\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (http_requests_total{job=\"librechat\"}) + 1)), \"source_part\", \"s1\", \"\", \"\")) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (count by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (http_requests_total{job=\"librechat\"}) == 1)"
+        },
+        "cortex_status_http_requests_rate_sample_count": {
+          "query": "min by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (label_replace((min by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (count_over_time(http_requests_total{job=\"librechat\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (count_over_time(up{job=\"librechat\"}[2m]))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (http_requests_total{job=\"librechat\"}) + 1)), \"source_part\", \"s1\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (label_replace((min by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (count_over_time(http_requests_total{job=\"librechat\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (count_over_time(up{job=\"librechat\"}[2m]))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (http_requests_total{job=\"librechat\"}) + 1)), \"source_part\", \"s1\", \"\", \"\"))"
+        },
+        "cortex_status_http_requests_rate_resets": {
+          "query": "max by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (label_replace((resets(http_requests_total{job=\"librechat\"}[2m])), \"source_part\", \"s0\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (label_replace((resets(http_requests_total{job=\"librechat\"}[2m])),\"source_part\",\"s0\",\"\",\"\"))"
+        }
+      }
+    },
+    {
+      "name": "cortex-status-http_latency_p95_seconds",
+      "intervalSeconds": 30,
+      "limit": 1024,
+      "rules": [
+        "cortex_status_http_latency_p95_seconds",
+        "cortex_status_http_latency_p95_seconds_source_time_seconds",
+        "cortex_status_http_latency_p95_seconds_sample_count",
+        "cortex_status_http_latency_p95_seconds_resets"
+      ],
+      "expressions": {
+        "cortex_status_http_latency_p95_seconds": {
+          "query": "max by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (histogram_quantile(0.95, sum by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status, le) (((rate(http_request_duration_seconds_bucket{job=\"librechat\"}[2m]) and ignoring (le) ((count without (le) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\"}[2m])) == 8) and (count without (le) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\",le=~\"0[.]05|0[.]1|0[.]3|0[.]5|1|2|5|[+]Inf\"}[2m])) == 8))) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status, le) ((count by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status, le) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\"}[2m])) == 1) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (count by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (count by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status, le) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\"}[2m]))) == 8) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (count by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\",le=~\"0[.]05|0[.]1|0[.]3|0[.]5|1|2|5|[+]Inf\"}[2m])) == 8)))))) and on (job, node, instance) ((up{job=\"librechat\"} == 1)) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) ((time() - timestamp(http_request_duration_seconds_count{job=\"librechat\"}) <= 90)) and on (job, node, instance) ((time() - timestamp(up{job=\"librechat\"}) <= 90)) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) ((count_over_time(http_request_duration_seconds_count{job=\"librechat\"}[2m]) >= 4)) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) ((resets(http_request_duration_seconds_count{job=\"librechat\"}[2m]) == 0)) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (rate(http_request_duration_seconds_count{job=\"librechat\"}[2m]) > 0) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (count by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (http_request_duration_seconds_count{job=\"librechat\"}) == 1) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (max by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (histogram_quantile(0.95, sum by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status, le) (((rate(http_request_duration_seconds_bucket{job=\"librechat\"}[2m]) and ignoring (le) ((count without (le) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\"}[2m])) == 8) and (count without (le) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\",le=~\"0[.]05|0[.]1|0[.]3|0[.]5|1|2|5|[+]Inf\"}[2m])) == 8))) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status, le) ((count by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status, le) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\"}[2m])) == 1) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (count by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (count by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status, le) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\"}[2m]))) == 8) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (count by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\",le=~\"0[.]05|0[.]1|0[.]3|0[.]5|1|2|5|[+]Inf\"}[2m])) == 8)))))) >= 0) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (min by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\"}[2m])) >= 4) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (max by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (resets(http_request_duration_seconds_bucket{job=\"librechat\"}[2m])) == 0) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (time() - min by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (timestamp(http_request_duration_seconds_bucket{job=\"librechat\"})) <= 90) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (count by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (http_request_duration_seconds_bucket{job=\"librechat\"}) == 8) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (max by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (http_request_duration_seconds_bucket{job=\"librechat\",le=\"+Inf\"}) == http_request_duration_seconds_count{job=\"librechat\"})",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (histogram_quantile(0.95, sum by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status,le) (((rate(http_request_duration_seconds_bucket{job=\"librechat\"}[2m]) and ignoring(le) ((count without(le) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\"}[2m])) == 8) and (count without(le) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\",le=~\"0[.]05|0[.]1|0[.]3|0[.]5|1|2|5|[+]Inf\"}[2m])) == 8))) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status,le) ((count by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status,le) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\"}[2m])) == 1) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (count by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (count by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status,le) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\"}[2m]))) == 8) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (count by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\",le=~\"0[.]05|0[.]1|0[.]3|0[.]5|1|2|5|[+]Inf\"}[2m])) == 8)))))) and on(job,node,instance) ((up{job=\"librechat\"} == 1)) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) ((time() - timestamp(http_request_duration_seconds_count{job=\"librechat\"}) <= 90)) and on(job,node,instance) ((time() - timestamp(up{job=\"librechat\"}) <= 90)) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) ((count_over_time(http_request_duration_seconds_count{job=\"librechat\"}[2m]) >= 4)) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) ((resets(http_request_duration_seconds_count{job=\"librechat\"}[2m]) == 0)) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (rate(http_request_duration_seconds_count{job=\"librechat\"}[2m]) > 0) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (count by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (http_request_duration_seconds_count{job=\"librechat\"}) == 1) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (max by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (histogram_quantile(0.95, sum by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status,le) (((rate(http_request_duration_seconds_bucket{job=\"librechat\"}[2m]) and ignoring(le) ((count without(le) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\"}[2m])) == 8) and (count without(le) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\",le=~\"0[.]05|0[.]1|0[.]3|0[.]5|1|2|5|[+]Inf\"}[2m])) == 8))) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status,le) ((count by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status,le) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\"}[2m])) == 1) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (count by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (count by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status,le) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\"}[2m]))) == 8) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (count by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\",le=~\"0[.]05|0[.]1|0[.]3|0[.]5|1|2|5|[+]Inf\"}[2m])) == 8)))))) >= 0) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (min by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\"}[2m])) >= 4) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (max by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (resets(http_request_duration_seconds_bucket{job=\"librechat\"}[2m])) == 0) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (time() - min by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (timestamp(http_request_duration_seconds_bucket{job=\"librechat\"})) <= 90) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (count by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (http_request_duration_seconds_bucket{job=\"librechat\"}) == 8) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (max by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (http_request_duration_seconds_bucket{job=\"librechat\",le=\"+Inf\"}) == http_request_duration_seconds_count{job=\"librechat\"})"
+        },
+        "cortex_status_http_latency_p95_seconds_source_time_seconds": {
+          "query": "min by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (label_replace((min by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (label_replace((min by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (timestamp(http_request_duration_seconds_count{job=\"librechat\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (timestamp(up{job=\"librechat\"}))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (http_request_duration_seconds_count{job=\"librechat\"}) + 1)), \"source_part\", \"s1\", \"\", \"\")) and on (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (count by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (http_request_duration_seconds_count{job=\"librechat\"}) == 1)), \"source_part\", \"support\", \"\", \"\") or label_replace((min by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (timestamp(http_request_duration_seconds_bucket{job=\"librechat\"}))), \"source_part\", \"buckets\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (label_replace((min by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (label_replace((min by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (timestamp(http_request_duration_seconds_count{job=\"librechat\"}))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (timestamp(up{job=\"librechat\"}))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (http_request_duration_seconds_count{job=\"librechat\"}) + 1)), \"source_part\", \"s1\", \"\", \"\")) and on(job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (count by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (http_request_duration_seconds_count{job=\"librechat\"}) == 1)),\"source_part\",\"support\",\"\",\"\") or label_replace((min by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (timestamp(http_request_duration_seconds_bucket{job=\"librechat\"}))),\"source_part\",\"buckets\",\"\",\"\"))"
+        },
+        "cortex_status_http_latency_p95_seconds_sample_count": {
+          "query": "min by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (label_replace((min by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (label_replace((min by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (count_over_time(http_request_duration_seconds_count{job=\"librechat\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job, node, instance) (count_over_time(up{job=\"librechat\"}[2m]))) * on (job, node, instance) group_right () (0 * max by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (http_request_duration_seconds_count{job=\"librechat\"}) + 1)), \"source_part\", \"s1\", \"\", \"\"))), \"source_part\", \"support\", \"\", \"\") or label_replace((min by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\"}[2m]))), \"source_part\", \"buckets\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "min by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (label_replace((min by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (label_replace((min by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (count_over_time(http_request_duration_seconds_count{job=\"librechat\"}[2m]))), \"source_part\", \"s0\", \"\", \"\") or label_replace(((min by (job,node,instance) (count_over_time(up{job=\"librechat\"}[2m]))) * on(job,node,instance) group_right() (0 * max by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (http_request_duration_seconds_count{job=\"librechat\"}) + 1)), \"source_part\", \"s1\", \"\", \"\"))),\"source_part\",\"support\",\"\",\"\") or label_replace((min by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (count_over_time(http_request_duration_seconds_bucket{job=\"librechat\"}[2m]))),\"source_part\",\"buckets\",\"\",\"\"))"
+        },
+        "cortex_status_http_latency_p95_seconds_resets": {
+          "query": "max by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (label_replace((max by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (label_replace((resets(http_request_duration_seconds_count{job=\"librechat\"}[2m])), \"source_part\", \"s0\", \"\", \"\"))), \"source_part\", \"support\", \"\", \"\") or label_replace((max by (job, node, instance, namespace, metrics_pod, pod_uid, method, path, status) (resets(http_request_duration_seconds_bucket{job=\"librechat\"}[2m]))), \"source_part\", \"buckets\", \"\", \"\"))",
+          "labels": {},
+          "sourceQuery": "max by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (label_replace((max by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (label_replace((resets(http_request_duration_seconds_count{job=\"librechat\"}[2m])),\"source_part\",\"s0\",\"\",\"\"))),\"source_part\",\"support\",\"\",\"\") or label_replace((max by (job,node,instance,namespace,metrics_pod,pod_uid,method,path,status) (resets(http_request_duration_seconds_bucket{job=\"librechat\"}[2m]))),\"source_part\",\"buckets\",\"\",\"\"))"
+        }
+      }
+    }
+  ],
+  "series": [
+    "cortex_status_cpu_utilization_ratio",
+    "cortex_status_cpu_utilization_ratio_resets",
+    "cortex_status_cpu_utilization_ratio_sample_count",
+    "cortex_status_cpu_utilization_ratio_source_time_seconds",
+    "cortex_status_filesystem_available_bytes",
+    "cortex_status_filesystem_available_bytes_resets",
+    "cortex_status_filesystem_available_bytes_sample_count",
+    "cortex_status_filesystem_available_bytes_source_time_seconds",
+    "cortex_status_filesystem_available_ratio",
+    "cortex_status_filesystem_available_ratio_resets",
+    "cortex_status_filesystem_available_ratio_sample_count",
+    "cortex_status_filesystem_available_ratio_source_time_seconds",
+    "cortex_status_filesystem_inodes_free",
+    "cortex_status_filesystem_inodes_free_ratio",
+    "cortex_status_filesystem_inodes_free_ratio_resets",
+    "cortex_status_filesystem_inodes_free_ratio_sample_count",
+    "cortex_status_filesystem_inodes_free_ratio_source_time_seconds",
+    "cortex_status_filesystem_inodes_free_resets",
+    "cortex_status_filesystem_inodes_free_sample_count",
+    "cortex_status_filesystem_inodes_free_source_time_seconds",
+    "cortex_status_gpu_memory_used_bytes",
+    "cortex_status_gpu_memory_used_bytes_resets",
+    "cortex_status_gpu_memory_used_bytes_sample_count",
+    "cortex_status_gpu_memory_used_bytes_source_time_seconds",
+    "cortex_status_gpu_power_watts",
+    "cortex_status_gpu_power_watts_resets",
+    "cortex_status_gpu_power_watts_sample_count",
+    "cortex_status_gpu_power_watts_source_time_seconds",
+    "cortex_status_gpu_utilization_ratio",
+    "cortex_status_gpu_utilization_ratio_resets",
+    "cortex_status_gpu_utilization_ratio_sample_count",
+    "cortex_status_gpu_utilization_ratio_source_time_seconds",
+    "cortex_status_http_latency_p95_seconds",
+    "cortex_status_http_latency_p95_seconds_resets",
+    "cortex_status_http_latency_p95_seconds_sample_count",
+    "cortex_status_http_latency_p95_seconds_source_time_seconds",
+    "cortex_status_http_requests_rate",
+    "cortex_status_http_requests_rate_resets",
+    "cortex_status_http_requests_rate_sample_count",
+    "cortex_status_http_requests_rate_source_time_seconds",
+    "cortex_status_memory_available_bytes",
+    "cortex_status_memory_available_bytes_resets",
+    "cortex_status_memory_available_bytes_sample_count",
+    "cortex_status_memory_available_bytes_source_time_seconds",
+    "cortex_status_memory_available_ratio",
+    "cortex_status_memory_available_ratio_resets",
+    "cortex_status_memory_available_ratio_sample_count",
+    "cortex_status_memory_available_ratio_source_time_seconds",
+    "cortex_status_network_receive_bytes_rate",
+    "cortex_status_network_receive_bytes_rate_resets",
+    "cortex_status_network_receive_bytes_rate_sample_count",
+    "cortex_status_network_receive_bytes_rate_source_time_seconds",
+    "cortex_status_network_receive_drop_rate",
+    "cortex_status_network_receive_drop_rate_resets",
+    "cortex_status_network_receive_drop_rate_sample_count",
+    "cortex_status_network_receive_drop_rate_source_time_seconds",
+    "cortex_status_network_receive_errs_rate",
+    "cortex_status_network_receive_errs_rate_resets",
+    "cortex_status_network_receive_errs_rate_sample_count",
+    "cortex_status_network_receive_errs_rate_source_time_seconds",
+    "cortex_status_network_transmit_bytes_rate",
+    "cortex_status_network_transmit_bytes_rate_resets",
+    "cortex_status_network_transmit_bytes_rate_sample_count",
+    "cortex_status_network_transmit_bytes_rate_source_time_seconds",
+    "cortex_status_network_transmit_drop_rate",
+    "cortex_status_network_transmit_drop_rate_resets",
+    "cortex_status_network_transmit_drop_rate_sample_count",
+    "cortex_status_network_transmit_drop_rate_source_time_seconds",
+    "cortex_status_network_transmit_errs_rate",
+    "cortex_status_network_transmit_errs_rate_resets",
+    "cortex_status_network_transmit_errs_rate_sample_count",
+    "cortex_status_network_transmit_errs_rate_source_time_seconds",
+    "cortex_status_pressure_cpu_waiting_ratio",
+    "cortex_status_pressure_cpu_waiting_ratio_resets",
+    "cortex_status_pressure_cpu_waiting_ratio_sample_count",
+    "cortex_status_pressure_cpu_waiting_ratio_source_time_seconds",
+    "cortex_status_pressure_io_stalled_ratio",
+    "cortex_status_pressure_io_stalled_ratio_resets",
+    "cortex_status_pressure_io_stalled_ratio_sample_count",
+    "cortex_status_pressure_io_stalled_ratio_source_time_seconds",
+    "cortex_status_pressure_io_waiting_ratio",
+    "cortex_status_pressure_io_waiting_ratio_resets",
+    "cortex_status_pressure_io_waiting_ratio_sample_count",
+    "cortex_status_pressure_io_waiting_ratio_source_time_seconds",
+    "cortex_status_pressure_memory_stalled_ratio",
+    "cortex_status_pressure_memory_stalled_ratio_resets",
+    "cortex_status_pressure_memory_stalled_ratio_sample_count",
+    "cortex_status_pressure_memory_stalled_ratio_source_time_seconds",
+    "cortex_status_pressure_memory_waiting_ratio",
+    "cortex_status_pressure_memory_waiting_ratio_resets",
+    "cortex_status_pressure_memory_waiting_ratio_sample_count",
+    "cortex_status_pressure_memory_waiting_ratio_source_time_seconds"
+  ],
+  "catalog": {
+    "cpu_utilization_ratio": {
+      "series": "cortex_status_cpu_utilization_ratio",
+      "sourceTimeSeries": "cortex_status_cpu_utilization_ratio_source_time_seconds",
+      "unit": "ratio",
+      "dimensions": ["job", "node", "instance", "cpu"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 4096,
+      "sampleCountSeries": "cortex_status_cpu_utilization_ratio_sample_count",
+      "resetsSeries": "cortex_status_cpu_utilization_ratio_resets",
+      "windowSeconds": 120
+    },
+    "memory_available_bytes": {
+      "series": "cortex_status_memory_available_bytes",
+      "sourceTimeSeries": "cortex_status_memory_available_bytes_source_time_seconds",
+      "unit": "bytes",
+      "dimensions": ["job", "node", "instance"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 64,
+      "sampleCountSeries": "cortex_status_memory_available_bytes_sample_count",
+      "resetsSeries": "cortex_status_memory_available_bytes_resets",
+      "windowSeconds": 0
+    },
+    "memory_available_ratio": {
+      "series": "cortex_status_memory_available_ratio",
+      "sourceTimeSeries": "cortex_status_memory_available_ratio_source_time_seconds",
+      "unit": "ratio",
+      "dimensions": ["job", "node", "instance"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 64,
+      "sampleCountSeries": "cortex_status_memory_available_ratio_sample_count",
+      "resetsSeries": "cortex_status_memory_available_ratio_resets",
+      "windowSeconds": 0
+    },
+    "pressure_cpu_waiting_ratio": {
+      "series": "cortex_status_pressure_cpu_waiting_ratio",
+      "sourceTimeSeries": "cortex_status_pressure_cpu_waiting_ratio_source_time_seconds",
+      "unit": "ratio",
+      "dimensions": ["job", "node", "instance"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 64,
+      "sampleCountSeries": "cortex_status_pressure_cpu_waiting_ratio_sample_count",
+      "resetsSeries": "cortex_status_pressure_cpu_waiting_ratio_resets",
+      "windowSeconds": 120
+    },
+    "pressure_io_waiting_ratio": {
+      "series": "cortex_status_pressure_io_waiting_ratio",
+      "sourceTimeSeries": "cortex_status_pressure_io_waiting_ratio_source_time_seconds",
+      "unit": "ratio",
+      "dimensions": ["job", "node", "instance"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 64,
+      "sampleCountSeries": "cortex_status_pressure_io_waiting_ratio_sample_count",
+      "resetsSeries": "cortex_status_pressure_io_waiting_ratio_resets",
+      "windowSeconds": 120
+    },
+    "pressure_io_stalled_ratio": {
+      "series": "cortex_status_pressure_io_stalled_ratio",
+      "sourceTimeSeries": "cortex_status_pressure_io_stalled_ratio_source_time_seconds",
+      "unit": "ratio",
+      "dimensions": ["job", "node", "instance"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 64,
+      "sampleCountSeries": "cortex_status_pressure_io_stalled_ratio_sample_count",
+      "resetsSeries": "cortex_status_pressure_io_stalled_ratio_resets",
+      "windowSeconds": 120
+    },
+    "pressure_memory_waiting_ratio": {
+      "series": "cortex_status_pressure_memory_waiting_ratio",
+      "sourceTimeSeries": "cortex_status_pressure_memory_waiting_ratio_source_time_seconds",
+      "unit": "ratio",
+      "dimensions": ["job", "node", "instance"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 64,
+      "sampleCountSeries": "cortex_status_pressure_memory_waiting_ratio_sample_count",
+      "resetsSeries": "cortex_status_pressure_memory_waiting_ratio_resets",
+      "windowSeconds": 120
+    },
+    "pressure_memory_stalled_ratio": {
+      "series": "cortex_status_pressure_memory_stalled_ratio",
+      "sourceTimeSeries": "cortex_status_pressure_memory_stalled_ratio_source_time_seconds",
+      "unit": "ratio",
+      "dimensions": ["job", "node", "instance"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 64,
+      "sampleCountSeries": "cortex_status_pressure_memory_stalled_ratio_sample_count",
+      "resetsSeries": "cortex_status_pressure_memory_stalled_ratio_resets",
+      "windowSeconds": 120
+    },
+    "filesystem_available_bytes": {
+      "series": "cortex_status_filesystem_available_bytes",
+      "sourceTimeSeries": "cortex_status_filesystem_available_bytes_source_time_seconds",
+      "unit": "bytes",
+      "dimensions": ["job", "node", "instance", "device", "mountpoint", "fstype"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 512,
+      "sampleCountSeries": "cortex_status_filesystem_available_bytes_sample_count",
+      "resetsSeries": "cortex_status_filesystem_available_bytes_resets",
+      "windowSeconds": 0
+    },
+    "filesystem_available_ratio": {
+      "series": "cortex_status_filesystem_available_ratio",
+      "sourceTimeSeries": "cortex_status_filesystem_available_ratio_source_time_seconds",
+      "unit": "ratio",
+      "dimensions": ["job", "node", "instance", "device", "mountpoint", "fstype"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 512,
+      "sampleCountSeries": "cortex_status_filesystem_available_ratio_sample_count",
+      "resetsSeries": "cortex_status_filesystem_available_ratio_resets",
+      "windowSeconds": 0
+    },
+    "filesystem_inodes_free": {
+      "series": "cortex_status_filesystem_inodes_free",
+      "sourceTimeSeries": "cortex_status_filesystem_inodes_free_source_time_seconds",
+      "unit": "count",
+      "dimensions": ["job", "node", "instance", "device", "mountpoint", "fstype"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 512,
+      "sampleCountSeries": "cortex_status_filesystem_inodes_free_sample_count",
+      "resetsSeries": "cortex_status_filesystem_inodes_free_resets",
+      "windowSeconds": 0
+    },
+    "filesystem_inodes_free_ratio": {
+      "series": "cortex_status_filesystem_inodes_free_ratio",
+      "sourceTimeSeries": "cortex_status_filesystem_inodes_free_ratio_source_time_seconds",
+      "unit": "ratio",
+      "dimensions": ["job", "node", "instance", "device", "mountpoint", "fstype"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 512,
+      "sampleCountSeries": "cortex_status_filesystem_inodes_free_ratio_sample_count",
+      "resetsSeries": "cortex_status_filesystem_inodes_free_ratio_resets",
+      "windowSeconds": 0
+    },
+    "network_receive_bytes_rate": {
+      "series": "cortex_status_network_receive_bytes_rate",
+      "sourceTimeSeries": "cortex_status_network_receive_bytes_rate_source_time_seconds",
+      "unit": "bytes_per_second",
+      "dimensions": ["job", "node", "instance", "device"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 512,
+      "sampleCountSeries": "cortex_status_network_receive_bytes_rate_sample_count",
+      "resetsSeries": "cortex_status_network_receive_bytes_rate_resets",
+      "windowSeconds": 120
+    },
+    "network_receive_drop_rate": {
+      "series": "cortex_status_network_receive_drop_rate",
+      "sourceTimeSeries": "cortex_status_network_receive_drop_rate_source_time_seconds",
+      "unit": "packets_per_second",
+      "dimensions": ["job", "node", "instance", "device"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 512,
+      "sampleCountSeries": "cortex_status_network_receive_drop_rate_sample_count",
+      "resetsSeries": "cortex_status_network_receive_drop_rate_resets",
+      "windowSeconds": 120
+    },
+    "network_receive_errs_rate": {
+      "series": "cortex_status_network_receive_errs_rate",
+      "sourceTimeSeries": "cortex_status_network_receive_errs_rate_source_time_seconds",
+      "unit": "errors_per_second",
+      "dimensions": ["job", "node", "instance", "device"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 512,
+      "sampleCountSeries": "cortex_status_network_receive_errs_rate_sample_count",
+      "resetsSeries": "cortex_status_network_receive_errs_rate_resets",
+      "windowSeconds": 120
+    },
+    "network_transmit_bytes_rate": {
+      "series": "cortex_status_network_transmit_bytes_rate",
+      "sourceTimeSeries": "cortex_status_network_transmit_bytes_rate_source_time_seconds",
+      "unit": "bytes_per_second",
+      "dimensions": ["job", "node", "instance", "device"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 512,
+      "sampleCountSeries": "cortex_status_network_transmit_bytes_rate_sample_count",
+      "resetsSeries": "cortex_status_network_transmit_bytes_rate_resets",
+      "windowSeconds": 120
+    },
+    "network_transmit_drop_rate": {
+      "series": "cortex_status_network_transmit_drop_rate",
+      "sourceTimeSeries": "cortex_status_network_transmit_drop_rate_source_time_seconds",
+      "unit": "packets_per_second",
+      "dimensions": ["job", "node", "instance", "device"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 512,
+      "sampleCountSeries": "cortex_status_network_transmit_drop_rate_sample_count",
+      "resetsSeries": "cortex_status_network_transmit_drop_rate_resets",
+      "windowSeconds": 120
+    },
+    "network_transmit_errs_rate": {
+      "series": "cortex_status_network_transmit_errs_rate",
+      "sourceTimeSeries": "cortex_status_network_transmit_errs_rate_source_time_seconds",
+      "unit": "errors_per_second",
+      "dimensions": ["job", "node", "instance", "device"],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 512,
+      "sampleCountSeries": "cortex_status_network_transmit_errs_rate_sample_count",
+      "resetsSeries": "cortex_status_network_transmit_errs_rate_resets",
+      "windowSeconds": 120
+    },
+    "gpu_utilization_ratio": {
+      "series": "cortex_status_gpu_utilization_ratio",
+      "sourceTimeSeries": "cortex_status_gpu_utilization_ratio_source_time_seconds",
+      "unit": "ratio",
+      "dimensions": [
+        "job",
+        "node",
+        "instance",
+        "UUID",
+        "gpu",
+        "device",
+        "pci_bus_id",
+        "namespace",
+        "pod",
+        "container"
+      ],
+      "maximumAgeSeconds": 60,
+      "maximumSeries": 256,
+      "sampleCountSeries": "cortex_status_gpu_utilization_ratio_sample_count",
+      "resetsSeries": "cortex_status_gpu_utilization_ratio_resets",
+      "windowSeconds": 0
+    },
+    "gpu_memory_used_bytes": {
+      "series": "cortex_status_gpu_memory_used_bytes",
+      "sourceTimeSeries": "cortex_status_gpu_memory_used_bytes_source_time_seconds",
+      "unit": "bytes",
+      "dimensions": [
+        "job",
+        "node",
+        "instance",
+        "UUID",
+        "gpu",
+        "device",
+        "pci_bus_id",
+        "namespace",
+        "pod",
+        "container"
+      ],
+      "maximumAgeSeconds": 60,
+      "maximumSeries": 256,
+      "sampleCountSeries": "cortex_status_gpu_memory_used_bytes_sample_count",
+      "resetsSeries": "cortex_status_gpu_memory_used_bytes_resets",
+      "windowSeconds": 0
+    },
+    "gpu_power_watts": {
+      "series": "cortex_status_gpu_power_watts",
+      "sourceTimeSeries": "cortex_status_gpu_power_watts_source_time_seconds",
+      "unit": "watts",
+      "dimensions": [
+        "job",
+        "node",
+        "instance",
+        "UUID",
+        "gpu",
+        "device",
+        "pci_bus_id",
+        "namespace",
+        "pod",
+        "container"
+      ],
+      "maximumAgeSeconds": 60,
+      "maximumSeries": 256,
+      "sampleCountSeries": "cortex_status_gpu_power_watts_sample_count",
+      "resetsSeries": "cortex_status_gpu_power_watts_resets",
+      "windowSeconds": 0
+    },
+    "http_requests_rate": {
+      "series": "cortex_status_http_requests_rate",
+      "sourceTimeSeries": "cortex_status_http_requests_rate_source_time_seconds",
+      "unit": "requests_per_second",
+      "dimensions": [
+        "job",
+        "node",
+        "instance",
+        "namespace",
+        "metrics_pod",
+        "pod_uid",
+        "method",
+        "path",
+        "status"
+      ],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 1024,
+      "sampleCountSeries": "cortex_status_http_requests_rate_sample_count",
+      "resetsSeries": "cortex_status_http_requests_rate_resets",
+      "windowSeconds": 120
+    },
+    "http_latency_p95_seconds": {
+      "series": "cortex_status_http_latency_p95_seconds",
+      "sourceTimeSeries": "cortex_status_http_latency_p95_seconds_source_time_seconds",
+      "unit": "seconds",
+      "dimensions": [
+        "job",
+        "node",
+        "instance",
+        "namespace",
+        "metrics_pod",
+        "pod_uid",
+        "method",
+        "path",
+        "status"
+      ],
+      "maximumAgeSeconds": 90,
+      "maximumSeries": 1024,
+      "sampleCountSeries": "cortex_status_http_latency_p95_seconds_sample_count",
+      "resetsSeries": "cortex_status_http_latency_p95_seconds_resets",
+      "windowSeconds": 120
+    }
+  },
+  "healthMaxAgeSeconds": 60,
+  "queryIdentity": {
+    "prometheusVersion": "3.13.3",
+    "method": "actual isolated Prometheus rules API canonical AST serialization",
+    "binarySha256": "24c05b9f958f0f8e5a0b15a525f70d8e8067a0efd9f53944d970236092458f5a",
+    "archiveSha256": "b349c732d8a853e657d0e7ae1bbad4d11b586615fb65fdc59d896b9f869c001e",
+    "rulesSourceSha256": "348d7a37ed00528cf1b300012bf0deebca05b1808c1898625714749960f55a9a",
+    "apiCaptureSha256": "8db200eaa67902842321dfbf1c54f66f38c868d1d1a2bb244c4b8cf96298fa7e",
+    "canonicalQueriesSha256": "0c98e87628dedaa45aa64802801ebdbf555f4ea7062e2baef5d5916a86b4e65a"
+  }
+}

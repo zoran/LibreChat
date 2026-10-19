@@ -21,6 +21,7 @@ import {
   EMAIL_CODE_ACCESS_MS,
   EMAIL_CODE_CHALLENGE_MS,
 } from './authMode';
+import { recipientAllowed } from './emailRecipientPolicy';
 
 const OPAQUE = /^[A-Za-z0-9_-]{43}$/;
 const requestSchema = z
@@ -97,10 +98,11 @@ function matches(c: IdentityReference, grant: EmailCodeGrant): boolean {
     c.policyVersion === grant.policyVersion
   );
 }
-const eligible = (identity: EmailCodeIdentity) =>
-  getEmailCodeSettings().domains.includes(
-    identity.user.email.slice(identity.user.email.lastIndexOf('@') + 1).toLowerCase(),
-  );
+const recipientEligible = (email: string) => {
+  const settings = getEmailCodeSettings();
+  return recipientAllowed(email, settings.domains, settings.qualification);
+};
+const eligible = (identity: EmailCodeIdentity) => recipientEligible(identity.user.email);
 
 async function readCurrentIdentity(
   reference: IdentityReference,
@@ -346,8 +348,7 @@ export function createEmailCodeAuth(deps: EmailCodeDependencies): {
     if (!parsed.success) fail('EMAIL_CODE_INVALID_REQUEST');
     const { email, attemptId } = parsed.data;
     const settings = getEmailCodeSettings();
-    if (!settings.domains.includes(email.slice(email.lastIndexOf('@') + 1)))
-      fail('EMAIL_CODE_DOMAIN_NOT_ALLOWED');
+    if (!recipientEligible(email)) fail('EMAIL_CODE_DOMAIN_NOT_ALLOWED');
     const cookie = req.cookies?.[EMAIL_ATTEMPT_COOKIE];
     const nonce =
       typeof cookie === 'string' && OPAQUE.test(cookie)
@@ -377,6 +378,7 @@ export function createEmailCodeAuth(deps: EmailCodeDependencies): {
     await deps.write(() =>
       repo.reserveEmailCodeAttempt({ challenge, previousGeneration: previous?.generation, now }),
     );
+    if (!recipientEligible(email)) fail('EMAIL_CODE_DOMAIN_NOT_ALLOWED');
     // Set binding even on a transport failure, allowing a bounded resend of this browser attempt.
     res.cookie(EMAIL_ATTEMPT_COOKIE, nonce, {
       ...EMAIL_CODE_COOKIE_OPTIONS,
@@ -416,8 +418,7 @@ export function createEmailCodeAuth(deps: EmailCodeDependencies): {
     const settings = getEmailCodeSettings();
     const challenge = await repo.getEmailCodeChallenge(parsed.data.attemptId, settings.tenantId);
     if (!challenge) fail('EMAIL_CODE_INVALID');
-    if (!settings.domains.includes(challenge.email.slice(challenge.email.lastIndexOf('@') + 1)))
-      fail('EMAIL_CODE_INVALID');
+    if (!recipientEligible(challenge.email)) fail('EMAIL_CODE_INVALID');
     const refreshNonce = randomBytes(32).toString('base64url');
     const balance = await deps.getBalance?.();
     const identity = await deps.write(() =>
@@ -436,7 +437,17 @@ export function createEmailCodeAuth(deps: EmailCodeDependencies): {
     );
     // A revoke racing issuance must not be published as a successful, resurrected session.
     const current = await repo.readEmailCodeIdentity(identity.grant.sessionId, settings.tenantId);
-    if (!current) fail('AUTH_SESSION_REQUIRED');
+    if (!current || !eligible(current)) {
+      // Redemption can finish after exception expiry; retire the unpublished exact grant.
+      await deps.write(() =>
+        repo.revokeEmailCodeSession(
+          identity.grant.sessionId,
+          identity.grant.userId,
+          settings.tenantId,
+        ),
+      );
+      fail('AUTH_SESSION_REQUIRED');
+    }
     return writeCredentials(res, current, issueTokens(current, refreshNonce));
   });
 
@@ -473,7 +484,7 @@ export function createEmailCodeAuth(deps: EmailCodeDependencies): {
       identity.grant.sessionId,
       identity.grant.tenantId,
     );
-    if (!current) fail('AUTH_SESSION_REQUIRED');
+    if (!current || !eligible(current)) fail('AUTH_SESSION_REQUIRED');
     if (current.grant.refreshGeneration !== identity.grant.refreshGeneration + 1)
       fail('REFRESH_REPLACED');
     return writeCredentials(res, current, issueTokens(current, refreshNonce));
