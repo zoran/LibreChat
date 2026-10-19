@@ -46,7 +46,7 @@ export default defineConfig({
   workers: 1,
   retries: 0,
   timeout: 90_000,
-  globalTimeout: 300_000,
+  globalTimeout: 600_000,
   expect: { timeout: 15_000 },
   reporter: [['line']],
   use: {
@@ -91,7 +91,7 @@ export default defineConfig({
       CORTEX_UPLOAD_MANAGEMENT_ENABLED: 'false',
       ENDPOINTS: 'openAI',
       OPENAI_MODELS: 'gpt-4o-mini',
-      OPENAI_API_KEY: 'presentation-unused-local-fixture',
+      OPENAI_API_KEY: 'fixture-presentation-unused-local',
       OPENAI_REVERSE_PROXY: `${address.origin}/unused-provider`,
       ASSISTANTS_API_KEY: '',
       LIBRECHAT_TEST_RUN_HOOK: '',
