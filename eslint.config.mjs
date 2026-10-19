@@ -276,6 +276,7 @@ export default [
             'cortex-status-edge-hit',
             'cortex-status-empty',
             'cortex-status-evidence',
+            'cortex-status-graph-pane',
             'cortex-status-inspector',
             'cortex-status-legend',
             'cortex-status-muted',

@@ -105,9 +105,12 @@ describe('email-code authentication composition', () => {
       const expiry = exception();
       const f = fixture();
       const pending = await challenge(f);
-      const original = f.repository.redeemEmailCode;
-      jest.spyOn(f.repository, 'redeemEmailCode').mockImplementation(async (input) => {
+      const redeem = jest.mocked(f.repository.redeemEmailCode);
+      const original = redeem.getMockImplementation()!;
+      let redeemed: EmailCodeIdentity | undefined;
+      redeem.mockImplementation(async (input) => {
         const value = await original(input);
+        redeemed = value;
         jest.spyOn(Date, 'now').mockReturnValue(expiry);
         return value;
       });
@@ -115,7 +118,17 @@ describe('email-code authentication composition', () => {
         .post('/verify')
         .set('Cookie', cookies(pending))
         .send({ attemptId: pending.body.attemptId, code: f.code() });
-      expect(reply.status).not.toBe(200);
+      expect(redeem).toHaveBeenCalledTimes(1);
+      expect(redeemed).toBeDefined();
+      expect(f.challenges.get(pending.body.attemptId)?.consumedAt).toEqual(expect.any(Date));
+      expect(Date.now()).toBe(expiry);
+      expect(f.repository.revokeEmailCodeSession).toHaveBeenCalledWith(
+        redeemed!.grant.sessionId,
+        redeemed!.grant.userId,
+        redeemed!.grant.tenantId,
+      );
+      expect(reply.status).toBe(401);
+      expect(reply.body).toEqual({ code: 'AUTH_SESSION_REQUIRED' });
       expect(reply.body.token).toBeUndefined();
       expect(cookies(reply)).not.toContain('refreshToken=');
     });
@@ -128,13 +141,23 @@ describe('email-code authentication composition', () => {
         .set('Cookie', cookies(pending))
         .send({ attemptId: pending.body.attemptId, code: f.code() });
       expect(verified.status).toBe(200);
-      const original = f.repository.rotateEmailCodeRefresh;
-      jest.spyOn(f.repository, 'rotateEmailCodeRefresh').mockImplementation(async (input) => {
+      const rotate = jest.mocked(f.repository.rotateEmailCodeRefresh);
+      const original = rotate.getMockImplementation()!;
+      let persisted = false;
+      rotate.mockImplementation(async (input) => {
         await original(input);
+        persisted = true;
         jest.spyOn(Date, 'now').mockReturnValue(expiry);
       });
       const reply = await request(f.app).post('/refresh').set('Cookie', cookies(verified));
-      expect(reply.status).not.toBe(200);
+      expect(rotate).toHaveBeenCalledTimes(1);
+      expect(persisted).toBe(true);
+      expect(Date.now()).toBe(expiry);
+      const [{ grant }] = rotate.mock.calls[0];
+      const current = await f.repository.readEmailCodeIdentity(grant.sessionId, grant.tenantId);
+      expect(current?.grant.refreshGeneration).toBe(grant.refreshGeneration + 1);
+      expect(reply.status).toBe(401);
+      expect(reply.body).toEqual({ code: 'AUTH_SESSION_REQUIRED' });
       expect(reply.body.token).toBeUndefined();
       expect(cookies(reply)).not.toContain('refreshToken=');
       expect((await request(f.app).post('/logout').set('Cookie', cookies(verified))).status).toBe(

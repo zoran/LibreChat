@@ -2,6 +2,7 @@
 import { STATUS_METRICS } from 'librechat-data-provider';
 import type { StatusSnapshot, StatusMeasurement } from 'librechat-data-provider';
 import type { Selection } from './topology';
+import { roleLabel, classificationState } from './classification';
 import { nodeState, edgeState } from './topology';
 import { useLocalize } from '~/hooks';
 export function formatMeasurement(m: StatusMeasurement, locale = 'de-DE'): string {
@@ -93,6 +94,28 @@ export default function StatusInspector({
         </button>
       </div>
       <p className="cortex-status-muted">{t(`com_status_state_${state}` as never)}</p>
+      {node && roleLabel(node, t) && (
+        <dl>
+          <dt>{t('com_status_classification' as never)}</dt>
+          <dd>{roleLabel(node, t)}</dd>
+          <dt>{t('com_status_basis')}</dt>
+          <dd>
+            {node.classification
+              ? t(`com_status_basis_${node.classification.basis}` as never)
+              : t('com_status_state_unknown')}
+          </dd>
+          <dt>{t('com_status_classification_freshness' as never)}</dt>
+          <dd>{t(`com_status_classification_${classificationState(node, now)}` as never)}</dd>
+          {node.classification?.evidence.map((proof) => (
+            <div className="contents" key={proof.sourceId}>
+              <dt>{t('com_status_evidence')}</dt>
+              <dd>
+                {proof.sourceId} · {new Date(proof.observedAt * 1000).toLocaleString('de-DE')}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      )}
       {edge && (
         <dl>
           <dt>{t('com_status_direction')}</dt>
@@ -101,6 +124,16 @@ export default function StatusInspector({
           <dd>{t(`com_status_purpose_${edge.purpose}` as never)}</dd>
           <dt>{t('com_status_basis')}</dt>
           <dd>{t(`com_status_basis_${edge.basis}` as never)}</dd>
+          {edge.membershipRoles && (
+            <>
+              <dt>{t('com_status_cluster_roles' as never)}</dt>
+              <dd>
+                {edge.membershipRoles
+                  .map((role) => t(`com_status_membership_${role}` as never))
+                  .join(' · ')}
+              </dd>
+            </>
+          )}
           <dt>{t('com_status_reason')}</dt>
           <dd>{t(`com_status_reason_${edge.reason}` as never)}</dd>
         </dl>

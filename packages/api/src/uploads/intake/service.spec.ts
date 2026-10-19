@@ -126,7 +126,7 @@ describe('isolated intake HTTP service with real router, socket lifecycle and at
       expect.objectContaining({
         operationId: '11111111-1111-4111-8111-111111111111',
         capability,
-        command: { action: 'authorize' },
+        command: { action: 'authorize', dispatch: null },
       }),
     );
   });

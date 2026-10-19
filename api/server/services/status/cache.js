@@ -11,9 +11,9 @@ const LIMITS = Object.freeze({
   waiters: 64,
 });
 const KEYS = [
-  '{cortex-status-v1}:snapshot',
-  '{cortex-status-v1}:lease',
-  '{cortex-status-v1}:waiters',
+  '{cortex-status-v2}:snapshot',
+  '{cortex-status-v2}:lease',
+  '{cortex-status-v2}:waiters',
 ];
 // All three keys share the existing Redis client's hash slot and namespace prefix.
 const CLAIM = `-- cortex-status-claim-v1

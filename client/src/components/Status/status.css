@@ -56,13 +56,23 @@
   position: relative;
   flex: 1;
   min-height: 0;
-  overflow: hidden;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.cortex-status-graph-pane {
+  display: grid;
+  grid-template-rows: auto minmax(min-content, 1fr) auto;
+  flex: 1;
+  min-width: 0;
+  min-height: min-content;
+  align-content: start;
+  gap: 0.5rem;
 }
 .cortex-status-canvas {
   position: relative;
-  flex: 1;
+  display: grid;
   min-width: 0;
-  min-height: 22rem;
+  min-height: 18rem;
   background: radial-gradient(
     circle at 1px 1px,
     rgb(var(--border-light) / 0.16) 1px,
@@ -71,6 +81,8 @@
   background-size: 24px 24px;
 }
 .cortex-status-scene {
+  position: absolute;
+  inset: 0;
   display: block;
   width: 100%;
   height: 100%;
@@ -82,7 +94,8 @@
   color: rgb(var(--text-secondary));
   transition: opacity 0.16s;
 }
-.cortex-status-node rect {
+.cortex-status-node > rect,
+.cortex-status-node > path[data-frame] {
   fill: rgb(var(--surface-primary));
   stroke: rgb(var(--border-medium) / 0.5);
   stroke-width: 1.5;
@@ -97,14 +110,34 @@
   font-size: 12px;
   font-weight: 600;
 }
-.cortex-status-node circle {
+.cortex-status-node > circle {
   fill: currentColor;
+}
+.cortex-status-node [data-role-icon] {
+  color: rgb(var(--text-primary));
+}
+.cortex-status-node [data-role-icon] * {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+}
+.cortex-status-node [data-role-label] {
+  font-size: 12px;
+}
+.cortex-status-node[data-resource='gpu-server'] > rect {
+  fill: rgb(var(--surface-secondary));
+}
+.cortex-status-node[data-resource='kubernetes-cluster'] > path[data-frame] {
+  stroke-width: 2.5;
+  fill: rgb(var(--surface-secondary));
 }
 .cortex-status-node[data-state='healthy'] {
   color: rgb(var(--accent-primary));
 }
-.cortex-status-node.is-selected rect,
-.cortex-status-node:focus rect {
+.cortex-status-node.is-selected > rect,
+.cortex-status-node:focus > rect,
+.cortex-status-node.is-selected > path[data-frame],
+.cortex-status-node:focus > path[data-frame] {
   stroke: rgb(var(--accent-primary));
   stroke-width: 3;
 }
@@ -136,13 +169,22 @@
   opacity: 0.13;
 }
 .cortex-status-controls {
-  position: absolute;
-  bottom: 1rem;
-  left: 1rem;
   display: flex;
+  align-items: flex-start;
   gap: 0.35rem;
   flex-wrap: wrap;
-  max-width: calc(100% - 2rem);
+  margin: 0 1rem 0.75rem;
+  min-width: 0;
+}
+.cortex-status-controls details {
+  min-width: 0;
+  max-width: 100%;
+}
+.cortex-status-controls details[open] {
+  flex: 1 1 100%;
+}
+.cortex-status-controls details[open] .cortex-status-results {
+  max-height: 12rem;
 }
 .cortex-status-inspector {
   width: 22rem;
@@ -204,9 +246,7 @@
   border-top: 1px solid rgb(var(--border-light) / 0.15);
 }
 .cortex-status-search {
-  position: absolute;
-  top: 1rem;
-  left: 1rem;
+  margin: 0.75rem 1rem 0;
   width: 17rem;
   max-width: calc(100% - 2rem);
 }
@@ -259,18 +299,18 @@
   .cortex-status-workspace {
     flex-direction: column;
   }
+  .cortex-status-graph-pane {
+    flex: none;
+  }
   .cortex-status-inspector {
-    position: absolute;
-    bottom: 0;
-    left: 0;
-    right: 0;
+    flex: none;
     width: auto;
     max-width: none;
-    max-height: 46%;
+    min-height: 12rem;
+    max-height: min(22rem, 46vh);
     border-left: 0;
     border-top: 1px solid rgb(var(--border-light) / 0.3);
     border-radius: 1rem 1rem 0 0;
-    z-index: 2;
     padding: 1rem;
   }
   .cortex-status-canvas {
@@ -280,11 +320,11 @@
     font-size: 0.65rem;
     gap: 0.5rem;
   }
-  .cortex-status-controls {
-    bottom: 0.7rem;
+  .cortex-status-controls button {
+    padding-inline: 0.5rem;
   }
-  .cortex-status-workspace:has(.cortex-status-inspector) .cortex-status-controls {
-    bottom: 48%;
+  .cortex-status-controls summary [data-list-label] {
+    display: none;
   }
 }
 @media (prefers-reduced-motion: reduce) {
@@ -293,4 +333,71 @@
     animation: none !important;
     scroll-behavior: auto !important;
   }
+}
+
+/* Role and state symbols use screen pixels at compact zoom; each state has a distinct shape. */
+.cortex-status-node [data-compact-role] [data-frame] {
+  fill: rgb(var(--surface-primary));
+  stroke: rgb(var(--text-primary));
+  stroke-width: 1;
+}
+.cortex-status-node[data-resource='gpu-server'] [data-compact-role] [data-frame],
+.cortex-status-node[data-resource^='kubernetes-'] [data-compact-role] [data-frame] {
+  fill: rgb(var(--surface-secondary));
+}
+.cortex-status-node [data-compact-role] [data-frame='pins'] {
+  fill: none;
+}
+.cortex-status-node [data-compact-role] [data-screen-label] {
+  fill: rgb(var(--text-primary));
+  font-size: 12px;
+  font-weight: 600;
+  stroke: none;
+}
+.cortex-status [data-screen-state] > rect {
+  fill: rgb(var(--surface-primary));
+  stroke: none;
+}
+.cortex-status [data-screen-state] > path {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.25;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.cortex-status-node.is-selected [data-compact-role] [data-frame],
+.cortex-status-node:focus [data-compact-role] [data-frame] {
+  stroke: rgb(var(--accent-primary));
+  stroke-width: 2;
+}
+.cortex-status-scene [data-role-leader-for] {
+  fill: none;
+  stroke: rgb(var(--text-tertiary));
+  stroke-width: 1;
+}
+
+.cortex-status-controls summary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  min-width: 2.75rem;
+  min-height: 2.75rem;
+  padding: 0.55rem;
+  border: 1px solid rgb(var(--border-light) / var(--border-light-alpha, 0.15));
+  border-radius: 0.65rem;
+  background: rgb(var(--surface-primary));
+  font-size: 0.8rem;
+  list-style: none;
+  cursor: pointer;
+}
+.cortex-status-legend [data-state-legend] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.7rem;
+}
+.cortex-status-legend [data-legend-state] {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
 }

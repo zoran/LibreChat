@@ -257,6 +257,11 @@ function createProjector({ readStatusSnapshot, STATUS_METRICS }) {
     const snapshot = checked(value);
     if (!finite(now) || now < snapshot.generatedAt) throw Error('STATUS_CLOCK_INVALID');
     snapshot.generatedAt = now;
+    for (const node of snapshot.nodes) {
+      const c = node.classification;
+      if (c?.state === 'known' && c.evidence.some((e) => now - e.observedAt > e.maxAgeSeconds))
+        c.state = 'stale';
+    }
     for (const parameter of snapshot.parameters)
       if (
         parameter.state === 'known' &&

@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "generatedAt": 1792411344.229926,
   "selectedObserverId": "cpu2",
   "sources": [
@@ -69,7 +69,24 @@
           "reason": "not_measured",
           "evidence": []
         }
-      ]
+      ],
+      "classification": {
+        "kind": "server",
+        "role": "gpu",
+        "basis": "desired",
+        "state": "known",
+        "evidence": [
+          {
+            "sourceId": "inventory",
+            "observedAt": 1792411344.229926,
+            "maxAgeSeconds": 86400,
+            "coverage": {
+              "expected": 1,
+              "observed": 1
+            }
+          }
+        ]
+      }
     },
     {
       "id": "physical:host:gpu-b",
@@ -87,7 +104,24 @@
           "reason": "not_measured",
           "evidence": []
         }
-      ]
+      ],
+      "classification": {
+        "kind": "server",
+        "role": "gpu",
+        "basis": "desired",
+        "state": "known",
+        "evidence": [
+          {
+            "sourceId": "inventory",
+            "observedAt": 1792411344.229926,
+            "maxAgeSeconds": 86400,
+            "coverage": {
+              "expected": 1,
+              "observed": 1
+            }
+          }
+        ]
+      }
     },
     {
       "id": "physical:gpu:GPU-00000000-0000-0000-0000-000000000001",
@@ -105,7 +139,8 @@
           "reason": "not_measured",
           "evidence": []
         }
-      ]
+      ],
+      "classification": null
     },
     {
       "id": "physical:gpu:GPU-00000000-0000-0000-0000-000000000002",
@@ -123,7 +158,8 @@
           "reason": "not_measured",
           "evidence": []
         }
-      ]
+      ],
+      "classification": null
     },
     {
       "id": "physical:gpu:GPU-00000000-0000-0000-0000-000000000003",
@@ -141,7 +177,8 @@
           "reason": "not_measured",
           "evidence": []
         }
-      ]
+      ],
+      "classification": null
     },
     {
       "id": "logical:service:cortex",
@@ -159,7 +196,8 @@
           "reason": "not_measured",
           "evidence": []
         }
-      ]
+      ],
+      "classification": null
     },
     {
       "id": "logical:service:deepseek",
@@ -177,7 +215,8 @@
           "reason": "not_measured",
           "evidence": []
         }
-      ]
+      ],
+      "classification": null
     },
     {
       "id": "logical:service:ocr",
@@ -195,7 +234,8 @@
           "reason": "not_measured",
           "evidence": []
         }
-      ]
+      ],
+      "classification": null
     },
     {
       "id": "logical:service:embedder",
@@ -213,7 +253,8 @@
           "reason": "not_measured",
           "evidence": []
         }
-      ]
+      ],
+      "classification": null
     },
     {
       "id": "logical:service:reranker",
@@ -231,7 +272,8 @@
           "reason": "not_measured",
           "evidence": []
         }
-      ]
+      ],
+      "classification": null
     },
     {
       "id": "runtime:pod:app-1",
@@ -249,7 +291,8 @@
           "reason": "not_measured",
           "evidence": []
         }
-      ]
+      ],
+      "classification": null
     },
     {
       "id": "runtime:pod:ds-a",
@@ -267,7 +310,8 @@
           "reason": "not_measured",
           "evidence": []
         }
-      ]
+      ],
+      "classification": null
     },
     {
       "id": "runtime:pod:ds-b",
@@ -285,7 +329,8 @@
           "reason": "not_measured",
           "evidence": []
         }
-      ]
+      ],
+      "classification": null
     },
     {
       "id": "runtime:pod:ocr-1",
@@ -303,7 +348,8 @@
           "reason": "not_measured",
           "evidence": []
         }
-      ]
+      ],
+      "classification": null
     },
     {
       "id": "runtime:pod:embedder-1",
@@ -321,7 +367,8 @@
           "reason": "not_measured",
           "evidence": []
         }
-      ]
+      ],
+      "classification": null
     },
     {
       "id": "runtime:pod:reranker-1",
@@ -339,7 +386,358 @@
           "reason": "not_measured",
           "evidence": []
         }
-      ]
+      ],
+      "classification": null
+    },
+    {
+      "id": "physical:host:control-a",
+      "identity": {
+        "scope": "physical",
+        "kind": "host",
+        "key": "control-a"
+      },
+      "label": "Diensteserver A",
+      "layer": "hardware",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ],
+      "classification": {
+        "kind": "server",
+        "role": "cpu",
+        "basis": "desired",
+        "state": "known",
+        "evidence": [
+          {
+            "sourceId": "inventory",
+            "observedAt": 1792411344.229926,
+            "maxAgeSeconds": 86400,
+            "coverage": {
+              "expected": 1,
+              "observed": 1
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "logical:service:kubernetes-cluster",
+      "identity": {
+        "scope": "logical",
+        "kind": "service",
+        "key": "kubernetes-cluster"
+      },
+      "label": "Kubernetes-Cluster",
+      "layer": "orchestration",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ],
+      "classification": {
+        "kind": "kubernetes",
+        "role": "cluster",
+        "basis": "desired",
+        "state": "known",
+        "evidence": [
+          {
+            "sourceId": "inventory",
+            "observedAt": 1792411344.229926,
+            "maxAgeSeconds": 86400,
+            "coverage": {
+              "expected": 1,
+              "observed": 1
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "logical:service:kubernetes-api-server",
+      "identity": {
+        "scope": "logical",
+        "kind": "service",
+        "key": "kubernetes-api-server"
+      },
+      "label": "Kubernetes API-Server",
+      "layer": "orchestration",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ],
+      "classification": {
+        "kind": "kubernetes",
+        "role": "api_server",
+        "basis": "desired",
+        "state": "known",
+        "evidence": [
+          {
+            "sourceId": "inventory",
+            "observedAt": 1792411344.229926,
+            "maxAgeSeconds": 86400,
+            "coverage": {
+              "expected": 1,
+              "observed": 1
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "logical:service:kubernetes-controller-manager",
+      "identity": {
+        "scope": "logical",
+        "kind": "service",
+        "key": "kubernetes-controller-manager"
+      },
+      "label": "Controller-Manager",
+      "layer": "orchestration",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ],
+      "classification": {
+        "kind": "kubernetes",
+        "role": "controller_manager",
+        "basis": "desired",
+        "state": "known",
+        "evidence": [
+          {
+            "sourceId": "inventory",
+            "observedAt": 1792411344.229926,
+            "maxAgeSeconds": 86400,
+            "coverage": {
+              "expected": 1,
+              "observed": 1
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "logical:service:kubernetes-scheduler",
+      "identity": {
+        "scope": "logical",
+        "kind": "service",
+        "key": "kubernetes-scheduler"
+      },
+      "label": "Scheduler",
+      "layer": "orchestration",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ],
+      "classification": {
+        "kind": "kubernetes",
+        "role": "scheduler",
+        "basis": "desired",
+        "state": "known",
+        "evidence": [
+          {
+            "sourceId": "inventory",
+            "observedAt": 1792411344.229926,
+            "maxAgeSeconds": 86400,
+            "coverage": {
+              "expected": 1,
+              "observed": 1
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "logical:service:kubernetes-etcd",
+      "identity": {
+        "scope": "logical",
+        "kind": "service",
+        "key": "kubernetes-etcd"
+      },
+      "label": "etcd",
+      "layer": "orchestration",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ],
+      "classification": {
+        "kind": "kubernetes",
+        "role": "etcd",
+        "basis": "desired",
+        "state": "known",
+        "evidence": [
+          {
+            "sourceId": "inventory",
+            "observedAt": 1792411344.229926,
+            "maxAgeSeconds": 86400,
+            "coverage": {
+              "expected": 1,
+              "observed": 1
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "logical:service:kubernetes-kubelet",
+      "identity": {
+        "scope": "logical",
+        "kind": "service",
+        "key": "kubernetes-kubelet"
+      },
+      "label": "Kubelet",
+      "layer": "orchestration",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ],
+      "classification": {
+        "kind": "kubernetes",
+        "role": "kubelet",
+        "basis": "desired",
+        "state": "known",
+        "evidence": [
+          {
+            "sourceId": "inventory",
+            "observedAt": 1792411344.229926,
+            "maxAgeSeconds": 86400,
+            "coverage": {
+              "expected": 1,
+              "observed": 1
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "logical:service:kubernetes-container-runtime",
+      "identity": {
+        "scope": "logical",
+        "kind": "service",
+        "key": "kubernetes-container-runtime"
+      },
+      "label": "containerd",
+      "layer": "orchestration",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ],
+      "classification": {
+        "kind": "kubernetes",
+        "role": "container_runtime",
+        "basis": "desired",
+        "state": "known",
+        "evidence": [
+          {
+            "sourceId": "inventory",
+            "observedAt": 1792411344.229926,
+            "maxAgeSeconds": 86400,
+            "coverage": {
+              "expected": 1,
+              "observed": 1
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "logical:service:kubernetes-network",
+      "identity": {
+        "scope": "logical",
+        "kind": "service",
+        "key": "kubernetes-network"
+      },
+      "label": "Cilium",
+      "layer": "orchestration",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ],
+      "classification": {
+        "kind": "kubernetes",
+        "role": "network",
+        "basis": "desired",
+        "state": "known",
+        "evidence": [
+          {
+            "sourceId": "inventory",
+            "observedAt": 1792411344.229926,
+            "maxAgeSeconds": 86400,
+            "coverage": {
+              "expected": 1,
+              "observed": 1
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "logical:service:kubernetes-dns",
+      "identity": {
+        "scope": "logical",
+        "kind": "service",
+        "key": "kubernetes-dns"
+      },
+      "label": "CoreDNS",
+      "layer": "orchestration",
+      "assessments": [
+        {
+          "dimension": "availability",
+          "state": "unknown",
+          "reason": "not_measured",
+          "evidence": []
+        }
+      ],
+      "classification": {
+        "kind": "kubernetes",
+        "role": "dns",
+        "basis": "desired",
+        "state": "known",
+        "evidence": [
+          {
+            "sourceId": "inventory",
+            "observedAt": 1792411344.229926,
+            "maxAgeSeconds": 86400,
+            "coverage": {
+              "expected": 1,
+              "observed": 1
+            }
+          }
+        ]
+      }
     }
   ],
   "edges": [
@@ -846,6 +1244,408 @@
         }
       ],
       "purpose": "embedding"
+    },
+    {
+      "id": "k8s-fixture-24",
+      "from": "physical:host:control-a",
+      "to": "logical:service:kubernetes-cluster",
+      "kind": "membership",
+      "purpose": "cluster_membership",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ],
+      "membershipRoles": ["control_plane", "etcd"]
+    },
+    {
+      "id": "k8s-fixture-25",
+      "from": "physical:host:gpu-a",
+      "to": "logical:service:kubernetes-cluster",
+      "kind": "membership",
+      "purpose": "cluster_membership",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ],
+      "membershipRoles": ["worker"]
+    },
+    {
+      "id": "k8s-fixture-26",
+      "from": "physical:host:gpu-b",
+      "to": "logical:service:kubernetes-cluster",
+      "kind": "membership",
+      "purpose": "cluster_membership",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ],
+      "membershipRoles": ["worker"]
+    },
+    {
+      "id": "k8s-fixture-27",
+      "from": "logical:service:kubernetes-api-server",
+      "to": "logical:service:kubernetes-cluster",
+      "kind": "membership",
+      "purpose": "stack_component",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "k8s-fixture-28",
+      "from": "logical:service:kubernetes-api-server",
+      "to": "physical:host:control-a",
+      "kind": "placement",
+      "purpose": "configured_placement",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "k8s-fixture-29",
+      "from": "logical:service:kubernetes-controller-manager",
+      "to": "logical:service:kubernetes-cluster",
+      "kind": "membership",
+      "purpose": "stack_component",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "k8s-fixture-30",
+      "from": "logical:service:kubernetes-controller-manager",
+      "to": "physical:host:control-a",
+      "kind": "placement",
+      "purpose": "configured_placement",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "k8s-fixture-31",
+      "from": "logical:service:kubernetes-scheduler",
+      "to": "logical:service:kubernetes-cluster",
+      "kind": "membership",
+      "purpose": "stack_component",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "k8s-fixture-32",
+      "from": "logical:service:kubernetes-scheduler",
+      "to": "physical:host:control-a",
+      "kind": "placement",
+      "purpose": "configured_placement",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "k8s-fixture-33",
+      "from": "logical:service:kubernetes-etcd",
+      "to": "logical:service:kubernetes-cluster",
+      "kind": "membership",
+      "purpose": "stack_component",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "k8s-fixture-34",
+      "from": "logical:service:kubernetes-etcd",
+      "to": "physical:host:control-a",
+      "kind": "placement",
+      "purpose": "configured_placement",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "k8s-fixture-35",
+      "from": "logical:service:kubernetes-kubelet",
+      "to": "logical:service:kubernetes-cluster",
+      "kind": "membership",
+      "purpose": "stack_component",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "k8s-fixture-36",
+      "from": "logical:service:kubernetes-kubelet",
+      "to": "physical:host:control-a",
+      "kind": "placement",
+      "purpose": "configured_placement",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "k8s-fixture-37",
+      "from": "logical:service:kubernetes-container-runtime",
+      "to": "logical:service:kubernetes-cluster",
+      "kind": "membership",
+      "purpose": "stack_component",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "k8s-fixture-38",
+      "from": "logical:service:kubernetes-container-runtime",
+      "to": "physical:host:control-a",
+      "kind": "placement",
+      "purpose": "configured_placement",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "k8s-fixture-39",
+      "from": "logical:service:kubernetes-network",
+      "to": "logical:service:kubernetes-cluster",
+      "kind": "membership",
+      "purpose": "stack_component",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "k8s-fixture-40",
+      "from": "logical:service:kubernetes-network",
+      "to": "physical:host:control-a",
+      "kind": "placement",
+      "purpose": "configured_placement",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "k8s-fixture-41",
+      "from": "logical:service:kubernetes-dns",
+      "to": "logical:service:kubernetes-cluster",
+      "kind": "membership",
+      "purpose": "stack_component",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "k8s-fixture-42",
+      "from": "logical:service:cortex",
+      "to": "logical:service:kubernetes-cluster",
+      "kind": "dependency",
+      "purpose": "orchestration",
+      "basis": "desired",
+      "state": "unknown",
+      "reason": "not_measured",
+      "evidence": [
+        {
+          "sourceId": "inventory",
+          "observedAt": 1792411344.229926,
+          "maxAgeSeconds": 86400,
+          "coverage": {
+            "expected": 1,
+            "observed": 1
+          }
+        }
+      ]
     }
   ],
   "measurements": [

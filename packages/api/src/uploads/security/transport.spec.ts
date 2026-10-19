@@ -452,7 +452,7 @@ describe('bounded authenticated scanner transport', () => {
     const endpoint = await serve(createSecurityRequestHandler(core, { peers: peers() }));
     expect(await raw(endpoint, '/v1/prepare', payload, headers)).toEqual({
       status: 400,
-      value: '{"code":"security_uninspectable"}',
+      value: '{"version":2,"payload":{"code":"security_uninspectable"},"dispatch":null}',
     });
     expect(core.prepare).not.toHaveBeenCalled();
   });

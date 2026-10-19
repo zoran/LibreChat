@@ -5,6 +5,7 @@ import { emailCodeMessage } from '../../packages/api/src/auth/emailCodeMessage';
 import { emailCodeLink } from '../../packages/api/src/auth/emailCodeLink';
 import { seedConversations, seedMessages } from '../specs/mock/db';
 import { getAccessToken } from '../specs/mock/helpers';
+import { statusCases } from './status-cases';
 
 const appTitle = 'Example Workplace';
 const version = 'v1.2.3+example.1';
@@ -253,6 +254,80 @@ async function expectNoOverflow(page: Page) {
   ).toBeLessThanOrEqual(1);
 }
 
+async function expectCenteredLoginLayout(page: Page) {
+  await page.evaluate(async () => {
+    await document.fonts.ready;
+  });
+  const main = page.getByRole('main');
+  const heading = main.getByRole('heading', { name: 'Willkommen zurück', exact: true });
+  const logo = main.getByRole('img', { name: appTitle, exact: true });
+  const [mainBox, logoBox, headingBox, cardBox] = await Promise.all([
+    main.boundingBox(),
+    logo.boundingBox(),
+    heading.boundingBox(),
+    heading.locator('..').boundingBox(),
+  ]);
+  if (!mainBox || !logoBox || !headingBox || !cardBox) {
+    throw new Error('Login must have measurable main, logo, heading and form card');
+  }
+  const padding = await main.evaluate((element) => {
+    const style = getComputedStyle(element);
+    const shell = element.parentElement;
+    if (!shell) throw new Error('Login main must belong to its authentication shell');
+    const shellBox = shell.getBoundingClientRect();
+    const footer = shell.querySelector<HTMLElement>(':scope > [role="contentinfo"]');
+    const footerBox = footer?.getBoundingClientRect();
+    const footerStyle = footer && getComputedStyle(footer);
+    return {
+      top: parseFloat(style.paddingTop),
+      bottom: parseFloat(style.paddingBottom),
+      expected: matchMedia('(min-width: 640px)').matches ? 48 : 32,
+      shellHeight: shellBox.height,
+      viewportHeight: window.innerHeight,
+      shellBottom: shellBox.bottom,
+      footerTop:
+        footerBox && footerStyle
+          ? footerBox.top - parseFloat(footerStyle.marginTop)
+          : shellBox.bottom,
+      footerBottom:
+        footerBox && footerStyle
+          ? footerBox.bottom + parseFloat(footerStyle.marginBottom)
+          : shellBox.bottom,
+    };
+  });
+  // The shell may grow for long content; main must consume its remaining space above the footer.
+  expect(padding.shellHeight).toBeGreaterThanOrEqual(padding.viewportHeight - 1);
+  expect(
+    Math.abs(mainBox.y + mainBox.height - padding.footerTop),
+    'Login main must reach the footer or shell edge',
+  ).toBeLessThanOrEqual(1);
+  expect(
+    Math.abs(padding.footerBottom - padding.shellBottom),
+    'The footer must end at the authentication shell edge',
+  ).toBeLessThanOrEqual(1);
+  // Center the complete logo/card block inside main; the footer is outside this region.
+  const above = logoBox.y - mainBox.y;
+  const below = mainBox.y + mainBox.height - (cardBox.y + cardBox.height);
+  expect(
+    Math.abs(above - below),
+    'Logo and form must share vertical centering',
+  ).toBeLessThanOrEqual(2);
+  expect(above).toBeGreaterThanOrEqual(padding.expected - 1);
+  expect(below).toBeGreaterThanOrEqual(padding.expected - 1);
+  expect(padding.top).toBe(padding.expected);
+  expect(padding.bottom).toBe(padding.expected);
+  expect(
+    Math.abs(headingBox.y - (logoBox.y + logoBox.height) - 40),
+    'The visible heading must start approximately 40px below the logo',
+  ).toBeLessThanOrEqual(1);
+  for (const box of [logoBox, cardBox]) {
+    expect(
+      Math.abs(box.x + box.width / 2 - (mainBox.x + mainBox.width / 2)),
+      'Logo and form must share horizontal centering',
+    ).toBeLessThanOrEqual(1);
+  }
+}
+
 async function openSettings(page: Page) {
   const account = page.getByTestId('nav-user');
   const drawer = page.locator('#mobile-drawer');
@@ -312,6 +387,7 @@ test('German presentation survives old English preferences, login, settings, rel
   await expect(page.getByRole('button', { name: 'Wert anzeigen' })).toBeVisible();
   await expect(page.getByRole('region', { name: 'Benachrichtigungen (F8)' })).toBeAttached();
   await expectNoOverflow(page);
+  await expectCenteredLoginLayout(page);
   await page.screenshot({ path: testInfo.outputPath('presentation-login.png') });
 
   const email = `presentation-${randomUUID()}@example.invalid`;
@@ -455,8 +531,15 @@ for (const theme of ['light', 'dark'] as const) {
     await expect(form.getByRole('textbox', { name: 'E-Mail-Adresse', exact: true })).toBeVisible();
     await expectThemedLogo(page.getByRole('img', { name: appTitle, exact: true }), theme);
     await expectReadableAuthText(form.locator('label').filter({ hasText: /^E-Mail-Adresse$/ }));
+    await expectCenteredLoginLayout(page);
     await expectNoOverflow(page);
     await page.screenshot({ path: testInfo.outputPath(`presentation-email-code-${theme}.png`) });
+    const emailInput = form.getByRole('textbox', { name: 'E-Mail-Adresse', exact: true });
+    await emailInput.press('Tab');
+    const requestCode = form.locator('button[type="submit"]');
+    await expect(requestCode).toBeFocused();
+    await requestCode.press('Shift+Tab');
+    await expect(emailInput).toBeFocused();
   });
 
   test(`mail route resolves authentication and retains ${theme} branding through rejection and recovery (controlled auth boundary)`, async ({
@@ -610,3 +693,5 @@ for (const centered of [true, false]) {
     }
   });
 }
+
+statusCases(configureBranding, signInFixture, prepareEnglish, expectGerman, expectNoOverflow);

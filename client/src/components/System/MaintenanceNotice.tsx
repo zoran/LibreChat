@@ -10,6 +10,8 @@ export default function MaintenanceNotice() {
   const [active, setActive] = useState(false);
   const dialog = useRef<HTMLDialogElement>(null);
   const heading = useRef<HTMLHeadingElement>(null);
+  const observedOperation = useRef<string | null>(null);
+  const reloadRequested = useRef(false);
   // Startup config itself can be blocked when maintenance starts during page loading.
   const enabled = config?.maintenanceStatusEnabled !== false || active;
 
@@ -18,7 +20,7 @@ export default function MaintenanceNotice() {
     let disposed = false;
     let pending: AbortController | undefined;
     const check = async () => {
-      if (disposed || pending) return;
+      if (disposed || pending || reloadRequested.current) return;
       const controller = new AbortController();
       pending = controller;
       const timeout = window.setTimeout(() => controller.abort(), 3000);
@@ -40,6 +42,24 @@ export default function MaintenanceNotice() {
           'active' in status &&
           typeof status.active === 'boolean'
         ) {
+          const operationId = 'operationId' in status ? status.operationId : undefined;
+          if (
+            status.active &&
+            typeof operationId === 'string' &&
+            operationId.match(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$/)?.[0] === operationId
+          ) {
+            observedOperation.current = operationId;
+          }
+          if (!status.active) {
+            const releasedOperation = observedOperation.current;
+            observedOperation.current = null;
+            // Status is read-only. Other pages may hold unsaved composer input.
+            if (releasedOperation && /^\/status\/?$/.test(window.location.pathname)) {
+              reloadRequested.current = true;
+              window.location.reload();
+              return;
+            }
+          }
           setActive(status.active);
         }
       } catch {

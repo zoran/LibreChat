@@ -477,3 +477,125 @@ test('enforces per-node parameter count and evidence capture kind', () => {
   v.parameterEvidence[0].timeBasis = 'benchmark_run';
   expect(readStatusSnapshot(v)).toBeNull();
 });
+
+describe('v2 inventory classifications and orchestration boundaries', () => {
+  const current = () => readStatusSnapshot(representative)!;
+  test('one graph carries desired roles independently of unknown health and runtime placement', () => {
+    const s = current();
+    expect(s.version).toBe(2);
+    const cpu = s.nodes.find((n) => n.id === 'physical:host:control-a')!;
+    expect(cpu.classification).toMatchObject({
+      kind: 'server',
+      role: 'cpu',
+      basis: 'desired',
+      state: 'known',
+    });
+    expect(cpu.assessments[0].state).toBe('unknown');
+    expect(s.nodes.filter((n) => n.classification?.kind === 'kubernetes')).toHaveLength(9);
+    expect(
+      s.edges.find((e) => e.from === cpu.id && e.kind === 'membership')?.membershipRoles,
+    ).toEqual(['control_plane', 'etcd']);
+    expect(
+      s.edges
+        .filter((e) => e.kind === 'placement')
+        .every((e) => e.basis === 'desired' && e.state === 'unknown'),
+    ).toBe(true);
+    cpu.classification = null;
+    cpu.label = 'GPU-123';
+    expect(readStatusSnapshot(s)?.nodes.find((n) => n.id === cpu.id)?.classification).toBeNull();
+    expect(readStatusSnapshot({ ...s, version: 1 })).toBeNull();
+  });
+
+  test.each([
+    [
+      'missing required classification',
+      (s: ReturnType<typeof fresh>) => {
+        Reflect.deleteProperty(s.nodes[0], 'classification');
+      },
+    ],
+    [
+      'hostname-derived role',
+      (s: ReturnType<typeof fresh>) => {
+        s.nodes[0].classification!.evidence = [];
+      },
+    ],
+    [
+      'server role on a GPU device',
+      (s: ReturnType<typeof fresh>) => {
+        s.nodes[2].classification = s.nodes[0].classification;
+      },
+    ],
+    [
+      'observed inventory role',
+      (s: ReturnType<typeof fresh>) => {
+        s.nodes[0].classification!.basis = 'observed';
+      },
+    ],
+    [
+      'wrong source kind',
+      (s: ReturnType<typeof fresh>) => {
+        s.nodes[0].classification!.evidence[0].sourceId = 'runtime';
+      },
+    ],
+    [
+      'uncovered inventory role',
+      (s: ReturnType<typeof fresh>) => {
+        s.nodes[0].classification!.evidence[0].coverage.observed = 0;
+      },
+    ],
+    [
+      'stale evidence called known',
+      (s: ReturnType<typeof fresh>) => {
+        s.nodes[0].classification!.evidence[0].observedAt -= 86401;
+      },
+    ],
+    [
+      'fresh evidence called stale',
+      (s: ReturnType<typeof fresh>) => {
+        s.nodes[0].classification!.state = 'stale';
+      },
+    ],
+    [
+      'duplicate membership role',
+      (s: ReturnType<typeof fresh>) => {
+        s.edges.find((e) => e.purpose === 'cluster_membership')!.membershipRoles = [
+          'worker',
+          'worker',
+        ];
+      },
+    ],
+    [
+      'missing membership role',
+      (s: ReturnType<typeof fresh>) => {
+        Reflect.deleteProperty(
+          s.edges.find((e) => e.purpose === 'cluster_membership')!,
+          'membershipRoles',
+        );
+      },
+    ],
+    [
+      'membership on wrong target',
+      (s: ReturnType<typeof fresh>) => {
+        s.edges.find((e) => e.purpose === 'cluster_membership')!.to = s.nodes[0].id;
+      },
+    ],
+    [
+      'configured placement called observed',
+      (s: ReturnType<typeof fresh>) => {
+        s.edges.find((e) => e.kind === 'placement')!.basis = 'observed';
+      },
+    ],
+    [
+      'configured component called runtime deployment',
+      (s: ReturnType<typeof fresh>) => {
+        const e = s.edges.find((e) => e.kind === 'placement')!;
+        e.kind = 'deployment';
+        e.purpose = 'runtime_placement';
+      },
+    ],
+  ])('rejects %s', (_label, mutate) => {
+    const s = fresh();
+    mutate(s);
+    expect(readStatusSnapshot(s)).toBeNull();
+  });
+});
