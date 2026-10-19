@@ -100,7 +100,7 @@ export function generate() {
   const alpineRelease = fs.readFileSync(regular('/etc/alpine-release'), 'utf8').trim();
   need(/^[0-9]+\.[0-9]+\.[0-9]+$/u.test(alpineRelease));
   const require = createRequire('/app/packages/api/package.json');
-  const setpriv = regular('/usr/bin/setpriv');
+  const setpriv = regular('/bin/setpriv');
   const prlimit = regular('/usr/bin/prlimit');
   toolHelp(setpriv, ['--no-new-privs', '--seccomp-filter', '--landlock-access', '--landlock-rule']);
   toolHelp(prlimit, ['--core']);
