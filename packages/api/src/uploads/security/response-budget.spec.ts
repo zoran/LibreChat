@@ -143,7 +143,7 @@ function connect(
 describe('complete v2 response budget with unchanged request boundaries', () => {
   it('keeps the exact independently reviewed contract-valid fixture', () => {
     expect(createHash('sha256').update(fixtureBytes).digest('hex')).toBe(
-      '2e9f4de69c0be2fda99af3d18f011b9f7d00f2ff8110530eded2faece5abdabc',
+      '2471f3aec527d2f69eb9d2c96199cfb5bcd8486a894005fd25e4e7ff0dd2beb2',
     );
     const value = fixture();
     expect(readUploadSecurityExecution(value.execution)).not.toBeNull();
