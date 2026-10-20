@@ -131,16 +131,96 @@ async function clickRenderedMailLink(page: Page, baseURL: string) {
   const trustedClient = new URL(baseURL);
   trustedClient.protocol = 'https:';
   const link = emailCodeLink(trustedClient.href, mailAttemptId, mailCode);
-  const message = emailCodeMessage({ appTitle, code: mailCode, locale: 'de', link });
+  const logoPath = process.env.PRESENTATION_MAIL_LOGO_PATH;
+  if (logoPath !== undefined && !logoPath.startsWith('/')) {
+    throw new Error('A configured presentation mail PNG path must be absolute');
+  }
+  const message = emailCodeMessage({
+    appTitle,
+    code: mailCode,
+    locale: 'de',
+    link,
+    embeddedLogo: logoPath !== undefined,
+  });
   if (!message.html) throw new Error('The production mail renderer must supply its link');
+  let html = message.html;
+  if (logoPath !== undefined) {
+    expect(html.match(/src="cid:application-logo@local"/g)).toHaveLength(1);
+    // A browser has no MIME attachment resolver: map the actual configured CID PNG locally.
+    html = html.replace('src="cid:application-logo@local"', 'src="/__presentation-mail-logo.png"');
+    await page.route('**/__presentation-mail-logo.png', (route) =>
+      route.fulfill({ contentType: 'image/png', path: logoPath }),
+    );
+  }
   await page.route('**/__presentation-mail', (route) =>
-    route.fulfill({ contentType: 'text/html', body: message.html }),
+    route.fulfill({ contentType: 'text/html', body: html }),
   );
   await page.goto('/__presentation-mail');
-  const anchor = page.getByRole('link', { name: `Mit dem Code ${mailCode} anmelden`, exact: true });
+  if (logoPath !== undefined) {
+    const mailLogo = page.getByRole('img', { name: appTitle, exact: true });
+    await expect(mailLogo).toBeVisible();
+    await expect
+      .poll(() =>
+        mailLogo.evaluate(
+          (image) => image instanceof HTMLImageElement && image.complete && image.naturalWidth > 0,
+        ),
+      )
+      .toBe(true);
+    const geometry = await mailLogo.evaluate((image) => {
+      const cell = image.closest('td');
+      if (!cell) throw new Error('Mail logo must belong to its header cell');
+      const logo = image.getBoundingClientRect();
+      const header = cell.getBoundingClientRect();
+      const style = getComputedStyle(cell);
+      return {
+        width: logo.width,
+        available: header.width - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
+        centerDifference: Math.abs(logo.x + logo.width / 2 - header.x - header.width / 2),
+        duplicateTitle: cell.textContent?.trim(),
+      };
+    });
+    expect(geometry.width).toBeCloseTo(Math.min(300, geometry.available), 0);
+    expect(geometry.centerDifference).toBeLessThanOrEqual(1);
+    expect(geometry.duplicateTitle).toBe('');
+  }
+  expect(
+    await page
+      .locator('body,table,td,h1,p,a')
+      .evaluateAll((elements) =>
+        elements.every((element) => /^Arial\b/.test(getComputedStyle(element).fontFamily)),
+      ),
+  ).toBe(true);
+  const code = page.getByText(mailCode, { exact: true });
+  await expect(code).toBeVisible();
+  await expect(code).toHaveText(mailCode);
+  expect(await code.evaluate((element) => element.closest('a') === null)).toBe(true);
+  expect(await code.evaluate((element) => getComputedStyle(element).fontFamily)).toMatch(
+    /^Arial\b/,
+  );
+  expect(
+    await code.evaluate((element) => {
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(element);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+      const selected = selection?.toString();
+      selection?.removeAllRanges();
+      return selected;
+    }),
+  ).toBe(mailCode);
+  const anchor = page.getByRole('link', { name: link, exact: true });
+  await expect(anchor).toBeVisible();
+  await expect(anchor).toHaveText(link);
   const href = await anchor.getAttribute('href');
   expect(href).toBe(link);
   if (!href) throw new Error('Rendered mail has no link');
+  const codeBox = await code.boundingBox();
+  const linkBox = await anchor.boundingBox();
+  if (!codeBox || !linkBox) throw new Error('Mail code and full URL must have visible geometry');
+  expect(linkBox.y).toBeGreaterThanOrEqual(codeBox.y + codeBox.height);
+  await expectNoOverflow(page);
+  await page.screenshot({ path: test.info().outputPath('presentation-rendered-mail.png') });
   const localLink = new URL(href);
   // Production requires HTTPS; only the scheme changes for this enforced HTTP loopback harness.
   localLink.protocol = new URL(baseURL).protocol;
