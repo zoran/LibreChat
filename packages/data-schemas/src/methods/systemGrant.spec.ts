@@ -40,6 +40,27 @@ beforeEach(async () => {
 });
 
 describe('systemGrant methods', () => {
+  it('does not silently adopt a manual grant as a configured administrator grant', async () => {
+    const input = {
+      principalType: PrincipalType.USER,
+      principalId: new Types.ObjectId(),
+      capability: SystemCapabilities.ACCESS_ADMIN,
+    };
+    await methods.grantCapability(input);
+    await expect(
+      methods.grantCapability({
+        ...input,
+        managedBy: {
+          owner: 'configured-platform-administrators',
+          tenantId: 'cortex-bwi',
+          email: 'operator@employees.example.test',
+          revision: 1,
+          digest: 'a'.repeat(64),
+        },
+      } as Parameters<typeof methods.grantCapability>[0]),
+    ).rejects.toThrow('CONFIGURED_ADMIN_GRANT_CONFLICT');
+  });
+
   describe('seedSystemGrants', () => {
     it('seeds every SystemCapabilities value for the ADMIN role', async () => {
       await methods.seedSystemGrants();

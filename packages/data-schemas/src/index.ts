@@ -15,6 +15,7 @@ export type {
 export { createUploadManagementRepository } from './methods/uploadManagement';
 export type { UploadManagementRepository } from './methods/uploadManagement';
 export { createEmailCodeMethods } from './methods/emailCode';
+export { createConfiguredAdministratorMethods } from './methods/configuredAdministrators';
 export type * from './types/emailCode';
 export * from './app';
 export * from './admin';

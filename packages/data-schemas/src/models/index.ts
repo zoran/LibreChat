@@ -1,3 +1,7 @@
+import {
+  createDocumentWorkspaceModel,
+  createDocumentWorkspaceRevisionModel,
+} from './documentWorkspace';
 import { createAgentQueuedTurnModel, createAgentQueuedTurnSequenceModel } from './queuedTurn';
 import { createAgentTriggerLaneSequenceModel } from './triggerLaneSequence';
 import { createScheduleModel, createScheduleRunModel } from './schedule';
@@ -5,6 +9,7 @@ import { getTenantIndexMigrationHint } from '~/migrations/tenantIndexes';
 import { createGenerationAdmissionModel } from './generationAdmission';
 import { createSkillSyncCredentialModel } from './skillSyncCredential';
 import { createOpenIDRefreshFlightModel } from './openidRefreshFlight';
+import { createPlatformAdminPolicyModel } from './platformAdminPolicy';
 import { createAgentTriggerUserPurgeModel } from './triggerUserPurge';
 import { createRefreshTokenBridgeModel } from './refreshTokenBridge';
 import { createAgentTriggerDeliveryModel } from './triggerDelivery';
@@ -14,10 +19,6 @@ import { createConversationTagModel } from './conversationTag';
 import { createCodeEnvironmentModel } from './codeEnvironment';
 import { createAgentCategoryModel } from './agentCategory';
 import { createChatProjectModel } from './chatProject';
-import {
-  createDocumentWorkspaceModel,
-  createDocumentWorkspaceRevisionModel,
-} from './documentWorkspace';
 import { createAgentApiKeyModel } from './agentApiKey';
 import { createTransactionModel } from './transaction';
 import { createPromptGroupModel } from './promptGroup';
@@ -96,6 +97,7 @@ export function createModels(mongoose: typeof import('mongoose')): {
   AccessRole: ReturnType<typeof createAccessRoleModel>;
   AclEntry: ReturnType<typeof createAclEntryModel>;
   SystemGrant: ReturnType<typeof createSystemGrantModel>;
+  PlatformAdminPolicy: ReturnType<typeof createPlatformAdminPolicyModel>;
   AuditLog: ReturnType<typeof createAuditLogModel>;
   Group: ReturnType<typeof createGroupModel>;
   Config: ReturnType<typeof createConfigModel>;
@@ -150,6 +152,7 @@ export function createModels(mongoose: typeof import('mongoose')): {
     AccessRole: createAccessRoleModel(mongoose),
     AclEntry: createAclEntryModel(mongoose),
     SystemGrant: createSystemGrantModel(mongoose),
+    PlatformAdminPolicy: createPlatformAdminPolicyModel(mongoose),
     AuditLog: createAuditLogModel(mongoose),
     Group: createGroupModel(mongoose),
     Config: createConfigModel(mongoose),

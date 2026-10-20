@@ -1,3 +1,4 @@
+export * from './configuredAdministrators';
 export * from './domain';
 export * from './maintenance';
 export * from './sessionMaintenance';

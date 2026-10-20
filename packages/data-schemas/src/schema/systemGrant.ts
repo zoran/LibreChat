@@ -49,6 +49,20 @@ const systemGrantSchema: Schema<ISystemGrant> = new Schema<ISystemGrant>(
       type: Date,
       required: false,
     },
+    managedBy: {
+      type: new Schema(
+        {
+          owner: { type: String, enum: ['configured-platform-administrators'], required: true },
+          tenantId: { type: String, required: true },
+          email: { type: String, required: true },
+          revision: { type: Number, required: true, min: 1 },
+          digest: { type: String, required: true, match: /^[a-f0-9]{64}$/ },
+        },
+        { _id: false },
+      ),
+      required: false,
+      immutable: true,
+    },
   },
   { timestamps: true },
 );
@@ -67,5 +81,6 @@ systemGrantSchema.index(
 
 systemGrantSchema.index({ capability: 1, tenantId: 1 });
 systemGrantSchema.index({ principalType: 1, capability: 1, tenantId: 1 });
+systemGrantSchema.index({ 'managedBy.owner': 1 }, { sparse: true });
 
 export default systemGrantSchema;

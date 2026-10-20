@@ -1,4 +1,4 @@
-import type { Document, Types } from 'mongoose';
+import type { ClientSession, Document, Types } from 'mongoose';
 import type {
   AdminAuditLogEntry,
   AuditAction,
@@ -84,6 +84,8 @@ export interface RecordAuditEntryInput {
 
 /** Options that shape a single audit write. */
 export interface RecordAuditEntryOptions {
+  /** Join the caller's transaction; any append error must abort that transaction. */
+  session?: ClientSession;
   /**
    * When true, a failed write throws instead of resolving to `null`. Callers
    * that must not proceed without a durable audit record opt in here; the

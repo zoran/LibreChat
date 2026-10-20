@@ -1,5 +1,6 @@
 import { PrincipalType, SystemRoles } from 'librechat-data-provider';
 import type { Types, Model, ClientSession, FilterQuery } from 'mongoose';
+import type { ConfiguredAdministratorGrantOwner } from '~/types/systemGrant';
 import type { SystemCapability } from '~/types/admin';
 import type { ISystemGrant } from '~/types';
 import { SystemCapabilities, CapabilityImplications } from '~/admin/capabilities';
@@ -65,6 +66,7 @@ export function createSystemGrantMethods(mongoose: typeof import('mongoose')): {
       capability: SystemCapability;
       tenantId?: string;
       grantedBy?: string | Types.ObjectId;
+      managedBy?: ConfiguredAdministratorGrantOwner;
     },
     session?: ClientSession,
   ) => Promise<{ grant: ISystemGrant | null; created: boolean }>;
@@ -80,6 +82,7 @@ export function createSystemGrantMethods(mongoose: typeof import('mongoose')): {
       principalId: string | Types.ObjectId;
       capability: SystemCapability;
       tenantId?: string;
+      managedByOwner?: ConfiguredAdministratorGrantOwner['owner'];
     },
     session?: ClientSession,
   ) => Promise<{ deletedCount: number }>;
@@ -318,18 +321,47 @@ export function createSystemGrantMethods(mongoose: typeof import('mongoose')): {
       capability,
       tenantId,
       grantedBy,
+      managedBy,
     }: {
       principalType: PrincipalType;
       principalId: string | Types.ObjectId;
       capability: SystemCapability;
       tenantId?: string;
       grantedBy?: string | Types.ObjectId;
+      managedBy?: ConfiguredAdministratorGrantOwner;
     },
     session?: ClientSession,
   ): Promise<{ grant: ISystemGrant | null; created: boolean }> {
     const SystemGrant = mongoose.models.SystemGrant as Model<ISystemGrant>;
 
     const normalizedPrincipalId = normalizePrincipalId(principalId, principalType);
+    if (
+      managedBy &&
+      (managedBy.owner !== 'configured-platform-administrators' ||
+        principalType !== PrincipalType.USER ||
+        capability !== SystemCapabilities.ACCESS_ADMIN ||
+        tenantId != null ||
+        !Number.isSafeInteger(managedBy.revision) ||
+        managedBy.revision < 1 ||
+        !/^[a-f0-9]{64}$/.test(managedBy.digest) ||
+        !managedBy.tenantId ||
+        !managedBy.email)
+    ) {
+      throw new Error('CONFIGURED_ADMIN_GRANT_INVALID');
+    }
+    const requireMatchingOwner = (grant: ISystemGrant | null) => {
+      const owner = grant?.managedBy;
+      if (
+        managedBy &&
+        (!owner ||
+          owner.owner !== managedBy.owner ||
+          owner.tenantId !== managedBy.tenantId ||
+          owner.email !== managedBy.email)
+      ) {
+        throw new Error('CONFIGURED_ADMIN_GRANT_CONFLICT');
+      }
+      return grant;
+    };
 
     const filter: FilterQuery<ISystemGrant> = {
       principalType,
@@ -352,6 +384,7 @@ export function createSystemGrantMethods(mongoose: typeof import('mongoose')): {
         grantedAt: new Date(),
         ...(grantedBy != null && { grantedBy }),
         ...(tenantId != null && { tenantId }),
+        ...(managedBy && { managedBy }),
       },
     };
 
@@ -366,13 +399,18 @@ export function createSystemGrantMethods(mongoose: typeof import('mongoose')): {
         includeResultMetadata: true,
         session,
       });
-      return { grant: result.value, created: result.lastErrorObject?.upserted != null };
+      return {
+        grant: requireMatchingOwner(result.value),
+        created: result.lastErrorObject?.upserted != null,
+      };
     } catch (err) {
       if ((err as { code?: number }).code === 11000) {
+        // A duplicate aborts a Mongo transaction; its owner must retry the whole transaction.
+        if (session?.inTransaction()) throw err;
         /** A concurrent insert won the race: the row exists and we did not create
          * it, so this is not an auditable change. */
         const grant = (await SystemGrant.findOne(filter).lean()) as ISystemGrant | null;
-        return { grant, created: false };
+        return { grant: requireMatchingOwner(grant), created: false };
       }
       throw err;
     }
@@ -389,11 +427,13 @@ export function createSystemGrantMethods(mongoose: typeof import('mongoose')): {
       principalId,
       capability,
       tenantId,
+      managedByOwner,
     }: {
       principalType: PrincipalType;
       principalId: string | Types.ObjectId;
       capability: SystemCapability;
       tenantId?: string;
+      managedByOwner?: ConfiguredAdministratorGrantOwner['owner'];
     },
     session?: ClientSession,
   ): Promise<{ deletedCount: number }> {
@@ -406,6 +446,7 @@ export function createSystemGrantMethods(mongoose: typeof import('mongoose')): {
       principalId: normalizedPrincipalId,
       capability,
       tenantId: tenantId != null ? tenantId : { $exists: false },
+      ...(managedByOwner && { 'managedBy.owner': managedByOwner }),
     };
 
     const options = session ? { session } : {};

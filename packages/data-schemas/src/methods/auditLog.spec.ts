@@ -1,5 +1,5 @@
 import mongoose, { Types } from 'mongoose';
-import { MongoMemoryServer } from 'mongodb-memory-server';
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import type { RecordAuditEntryInput } from '~/types';
 import type * as t from '~/types';
 import auditLogSchema, { GENESIS_HASH, PLATFORM_CHAIN_KEY } from '~/schema/auditLog';
@@ -12,7 +12,7 @@ jest.mock('~/config/winston', () => ({
   debug: jest.fn(),
 }));
 
-let mongoServer: MongoMemoryServer;
+let mongoServer: MongoMemoryReplSet;
 let AuditLog: mongoose.Model<t.IAuditLog>;
 let methods: ReturnType<typeof createAuditLogMethods>;
 
@@ -38,7 +38,7 @@ async function seed(count: number, over: Partial<RecordAuditEntryInput> = {}): P
 }
 
 beforeAll(async () => {
-  mongoServer = await MongoMemoryServer.create();
+  mongoServer = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
   AuditLog = mongoose.models.AuditLog || mongoose.model<t.IAuditLog>('AuditLog', auditLogSchema);
   methods = createAuditLogMethods(mongoose);
   await mongoose.connect(mongoServer.getUri());
@@ -55,6 +55,42 @@ beforeEach(async () => {
 });
 
 describe('auditLog methods', () => {
+  it('commits a chained pair in the caller transaction', async () => {
+    await mongoose.connection.transaction(async (session) => {
+      await methods.recordAuditEntry(baseInput(), { session, failClosed: true });
+      await methods.recordAuditEntry(baseInput({ action: 'grant.removed' }), {
+        session,
+        failClosed: true,
+      });
+    });
+    expect(await AuditLog.countDocuments()).toBe(2);
+    expect(await methods.verifyAuditChain('tenant-a')).toMatchObject({ ok: true, checked: 2 });
+  });
+
+  it('rolls back an audit append when its caller transaction aborts', async () => {
+    await expect(
+      mongoose.connection.transaction(async (session) => {
+        await methods.recordAuditEntry(baseInput(), { session, failClosed: true });
+        throw new Error('CALLER_ABORT');
+      }),
+    ).rejects.toThrow('CALLER_ABORT');
+    expect(await AuditLog.countDocuments()).toBe(0);
+  });
+
+  it('never swallows an append failure inside a caller transaction', async () => {
+    const create = jest.spyOn(AuditLog, 'create').mockRejectedValueOnce(new Error('APPEND_FAILED'));
+    try {
+      await expect(
+        mongoose.connection.transaction(async (session) => {
+          await methods.recordAuditEntry(baseInput(), { session });
+        }),
+      ).rejects.toThrow('APPEND_FAILED');
+    } finally {
+      create.mockRestore();
+    }
+    expect(await AuditLog.countDocuments()).toBe(0);
+  });
+
   describe('recordAuditEntry', () => {
     it('persists a tenant-scoped entry with denormalized + derived fields', async () => {
       const doc = await methods.recordAuditEntry(baseInput());

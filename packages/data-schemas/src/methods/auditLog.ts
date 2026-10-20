@@ -363,6 +363,7 @@ export function createAuditLogMethods(
         /** Guarantee the unique seq index exists before serializing on it. */
         await ensureIndexes();
         const last = await AuditLog.findOne({ chainKey })
+          .session(options?.session ?? null)
           .sort({ seq: -1 })
           .select('seq hash')
           .lean<{ seq: number; hash: string }>();
@@ -386,7 +387,7 @@ export function createAuditLogMethods(
           prevHash,
           createdAt,
         });
-        const doc = await AuditLog.create({
+        const entry = {
           schemaVersion: AUDIT_SCHEMA_VERSION,
           category,
           action: input.action,
@@ -402,9 +403,15 @@ export function createAuditLogMethods(
           prevHash,
           hash,
           createdAt,
-        });
-        return doc;
+        };
+        if (options?.session) {
+          const [doc] = await AuditLog.create([entry], { session: options.session });
+          return doc;
+        }
+        return await AuditLog.create(entry);
       } catch (err) {
+        // Transaction failures belong to the outer transaction retry/rollback owner.
+        if (options?.session) throw err;
         if (isDuplicateKeyError(err) && attempt < MAX_APPEND_RETRIES - 1) {
           /** Jittered backoff de-correlates racing writers before they recompute
            * the tail `seq`, so the next attempt is very unlikely to collide. */

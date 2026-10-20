@@ -21,17 +21,13 @@ import {
   EMAIL_CODE_ACCESS_MS,
   EMAIL_CODE_CHALLENGE_MS,
 } from './authMode';
+import { emailCodeAddressSchema } from './emailCodeAddress';
 import { recipientAllowed } from './emailRecipientPolicy';
 
 const OPAQUE = /^[A-Za-z0-9_-]{43}$/;
 const requestSchema = z
   .object({
-    email: z
-      .string()
-      .trim()
-      .max(254)
-      .email()
-      .transform((email) => email.toLowerCase()),
+    email: emailCodeAddressSchema,
     attemptId: z.string().regex(OPAQUE).optional(),
   })
   .strict();

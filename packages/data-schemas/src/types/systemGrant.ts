@@ -1,6 +1,14 @@
-import type { Document, Types } from 'mongoose';
 import type { PrincipalType } from 'librechat-data-provider';
+import type { Document, Types } from 'mongoose';
 import type { SystemCapability } from '~/types/admin';
+
+export interface ConfiguredAdministratorGrantOwner {
+  owner: 'configured-platform-administrators';
+  tenantId: string;
+  email: string;
+  revision: number;
+  digest: string;
+}
 
 export type SystemGrant = {
   /** The type of principal — matches PrincipalType enum values */
@@ -17,6 +25,8 @@ export type SystemGrant = {
   grantedAt?: Date;
   /** Reserved for future TTL enforcement — time-bounded / temporary grants. */
   expiresAt?: Date;
+  /** Immutable creation provenance; reconciliation never adopts a manual grant. */
+  managedBy?: ConfiguredAdministratorGrantOwner;
 };
 
 export type ISystemGrant = SystemGrant &

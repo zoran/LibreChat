@@ -5,12 +5,15 @@ const {
   findMatchingPattern,
   isDeploymentSkillId,
   createMessageBudgetReader,
+  getConfiguredAdministratorPolicy,
 } = require('@librechat/api');
 const getLogStores = require('~/cache/getLogStores');
 
 const messageBudget = createMessageBudgetReader();
+const configuredAdministratorPolicy = getConfiguredAdministratorPolicy();
 
 const methods = createMethods(mongoose, {
+  configuredAdministratorPolicy,
   matchModelName,
   findMatchingPattern,
   isExternalSkillId: isDeploymentSkillId,
@@ -19,10 +22,14 @@ const methods = createMethods(mongoose, {
 });
 
 const seedDatabase = async () => {
+  await methods.assertConfiguredAdministratorPolicyPresence(configuredAdministratorPolicy);
   await methods.initializeRoles();
   await methods.seedDefaultRoles();
   await methods.ensureDefaultCategories();
   await methods.seedSystemGrants();
+  if (configuredAdministratorPolicy) {
+    await methods.reconcileConfiguredAdministrators(configuredAdministratorPolicy);
+  }
 };
 
 module.exports = {

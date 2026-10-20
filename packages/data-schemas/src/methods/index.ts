@@ -32,6 +32,9 @@ import type {
 import type { RoleMethods, RoleDeps } from './role';
 import { createBrowserMethods, type BrowserMethods } from './browser';
 import { createEmailCodeMethods } from './emailCode';
+import { createConfiguredAdministratorMethods } from './configuredAdministrators';
+import type { ConfiguredAdministratorPolicy } from '~/types/platformAdminPolicy';
+type ConfiguredAdministratorMethods = ReturnType<typeof createConfiguredAdministratorMethods>;
 import type { EmailCodeRepository } from '../types/emailCode';
 export type { BrowserIdentity, BrowserUser, BrowserMethods } from './browser';
 import {
@@ -278,6 +281,7 @@ export type AllMethods = CheckpointSourceMethods &
   UserMethods &
   BrowserMethods &
   EmailCodeRepository &
+  ConfiguredAdministratorMethods &
   GenerationAdmissionMethods &
   SessionMethods &
   TokenMethods &
@@ -329,6 +333,8 @@ export type AllMethods = CheckpointSourceMethods &
 
 /** Dependencies injected from the api layer into createMethods */
 export interface CreateMethodsDeps {
+  /** Trusted server configuration only; never sourced from a login request or token. */
+  configuredAdministratorPolicy?: ConfiguredAdministratorPolicy;
   /** Matches a model name to a canonical key. From @librechat/api. */
   matchModelName?: (model: string, endpoint?: string) => string | undefined;
   /** Finds the first key in values whose key is a substring of model. From @librechat/api. */
@@ -464,6 +470,11 @@ export function createMethods(
   const aclEntryMethods = createAclEntryMethods(mongoose);
 
   const systemGrantMethods = createSystemGrantMethods(mongoose);
+  const auditLogMethods = createAuditLogMethods(mongoose);
+  const configuredAdministratorMethods = createConfiguredAdministratorMethods(mongoose, {
+    recordAuditEntry: auditLogMethods.recordAuditEntry,
+  });
+  const configuredPolicy = deps.configuredAdministratorPolicy;
 
   // Internal removeAllPermissions: use deleteAclEntries from aclEntryMethods
   // instead of requiring it as an external dep from PermissionService
@@ -520,7 +531,19 @@ export function createMethods(
   return {
     ...createUserMethods(mongoose, { getCache: deps.getCache }),
     ...createBrowserMethods(mongoose),
-    ...createEmailCodeMethods(mongoose),
+    ...createEmailCodeMethods(mongoose, {
+      reconcileConfiguredAdministrators: configuredPolicy
+        ? async (tenantId, session) => {
+            if (tenantId !== configuredPolicy.tenantId) {
+              throw new Error('Configured administrator tenant mismatch');
+            }
+            await configuredAdministratorMethods.reconcileConfiguredAdministrators(
+              configuredPolicy,
+              { session },
+            );
+          }
+        : undefined,
+    }),
     ...createGenerationAdmissionMethods(mongoose),
     ...createCheckpointSourceMethods(mongoose),
     ...createToolApprovalGrantMethods(mongoose),
@@ -544,7 +567,8 @@ export function createMethods(
     ...userGroupMethods,
     ...aclEntryMethods,
     ...systemGrantMethods,
-    ...createAuditLogMethods(mongoose),
+    ...auditLogMethods,
+    ...configuredAdministratorMethods,
     ...createShareMethods(mongoose),
     ...createPluginAuthMethods(mongoose),
     /* Tier 1 */

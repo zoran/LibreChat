@@ -1,5 +1,3 @@
-import { EMAIL_CODE_IDLE_MS, EMAIL_CODE_ABSOLUTE_MS } from '../emailCodePolicy';
-import { emailCodeProfileName } from '../utils/emailCodeProfile';
 import { timingSafeEqual } from 'node:crypto';
 import type { ClientSession } from 'mongoose';
 import type {
@@ -11,6 +9,8 @@ import type {
 } from '~/types/emailCode';
 import type { ISession } from '~/types/session';
 import type { IUser } from '~/types/user';
+import { EMAIL_CODE_IDLE_MS, EMAIL_CODE_ABSOLUTE_MS } from '../emailCodePolicy';
+import { emailCodeProfileName } from '../utils/emailCodeProfile';
 import { createEmailCodeModels } from '~/models/emailCode';
 import { tenantStorage } from '~/config/tenantContext';
 import { createUserMethods } from './user';
@@ -41,7 +41,12 @@ const same = (a: string, b: string) =>
   timingSafeEqual(Buffer.from(a, 'hex'), Buffer.from(b, 'hex'));
 
 /** Native User/Session composition and one transactional challenge authority across replicas. */
-export function createEmailCodeMethods(mongoose: typeof import('mongoose')): EmailCodeRepository {
+export function createEmailCodeMethods(
+  mongoose: typeof import('mongoose'),
+  deps: {
+    reconcileConfiguredAdministrators?: (tenantId: string, session: ClientSession) => Promise<void>;
+  } = {},
+): EmailCodeRepository {
   const { EmailCodeChallenge: Challenge, EmailCodeBudget: Counter } =
     createEmailCodeModels(mongoose);
   const users = createUserMethods(mongoose);
@@ -289,6 +294,9 @@ export function createEmailCodeMethods(mongoose: typeof import('mongoose')): Ema
             ).lean<IUser>();
             if (updated) user = updated;
           }
+          // Only a successfully verified identity can materialize a configured grant.
+          // A policy/audit failure aborts user, session and challenge consumption together.
+          await deps.reconcileConfiguredAdministrators?.(c.tenantId, session);
           const grant = (
             await mongoose.models.Session.create(
               [

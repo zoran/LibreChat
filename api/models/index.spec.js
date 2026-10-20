@@ -1,5 +1,6 @@
 jest.mock('@librechat/data-schemas', () => ({ createMethods: jest.fn(() => ({})) }));
 jest.mock('@librechat/api', () => ({
+  getConfiguredAdministratorPolicy: jest.fn(() => undefined),
   matchModelName: jest.fn(),
   findMatchingPattern: jest.fn(),
   isDeploymentSkillId: jest.fn(),
