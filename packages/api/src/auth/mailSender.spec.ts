@@ -159,7 +159,7 @@ describe('bounded approved SMTP submission', () => {
     }
   });
 
-  it('links the displayed code to the configured HTTPS origin with escaped HTML', async () => {
+  it('keeps plain code separate from the full trusted HTTPS link with escaped HTML', async () => {
     const f = fixture({
       ...config,
       clientUrl: 'https://portal.example.test/chat/',
@@ -170,8 +170,11 @@ describe('bounded approved SMTP submission', () => {
     f.callbacks[0](null, { accepted: [input.email], response: '250 queued' });
     await pending;
     const message = f.messages[0] as { html: string; text: string };
+    const escapedLink = `https://portal.example.test/chat/login/email-code#attemptId=${'a'.repeat(43)}&amp;code=01234567`;
     expect(message.html).toContain('https://portal.example.test/chat/login/email-code#attemptId=');
-    expect(message.html).toContain('&amp;code=01234567">01234567</a>');
+    expect(message.html).toMatch(/<p\b[^>]*>01234567<\/p>/);
+    expect(message.html).not.toContain('>01234567</a>');
+    expect(message.html).toContain(`href="${escapedLink}">${escapedLink}</a>`);
     expect(message.html).toContain('&lt;Portal &amp; friends&gt;');
     expect(message.text).toContain('01234567');
     expect(message.text).toContain('https://portal.example.test/chat/login/email-code#attemptId=');
