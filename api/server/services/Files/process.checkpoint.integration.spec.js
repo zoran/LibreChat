@@ -27,6 +27,7 @@ jest.mock('~/server/services/Files/strategies', () => ({ getStrategyFunctions: j
 // Preserve the real File, Message and Agent methods while excluding unrelated app composition.
 jest.mock('~/models', () => require('@librechat/data-schemas').createMethods(require('mongoose')));
 
+schemas.createModels(mongoose);
 const db = require('~/models');
 const { getStrategyFunctions } = require('./strategies');
 const { processDeleteRequest } = require('./process');
@@ -348,7 +349,6 @@ beforeAll(async () => {
     replSet: { count: 1, storageEngine: 'wiredTiger' },
   });
   await mongoose.connect(mongo.getUri('files_checkpoint_composition'));
-  schemas.createModels(mongoose);
   await Promise.all(Object.values(mongoose.models).map((model) => model.init()));
 }, 60000);
 
