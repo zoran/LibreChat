@@ -4,6 +4,7 @@
   flex-direction: column;
   min-height: 0;
   height: 100%;
+  overflow: auto;
   color: rgb(var(--text-primary));
   background: rgb(var(--surface-primary));
   font-family: inherit;
@@ -54,8 +55,8 @@
 .cortex-status-workspace {
   display: flex;
   position: relative;
-  flex: 1;
-  min-height: 0;
+  flex: 1 0 auto;
+  min-height: min-content;
   overflow: auto;
   overscroll-behavior: contain;
 }
@@ -406,7 +407,8 @@
 .cortex-status-usage {
   padding: 0.6rem 1.25rem;
   border-bottom: 1px solid rgb(var(--border-light) / 0.15);
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  min-height: 4rem;
   max-height: 19rem;
   overflow: auto;
   font-size: 0.75rem;
@@ -430,6 +432,13 @@
   justify-content: space-between;
   gap: 0.5rem;
   align-items: center;
+}
+.cortex-status-usage-heading {
+  flex-wrap: wrap;
+}
+.cortex-status-usage-heading > label {
+  min-width: 0;
+  max-width: 100%;
 }
 .cortex-status-usage select {
   color: inherit;

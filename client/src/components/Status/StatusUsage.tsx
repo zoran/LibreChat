@@ -286,7 +286,7 @@ export function StatusUsageDetails({
       }}
     >
       <div className="flex items-start justify-between gap-2">
-        <h2 ref={heading} tabIndex={-1}>
+        <h2 ref={heading} tabIndex={-1} className="min-h-11">
           {text('title')}
         </h2>
         <button onClick={onClose} aria-label={text('close')}>
