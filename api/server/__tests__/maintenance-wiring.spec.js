@@ -3,17 +3,25 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../index.js'), 'utf8');
+const runtimeSource = fs.readFileSync(path.join(__dirname, '../services/start/runtime.js'), 'utf8');
 test('gives uploads the same process identity as native application maintenance', async () => {
   const identity = Object.freeze({ incarnation: 'native-process' });
   const initializeUploads = jest.fn();
-  const statement = source.match(/const uploads = await initializeUploads\([^;]+;/)?.[0];
+  const statement = runtimeSource.match(/const uploads = await initializeUploads\([^;]+;/)?.[0];
+  const recordOriginalPublication = jest.fn();
+  expect(source).toContain('identity: maintenance.identity,');
   expect(statement).toBeDefined();
   await vm.runInNewContext(`(async () => {${statement}})()`, {
     registry: 'registry',
-    maintenance: { identity },
+    identity,
+    recordOriginalPublication,
     initializeUploads,
   });
-  expect(initializeUploads).toHaveBeenCalledWith({ registry: 'registry', identity });
+  expect(initializeUploads).toHaveBeenCalledWith({
+    registry: 'registry',
+    identity,
+    recordOriginalPublication,
+  });
 });
 
 test('wires all actual work facades, late browser load, and the same external census', async () => {
@@ -98,7 +106,7 @@ test('establishes auth admission before Passport and session setup', () => {
 });
 
 test('joins the actual orphan-preview boot write before further startup', async () => {
-  const start = source.indexOf('  await runAsSystem(sweepOrphanedPreviews);');
+  const start = runtimeSource.indexOf('  await runAsSystem(sweepOrphanedPreviews);');
   expect(start).toBeGreaterThan(0);
   const write = {};
   let finish;
@@ -108,7 +116,7 @@ test('joins the actual orphan-preview boot write before further startup', async 
   const nextStartupStep = jest.fn();
   const runAsSystem = jest.fn(() => pending);
   const run = vm.runInNewContext(
-    `(async () => {${source.slice(start, source.indexOf('\n', start))}\nnextStartupStep();})()`,
+    `(async () => {${runtimeSource.slice(start, runtimeSource.indexOf('\n', start))}\nnextStartupStep();})()`,
     { runAsSystem, sweepOrphanedPreviews: write, nextStartupStep },
   );
   expect(runAsSystem).toHaveBeenCalledWith(write);
@@ -116,4 +124,95 @@ test('joins the actual orphan-preview boot write before further startup', async 
   finish();
   await run;
   expect(nextStartupStep).toHaveBeenCalledTimes(1);
+});
+
+/** A fresh process must register its real models before the first actual method consumer.
+ * Only transport/startup adapters are inert: no Mongo, credentials, search or background work.
+ * The DB module, OAuth consumer, api/models and both schema factories execute their real bytes.
+ */
+test.each(['index', 'runtime'])('registers models before %s startup consumers', async (entry) => {
+  const mongoose = require('mongoose');
+  const schema = jest.requireActual('@librechat/data-schemas');
+  const api = jest.requireActual('@librechat/api');
+  const instance = new mongoose.Mongoose();
+  instance.set('autoIndex', false);
+  instance.set('autoCreate', false);
+  const apiRoot = path.dirname(path.dirname(require.resolve('~/models')));
+  const trace = [];
+  const cache = new Map();
+  const noop = () => {};
+  const connectDb = jest.fn(async () => trace.push('connect'));
+  const indexSync = jest.fn(async () => trace.push('indexSync'));
+  const lifecycle = jest.fn(() => trace.push('reconciler'));
+  const usage = jest.fn(async () => {
+    trace.push('usage');
+    return { recordOriginalPublication: noop };
+  });
+  const inertAdapters = new Set();
+  function load(name) {
+    if (cache.has(name)) return cache.get(name).exports;
+    const module = { exports: {} };
+    cache.set(name, module);
+    trace.push(name);
+    let contents;
+    if (name === 'server/index.js') contents = source;
+    else if (name === 'server/services/start/runtime.js') contents = runtimeSource;
+    else contents = fs.readFileSync(path.join(apiRoot, name), 'utf8');
+    if (name === 'server/index.js') {
+      const end = "const agentEventMethods = require('~/models');";
+      expect(contents).toContain(end);
+      contents = contents.slice(0, contents.indexOf(end) + end.length);
+    }
+    const localRequire = (id) => {
+      if (id === 'mongoose') return instance;
+      if (id === '@librechat/data-schemas') return schema;
+      if (id === '@librechat/api')
+        return { ...api, startCodeEnvironmentLifecycleReconciler: lifecycle };
+      if (id === '~/db') return load('db/index.js');
+      if (id === '~/models') return load('models/index.js');
+      if (id === './services/initializeOAuthReconnectManager')
+        return load('server/services/initializeOAuthReconnectManager.js');
+      if (id === './services/start/runtime') return load('server/services/start/runtime.js');
+      if (name === 'db/index.js' && id === './connect') return { connectDb };
+      if (name === 'db/index.js' && id === './indexSync') {
+        expect(instance.models.Message).toBeDefined();
+        expect(instance.models.Conversation).toBeDefined();
+        return indexSync;
+      }
+      if (id === '../status/usage') return { initializeStatusUsage: usage };
+      if (id === 'fs') return fs;
+      if (id === 'path') return path;
+      if (id === 'librechat-data-provider') return require('librechat-data-provider');
+      // Credentials/telemetry, HTTP middleware, cache and remote service adapters are not started.
+      inertAdapters.add(`${name}:${id}`);
+      return noop;
+    };
+    const execute = vm.runInNewContext(
+      `(function(require,module,exports,__dirname){${contents}\n})`,
+      {},
+      { filename: path.join(apiRoot, name) },
+    );
+    execute(localRequire, module, module.exports, path.dirname(path.join(apiRoot, name)));
+    return module.exports;
+  }
+  const target = entry === 'index' ? 'server/index.js' : 'server/services/start/runtime.js';
+  const result = load(target);
+  expect(trace.indexOf('db/index.js')).toBeGreaterThan(-1);
+  expect(trace.indexOf('db/index.js')).toBeLessThan(trace.indexOf('models/index.js'));
+  expect(trace.filter((name) => name === 'db/index.js')).toHaveLength(1);
+  expect(instance.models.Role).toBeDefined();
+  expect(typeof cache.get('models/index.js').exports.findToken).toBe('function');
+  expect(connectDb).not.toHaveBeenCalled();
+  expect(indexSync).not.toHaveBeenCalled();
+  expect(inertAdapters.size).toBeGreaterThan(0);
+  if (entry === 'runtime') {
+    await result.initializeConnectedRuntime({
+      mongoose: instance,
+      identity: { incarnation: 'test' },
+    });
+    expect(connectDb).toHaveBeenCalledTimes(1);
+    expect(
+      trace.filter((name) => ['connect', 'usage', 'reconciler', 'indexSync'].includes(name)),
+    ).toEqual(['connect', 'usage', 'reconciler', 'indexSync']);
+  }
 });

@@ -3,6 +3,7 @@ import { STATUS_METRICS } from 'librechat-data-provider';
 import type { StatusSnapshot, StatusMeasurement } from 'librechat-data-provider';
 import type { Selection } from './topology';
 import { roleLabel, classificationState } from './classification';
+import { StatusUsageDetails } from './StatusUsage';
 import { nodeState, edgeState } from './topology';
 import { useLocalize } from '~/hooks';
 export function formatMeasurement(m: StatusMeasurement, locale = 'de-DE'): string {
@@ -40,12 +41,14 @@ function parameterValue(
   return String(p.value);
 }
 export default function StatusInspector({
+  usageOpen = false,
   snapshot,
   selection,
   now,
   onSelect,
   onClose,
 }: {
+  usageOpen?: boolean;
   snapshot: StatusSnapshot;
   selection: Selection;
   now: number;
@@ -53,6 +56,7 @@ export default function StatusInspector({
   onClose: () => void;
 }) {
   const t = useLocalize();
+  if (usageOpen) return <StatusUsageDetails usage={snapshot.usage} now={now} onClose={onClose} />;
   if (!selection) return null;
   const node =
     selection.kind === 'node' ? snapshot.nodes.find((n) => n.id === selection.id) : undefined;

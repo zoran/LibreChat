@@ -401,3 +401,84 @@
   align-items: center;
   gap: 0.3rem;
 }
+
+/* One compact platform aggregate; details share the existing inspector. */
+.cortex-status-usage {
+  padding: 0.6rem 1.25rem;
+  border-bottom: 1px solid rgb(var(--border-light) / 0.15);
+  flex: 0 0 auto;
+  max-height: 19rem;
+  overflow: auto;
+  font-size: 0.75rem;
+}
+.cortex-status-usage-counts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.4rem;
+  margin: 0 0 0.35rem;
+}
+.cortex-status-usage-counts dd {
+  margin: 0;
+}
+.cortex-status-usage-counts dd:first-of-type {
+  font-size: 1rem;
+  font-weight: 600;
+}
+.cortex-status-usage-heading,
+.cortex-status-usage-axis {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  align-items: center;
+}
+.cortex-status-usage select {
+  color: inherit;
+  background: rgb(var(--surface-primary));
+  border: 1px solid rgb(var(--border-light) / 0.3);
+  border-radius: 0.4rem;
+  min-height: 2.75rem;
+  max-width: 100%;
+}
+.cortex-status-usage-chart {
+  display: block;
+  width: 100%;
+  height: 3.75rem;
+  color: rgb(var(--accent-primary));
+}
+.cortex-status-usage-chart rect {
+  fill: currentColor;
+}
+.cortex-status-usage-chart [data-quality='partial'] {
+  fill-opacity: 0.35;
+  stroke: currentColor;
+  stroke-dasharray: 2 2;
+}
+.cortex-status-usage-axis,
+.cortex-status-usage-reading {
+  color: rgb(var(--text-secondary));
+  font-size: 0.65rem;
+  overflow-wrap: anywhere;
+}
+.cortex-status-usage-hour {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.cortex-status-usage-hour input {
+  flex: 1;
+  min-width: 0;
+  min-height: 1.5rem;
+  accent-color: rgb(var(--accent-primary));
+}
+@media (max-width: 639px) {
+  .cortex-status-usage {
+    padding-inline: 0.75rem;
+    max-height: 20rem;
+  }
+  .cortex-status-usage-counts {
+    gap: 0.25rem 1rem;
+  }
+  .cortex-status-usage-heading {
+    align-items: flex-end;
+  }
+}

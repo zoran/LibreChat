@@ -33,6 +33,7 @@ import {
   RESOURCE_MAX,
   MAX_QUEUE_BYTES,
   FALLBACK_LIMITS,
+  hasValidUploadPublicationTime,
   reject,
 } from './uploadManagementStore';
 import { validateUploadMigrationSecurity } from './uploadManagement.security';
@@ -86,6 +87,7 @@ export function createUploadMigrationMethods(
   function validateRow(value: unknown): StoredUpload {
     if (!value || typeof value !== 'object' || Array.isArray(value)) reject('migration_conflict');
     const row = value as StoredUpload;
+    if (!hasValidUploadPublicationTime(row)) reject('migration_conflict');
     const origin =
       row.derivedOrigin === undefined ? undefined : readUploadDerivedOrigin(row.derivedOrigin);
     if (origin === null) reject('migration_conflict');

@@ -144,6 +144,8 @@ export type StoredUpload = {
   textRemoved?: boolean;
   parserExecution?: UploadParserExecution;
   publishedDigest?: string;
+  /** Immutable first actual publication time; absent historical rows remain unknown. Private. */
+  firstPublishedAtMs?: number;
 };
 export type GlobalState = ResourceTotals & {
   revision: number;
@@ -264,6 +266,28 @@ export function storedUploadPrincipal(
       : { tenantId: row.tenantId, userId: row.userId, authentication: 'verified-email' as const };
   if (!isUploadPrincipal(principal)) reject('unavailable');
   return principal;
+}
+export function hasValidUploadPublicationTime(row: StoredUpload): boolean {
+  return (
+    row.firstPublishedAtMs === undefined ||
+    (Number.isSafeInteger(row.firstPublishedAtMs) &&
+      row.firstPublishedAtMs >= 0 &&
+      row.firstPublishedAtMs <= 8.64e15 &&
+      row.acceptedAt !== undefined &&
+      row.firstPublishedAtMs >= row.acceptedAt &&
+      row.expiresAt !== undefined &&
+      row.firstPublishedAtMs < row.expiresAt &&
+      // Publication removes its active lease. Only ready -> deleted/expired retains this
+      // history; queued/failed operations have not published and must remain unknown.
+      ['ready', 'deleted', 'expired'].includes(row.state) &&
+      typeof row.publishedDigest === 'string' &&
+      /^[a-f0-9]{64}$/.test(row.publishedDigest) &&
+      row.workerKind === 'processing' &&
+      row.writerStopped === true &&
+      Number.isSafeInteger(row.workerGeneration) &&
+      row.workerGeneration! > 0 &&
+      row.parserExecution?.attemptId === `${row._id}.${row.workerGeneration}`)
+  );
 }
 export function project(row: StoredUpload, now: number): UploadOperation {
   return {
@@ -428,6 +452,7 @@ export function createUploadStore(
       workerKind: String,
       parserExecution: S.Types.Mixed,
       publishedDigest: String,
+      firstPublishedAtMs: { type: Number, min: 0, max: 8.64e15, validate: Number.isSafeInteger },
       originalRemoved: Boolean,
       textRemoved: Boolean,
     },
@@ -534,8 +559,31 @@ export function createUploadStore(
   async function save(row: StoredUpload, session: ClientSession): Promise<void> {
     if (mongoose.mongo.BSON.calculateObjectSize(row) > UPLOAD_RECORD_BYTES)
       reject('capacity_exceeded');
+    if (!hasValidUploadPublicationTime(row)) reject('unavailable');
+    // Compare the persisted time in this replacement write, preserving the original in
+    // the same transaction. First assignment requires never-published processing.
+    const publication =
+      row.firstPublishedAtMs === undefined
+        ? { firstPublishedAtMs: { $exists: false } }
+        : {
+            $or: [
+              { firstPublishedAtMs: row.firstPublishedAtMs },
+              ...(row.state === 'ready' &&
+              typeof row.publishedDigest === 'string' &&
+              /^[a-f0-9]{64}$/.test(row.publishedDigest)
+                ? [
+                    {
+                      firstPublishedAtMs: { $exists: false },
+                      publishedDigest: { $exists: false },
+                      state: 'processing',
+                    },
+                  ]
+                : []),
+            ],
+          };
     row.revision++;
-    await Operation.replaceOne({ _id: row._id }, row, { session });
+    const saved = await Operation.replaceOne({ _id: row._id, ...publication }, row, { session });
+    if (saved.matchedCount !== 1) reject('unavailable');
   }
   /** Activation cannot reinterpret old receipts or hide unresolved external custody. */
   async function assertCurrentSecurityState(session: ClientSession): Promise<void> {

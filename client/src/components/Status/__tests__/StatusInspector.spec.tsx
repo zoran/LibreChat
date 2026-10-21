@@ -1,6 +1,6 @@
 import React from 'react';
-import { readStatusSnapshot } from 'librechat-data-provider';
 import { render, screen, fireEvent } from '@testing-library/react';
+import { encodeStatusSnapshot, readStatusSnapshot } from 'librechat-data-provider';
 import type { StatusMeasurement } from 'librechat-data-provider';
 import fixture from '../../../../../packages/data-provider/src/status-fixtures/representative.json';
 import StatusInspector, { formatMeasurement } from '../StatusInspector';
@@ -154,7 +154,7 @@ it.each(scopeCases)(
     const measurement = raw.measurements.find((m) => m.scope.kind === firstScope.kind);
     if (!measurement) throw new Error('missing scoped fixture');
     measurement.scope = firstScope;
-    const initial = readStatusSnapshot(raw);
+    const initial = readStatusSnapshot(encodeStatusSnapshot(raw));
     if (!initial) throw new Error('invalid initial fixture');
     const show = (s: NonNullable<typeof initial>) => (
       <StatusInspector
@@ -169,7 +169,7 @@ it.each(scopeCases)(
     for (const label of firstLabels) expect(view.container.textContent).toContain(label);
     const before = view.container.textContent;
     measurement.scope = nextScope;
-    const next = readStatusSnapshot(raw);
+    const next = readStatusSnapshot(encodeStatusSnapshot(raw));
     if (!next) throw new Error('invalid next fixture');
     view.rerender(show(next));
     for (const label of nextLabels) expect(view.container.textContent).toContain(label);

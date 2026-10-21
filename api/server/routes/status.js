@@ -1,9 +1,14 @@
 const { ioredisClient, recordStatusOperation } = require('@librechat/api');
 const { SystemCapabilities } = require('@librechat/data-schemas');
-const { readStatusSnapshot, STATUS_METRICS } = require('librechat-data-provider');
+const {
+  readStatusSnapshot,
+  encodeStatusSnapshot,
+  STATUS_METRICS,
+} = require('librechat-data-provider');
 const { requireJwtAuth } = require('~/server/middleware');
 const { requireCapability, hasCapability } = require('~/server/middleware/roles/capabilities');
 const { createStatusService } = require('~/server/services/status/service');
+const { readStatusUsage } = require('~/server/services/status/usage');
 const { createStatusRouter } = require('~/server/services/status/router');
 
 module.exports = createStatusRouter({
@@ -14,7 +19,9 @@ module.exports = createStatusRouter({
   record: recordStatusOperation,
   getSnapshot: createStatusService({
     client: ioredisClient,
+    readUsage: readStatusUsage,
     readStatusSnapshot,
+    encodeStatusSnapshot,
     STATUS_METRICS,
     record: recordStatusOperation,
   }),

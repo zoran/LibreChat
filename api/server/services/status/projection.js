@@ -247,9 +247,9 @@ function sampleFor(measurement, node, observer, parents, now) {
     },
   };
 }
-function createProjector({ readStatusSnapshot, STATUS_METRICS }) {
+function createProjector({ readStatusSnapshot, encodeStatusSnapshot, STATUS_METRICS }) {
   function checked(value) {
-    const result = readStatusSnapshot(value);
+    const result = readStatusSnapshot(encodeStatusSnapshot(value));
     if (!result) throw Error('STATUS_DTO_INVALID');
     return result;
   }
@@ -257,6 +257,20 @@ function createProjector({ readStatusSnapshot, STATUS_METRICS }) {
     const snapshot = checked(value);
     if (!finite(now) || now < snapshot.generatedAt) throw Error('STATUS_CLOCK_INVALID');
     snapshot.generatedAt = now;
+    for (const group of [
+      ...Object.values(snapshot.usage.current).filter((item) => typeof item === 'object'),
+      ...Object.values(snapshot.usage.lastHour.groups),
+      ...snapshot.usage.history.rows.flatMap((row) => Object.values(row.groups)),
+    ]) {
+      if (
+        ['complete', 'partial'].includes(group.quality) &&
+        group.observedAt !== null &&
+        now - group.observedAt > group.maxAgeSeconds
+      ) {
+        group.quality = 'stale';
+        group.reason = 'source_stale';
+      }
+    }
     for (const node of snapshot.nodes) {
       const c = node.classification;
       if (c?.state === 'known' && c.evidence.some((e) => now - e.observedAt > e.maxAgeSeconds))

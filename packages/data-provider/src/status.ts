@@ -1,4 +1,14 @@
-/** Public Status v2 reader: bounds and cross-resource coherence; schemas remain internal. */
+/** Public Status v3 reader: bounds and cross-resource coherence; schemas remain internal. */
+import { decodeStatusWire, packStatusWire } from './status-wire';
+export type { StatusWireSnapshot } from './status-wire';
+export type {
+  StatusUsage,
+  StatusUsageWindow,
+  StatusUsageGroup,
+  StatusUsageGroups,
+  StatusComparisonReference,
+} from './status-usage';
+export { createUnknownStatusUsage, STATUS_USAGE_COLUMNS } from './status-usage';
 import type { StatusSnapshot, StatusEvidence } from './status-schema';
 import {
   shape,
@@ -486,9 +496,19 @@ export function readStatusSnapshot(value: unknown): StatusSnapshot | null {
     const data = detached(value);
     if (new TextEncoder().encode(JSON.stringify(data)).byteLength > STATUS_LIMITS.maxBytes)
       return null;
-    const result = shape.safeParse(data);
-    return result.success && coherent(result.data) ? result.data : null;
+    const result = decodeStatusWire(data);
+    return result && coherent(result) ? result : null;
   } catch {
     return null;
   }
+}
+
+/** One external wire contract; internal rich objects are never accepted by the reader. */
+export function encodeStatusSnapshot(value: StatusSnapshot) {
+  const clean = detached(value) as StatusSnapshot;
+  const { usage, ...base } = clean;
+  if (!shape.safeParse(base).success || !coherent(clean)) throw new Error('STATUS_DTO_INVALID');
+  const wire = packStatusWire({ ...base, usage } as StatusSnapshot);
+  if (!readStatusSnapshot(wire)) throw new Error('STATUS_DTO_INVALID');
+  return wire;
 }

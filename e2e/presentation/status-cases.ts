@@ -20,14 +20,17 @@ function controlledSnapshot() {
   // Recorded inventory topology; seven assessments and one missing role are deliberate fixtures.
   // The browser clock starts at this observation time and keeps advancing; no native health claim.
   const text = readFileSync(path.join(__dirname, 'status.inventory.fixture.json'), 'utf8');
-  expect(Buffer.byteLength(text)).toBeLessThanOrEqual(STATUS_LIMITS.maxBytes);
-  const snapshot = readStatusSnapshot(JSON.parse(text));
+  const wire: unknown = JSON.parse(text);
+  // The transport carries compact JSON; indentation in the source fixture is not payload data.
+  const body = JSON.stringify(wire);
+  expect(Buffer.byteLength(body, 'utf8')).toBeLessThanOrEqual(STATUS_LIMITS.maxBytes);
+  const snapshot = readStatusSnapshot(wire);
   if (!snapshot)
     throw new Error('The controlled Status fixture must pass the current public reader');
-  expect(snapshot.version).toBe(2);
+  expect(snapshot.version).toBe(3);
   expect(snapshot.nodes).toHaveLength(164);
   expect(snapshot.nodes.filter((node) => node.identity.kind === 'host')).toHaveLength(14);
-  return snapshot;
+  return { snapshot, body };
 }
 
 async function settled(page: Page) {
@@ -481,14 +484,14 @@ export function statusCases(
   expectNoOverflow: (page: Page) => Promise<void>,
 ) {
   for (const theme of ['light', 'dark'] as const) {
-    test(`Cortex Status v2 ${theme} layout, state cues and keyboard remain usable`, async ({
+    test(`Cortex Status v3 ${theme} layout, state cues and keyboard remain usable`, async ({
       page,
       context,
       baseURL,
       isMobile,
     }, testInfo) => {
       if (!baseURL) throw new Error('Status presentation requires the existing loopback app');
-      const snapshot = controlledSnapshot();
+      const { snapshot, body } = controlledSnapshot();
       const cpu = snapshot.nodes.find(
         (node) => node.classification?.kind === 'server' && node.classification.role === 'cpu',
       )!;
@@ -513,7 +516,9 @@ export function statusCases(
       await page.route('**/api/status/access', (route) =>
         route.fulfill({ json: { allowed: true } }),
       );
-      await page.route(/\/api\/status(?:\?.*)?$/, (route) => route.fulfill({ json: snapshot }));
+      await page.route(/\/api\/status(?:\?.*)?$/, (route) =>
+        route.fulfill({ contentType: 'application/json', body }),
+      );
       const scene = page.locator('.cortex-status-scene');
       const inspector = page.getByRole('complementary', { name: 'Komponentendetails' });
       try {
@@ -654,7 +659,8 @@ export function statusCases(
           body: Buffer.from(
             JSON.stringify(
               {
-                fixture: 'controlled strict-v2 inventory; access and snapshot intercepted',
+                fixture:
+                  'controlled strict-v3 compact wire inventory; access and snapshot intercepted',
                 observationTime: snapshot.generatedAt,
                 nodeCount: snapshot.nodes.length,
                 pageErrors,

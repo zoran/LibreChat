@@ -1,178 +1,39 @@
 /** Real Mongo publication, accounting and cleanup of one private original-bound derivation. */
 import mongoose from 'mongoose';
-import { createHash, randomUUID } from 'node:crypto';
-import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import { UPLOAD_MAX_TEXT_BYTES } from 'librechat-data-provider';
-import type { ManagedDocumentResult, UploadLease, UploadPrincipal } from 'librechat-data-provider';
+import type { StoredUpload, CounterRow } from './uploadManagementStore';
+import { useUploadStructureFixture } from './uploadManagement.structure.fixture';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createFileRetentionMethods } from './fileRetention';
+import { createUploadStore } from './uploadManagementStore';
 import { createFileMethods } from './file';
 import { createModels } from '~/models';
-
 describe('original-bound managed document structure', () => {
-  const db = new mongoose.Mongoose();
-  let mongo: MongoMemoryReplSet;
-  let repository: ReturnType<typeof createUploadManagementRepository>;
-  const now = Date.now();
-  const policy = 'c'.repeat(64);
-  const bytes = Buffer.from('original');
-  const sha256 = createHash('sha256').update(bytes).digest('hex');
-  const user: UploadPrincipal = {
-    tenantId: 'tenant-a',
-    userId: new mongoose.Types.ObjectId().toString(),
-    authentication: 'verified-email',
-  };
-  const worker = { hostId: 'host-a', instanceId: 'app-a' };
-  const result = (text = 'Derived text'): ManagedDocumentResult & { writerStopped: true } => ({
-    text,
-    writerStopped: true,
-    structure: {
-      version: 1,
-      source: { sha256, bytes: bytes.length, mediaType: 'text/plain' },
-      extractor: { name: 'fixture', version: '1' },
-      pages: [],
-      elements: [
-        { id: 'e1', kind: 'paragraph', start: 0, end: text.length, page: null, parentId: null },
-      ],
-      quality: { status: 'complete', warnings: [] },
-    },
-  });
-  const localGone = (lease: UploadLease) => ({
-    operationId: lease.operationId,
-    generation: lease.generation,
-    writerStopped: true,
-    localCopiesAbsent: true,
-    originalAbsent: false,
-    textAndHistoryRemoved: false,
-  });
-  beforeAll(async () => {
-    mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
-    await db.connect(mongo.getUri('document-structure'));
-    createModels(db);
-    await db.models.File.init();
-  });
-  beforeEach(async () => {
-    for (const name of ['User', 'File', 'Message', 'UploadOperation', 'UploadCounter'])
-      if (db.models[name]) await db.models[name].deleteMany({});
-    await db.models.User.create({
-      _id: user.userId,
-      tenantId: user.tenantId,
-      email: 'upload-structure@example.test',
-      emailVerified: true,
-    });
-    repository = createUploadManagementRepository(db, {
-      enabled: true,
-      reconciled: true,
-      securityPolicySha256: policy,
-      baseline: { originalBytes: 0, objectBytes: 0, textBytes: 0, recordBytes: 0, bundles: 0 },
-    });
-    await repository.initialize();
-  });
-  afterAll(async () => {
-    await db.disconnect();
-    await mongo?.stop();
-  });
-  const raw = () => db.models.File.collection.findOne({ file_id: 'structure' });
-  async function processing() {
-    await repository.reserve(
-      user,
-      {
-        operationId: 'structure',
-        idempotencyKey: randomUUID(),
-        mediaType: 'text/plain',
-        declaredBytes: bytes.length,
-        fingerprint: JSON.stringify([{ kind: 'personal' }, 'text/plain', bytes.length]),
-      },
-      now,
-    );
-    const transfer = (await repository.claim({
-      kind: 'transfer',
-      principal: user,
-      operationId: 'structure',
-      worker,
-      now,
-    }))!;
-    const execution = {
-      version: 2 as const,
-      custody: { kind: 'none' as const },
-      attemptId: `structure.${transfer.generation}`,
-      instanceId: randomUUID(),
-      executionId: randomUUID(),
-      expiresAt: new Date(now + 60_000).toISOString(),
-    };
-    await repository.bindSecurityExecution(transfer, execution, now);
-    await repository.settleSecurityExecution(
-      transfer,
-      { execution, writerStopped: true, transientDataRemoved: true },
-      now,
-    );
-    await repository.accept(
-      user,
-      transfer,
-      {
-        outcome: 'durable',
-        bytes: bytes.length,
-        source: 's3',
-        filepath: '/api/files/download/structure',
-        storageKey: `t/${user.tenantId}/managed-uploads/${user.userId}/structure.${transfer.generation}__original`,
-        integrity: {
-          version: 1,
-          algorithm: 'sha256',
-          sha256,
-          chunkBytes: 262144,
-          chunkSha256: [sha256],
-        },
-      },
-      {
-        version: 1,
-        decision: 'approved',
-        policySha256: policy,
-        subject: {
-          tenantId: user.tenantId,
-          userId: user.userId,
-          operationId: 'structure',
-          transferGeneration: transfer.generation,
-          mediaType: 'text/plain',
-          bytes: bytes.length,
-          sha256,
-        },
-        scannerVersion: 'fixture-v1',
-        checkedAt: new Date(now).toISOString(),
-        coverage: { complete: true, pages: 1, parts: 1 },
-      },
-      { filename: 'original.txt' },
-      now,
-    );
-    await repository.confirmCleanup(localGone(transfer), now);
-    const lease = (await repository.claim({ kind: 'processing', worker, now }))!;
-    await repository.bindProcessingExecution(
-      lease,
-      {
-        attemptId: `structure.${lease.generation}`,
-        instanceId: 'parser-a',
-        expiresAt: new Date(now + 60_000).toISOString(),
-      },
-      now,
-    );
-    return lease;
-  }
-
+  const fixture = useUploadStructureFixture();
+  const { db, user, now, policy, sha256, result, localGone, raw, processing } = fixture;
   it('commits text and private structure together and charges both exactly once', async () => {
     const lease = await processing();
     const document = result('Ünicode 😀');
     const expected =
       Buffer.byteLength(document.text) + Buffer.byteLength(JSON.stringify(document.structure));
     const before = structuredClone(document);
-    const ready = await repository.publish(lease, document, now);
+    const ready = await fixture.repository.publish(lease, document, now);
     expect(document).toEqual(before);
+    expect(await db.models.UploadOperation.findById('structure').lean()).toMatchObject({
+      firstPublishedAtMs: now,
+    });
+    expect(ready).not.toHaveProperty('firstPublishedAtMs');
     expect(await raw()).toMatchObject({
       text: document.text,
       documentStructure: document.structure,
       status: 'ready',
     });
-    expect((await repository.metrics(now)).textBytes).toBe(expected);
+    expect((await fixture.repository.metrics(now)).textBytes).toBe(expected);
     const second = createUploadManagementRepository(db, { securityPolicySha256: policy });
     expect((await second.publish(lease, document, now + 1)).revision).toBe(ready.revision);
+    expect(await db.models.UploadOperation.findById('structure').lean()).toMatchObject({
+      firstPublishedAtMs: now,
+    });
     expect((await second.metrics(now)).textBytes).toBe(expected);
     expect(await db.models.File.findOne({ file_id: 'structure' }).lean()).not.toHaveProperty(
       'documentStructure',
@@ -192,20 +53,268 @@ describe('original-bound managed document structure', () => {
       if (field === 'sha256') document.structure.source.sha256 = 'f'.repeat(64);
       if (field === 'bytes') document.structure.source.bytes++;
       if (field === 'mediaType') document.structure.source.mediaType = 'application/pdf';
-      await expect(repository.publish(lease, document, now)).rejects.toMatchObject({
+      await expect(fixture.repository.publish(lease, document, now)).rejects.toMatchObject({
         code: 'processing_failed',
       });
       expect(await raw()).toMatchObject({ status: 'pending' });
+      expect(await db.models.UploadOperation.findById('structure').lean()).not.toHaveProperty(
+        'firstPublishedAtMs',
+      );
       expect(await raw()).not.toHaveProperty('documentStructure');
       expect(await raw()).not.toHaveProperty('text');
-      expect((await repository.metrics(now)).textBytes).toBe(UPLOAD_MAX_TEXT_BYTES);
+      expect((await fixture.repository.metrics(now)).textBytes).toBe(UPLOAD_MAX_TEXT_BYTES);
     },
   );
+
+  it('rolls back File publication and first time when the operation save fails', async () => {
+    const lease = await processing();
+    const replace = jest
+      .spyOn(db.models.UploadOperation, 'replaceOne')
+      .mockRejectedValueOnce(new Error('publication save failed'));
+    await expect(fixture.repository.publish(lease, result(), now + 100)).rejects.toThrow(
+      'publication save failed',
+    );
+    replace.mockRestore();
+    expect(await raw()).toMatchObject({ status: 'pending' });
+    expect(await db.models.UploadOperation.findById('structure').lean()).not.toHaveProperty(
+      'firstPublishedAtMs',
+    );
+    await fixture.repository.publish(lease, result(), now + 200);
+    expect(await db.models.UploadOperation.findById('structure').lean()).toMatchObject({
+      firstPublishedAtMs: now + 200,
+    });
+  });
+  it('keeps old ready rows without a publication time historically unknown on replay', async () => {
+    const lease = await processing();
+    await fixture.repository.publish(lease, result(), now);
+    await (
+      db.models.UploadOperation.collection as unknown as mongoose.Collection<StoredUpload>
+    ).updateOne({ _id: 'structure' }, { $unset: { firstPublishedAtMs: '' } });
+    await fixture.repository.publish(lease, result(), now + 500);
+    expect(await db.models.UploadOperation.findById('structure').lean()).not.toHaveProperty(
+      'firstPublishedAtMs',
+    );
+  });
+  it.each(['replace', 'remove'])(
+    'prevents a later private save from attempting to %s the first publication time',
+    async (kind) => {
+      const lease = await processing();
+      await fixture.repository.publish(lease, result(), now);
+      const store = createUploadStore(db, {});
+      await expect(
+        store.transaction(async (session) => {
+          const row = (await store.Operation.findById('structure').session(session).lean())!;
+          if (kind === 'replace') row.firstPublishedAtMs = now + 1;
+          else delete row.firstPublishedAtMs;
+          await store.save(row, session);
+        }),
+      ).rejects.toMatchObject({ code: 'unavailable' });
+      expect(await db.models.UploadOperation.findById('structure').lean()).toMatchObject({
+        firstPublishedAtMs: now,
+      });
+    },
+  );
+
+  it('keeps one captured publication clock across an actual transaction retry', async () => {
+    const lease = await processing();
+    const error = new mongoose.mongo.MongoServerError({ message: 'retry publication', code: 112 });
+    error.addErrorLabel('TransientTransactionError');
+    const replace = jest
+      .spyOn(db.models.UploadOperation, 'replaceOne')
+      .mockRejectedValueOnce(error);
+    try {
+      await fixture.repository.publish(lease, result(), now + 100);
+      expect(replace).toHaveBeenCalledTimes(2);
+    } finally {
+      replace.mockRestore();
+    }
+    expect(await db.models.UploadOperation.findById('structure').lean()).toMatchObject({
+      firstPublishedAtMs: now + 100,
+    });
+  });
+  it.each([
+    [false, 'ready'],
+    [true, 'ready'],
+    [false, 'deleted'],
+    [true, 'deleted'],
+    [false, 'expired'],
+    [true, 'expired'],
+  ] as const)(
+    'round-trips first publication history with legacy-unknown=%s and state=%s',
+    async (legacy, state) => {
+      const lease = await processing();
+      await fixture.repository.publish(lease, result(), now + 100);
+      await fixture.repository.confirmCleanup(localGone(lease), now + 101);
+      if (state === 'deleted') await fixture.repository.delete(user, 'structure', now + 102);
+      if (state === 'expired') {
+        const row = (await db.models.UploadOperation.findById('structure').lean<
+          StoredUpload & Required<Pick<StoredUpload, 'expiresAt'>>
+        >())!;
+        await fixture.repository.reconcile(row.expiresAt);
+      }
+      expect(await db.models.UploadOperation.findById('structure').lean()).toMatchObject({ state });
+      if (legacy)
+        await (
+          db.models.UploadOperation.collection as unknown as mongoose.Collection<StoredUpload>
+        ).updateOne({ _id: 'structure' }, { $unset: { firstPublishedAtMs: '' } });
+      const page = await fixture.repository.exportSnapshot({
+        epoch: 'publication-time',
+        limit: 100,
+      });
+      const record = page.records.find((item) => item.type === 'operation')!.value as StoredUpload;
+      if (legacy) expect(record).not.toHaveProperty('firstPublishedAtMs');
+      else expect(record.firstPublishedAtMs).toBe(now + 100);
+      const target = new mongoose.Mongoose();
+      try {
+        await target.connect(fixture.mongo.getUri(`publication-import-${legacy}-${state}`));
+        createModels(target);
+        const imported = createUploadManagementRepository(target, { securityPolicySha256: policy });
+        await imported.initialize();
+        await imported.importSnapshot(page);
+        await imported.importSnapshot(page);
+        const stored = await target.models.UploadOperation.findById('structure').lean();
+        if (legacy) expect(stored).not.toHaveProperty('firstPublishedAtMs');
+        else expect(stored).toMatchObject({ firstPublishedAtMs: now + 100 });
+      } finally {
+        await target.disconnect();
+      }
+    },
+  );
+  it.each(['before-acceptance', 'after-expiry', 'fractional'])(
+    'rejects malformed first publication %s during migration',
+    async (kind) => {
+      const lease = await processing();
+      await fixture.repository.publish(lease, result(), now + 100);
+      await fixture.repository.confirmCleanup(localGone(lease), now + 101);
+      const row = (await db.models.UploadOperation.findById('structure').lean<
+        StoredUpload & Required<Pick<StoredUpload, 'expiresAt'>>
+      >())!;
+      let firstPublishedAtMs: number;
+      if (kind === 'before-acceptance') firstPublishedAtMs = now - 1;
+      else if (kind === 'after-expiry') firstPublishedAtMs = row.expiresAt;
+      else firstPublishedAtMs = now + 0.5;
+      await (
+        db.models.UploadOperation.collection as unknown as mongoose.Collection<StoredUpload>
+      ).updateOne({ _id: 'structure' }, { $set: { firstPublishedAtMs } });
+      await expect(
+        fixture.repository.exportSnapshot({ epoch: 'invalid-publication' }),
+      ).rejects.toMatchObject({ code: 'migration_conflict' });
+    },
+  );
+
+  it.each([
+    ['queued_processing', false],
+    ['failed', false],
+    ['queued_processing', true],
+    ['failed', true],
+  ] as const)(
+    'rejects invented %s publication history with forged digest=%s atomically',
+    async (state, withDigest) => {
+      const lease = await processing();
+      await fixture.repository.fail(lease, 'processing_failed', now + 10);
+      await fixture.repository.confirmCleanup(localGone(lease), now + 11);
+      if (state === 'queued_processing')
+        await fixture.repository.retryProcessing(user, 'structure', now + 12);
+      const page = await fixture.repository.exportSnapshot({ epoch: 'unpublished-history' });
+      const forged = structuredClone(page);
+      const record = forged.records.find((item) => item.type === 'operation')!
+        .value as StoredUpload;
+      expect(record.state).toBe(state);
+      expect(record).not.toHaveProperty('firstPublishedAtMs');
+      record.firstPublishedAtMs = now + 1;
+      if (withDigest) record.publishedDigest = 'd'.repeat(64);
+      // Both import and re-export exercise the real shared row validator; no partial import survives.
+      const target = new mongoose.Mongoose();
+      try {
+        await target.connect(fixture.mongo.getUri(`forged-history-${state}-${withDigest}`));
+        createModels(target);
+        const imported = createUploadManagementRepository(target, { securityPolicySha256: policy });
+        await imported.initialize();
+        await expect(imported.importSnapshot(forged)).rejects.toMatchObject({
+          code: 'migration_conflict',
+        });
+        expect(await target.models.UploadOperation.countDocuments()).toBe(0);
+        expect(
+          (await target.models.UploadCounter.findById('global').lean<CounterRow>())!.value,
+        ).not.toHaveProperty('migration');
+        await imported.importSnapshot(page);
+        expect(await target.models.UploadOperation.findById('structure').lean()).not.toHaveProperty(
+          'firstPublishedAtMs',
+        );
+      } finally {
+        await target.disconnect();
+      }
+      await (
+        db.models.UploadOperation.collection as unknown as mongoose.Collection<StoredUpload>
+      ).updateOne(
+        { _id: 'structure' },
+        {
+          $set: {
+            firstPublishedAtMs: now + 1,
+            ...(withDigest ? { publishedDigest: 'd'.repeat(64) } : {}),
+          },
+        },
+      );
+      await expect(
+        fixture.repository.exportSnapshot({ epoch: 'unpublished-history' }),
+      ).rejects.toMatchObject({ code: 'migration_conflict' });
+    },
+  );
+  it.each(['missing-digest', 'bad-digest', 'missing-parser', 'unfinished-writer'])(
+    'rejects present publication time with %s history',
+    async (kind) => {
+      const lease = await processing();
+      await fixture.repository.publish(lease, result(), now + 100);
+      await fixture.repository.confirmCleanup(localGone(lease), now + 101);
+      let change: mongoose.mongo.UpdateFilter<StoredUpload>;
+      if (kind === 'missing-digest') change = { $unset: { publishedDigest: '' } };
+      else if (kind === 'bad-digest') change = { $set: { publishedDigest: 'not-a-digest' } };
+      else if (kind === 'missing-parser') change = { $unset: { parserExecution: '' } };
+      else change = { $set: { writerStopped: false } };
+      await (
+        db.models.UploadOperation.collection as unknown as mongoose.Collection<StoredUpload>
+      ).updateOne({ _id: 'structure' }, change);
+      await expect(
+        fixture.repository.exportSnapshot({ epoch: 'invalid-history' }),
+      ).rejects.toMatchObject({
+        code: 'migration_conflict',
+      });
+    },
+  );
+
+  it('retains the first publication time after deletion without exposing it publicly', async () => {
+    const lease = await processing();
+    await fixture.repository.publish(lease, result(), now + 100);
+    await fixture.repository.confirmCleanup(localGone(lease), now + 101);
+    const deleted = await fixture.repository.delete(user, 'structure', now + 102);
+    expect(deleted).not.toHaveProperty('firstPublishedAtMs');
+    expect(await db.models.UploadOperation.findById('structure').lean()).toMatchObject({
+      firstPublishedAtMs: now + 100,
+    });
+  });
+  it('refuses to backfill a legacy ready timestamp through the private save owner', async () => {
+    const lease = await processing();
+    await fixture.repository.publish(lease, result(), now);
+    await (
+      db.models.UploadOperation.collection as unknown as mongoose.Collection<StoredUpload>
+    ).updateOne({ _id: 'structure' }, { $unset: { firstPublishedAtMs: '' } });
+    const store = createUploadStore(db, {});
+    await expect(
+      store.transaction(async (session) => {
+        const row = (await store.Operation.findById('structure').session(session).lean())!;
+        row.firstPublishedAtMs = now + 1;
+        await store.save(row, session);
+      }),
+    ).rejects.toMatchObject({ code: 'unavailable' });
+    expect(await db.models.UploadOperation.findById('structure').lean()).not.toHaveProperty(
+      'firstPublishedAtMs',
+    );
+  });
 
   it('refuses changed structure on retry while canonical object key order remains idempotent', async () => {
     const lease = await processing();
     const document = result();
-    await repository.publish(lease, document, now);
+    await fixture.repository.publish(lease, document, now);
     const reordered = {
       ...document,
       structure: {
@@ -217,11 +326,11 @@ describe('original-bound managed document structure', () => {
         version: 1 as const,
       },
     };
-    await expect(repository.publish(lease, reordered, now)).resolves.toMatchObject({
+    await expect(fixture.repository.publish(lease, reordered, now)).resolves.toMatchObject({
       state: 'ready',
     });
     document.structure.extractor.version = '2';
-    await expect(repository.publish(lease, document, now)).rejects.toMatchObject({
+    await expect(fixture.repository.publish(lease, document, now)).rejects.toMatchObject({
       code: 'lease_lost',
     });
     expect((await raw())!.documentStructure.extractor.version).toBe('1');
@@ -230,10 +339,10 @@ describe('original-bound managed document structure', () => {
   it('includes structure in the existing representation ceiling', async () => {
     const lease = await processing();
     await expect(
-      repository.publish(lease, result('x'.repeat(UPLOAD_MAX_TEXT_BYTES)), now),
+      fixture.repository.publish(lease, result('x'.repeat(UPLOAD_MAX_TEXT_BYTES)), now),
     ).rejects.toMatchObject({ code: 'processing_failed' });
     expect(await raw()).not.toHaveProperty('documentStructure');
-    expect((await repository.metrics(now)).textBytes).toBe(UPLOAD_MAX_TEXT_BYTES);
+    expect((await fixture.repository.metrics(now)).textBytes).toBe(UPLOAD_MAX_TEXT_BYTES);
   });
 
   it('rejects malformed publication and unjoined writers without reading accessors', async () => {
@@ -248,13 +357,13 @@ describe('original-bound managed document structure', () => {
       { ...result(), writerStopped: false },
       { text: 'legacy', writerStopped: true },
     ]) {
-      await expect(repository.publish(lease, value as never, now)).rejects.toMatchObject({
+      await expect(fixture.repository.publish(lease, value as never, now)).rejects.toMatchObject({
         code: 'processing_failed',
       });
     }
     expect(getter).not.toHaveBeenCalled();
     expect(await raw()).not.toHaveProperty('documentStructure');
-    expect((await repository.metrics(now)).textBytes).toBe(UPLOAD_MAX_TEXT_BYTES);
+    expect((await fixture.repository.metrics(now)).textBytes).toBe(UPLOAD_MAX_TEXT_BYTES);
   });
 
   it('also binds the native File publication to its approved original inside the transaction', async () => {
@@ -285,17 +394,17 @@ describe('original-bound managed document structure', () => {
 
   it('removes private structure through the existing retained File deletion and cleanup fence', async () => {
     const lease = await processing();
-    await repository.publish(lease, result(), now);
-    await repository.confirmCleanup(localGone(lease), now);
-    await repository.delete(user, 'structure', now);
+    await fixture.repository.publish(lease, result(), now);
+    await fixture.repository.confirmCleanup(localGone(lease), now);
+    await fixture.repository.delete(user, 'structure', now);
     await createFileRetentionMethods(db).finalizeFileSourceDeletion(user, ['structure']);
-    await repository.confirmCleanup(
+    await fixture.repository.confirmCleanup(
       { ...localGone(lease), originalAbsent: true, textAndHistoryRemoved: true },
       now,
     );
     expect(await raw()).not.toHaveProperty('documentStructure');
     expect(await raw()).not.toHaveProperty('text');
-    expect((await repository.metrics(now)).textBytes).toBe(0);
+    expect((await fixture.repository.metrics(now)).textBytes).toBe(0);
   });
 
   it('does not admit structure through generic File creation or dotted updates', async () => {

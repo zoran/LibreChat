@@ -1,6 +1,8 @@
 import {
   STATUS_PARAMETERS,
-  readStatusSnapshot,
+  readStatusSnapshot as readWireStatusSnapshot,
+  encodeStatusSnapshot,
+  type StatusSnapshot,
   STATUS_LIMITS,
   STATUS_METRICS,
   STATUS_ZOOM_PRESETS,
@@ -8,7 +10,20 @@ import {
 import representative from './status-fixtures/representative.json';
 import degraded from './status-fixtures/degraded.json';
 
-const fresh = (): typeof representative => JSON.parse(JSON.stringify(representative));
+// Coherence mutation tests operate on the decoded model and explicitly re-encode.
+// The externally exposed reader remains wire-only.
+const readStatusSnapshot = (value: unknown): StatusSnapshot | null => {
+  try {
+    const m = (value as { measurements?: unknown[] })?.measurements;
+    return readWireStatusSnapshot(
+      m?.length && !Array.isArray(m[0]) ? encodeStatusSnapshot(value as StatusSnapshot) : value,
+    );
+  } catch {
+    return null;
+  }
+};
+const fresh = (): StatusSnapshot =>
+  JSON.parse(JSON.stringify(readWireStatusSnapshot(representative)));
 
 describe('one Cortex Status snapshot contract', () => {
   test('one graph preserves many-to-many allocation and zero traffic across all presets', () => {
@@ -166,7 +181,12 @@ describe('one Cortex Status snapshot contract', () => {
     [
       'runtime mismatch',
       (s: ReturnType<typeof fresh>) => {
-        s.measurements[6].scope.instanceId = 'different-pod';
+        (
+          s.measurements[6].scope as Extract<
+            StatusSnapshot['measurements'][number]['scope'],
+            { kind: 'http' }
+          >
+        ).instanceId = 'different-pod';
       },
     ],
     [
@@ -356,7 +376,7 @@ describe('review regressions and source-bound settings', () => {
     [
       'unknown parameter key',
       (v: ReturnType<typeof fresh>) => {
-        v.parameters[0].key = 'environment.API_KEY';
+        (v.parameters[0] as { key: string }).key = 'environment.API_KEY';
       },
     ],
     [
@@ -462,7 +482,7 @@ test('enforces per-node parameter count and evidence capture kind', () => {
     .slice(0, 25)
     .map(([key, d]) => ({
       nodeId: 'logical:service:deepseek',
-      key,
+      key: key as keyof typeof STATUS_PARAMETERS,
       label: d.label,
       unit: d.unit,
       stage: 'configured',
@@ -482,7 +502,7 @@ describe('v2 inventory classifications and orchestration boundaries', () => {
   const current = () => readStatusSnapshot(representative)!;
   test('one graph carries desired roles independently of unknown health and runtime placement', () => {
     const s = current();
-    expect(s.version).toBe(2);
+    expect(s.version).toBe(3);
     const cpu = s.nodes.find((n) => n.id === 'physical:host:control-a')!;
     expect(cpu.classification).toMatchObject({
       kind: 'server',

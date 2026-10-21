@@ -292,6 +292,13 @@ export default [
             'cortex-status-title',
             'cortex-status-toolbar',
             'cortex-status-workspace',
+            'cortex-status-usage',
+            'cortex-status-usage-counts',
+            'cortex-status-usage-heading',
+            'cortex-status-usage-chart',
+            'cortex-status-usage-axis',
+            'cortex-status-usage-hour',
+            'cortex-status-usage-reading',
             'is-context',
             'is-selected',
             // client/src/style.css and the library's component CSS

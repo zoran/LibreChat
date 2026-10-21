@@ -1,3 +1,13 @@
+export { createStatusUsageMethods } from './methods/statusUsage';
+export type { StatusUsageOptions, StatusUsageMethods } from './methods/statusUsage';
+export { createStatusUsageCurrentMethods } from './methods/statusUsageCurrent';
+export type {
+  StatusUsageCurrentPolicy,
+  StatusUsageCurrentProof,
+  StatusUsageCurrentMethods,
+} from './methods/statusUsageCurrent';
+export { STATUS_USAGE_STORAGE_LIMITS } from './types/statusUsage';
+export type * from './types/statusUsage';
 export { createFileLibraryMethods, InvalidFileLibraryInputError } from './methods/fileLibrary';
 export type { FileLibraryMethods } from './methods/fileLibrary';
 export { EMAIL_CODE_IDLE_MS, EMAIL_CODE_ABSOLUTE_MS } from './emailCodePolicy';

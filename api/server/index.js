@@ -5,7 +5,6 @@ const fs = require('fs');
 const path = require('path');
 require('module-alias')({ base: path.resolve(__dirname, '..') });
 const cors = require('cors');
-const axios = require('axios');
 const express = require('express');
 const mongoose = require('mongoose');
 const passport = require('passport');
@@ -34,7 +33,6 @@ const {
   ErrorController,
   memoryDiagnostics,
   createSecurityHeaders,
-  performStartupChecks,
   handleJsonParseError,
   excludeRumBodyParser,
   GenerationJobManager,
@@ -42,48 +40,28 @@ const {
   createStreamServices,
   agentStartupIngressMiddleware,
   agentStartupTelemetryMiddleware,
-  initializeFileStorage,
-  initializeDeploymentSkills,
-  initializeDeploymentPlugins,
-  getDeploymentPluginSkills,
-  getDeploymentPluginHookCapabilities,
-  registerDeploymentPluginHooks,
-  hasDeploymentPluginHooks,
-  hasDeploymentPluginToolApprovalHooks,
-  setPluginHookSource,
-  loadToolApprovalHooks,
   maybeInjectQueryDevtoolsBootstrap,
   injectConfiguredFooterBootstrap,
   preAuthTenantMiddleware,
   requestContextMiddleware,
   registerShutdownTask,
   getRemainingShutdownMs,
-  registerBackgroundTaskShutdown,
   configureServerTimeouts,
   setupGracefulShutdown,
-  updateInterfacePermissions,
   configureMessageFilterRegexValidator,
   configureFileConfigRegexEngine,
-  configureAgentEventRuntime,
   createAgentEventTerminalHandler,
   createScheduleWriteGate,
-  startCodeEnvironmentLifecycleReconciler,
   waitForRedisStartup,
-  warnOnUnreachableDeliveryPaths,
   createCodeApiUploadRegistry,
 } = require('@librechat/api');
-const { connectDb, indexSync } = require('~/db');
-const {
-  updateAccessPermissions,
-  sweepOrphanedPreviews,
-  getRoleByName,
-  seedDatabase,
-} = require('~/models');
+// Register existing Mongoose models before any application method consumer.
+require('~/db');
 const initializeOAuthReconnectManager = require('./services/initializeOAuthReconnectManager');
 const { capabilityContextMiddleware } = require('./middleware/roles/capabilities');
 const { createManagedIntakeIngress } = require('./middleware/requireManagedIntake');
 const createValidateImageRequest = require('./middleware/validateImageRequest');
-const { initializeGitHubSkillSync, skillSyncMaintenance } = require('./services/Skills/sync');
+const { skillSyncMaintenance } = require('./services/Skills/sync');
 const {
   initializeAgentTriggerService,
   agentTriggerMaintenance,
@@ -96,20 +74,21 @@ const {
   scheduleMaintenance,
 } = require('./services/Schedules');
 const { jwtLogin, ldapLogin, passportLogin } = require('~/strategies');
-const { startExpiredFileSweep } = require('./services/Files/process');
 const { checkMigrations } = require('./services/start/migration');
 const optionalJwtAuth = require('./middleware/optionalJwtAuth');
 const requireJwtAuth = require('./middleware/requireJwtAuth');
-const { initializeUploads, getUploadRuntime } = require('./services/Uploads');
+const { getUploadRuntime } = require('./services/Uploads');
+const {
+  initializeApplicationRuntime,
+  initializeConnectedRuntime,
+} = require('./services/start/runtime');
 const initializeMCPs = require('./services/initializeMCPs');
-const { configureSubagentTaskRouting } = require('./services/Endpoints/agents/subagentThreadStore');
 const configureSocialLogins = require('./socialLogins');
 const {
   legacyAuthMaintenance,
   authAdmissionMiddleware,
 } = require('./services/LegacyAuthMaintenance');
 const createSpaFallback = require('./utils/fallback');
-const { getAppConfig } = require('./services/Config');
 const staticCache = require('./utils/staticCache');
 const noIndex = require('./middleware/noIndex');
 const agentEventMethods = require('~/models');
@@ -262,15 +241,9 @@ const startServer = async () => {
     logger.warn('[metrics] METRICS_SECRET is not set - /metrics will return 401 for all requests');
   }
 
-  if (typeof Bun !== 'undefined') {
-    axios.defaults.headers.common['Accept-Encoding'] = 'gzip';
-  }
-  await connectDb();
-
-  logger.info('Connected to MongoDB');
-  startCodeEnvironmentLifecycleReconciler({ mongoose });
-  indexSync().catch((err) => {
-    logger.error('[indexSync] Background sync failed:', err);
+  const statusUsage = await initializeConnectedRuntime({
+    mongoose,
+    identity: maintenance.identity,
   });
 
   app.disable('x-powered-by');
@@ -294,66 +267,12 @@ const startServer = async () => {
     );
   }
 
-  await runAsSystem(seedDatabase);
-  /* Recover stuck `status: 'pending'` records from a crash mid-render.
-   * `runAsSystem` is required — `File` is tenant-isolated and strict
-   * mode rejects unscoped queries. Lazy sweep in the preview endpoint
-   * covers anything younger than the boot cutoff. */
-  // Complete the only boot sweep before readiness or the maintenance listener.
-  // An unknown write outcome prevents startup instead of reporting an idle owner.
-  await runAsSystem(sweepOrphanedPreviews);
-  const appConfig = await getAppConfig({ baseOnly: true });
-  await configureSubagentTaskRouting(appConfig?.endpoints?.agents?.subagentActivity);
-  registerBackgroundTaskShutdown({
-    interruptGraceMs: appConfig?.endpoints?.agents?.backgroundTasks?.shutdownInterruptGraceMs,
-  });
-  configureAgentEventRuntime(appConfig?.endpoints?.agents?.eventDriven);
-  warnOnUnreachableDeliveryPaths(appConfig);
-  initializeFileStorage(appConfig);
-  const uploads = await initializeUploads({ registry, identity: maintenance.identity });
-  if (uploads) {
-    registerShutdownTask(
-      'managed upload workers',
-      () =>
-        uploads.close(
-          AbortSignal.timeout(Math.max(1, getRemainingShutdownMs() - SHUTDOWN_TEARDOWN_RESERVE_MS)),
-        ),
-      { priority: 105 },
-    );
-  }
-  const projectRoot = path.resolve(__dirname, '../..');
-  // Plugin hooks execute only when the operator opts in via DEPLOYMENT_PLUGIN_HOOKS;
-  // without it, declared hook documents load as parsed-but-inert with a warning.
-  await initializeDeploymentPlugins({
-    projectRoot,
-    hookCapabilities: getDeploymentPluginHookCapabilities(),
-  });
-  // Hand the run seam its plugin-hook source without a packages/api-internal
-  // agents -> plugins import (see agents/hooks/source.ts).
-  setPluginHookSource({
-    hasHooks: hasDeploymentPluginHooks,
-    hasToolApprovalHooks: hasDeploymentPluginToolApprovalHooks,
-    register: registerDeploymentPluginHooks,
-  });
-  await initializeDeploymentSkills({
-    projectRoot,
-    additionalSkills: getDeploymentPluginSkills(),
-  });
-  initializeGitHubSkillSync(appConfig);
-  startExpiredFileSweep({ appConfig, loadAppConfig: getAppConfig });
-  // Register any programmatic tool-approval policy hooks declared in
-  // `endpoints.agents.toolApproval.hooks`. Honor the `enabled` kill switch: when tool
-  // approval is off we pass no hooks, so a disabled endpoint imports/runs nothing (and any
-  // previously loaded batch is unregistered). Hooks are read from the BASE config only —
-  // they register once, process-wide; per-user/tenant differences belong inside the hook
-  // (via its context), not in per-override module lists.
-  const toolApproval = appConfig?.endpoints?.agents?.toolApproval;
-  await loadToolApprovalHooks(toolApproval?.enabled ? toolApproval.hooks : undefined, {
-    basePath: path.resolve(__dirname, '../..'),
-  });
-  await runAsSystem(async () => {
-    await performStartupChecks(appConfig);
-    await updateInterfacePermissions({ appConfig, getRoleByName, updateAccessPermissions });
+  const { appConfig, uploads } = await initializeApplicationRuntime({
+    registry,
+    identity: maintenance.identity,
+    recordOriginalPublication: statusUsage?.recordOriginalPublication,
+    projectRoot: path.resolve(__dirname, '../..'),
+    shutdownTeardownReserveMs: SHUTDOWN_TEARDOWN_RESERVE_MS,
   });
 
   /* Route modules build their rate limiters as they load, so they load only after the

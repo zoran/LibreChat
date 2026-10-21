@@ -359,7 +359,7 @@ async function createUploadComposition({
 }
 
 /** Called once after database/storage initialization. Disabled means no adapter, timer or watch. */
-async function initializeUploads({ registry, identity }) {
+async function initializeUploads({ registry, identity, recordOriginalPublication }) {
   if (process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED !== 'true') return undefined;
   if (current) return current;
   if (
@@ -393,6 +393,7 @@ async function initializeUploads({ registry, identity }) {
   }
   const repository = createUploadManagementRepository(mongoose, {
     securityPolicySha256: security.policySha256,
+    recordOriginalPublication,
   });
   // Initialization never attests an empty store or enables an unreconciled authority.
   await runAsSystem(() => repository.initialize());

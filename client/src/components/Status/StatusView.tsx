@@ -14,6 +14,7 @@ import { getAppTitle } from '~/utils/presentation';
 import { nodeDescription } from './classification';
 import StatusInspector from './StatusInspector';
 import useStatusCamera from './useStatusCamera';
+import StatusUsageSummary from './StatusUsage';
 import AppLogo from '~/components/ui/AppLogo';
 import StatusTopology from './StatusTopology';
 import './status.css';
@@ -34,6 +35,7 @@ export function StatusPresentation({
   const t = useLocalize();
   const { data: startupConfig } = useGetStartupConfig();
   const [search, setSearch] = useState('');
+  const [usageOpen, setUsageOpen] = useState(false);
   const presentation = useRef<HTMLElement>(null);
   const pendingFocus = useRef<string | null>(null);
   const camera = useStatusCamera();
@@ -68,6 +70,7 @@ export function StatusPresentation({
     }
   }, [snapshot, positions, focus]);
   const select = (value: Selection) => {
+    setUsageOpen(false);
     if (value?.kind === 'node')
       focus(graphBounds(focusNodes(snapshot, value.id, preset), positions), true, {
         selection: value,
@@ -76,6 +79,16 @@ export function StatusPresentation({
     else setSelection(value);
   };
   const close = () => {
+    if (usageOpen) {
+      setUsageOpen(false);
+      requestAnimationFrame(() =>
+        presentation.current
+          ?.querySelector<HTMLButtonElement>('[data-usage-details="true"]')
+          ?.focus(),
+      );
+      return;
+    }
+    setUsageOpen(false);
     setSelection(null);
     requestAnimationFrame(() =>
       document.querySelector<SVGSVGElement>('.cortex-status-scene')?.focus(),
@@ -123,7 +136,16 @@ export function StatusPresentation({
           {warning}
         </p>
       )}
-      <div className="cortex-status-workspace" data-inspector-open={Boolean(selection)}>
+      <StatusUsageSummary
+        usage={snapshot.usage}
+        now={now}
+        detailsOpen={usageOpen}
+        onDetails={() => setUsageOpen(true)}
+      />
+      <div
+        className="cortex-status-workspace"
+        data-inspector-open={Boolean(selection) || usageOpen}
+      >
         <div className="cortex-status-graph-pane">
           <div className="cortex-status-search">
             <input
@@ -204,6 +226,7 @@ export function StatusPresentation({
           </div>
         </div>
         <StatusInspector
+          usageOpen={usageOpen}
           snapshot={snapshot}
           selection={selection}
           now={now}

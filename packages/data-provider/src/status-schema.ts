@@ -1,6 +1,7 @@
-/** Internal shapes for the single public Status v2 contract; no observation or transport authority. */
+/** Internal shapes for the single public Status v3 contract; no observation or transport authority. */
 import { z } from 'zod';
 import type { StatusParameterKey } from './status-parameters';
+import type { StatusUsage } from './status-usage';
 import { STATUS_PARAMETERS } from './status-parameters';
 export { STATUS_PARAMETERS };
 export type { StatusParameterKey };
@@ -368,7 +369,7 @@ const parameter = z
 
 export const shape = z
   .object({
-    version: z.literal(2),
+    version: z.literal(3),
     generatedAt: time,
     selectedObserverId: token.nullable(),
     sources: z
@@ -378,6 +379,7 @@ export const shape = z
             id: token,
             kind: z.enum([
               'prometheus',
+              'application_usage',
               'inventory',
               'runtime',
               'acceptance',
@@ -397,7 +399,7 @@ export const shape = z
     parameterEvidence: z.array(parameterEvidence).max(STATUS_LIMITS.maxParameterEvidence),
   })
   .strict();
-export type StatusSnapshot = z.infer<typeof shape>;
+export type StatusSnapshot = z.infer<typeof shape> & { usage: StatusUsage };
 export type StatusNode = StatusSnapshot['nodes'][number];
 export type StatusEdge = StatusSnapshot['edges'][number];
 export type StatusMeasurement = StatusSnapshot['measurements'][number];

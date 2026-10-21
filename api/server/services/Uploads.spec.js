@@ -229,7 +229,7 @@ describe('Cortex upload adapter trust boundaries', () => {
     },
   );
 
-  it('binds the native durable owner to the validated scanner policy', async () => {
+  it('binds the native durable owner to the validated scanner policy and publication port', async () => {
     Object.assign(process.env, {
       CORTEX_UPLOAD_MANAGEMENT_ENABLED: 'true',
       POD_NODE_NAME: 'cpu-2',
@@ -271,9 +271,13 @@ describe('Cortex upload adapter trust boundaries', () => {
       source: process.env.BUILD_COMMIT,
       incarnation: '52345678-1234-4234-8234-123456789012',
     });
-    await expect(initializeUploads({ identity })).rejects.toThrow('fixture-platform-stop');
+    const recordOriginalPublication = jest.fn();
+    await expect(initializeUploads({ identity, recordOriginalPublication })).rejects.toThrow(
+      'fixture-platform-stop',
+    );
     expect(createUploadManagementRepository).toHaveBeenCalledWith(require('mongoose'), {
       securityPolicySha256: security.policySha256,
+      recordOriginalPublication,
     });
     expect(createUploadPlatform).toHaveBeenCalledWith({
       repository,

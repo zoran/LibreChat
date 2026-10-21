@@ -1,6 +1,6 @@
 import React from 'react';
-import { readStatusSnapshot } from 'librechat-data-provider';
 import { render, screen, fireEvent, within } from '@testing-library/react';
+import { encodeStatusSnapshot, readStatusSnapshot } from 'librechat-data-provider';
 import fixture from '../../../../../packages/data-provider/src/status-fixtures/representative.json';
 import StatusView, { StatusPresentation } from '../StatusView';
 import german from '../../../locales/de/translation.json';
@@ -279,7 +279,7 @@ it('retains compact role, unknown-role and health cues when the measured canvas 
   const s = snapshot();
   const unknown = s.nodes.find((n) => n.id === 'physical:host:gpu-b')!;
   unknown.classification = null;
-  expect(readStatusSnapshot(s)).not.toBeNull();
+  expect(readStatusSnapshot(encodeStatusSnapshot(s))).not.toBeNull();
   let box = {
     width: 390,
     height: 288,
@@ -366,7 +366,7 @@ it('retains compact role, unknown-role and health cues when the measured canvas 
             state === 'disagreement' ? [evidence, { ...evidence, sourceId: 'cpu3' }] : [evidence],
         },
       ];
-      const admitted = readStatusSnapshot(next);
+      const admitted = readStatusSnapshot(encodeStatusSnapshot(next));
       expect(admitted).not.toBeNull();
       view.rerender(
         <StatusPresentation

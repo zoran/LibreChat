@@ -18,6 +18,7 @@ import { createSkillSyncStatusModel } from './skillSyncStatus';
 import { createConversationTagModel } from './conversationTag';
 import { createCodeEnvironmentModel } from './codeEnvironment';
 import { createAgentCategoryModel } from './agentCategory';
+import { createStatusUsageModels } from './statusUsage';
 import { createChatProjectModel } from './chatProject';
 import { createAgentApiKeyModel } from './agentApiKey';
 import { createTransactionModel } from './transaction';
@@ -58,6 +59,8 @@ import logger from '~/config/winston';
  * Creates all database models for all collections
  */
 export function createModels(mongoose: typeof import('mongoose')): {
+  StatusUsageReceipt: ReturnType<typeof createStatusUsageModels>['Receipt'];
+  StatusUsageBucket: ReturnType<typeof createStatusUsageModels>['Bucket'];
   User: ReturnType<typeof createUserModel>;
   ToolApprovalGrant: ReturnType<typeof createToolApprovalGrantModel>;
   Token: ReturnType<typeof createTokenModel>;
@@ -112,7 +115,10 @@ export function createModels(mongoose: typeof import('mongoose')): {
   GenerationAdmission: ReturnType<typeof createGenerationAdmissionModel>;
   OpenIDRefreshFlight: ReturnType<typeof createOpenIDRefreshFlightModel>;
 } {
+  const statusUsage = createStatusUsageModels(mongoose);
   const models = {
+    StatusUsageReceipt: statusUsage.Receipt,
+    StatusUsageBucket: statusUsage.Bucket,
     User: createUserModel(mongoose),
     ToolApprovalGrant: createToolApprovalGrantModel(mongoose),
     Token: createTokenModel(mongoose),
