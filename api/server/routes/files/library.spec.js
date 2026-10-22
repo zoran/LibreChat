@@ -8,6 +8,7 @@ let mockMode = 'default';
 let mockRuntime;
 const mockOwner = { userId: '0123456789abcdef01234567', tenantId: 'library-tenant' };
 jest.mock('@librechat/api', () => ({
+  createManagedFileHandlers: jest.requireActual('@librechat/api').createManagedFileHandlers,
   getAuthMode: () => mockMode,
   restoreTenantContextFromReq: (_req, _res, next) => next(),
 }));

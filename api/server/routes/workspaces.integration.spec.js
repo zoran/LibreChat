@@ -188,13 +188,17 @@ describe('Workspace HTTP saves through native security and File lifecycle', () =
     management = createUploadManagement({
       repository,
       identity: {
-        authorize: async (principal, scope) =>
+        authorize: async (principal, request) =>
           [owner, foreign].some(
             (known) =>
               principal.userId === known.userId &&
               principal.tenantId === known.tenantId &&
               principal.authentication === known.authentication,
-          ) && scope.kind === 'personal',
+          ) &&
+          request.owner.scope.kind === 'personal' &&
+          'ownerUserId' in request.owner &&
+          request.owner.ownerUserId === principal.userId &&
+          request.owner.tenantId === principal.tenantId,
       },
       resources: { assertSafe: async () => void (await stat(intakeRoot)) },
     });
