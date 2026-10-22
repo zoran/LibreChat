@@ -61,7 +61,7 @@ test('startup supplies existing owner ports and routes readiness through mainten
     agentTriggerMaintenance: {},
     agentQueuedTurnMaintenance: {},
     skillSyncMaintenance: {},
-    expiredFileSweepMaintenance: {},
+    fileDeletionWorkOwner: { maintenance: {} },
     legacyAuthMaintenance: {},
     process: { env: {} },
     cacheConfig: { SHARED_STATE: { mode: 'sentinel' }, USE_REDIS: true },

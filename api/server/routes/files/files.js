@@ -10,6 +10,7 @@ const {
   handleFilesUsageRequest,
   buildDeleteFilesResponse,
   deleteAgentResourceFiles,
+  fileDeletionWorkOwner,
   shouldUseUploadSse,
   startUploadSseStream,
   sendUploadPolicyError,
@@ -321,25 +322,28 @@ router.delete('/', async (req, res) => {
         });
       }
 
-      const agentDeletion = await deleteAgentResourceFiles(
-        {
-          agentId: req.body.agent_id,
-          agentObjectId: agent._id.toString(),
-          toolResource: req.body.tool_resource,
-          requestedFileIds: fileIds,
-          attachedFileIds: agent.tool_resources?.[req.body.tool_resource]?.file_ids ?? [],
-          files: dbFiles.map((file) => ({
-            file_id: file.file_id,
-            owner: file.user?.toString() ?? null,
-            file,
-          })),
-          userId: req.user.id.toString(),
-        },
-        {
-          getSharedResourceFileIds: db.getSharedResourceFileIds,
-          removeAgentResourceFiles: db.removeAgentResourceFiles,
-          deleteFiles: (agentFiles) => processDeleteRequest({ req, files: agentFiles }),
-        },
+      const agentDeletion = await fileDeletionWorkOwner.run(async (work) =>
+        deleteAgentResourceFiles(
+          {
+            agentId: req.body.agent_id,
+            agentObjectId: agent._id.toString(),
+            toolResource: req.body.tool_resource,
+            requestedFileIds: fileIds,
+            attachedFileIds: agent.tool_resources?.[req.body.tool_resource]?.file_ids ?? [],
+            files: dbFiles.map((file) => ({
+              file_id: file.file_id,
+              owner: file.user?.toString() ?? null,
+              file,
+            })),
+            userId: req.user.id.toString(),
+          },
+          {
+            getSharedResourceFileIds: db.getSharedResourceFileIds,
+            removeAgentResourceFiles: (input) =>
+              work.effect(() => db.removeAgentResourceFiles(input)),
+            deleteFiles: (agentFiles) => processDeleteRequest({ req, files: agentFiles, work }),
+          },
+        ),
       );
 
       if (agentDeletion.outcome == null) {

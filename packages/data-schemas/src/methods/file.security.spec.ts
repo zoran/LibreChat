@@ -1,9 +1,9 @@
 /** Real Mongo evidence for private File approvals and native API enforcement; no mocked guards. */
 import mongoose from 'mongoose';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import { FileContext, UPLOAD_RETENTION_MS } from 'librechat-data-provider';
-import type { UploadSecurityApproval } from 'librechat-data-provider';
+import type { UploadLease, UploadSecurityApproval } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
 import type { ManagedUploadAcceptance } from './fileRetention';
 import {
@@ -11,6 +11,7 @@ import {
   FileSourceUnavailableError,
   resolveFileSources,
 } from './fileRetention';
+import { createUploadManagementRepository } from './uploadManagement';
 import { tenantStorage } from '~/config/tenantContext';
 import { createFileMethods } from './file';
 import { createModels } from '~/models';
@@ -20,6 +21,7 @@ describe('native File security boundary', () => {
   let mongo: MongoMemoryReplSet;
   let files: ReturnType<typeof createFileMethods>;
   let lifecycle: ReturnType<typeof createFileRetentionMethods>;
+  let repository: ReturnType<typeof createUploadManagementRepository>;
   const policy = 'c'.repeat(64);
   const now = Date.now();
   const bytes = Buffer.from('fixture\n');
@@ -38,7 +40,6 @@ describe('native File security boundary', () => {
       mediaType: 'text/plain',
       transferGeneration: 1,
       acceptedAt: now,
-      expiresAt: now + UPLOAD_RETENTION_MS,
       receipt: {
         outcome: 'durable',
         bytes: bytes.length,
@@ -81,45 +82,102 @@ describe('native File security boundary', () => {
     }
   }
 
-  async function ready(input = acceptance()): Promise<ManagedUploadAcceptance> {
-    await transaction(async (session) => {
-      await lifecycle.acceptManagedUpload(input, session);
-      await lifecycle.claimManagedUploadProcessing(
-        input.principal,
-        input.operationId,
-        7,
-        now,
-        session,
-      );
-      await lifecycle.publishManagedUpload(
-        input.principal,
-        input.operationId,
-        7,
-        {
-          text: `private content for ${input.operationId}`,
-          structure: {
-            version: 1,
-            source: { sha256, bytes: bytes.length, mediaType: 'text/plain' },
-            extractor: { name: 'fixture', version: '1' },
-            pages: [],
-            elements: [
-              {
-                id: 'e1',
-                kind: 'paragraph',
-                start: 0,
-                end: `private content for ${input.operationId}`.length,
-                page: null,
-                parentId: null,
-              },
-            ],
-            quality: { status: 'complete', warnings: [] },
-          },
-        },
-        now,
-        session,
-      );
+  const localGone = (lease: UploadLease) => ({
+    operationId: lease.operationId,
+    generation: lease.generation,
+    writerStopped: true,
+    localCopiesAbsent: true,
+    originalAbsent: false,
+    textAndHistoryRemoved: false,
+  });
+
+  async function ready(
+    input = acceptance(),
+  ): Promise<ManagedUploadAcceptance & { processingGeneration: number }> {
+    const at = input.acceptedAt;
+    const worker = { hostId: 'host-a', instanceId: 'app-a' };
+    await repository.reserve(
+      input.principal,
+      {
+        operationId: input.operationId,
+        idempotencyKey: randomUUID(),
+        mediaType: input.mediaType,
+        declaredBytes: input.receipt.bytes,
+        fingerprint: JSON.stringify([{ kind: 'personal' }, input.mediaType, input.receipt.bytes]),
+      },
+      at,
+    );
+    const transfer = await repository.claim({
+      kind: 'transfer',
+      principal: input.principal,
+      operationId: input.operationId,
+      worker,
+      now: at,
     });
-    return input;
+    if (!transfer) throw new Error('Fixture transfer claim unavailable');
+    expect(transfer.generation).toBe(input.transferGeneration);
+    const execution = {
+      version: 2 as const,
+      custody: { kind: 'none' as const },
+      attemptId: `${input.operationId}.${transfer.generation}`,
+      instanceId: randomUUID(),
+      executionId: randomUUID(),
+      expiresAt: new Date(at + 60_000).toISOString(),
+    };
+    await repository.bindSecurityExecution(transfer, execution, at);
+    await repository.settleSecurityExecution(
+      transfer,
+      { execution, writerStopped: true, transientDataRemoved: true },
+      at,
+    );
+    await repository.accept(
+      input.principal,
+      transfer,
+      input.receipt,
+      input.securityApproval,
+      { filename: input.filename },
+      at,
+    );
+    await repository.confirmCleanup(localGone(transfer), at);
+    const processing = await repository.claim({ kind: 'processing', worker, now: at });
+    if (!processing) throw new Error('Fixture processing claim unavailable');
+    expect(processing.operationId).toBe(input.operationId);
+    await repository.bindProcessingExecution(
+      processing,
+      {
+        attemptId: `${input.operationId}.${processing.generation}`,
+        instanceId: 'parser-a',
+        expiresAt: new Date(at + 60_000).toISOString(),
+      },
+      at,
+    );
+    await repository.publish(
+      processing,
+      {
+        text: `private content for ${input.operationId}`,
+        writerStopped: true,
+        structure: {
+          version: 1,
+          source: { sha256, bytes: bytes.length, mediaType: 'text/plain' },
+          extractor: { name: 'fixture', version: '1' },
+          pages: [],
+          elements: [
+            {
+              id: 'e1',
+              kind: 'paragraph',
+              start: 0,
+              end: `private content for ${input.operationId}`.length,
+              page: null,
+              parentId: null,
+            },
+          ],
+          quality: { status: 'complete', warnings: [] },
+        },
+      },
+      at,
+    );
+    await repository.confirmCleanup(localGone(processing), at);
+    return { ...input, processingGeneration: processing.generation };
   }
 
   const raw = (id = 'approved') => db.models.File.collection.findOne({ file_id: id });
@@ -169,7 +227,29 @@ describe('native File security boundary', () => {
   beforeEach(async () => {
     process.env.UPLOAD_SECURITY_POLICY_SHA256 = policy;
     process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = 'true';
-    await db.models.File.deleteMany({});
+    for (const name of [
+      'User',
+      'File',
+      'Message',
+      'UploadOperation',
+      'UploadCounter',
+      'FileReadReceipt',
+      'HousekeepingJob',
+    ])
+      if (db.models[name]) await db.models[name].deleteMany({});
+    await db.models.User.create({
+      _id: owner.userId,
+      tenantId: owner.tenantId,
+      email: 'file-security@example.test',
+      emailVerified: true,
+    });
+    repository = createUploadManagementRepository(db, {
+      enabled: true,
+      reconciled: true,
+      securityPolicySha256: policy,
+      baseline: { originalBytes: 0, objectBytes: 0, textBytes: 0, recordBytes: 0, bundles: 0 },
+    });
+    await repository.initialize();
   });
   afterEach(() => {
     for (const [key, value] of [
@@ -251,7 +331,9 @@ describe('native File security boundary', () => {
     const input = acceptance();
     change(input);
     await expect(
-      transaction((session) => lifecycle.acceptManagedUpload(input, session)),
+      transaction(async (session) => {
+        await lifecycle.acceptManagedUpload(input, session);
+      }),
     ).rejects.toBeInstanceOf(FileSourceUnavailableError);
     expect(await db.models.File.countDocuments()).toBe(0);
   });
@@ -278,7 +360,7 @@ describe('native File security boundary', () => {
     const input = await ready();
     expect(await raw()).toMatchObject({
       securityApproval: input.securityApproval,
-      previewRevision: '7',
+      previewRevision: String(input.processingGeneration),
       status: 'ready',
     });
     const lean = await db.models.File.findOne({ file_id: input.operationId }).lean();
@@ -469,7 +551,7 @@ describe('native File security boundary', () => {
           securityApproval: input.securityApproval,
           uploadOperationId: input.operationId,
           retentionAcceptedAt: new Date(now),
-          expiredAt: new Date(input.expiresAt),
+          expiredAt: new Date(input.acceptedAt + UPLOAD_RETENTION_MS),
           source: 's3',
           storageKey: input.receipt.storageKey,
           filepath: input.receipt.filepath,

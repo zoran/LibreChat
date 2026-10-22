@@ -98,11 +98,12 @@ describe('App promotion cleanup join', () => {
           ...(settlement.receipt ? { receipt: settlement.receipt } : {}),
         })!,
     );
+    const recordPromotionLocalCleanup = jest.fn().mockResolvedValue(true);
     const options = {
       task: value,
       worker: { ...app },
       attempts: journal.attempts,
-      repository: { settlePromotion },
+      repository: { settlePromotion, recordPromotionLocalCleanup },
       signal: new AbortController().signal,
       now: () => 42,
     };
@@ -113,7 +114,7 @@ describe('App promotion cleanup join', () => {
       registration.settle(result);
       return { registration, abort };
     }
-    return { journal, options, settlePromotion, register };
+    return { journal, options, settlePromotion, recordPromotionLocalCleanup, register };
   }
 
   it.each(['none', 'prepared', 'settled'])(
@@ -150,6 +151,31 @@ describe('App promotion cleanup join', () => {
     );
     expect(options.task.writerStopped).toBe(false);
     expect(options.task.localCopiesAbsent).toBe(false);
+  });
+
+  it('records the exact App local join while preserving an unknown original PUT receipt', async () => {
+    const value = task();
+    value.promotion!.receipt!.outcome = 'unknown';
+    const { options, register, settlePromotion, recordPromotionLocalCleanup } = setup(value);
+    const before = JSON.stringify(value.promotion);
+    register({
+      writerStopped: false,
+      localWriterStopped: true,
+      localCopiesAbsent: true,
+      storageOutcome: 'unknown',
+    });
+    expect(await settleUploadPromotionCleanup(options)).toBe(false);
+    expect(recordPromotionLocalCleanup).toHaveBeenCalledWith(
+      {
+        operationId: 'operation',
+        transferGeneration: 3,
+        promotionId: value.promotion!.promotionId,
+        worker: app,
+      },
+      42,
+    );
+    expect(settlePromotion).not.toHaveBeenCalled();
+    expect(JSON.stringify(value.promotion)).toBe(before);
   });
 
   it('waits for actual completion after cancellation; cancel alone is insufficient', async () => {

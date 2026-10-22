@@ -50,6 +50,7 @@ jest.mock('sharp', () =>
 
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
+  ...jest.requireActual('../../../../packages/api/src/files/deletion'),
   refreshS3FileUrls: jest.fn(),
 }));
 
@@ -1496,4 +1497,69 @@ describe('File Routes - Agent Files Endpoint', () => {
       expect(processAgentFileUpload).not.toHaveBeenCalled();
     });
   });
+});
+
+describe('foreground agent File deletion census', () => {
+  it.each(['unlink only', 'unlink after delete'])(
+    'retains the actual route %s branch through pause',
+    async (kind) => {
+      const { createFileDeletionWorkOwner, deleteAgentResourceFiles } = jest.requireActual(
+        '../../../../packages/api/src/files/deletion',
+      );
+      const fileDeletionWorkOwner = createFileDeletionWorkOwner();
+      const source = require('fs').readFileSync(
+        require('path').join(__dirname, 'files.js'),
+        'utf8',
+      );
+      const start = source.indexOf('const agentDeletion = await fileDeletionWorkOwner.run(');
+      const end = source.indexOf('if (agentDeletion.outcome == null)', start);
+      expect(start).toBeGreaterThan(0);
+      let resolveUnlink;
+      const unlink = new Promise((resolve) => {
+        resolveUnlink = resolve;
+      });
+      const removeAgentResourceFiles = jest.fn(() => unlink);
+      const own = kind === 'unlink after delete';
+      const files = [
+        { file_id: 'foreign', user: 'other' },
+        ...(own ? [{ file_id: 'own', user: 'user' }] : []),
+      ];
+      const processDeleteRequest = jest.fn(({ files: selected, work }) =>
+        fileDeletionWorkOwner.run(
+          async () => ({ deletedFileIds: selected.map((file) => file.file_id), failedFileIds: [] }),
+          work,
+        ),
+      );
+      const operation = require('vm').runInNewContext(
+        '(async () => {' + source.slice(start, end) + 'return agentDeletion;})()',
+        {
+          fileDeletionWorkOwner,
+          deleteAgentResourceFiles,
+          processDeleteRequest,
+          req: { body: { agent_id: 'agent', tool_resource: 'file_search' }, user: { id: 'user' } },
+          agent: {
+            _id: 'object',
+            tool_resources: { file_search: { file_ids: files.map((file) => file.file_id) } },
+          },
+          fileIds: files.map((file) => file.file_id),
+          dbFiles: files,
+          db: { getSharedResourceFileIds: async () => [], removeAgentResourceFiles },
+        },
+      );
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      expect(removeAgentResourceFiles).toHaveBeenCalledTimes(1);
+      fileDeletionWorkOwner.maintenance.pauseAdmissions('hold');
+      expect(await fileDeletionWorkOwner.maintenance.getMaintenanceCensus('hold')).toMatchObject({
+        pendingWrites: 1,
+      });
+      resolveUnlink();
+      const result = await operation;
+      expect(result.unlinkedFileIds).toEqual(['foreign']);
+      expect(processDeleteRequest).toHaveBeenCalledTimes(own ? 1 : 0);
+      expect(await fileDeletionWorkOwner.maintenance.getMaintenanceCensus('hold')).toMatchObject({
+        pendingWrites: 0,
+        complete: true,
+      });
+    },
+  );
 });

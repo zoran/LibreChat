@@ -27,6 +27,16 @@
         "types": "./dist/capabilities.d.cts",
         "default": "./dist/admin/capabilities.cjs"
       }
+    },
+    "./file-housekeeping-coverage": {
+      "import": {
+        "types": "./dist/fileCoverageAdmin.d.mts",
+        "default": "./dist/admin/fileCoverageAdmin.mjs"
+      },
+      "require": {
+        "types": "./dist/fileCoverageAdmin.d.cts",
+        "default": "./dist/admin/fileCoverageAdmin.cjs"
+      }
     }
   },
   "files": [
@@ -36,6 +46,7 @@
     "clean": "rimraf dist",
     "build": "npm run clean && tsdown",
     "build:watch": "tsdown --watch",
+    "typecheck": "tsc --noEmit -p tsconfig.build.json && tsc --noEmit -p tsconfig.spec.json",
     "test": "jest --coverage --watch",
     "test:ci": "jest --coverage --ci",
     "verify": "npm run test:ci",

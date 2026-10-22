@@ -13,8 +13,9 @@ import type { UploadOriginalIntegrity, UploadStorageReceipt } from 'librechat-da
 import type { S3Client } from '@aws-sdk/client-s3';
 import type { StoragePort } from '../../uploads/contract';
 import { verifyOriginalIntegrity } from '../../uploads/storage/integrity';
+import { createManagedDeletionAdapter } from './managedDeletion';
 import { uploadAttemptId } from '../../uploads/processing/paths';
-import { getS3Key, parseS3Key } from './crud';
+import { buildS3Key as getS3Key, parseS3Key } from './keys';
 
 const MAX_BYTES = 30 * 1024 * 1024;
 const ignoreStreamError = () => {
@@ -130,7 +131,32 @@ export function createManagedS3Storage(options: {
       /* observational only */
     }
   };
+  const deletion = createManagedDeletionAdapter(client, Bucket);
+  const deletionInput = (input: Parameters<StoragePort['beginDeletion']>[0]) => {
+    if (input.request.generation !== String(input.generation))
+      throw new Error('Managed deletion generation mismatch');
+    return {
+      binding: input.binding,
+      key: managedOriginalKey(input),
+      request: input.request,
+      signal: input.signal,
+      deadlineAtMs: input.deadlineAtMs,
+    };
+  };
   return {
+    describeDeletion: (input) => {
+      if (input.request.generation !== String(input.generation))
+        throw new Error('Managed deletion generation mismatch');
+      return deletion.describe({ key: managedOriginalKey(input), request: input.request });
+    },
+    acknowledgeDeletionConsumed: (input) =>
+      deletion.acknowledgeDeletionConsumed({
+        ...deletionInput(input),
+        receipt: input.receipt,
+        consumerCommitId: input.consumerCommitId,
+      }),
+    beginDeletion: (input) => deletion.begin(deletionInput(input)),
+    observeDeletion: (input) => deletion.observe(deletionInput(input)),
     async put(input) {
       const Key = managedOriginalKey(input.lease);
       const { operationId, generation } = input.lease;

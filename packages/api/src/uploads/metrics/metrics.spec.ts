@@ -208,4 +208,73 @@ describe('private finite upload metrics', () => {
     expect(() => metrics.rejectQuota('private-user' as never)).toThrow();
     expect(await registry.metrics()).not.toContain('private-user');
   });
+  it('counts only observed extraction calls and omits unknown durations and inactive stages', async () => {
+    const registry = new Registry();
+    const metrics = createUploadMetrics(registry, ['cpu-1']).bind('cpu-1');
+    metrics.observeDuration({ stage: 'processing', outcome: 'success', seconds: 9 });
+    expect(await registry.metrics()).not.toContain('cortex_upload_document_stage_outcomes_total{');
+    for (const outcome of ['success', 'failure', 'cancelled'] as const) {
+      metrics.observeDuration({ stage: 'extract', outcome, seconds: 2 });
+    }
+    metrics.observeDuration({ stage: 'extract', outcome: 'unknown' });
+    const text = await registry.metrics();
+    for (const outcome of ['success', 'failure', 'cancelled', 'unknown']) {
+      expect(text).toContain(
+        `cortex_upload_document_stage_outcomes_total{slot="cpu-1",stage="extract",outcome="${outcome}"} 1`,
+      );
+    }
+    for (const outcome of ['success', 'failure', 'cancelled']) {
+      expect(text).toContain(
+        `cortex_upload_duration_seconds_sum{slot="cpu-1",stage="extract",outcome="${outcome}"} 2`,
+      );
+    }
+    expect(text).not.toMatch(/cortex_upload_duration_seconds[^\n]*outcome="unknown"/);
+    expect(text).not.toMatch(/stage="(?:ocr|retrieve|rerank|answer)"/);
+  });
+  it('rejects unknown time, unbounded stages and invalid measurements before counting', async () => {
+    const registry = new Registry();
+    const metrics = createUploadMetrics(registry, ['cpu-1']).bind('cpu-1');
+    const invalid = [
+      { stage: 'private-request-id', outcome: 'success', seconds: 1 },
+      { stage: 'extract', outcome: 'private-user-id', seconds: 1 },
+      { stage: 'extract', outcome: 'skipped', seconds: 0 },
+      { stage: 'extract', outcome: 'success', seconds: NaN },
+      { stage: 'extract', outcome: 'failure', seconds: -1 },
+      { stage: 'extract', outcome: 'unknown', seconds: 0 },
+      { stage: 'processing', outcome: 'unknown' },
+    ];
+    for (const observation of invalid) {
+      expect(() => metrics.observeDuration(observation as never)).toThrow();
+    }
+    const text = await registry.metrics();
+    expect(text).not.toContain('cortex_upload_document_stage_outcomes_total{');
+    expect(text).not.toContain('cortex_upload_duration_seconds_count{');
+    expect(text).not.toContain('private-request-id');
+    expect(text).not.toContain('private-user-id');
+  });
+  it('bounds extraction series across the four admitted slots', async () => {
+    const registry = new Registry();
+    const slots = ['cpu-1', 'cpu-2', 'cpu-3', 'cpu-4'];
+    const owner = createUploadMetrics(registry, slots);
+    for (const slot of slots) {
+      const metrics = owner.bind(slot);
+      for (const outcome of ['success', 'failure', 'cancelled'] as const) {
+        metrics.observeDuration({ stage: 'extract', outcome, seconds: 1 });
+      }
+      metrics.observeDuration({ stage: 'extract', outcome: 'unknown' });
+    }
+    const samples = (await registry.metrics())
+      .split('\n')
+      .filter((line) => !line.startsWith('#') && line.includes('stage="extract"'));
+    // Four counters plus three 12-bucket histograms (+Inf, sum, count) per slot.
+    expect(samples).toHaveLength(196);
+    for (const line of samples) {
+      const labels = line.slice(line.indexOf('{') + 1, line.indexOf('}')).split(',');
+      expect(labels.map((label) => label.split('=')[0]).sort()).toEqual(
+        line.includes('_bucket{')
+          ? ['le', 'outcome', 'slot', 'stage']
+          : ['outcome', 'slot', 'stage'],
+      );
+    }
+  });
 });

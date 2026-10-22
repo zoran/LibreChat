@@ -178,9 +178,8 @@ const {
   createModelBoundChatModelCallback: createModelBoundContentCallback,
   getPrivateTextInspectionTokens,
   getPrivateTextModelHooks,
-  readFileSourceRetention,
-  deserializeQuoteRetention,
-  quoteRetentionContext,
+  applySteerSourceRetention,
+  admitModelSourceRetention,
   createPrivateTextInitialAdmissionCallback,
   withPrivateTextAdmissionConfig,
   requirePrivateTextAdmission,
@@ -871,76 +870,67 @@ class AgentClient extends BaseClient {
    * @param {import('@librechat/api').SteerQueueItem} item
    */
   async applySteerPart(streamId, item) {
-    if (item.quoteRetention) {
-      const context = quoteRetentionContext(deserializeQuoteRetention(item.quoteRetention));
-      if (context) {
-        const req = this.options.req;
-        const previous = readFileSourceRetention(req._fileSourceRetention);
-        req._fileSourceRetention = {
-          sourceFileIds: [
-            ...new Set([...(previous?.sourceFileIds ?? []), ...context.sourceFileIds]),
-          ],
-          sourceExpiresAt:
-            previous && previous.sourceExpiresAt < context.sourceExpiresAt
-              ? previous.sourceExpiresAt
-              : context.sourceExpiresAt,
+    return applySteerSourceRetention(
+      this.options.req,
+      item.quoteRetention,
+      (owner, selection) => db.resolveFileRetentionContext(owner, selection),
+      async () => {
+        const index = this.contentParts.length;
+        const part = {
+          type: ContentTypes.STEER,
+          [ContentTypes.STEER]: item.text,
+          steerId: item.steerId,
+          ...(item.clientSteerId && { clientSteerId: item.clientSteerId }),
+          createdAt: item.createdAt,
+          ...(item.files?.length && { files: item.files }),
+          // Persisted separately from the text (mirroring `message.quotes`) so the
+          // UI renders reference blocks and replay re-merges them per turn.
+          ...(item.quotes?.length && { quotes: item.quotes }),
+          ...(item.quoteSourceRefs?.length && { quoteSourceRefs: item.quoteSourceRefs }),
         };
-      }
-    }
-    const index = this.contentParts.length;
-    const part = {
-      type: ContentTypes.STEER,
-      [ContentTypes.STEER]: item.text,
-      steerId: item.steerId,
-      ...(item.clientSteerId && { clientSteerId: item.clientSteerId }),
-      createdAt: item.createdAt,
-      ...(item.files?.length && { files: item.files }),
-      // Persisted separately from the text (mirroring `message.quotes`) so the
-      // UI renders reference blocks and replay re-merges them per turn.
-      ...(item.quotes?.length && { quotes: item.quotes }),
-      ...(item.quoteSourceRefs?.length && { quoteSourceRefs: item.quoteSourceRefs }),
-    };
-    this.contentParts.push(part);
-    this.steerOffsetState.offset += 1;
-    // durable: the chunk-log XADD is this event's recovery record — it must
-    // commit before the publish or a cross-replica reconnect that missed the
-    // pub/sub delivery reconstructs content without the steer part.
-    try {
-      await GenerationJobManager.emitChunk(
-        streamId,
-        {
-          event: SteerEvents.ON_STEER_APPLIED,
-          data: {
-            steerId: item.steerId,
-            ...(item.clientSteerId && { clientSteerId: item.clientSteerId }),
-            index,
-            part,
-            responseMessageId: this.responseMessageId,
-            conversationId: this.conversationId,
-          },
-        },
-        {
-          durable: true,
-          expectedCreatedAt: this.jobCreatedAt,
-          deliveredSteer: item,
-        },
-      );
-      this.appliedSteerParts.set(item.steerId, { index, part });
-      /** Only a COMMITTED steer is a hard semantic boundary. If its durable
-       *  append failed, the drain restores the queue item and the current
-       *  phase evidence must remain intact for the eventual retry. */
-      this.activityPhaseWiring?.drop?.();
-    } catch (error) {
-      /** The part and its receipt commit as one durable unit. Roll the local
-       * projection back when that commit fails so the drain can restore the
-       * claimed item instead of injecting an instruction absent from replay. */
-      if (this.contentParts[index] === part) {
-        this.contentParts.splice(index, 1);
-        this.steerOffsetState.offset -= 1;
-      }
-      this.appliedSteerParts.delete(item.steerId);
-      throw error;
-    }
+        this.contentParts.push(part);
+        this.steerOffsetState.offset += 1;
+        // durable: the chunk-log XADD is this event's recovery record — it must
+        // commit before the publish or a cross-replica reconnect that missed the
+        // pub/sub delivery reconstructs content without the steer part.
+        try {
+          await GenerationJobManager.emitChunk(
+            streamId,
+            {
+              event: SteerEvents.ON_STEER_APPLIED,
+              data: {
+                steerId: item.steerId,
+                ...(item.clientSteerId && { clientSteerId: item.clientSteerId }),
+                index,
+                part,
+                responseMessageId: this.responseMessageId,
+                conversationId: this.conversationId,
+              },
+            },
+            {
+              durable: true,
+              expectedCreatedAt: this.jobCreatedAt,
+              deliveredSteer: item,
+            },
+          );
+          this.appliedSteerParts.set(item.steerId, { index, part });
+          /** Only a COMMITTED steer is a hard semantic boundary. If its durable
+           *  append failed, the drain restores the queue item and the current
+           *  phase evidence must remain intact for the eventual retry. */
+          this.activityPhaseWiring?.drop?.();
+        } catch (error) {
+          /** The part and its receipt commit as one durable unit. Roll the local
+           * projection back when that commit fails so the drain can restore the
+           * claimed item instead of injecting an instruction absent from replay. */
+          if (this.contentParts[index] === part) {
+            this.contentParts.splice(index, 1);
+            this.steerOffsetState.offset -= 1;
+          }
+          this.appliedSteerParts.delete(item.steerId);
+          throw error;
+        }
+      },
+    );
   }
 
   async stripSteerAttachmentRefs(streamId, item) {
@@ -2148,95 +2138,27 @@ class AgentClient extends BaseClient {
           this.privateTextStart,
         ),
         ...(AgentClient.prototype.hasRetainedDocumentSources.call(this, fileProjection) && {
-          onSourceProjection: async ({ fileIds, sourceMessageIds }) => {
-            const req = this.options.req;
-            const owner = { userId: req.user.id, tenantId: req.user.tenantId };
-            const dependentHistory = new Set(
-              (this.modelBoundStoredMessages ?? [])
-                .filter(
-                  (message) => message.sourceFileIds?.length > 0 || message.quotes?.length > 0,
-                )
-                .map((message) => message.messageId ?? message.id),
-            );
-            // Model callbacks can overlap; a later resolver must not erase an already exposed source.
-            const mergeContext = (context) => {
-              if (!context) return context;
-              const current = readFileSourceRetention(req._fileSourceRetention);
-              if (!current) return context;
-              return {
-                sourceFileIds: [...new Set([...current.sourceFileIds, ...context.sourceFileIds])],
-                sourceExpiresAt:
-                  current.sourceExpiresAt < context.sourceExpiresAt
-                    ? current.sourceExpiresAt
-                    : context.sourceExpiresAt,
-              };
-            };
-            const previous = readFileSourceRetention(req._fileSourceRetention);
-            const selectedIds = new Set(sourceMessageIds);
-            const historyQuoteSnapshots = (this.modelBoundStoredMessages ?? [])
-              .filter(
-                (message) =>
-                  message.quotes?.length > 0 &&
-                  selectedIds.has(message.messageId ?? message.id) &&
-                  (message.messageId ?? message.id) !== req._quoteRetentionMessageId,
-              )
-              .map((message) => ({
-                messageId: message.messageId ?? message.id,
-                messageVersion: message.__v ?? null,
-                quotes: [...message.quotes],
-              }));
-            const selectedQuotes =
-              req._quoteRetention && sourceMessageIds.includes(req._quoteRetentionMessageId)
-                ? quoteRetentionContext(req._quoteRetention)
-                : undefined;
-            const context = mergeContext(
-              await db.resolveFileRetentionContext(owner, {
-                fileIds: [
-                  ...new Set([
-                    ...fileIds,
-                    ...(previous?.sourceFileIds ?? []),
-                    ...(selectedQuotes?.sourceFileIds ?? []),
-                  ]),
-                ],
-                historyMessageIds: sourceMessageIds.filter(
-                  (id) => dependentHistory.has(id) && id !== req._quoteRetentionMessageId,
-                ),
-                ...getCheckpointPreparation(
-                  this.options.checkpointPreparation,
-                  req,
-                )?.sourceRetentionOptions(this),
-                ...(historyQuoteSnapshots.length > 0 && { historyQuoteSnapshots }),
-              }),
-            );
-            if (!context) return;
-            // Keep failed admission source-bound too: an error/partial may not recreate revoked text.
-            req._fileSourceRetention = context;
-            const streamId = req._resumableStreamId;
-            if (
-              !streamId ||
-              this.jobCreatedAt == null ||
-              !(await GenerationJobManager.bindSourceRetention(
-                streamId,
-                this.jobCreatedAt,
-                context,
-              ))
-            ) {
-              throw new Error('Source generation admission failed');
-            }
-            try {
-              const revalidated = await db.resolveFileRetentionContext(owner, {
-                fileIds: context.sourceFileIds,
-                historyMessageIds: [],
-              });
-              if (!revalidated) throw new Error('Source binding disappeared');
-              req._fileSourceRetention = mergeContext(revalidated);
-            } catch (error) {
-              // A concurrent delete may have scanned before this generation was bound.
-              // Compensate through the same revoke owner before any provider admission.
-              await GenerationJobManager.revokeFileSourceGenerations(owner, context.sourceFileIds);
-              throw error;
-            }
-          },
+          onSourceProjection: (projection) =>
+            admitModelSourceRetention(
+              {
+                ...projection,
+                request: this.options.req,
+                storedMessages: this.modelBoundStoredMessages,
+                getJobCreatedAt: () => this.jobCreatedAt,
+                getCheckpointOptions: () =>
+                  getCheckpointPreparation(
+                    this.options.checkpointPreparation,
+                    this.options.req,
+                  )?.sourceRetentionOptions(this),
+              },
+              {
+                resolve: (owner, selection) => db.resolveFileRetentionContext(owner, selection),
+                bind: (streamId, createdAt, context) =>
+                  GenerationJobManager.bindSourceRetention(streamId, createdAt, context),
+                revoke: (owner, fileIds) =>
+                  GenerationJobManager.revokeFileSourceGenerations(owner, fileIds),
+              },
+            ),
         }),
       },
     );

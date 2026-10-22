@@ -8,14 +8,14 @@
   "sideEffects": false,
   "exports": {
     ".": {
+      "types": "./dist/types/index.d.ts",
       "import": "./dist/index.mjs",
-      "require": "./dist/index.js",
-      "types": "./dist/types/index.d.ts"
+      "require": "./dist/index.js"
     },
     "./react-query": {
+      "types": "./dist/types/react-query/index.d.ts",
       "import": "./dist/react-query/index.mjs",
-      "require": "./dist/react-query/index.js",
-      "types": "./dist/types/react-query/index.d.ts"
+      "require": "./dist/react-query/index.js"
     }
   },
   "files": [

@@ -22,7 +22,7 @@ describe('retention helpers', () => {
   const expirationDate = new Date('2030-01-01T00:00:00.000Z');
   let dependencies: jest.Mocked<RetentionDependencies>;
 
-  it('redacts only expired/revoked quote fields while pairing identical text and original deadlines', () => {
+  it('redacts only authoritative unavailable quote fields while preserving captured observations', () => {
     const refs = [{ messageId: 'A' }, null, { messageId: 'B', quoteIndex: 1, messageVersion: 3 }];
     const resolved = {
       quotes: ['same', 'independent', 'same'],
@@ -51,11 +51,12 @@ describe('retention helpers', () => {
       sourceFileIds: ['file-A', 'file-B'],
       sourceExpiresAt: new Date(3000),
     });
-    const redacted = redactQuoteRetention(wire, ['file-A'], 2000);
+    const redacted = redactQuoteRetention(wire, ['file-A']);
     expect(redacted.quotes).toEqual(['independent', 'same']);
     expect(redacted.quoteSourceRefs).toEqual([null, refs[2]]);
     expect(redacted.quoteSourceRetention).toEqual([{ ...wire.quoteSourceRetention[1], index: 1 }]);
-    expect(redactQuoteRetention(redacted, [], 5000)).toMatchObject({
+    expect(redactQuoteRetention(redacted, [])).toEqual(redacted);
+    expect(redactQuoteRetention(redacted, ['file-B'])).toMatchObject({
       quotes: ['independent'],
       quoteSourceRefs: [null],
       quoteSourceRetention: [],

@@ -185,7 +185,12 @@ describe('FilePreviewDialog lifecycle', () => {
     expect(mockOwnedPreview).not.toHaveBeenCalled();
     expect(screen.queryByText('extracted document')).toBeNull();
     view.rerender(<FilePreviewDialog {...props} deliveryPath="text" />);
-    expect(mockUseFilePreview).toHaveBeenLastCalledWith('f1', { enabled: true }, 'public-share');
+    expect(mockUseFilePreview).toHaveBeenLastCalledWith(
+      'f1',
+      { enabled: true },
+      'public-share',
+      'content',
+    );
     expect(screen.getByText('extracted document')).toBeInTheDocument();
   });
 

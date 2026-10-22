@@ -22,7 +22,10 @@ const stopped = {
 
 function fixture() {
   return createUploadWorkers({
-    processing: { worker } as never,
+    processing: { worker, stagingRoot: '/isolated-unused', documents: {} } as never,
+    settlement: {
+      repository: { cleanupForWorker: jest.fn().mockResolvedValue({ tasks: [], cursor: null }) },
+    } as never,
     runAsSystem: (run) => run(),
     idleMs: 100,
   });
@@ -201,7 +204,10 @@ describe('managed upload work ownership', () => {
     });
     processOne.mockRejectedValueOnce(new Error('processing failed'));
     const workers = createUploadWorkers({
-      processing: { worker } as never,
+      processing: { worker, stagingRoot: '/isolated-unused', documents: {} } as never,
+      settlement: {
+        repository: { cleanupForWorker: jest.fn().mockResolvedValue({ tasks: [], cursor: null }) },
+      } as never,
       runAsSystem: (run) => run(),
       idleMs: 100,
       onError,
@@ -237,5 +243,225 @@ describe('managed upload work ownership', () => {
     await expect(workers.close()).resolves.toEqual({ complete: true });
     await jest.advanceTimersByTimeAsync(1_000);
     expect(processOne).toHaveBeenCalledTimes(1);
+  });
+  it('services durable actor cleanup while new processing admission is paused', async () => {
+    const cleanupForWorker = jest.fn().mockResolvedValue({ tasks: [], cursor: null });
+    const workers = createUploadWorkers({
+      processing: { worker, stagingRoot: '/isolated-unused', documents: {} } as never,
+      settlement: { repository: { cleanupForWorker } } as never,
+      runAsSystem: (run) => run(),
+      idleMs: 100,
+    });
+    workers.start();
+    workers.maintenance.pauseAdmissions('pause');
+    try {
+      await jest.advanceTimersByTimeAsync(100);
+      expect(cleanupForWorker).toHaveBeenCalledWith(worker, expect.objectContaining({ limit: 16 }));
+      expect(processOne).not.toHaveBeenCalled();
+    } finally {
+      await workers.close();
+    }
+  });
+
+  it('settles before admission and immediately after an attempt without overlapping processing', async () => {
+    const events: string[] = [];
+    const cleanupForWorker = jest.fn(async () => {
+      events.push('settle');
+      return { tasks: [], cursor: null };
+    });
+    processOne.mockImplementationOnce(async () => {
+      events.push('process');
+      return { claimed: true, operation: undefined };
+    });
+    const workers = createUploadWorkers({
+      processing: { worker, stagingRoot: '/isolated-unused' } as never,
+      settlement: { repository: { cleanupForWorker } } as never,
+      runAsSystem: (run) => run(),
+      idleMs: 100,
+    });
+    workers.start();
+    await jest.advanceTimersByTimeAsync(101);
+    expect(events.slice(0, 3)).toEqual(['settle', 'process', 'settle']);
+    expect(processOne).toHaveBeenCalledTimes(1);
+    await workers.close();
+  });
+  it('reports a stuck settlement during drain and does not detach its actual flight', async () => {
+    let release!: (value: { tasks: []; cursor: null }) => void;
+    const cleanupForWorker = jest.fn(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    const workers = createUploadWorkers({
+      processing: { worker, stagingRoot: '/isolated-unused' } as never,
+      settlement: { repository: { cleanupForWorker } } as never,
+      runAsSystem: (run) => run(),
+      idleMs: 100,
+    });
+    workers.start();
+    await jest.advanceTimersByTimeAsync(100);
+    const stop = new AbortController();
+    const closing = workers.close(stop.signal);
+    stop.abort();
+    await expect(closing).resolves.toEqual({ complete: false });
+    expect((await workers.maintenance.getMaintenanceCensus(null)).complete).toBe(false);
+    cleanupForWorker.mockResolvedValue({ tasks: [], cursor: null });
+    release({ tasks: [], cursor: null });
+    await expect(workers.close()).resolves.toEqual({ complete: true });
+    expect(processOne).not.toHaveBeenCalled();
+  });
+
+  it('keeps pause census incomplete before the first owner discovery', async () => {
+    const cleanupForWorker = jest.fn().mockResolvedValue({
+      tasks: [{ ...task, state: 'failed' }],
+      cursor: 'op',
+    });
+    const workers = createUploadWorkers({
+      processing: { worker, stagingRoot: '/isolated-unused', documents: {} } as never,
+      settlement: {
+        repository: {
+          cleanupForWorker,
+          confirmActorCleanup: jest.fn().mockResolvedValue({
+            actorWriterStopped: false,
+            localCopiesAbsent: false,
+            writerStopped: false,
+          }),
+        },
+      } as never,
+      runAsSystem: (run) => run(),
+      idleMs: 100,
+    });
+    workers.start();
+    workers.maintenance.pauseAdmissions('pause');
+    try {
+      expect(cleanupForWorker).not.toHaveBeenCalled();
+      expect((await workers.maintenance.getMaintenanceCensus('pause')).complete).toBe(false);
+      await jest.advanceTimersByTimeAsync(100);
+      expect((await workers.maintenance.getMaintenanceCensus('pause')).complete).toBe(false);
+      cleanupForWorker.mockResolvedValue({ tasks: [], cursor: null });
+      await jest.advanceTimersByTimeAsync(100);
+      expect((await workers.maintenance.getMaintenanceCensus('pause')).complete).toBe(true);
+    } finally {
+      cleanupForWorker.mockResolvedValue({ tasks: [], cursor: null });
+      await workers.close();
+    }
+  });
+
+  it('does not let a pre-pause empty flight satisfy the newer pause census', async () => {
+    let finish!: (value: { tasks: []; cursor: null }) => void;
+    const cleanupForWorker = jest
+      .fn()
+      .mockResolvedValueOnce({ tasks: [], cursor: null })
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      )
+      .mockResolvedValue({ tasks: [], cursor: null });
+    const workers = createUploadWorkers({
+      processing: { worker, stagingRoot: '/isolated-unused', documents: {} } as never,
+      settlement: { repository: { cleanupForWorker } } as never,
+      runAsSystem: (run) => run(),
+      idleMs: 100,
+    });
+    workers.start();
+    await jest.advanceTimersByTimeAsync(200);
+    expect(cleanupForWorker).toHaveBeenCalledTimes(2);
+    workers.maintenance.pauseAdmissions('pause');
+    finish({ tasks: [], cursor: null });
+    await jest.advanceTimersByTimeAsync(0);
+    try {
+      expect((await workers.maintenance.getMaintenanceCensus('pause')).complete).toBe(false);
+      await jest.advanceTimersByTimeAsync(100);
+      expect((await workers.maintenance.getMaintenanceCensus('pause')).complete).toBe(true);
+      workers.maintenance.pauseAdmissions('pause');
+      expect((await workers.maintenance.getMaintenanceCensus('pause')).complete).toBe(true);
+    } finally {
+      await workers.close();
+    }
+  });
+
+  it.each([false, true])(
+    'requires discovery after an admitted local attempt finishes draining (scanner pending: %s)',
+    async (scannerPending) => {
+      let finish!: (value: { tasks: []; cursor: null }) => void;
+      const cleanupForWorker = jest
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finish = resolve;
+            }),
+        )
+        .mockResolvedValue({ tasks: [], cursor: null });
+      const workers = createUploadWorkers({
+        processing: { worker, stagingRoot: '/isolated-unused', documents: {} } as never,
+        settlement: { repository: { cleanupForWorker } } as never,
+        runAsSystem: (run) => run(),
+        idleMs: 100,
+      });
+      const ticket = workers.attempts.begin(jest.fn());
+      ticket.bind(lease);
+      if (scannerPending) ticket.settle({ ...stopped, securityPending: true });
+      workers.start();
+      workers.maintenance.pauseAdmissions('pause');
+      await jest.advanceTimersByTimeAsync(100);
+      if (scannerPending)
+        workers.attempts.recordCleanup(task, { ...stopped, securityPending: false });
+      else ticket.settle(stopped);
+      finish({ tasks: [], cursor: null });
+      await jest.advanceTimersByTimeAsync(0);
+      try {
+        expect((await workers.maintenance.getMaintenanceCensus('pause')).complete).toBe(false);
+        await jest.advanceTimersByTimeAsync(100);
+        expect((await workers.maintenance.getMaintenanceCensus('pause')).complete).toBe(true);
+      } finally {
+        await workers.close();
+      }
+    },
+  );
+
+  it('does not certify an empty query begun before a processing invocation drains', async () => {
+    let finishProcessing!: (value: Awaited<ReturnType<typeof processNextManagedUpload>>) => void;
+    let finishQuery!: (value: { tasks: []; cursor: null }) => void;
+    processOne.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finishProcessing = resolve;
+        }),
+    );
+    const cleanupForWorker = jest
+      .fn()
+      .mockResolvedValueOnce({ tasks: [], cursor: null })
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finishQuery = resolve;
+          }),
+      )
+      .mockResolvedValue({ tasks: [], cursor: null });
+    const workers = createUploadWorkers({
+      processing: { worker, stagingRoot: '/isolated-unused', documents: {} } as never,
+      settlement: { repository: { cleanupForWorker } } as never,
+      runAsSystem: (run) => run(),
+      idleMs: 100,
+    });
+    workers.start();
+    await jest.advanceTimersByTimeAsync(100);
+    workers.maintenance.pauseAdmissions('pause');
+    await jest.advanceTimersByTimeAsync(100);
+    finishProcessing({ claimed: true, operation: undefined });
+    finishQuery({ tasks: [], cursor: null });
+    // Flush the actual flights without running the newly scheduled recovery timer.
+    for (let turn = 0; turn < 30; turn++) await Promise.resolve();
+    try {
+      expect((await workers.maintenance.getMaintenanceCensus('pause')).complete).toBe(false);
+      await jest.advanceTimersByTimeAsync(100);
+      expect((await workers.maintenance.getMaintenanceCensus('pause')).complete).toBe(true);
+    } finally {
+      await workers.close();
+    }
   });
 });

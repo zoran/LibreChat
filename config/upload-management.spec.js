@@ -13,6 +13,7 @@ const {
 } = require('./upload-management');
 // Keep the real public contract loaded before native adapter tests install filesystem doubles.
 const {
+  RedisJobStore,
   parseUploadActivationGatewayContext,
   validateUploadActivationGateways,
 } = require('@librechat/api/upload-activation');
@@ -57,6 +58,35 @@ const CONFIG = {
   checkpointCollectionName: 'agent_checkpoints',
   checkpointWritesCollectionName: 'agent_checkpoint_writes',
 };
+const inspectionRequest = () => ({
+  ...request(),
+  action: 'inspect-checkpoint-indexes',
+  historicalLineageSha256: 'c'.repeat(64),
+});
+const lineage = () => ({
+  schema: 1,
+  targetBindingSha256: digest(TARGET),
+  configurationSha256: digest(CONFIG),
+  evidenceSha256: inspectionRequest().historicalLineageSha256,
+  stores: [],
+});
+function indexInspection() {
+  const { saturatedCounts: _counts, ...common } = producer('agent-checkpoints');
+  return {
+    ...common,
+    historicalLineageSha256: inspectionRequest().historicalLineageSha256,
+    collections: ['checkpoint', 'pending'].map((role) => ({
+      collection: `private_${role}`,
+      role,
+      rowCount: 3,
+      malformedKeyRows: 0,
+      duplicateGroups: 0,
+      duplicateExcessRows: 0,
+      indexes: [],
+      indexStatus: 'verified',
+    })),
+  };
+}
 function producer(owner) {
   const value = {
     schema: 1,
@@ -124,6 +154,7 @@ function livePorts() {
     },
     inspectReplay: jest.fn().mockImplementation(async () => producer('generation-stream')),
     inspectCheckpoints: jest.fn().mockImplementation(async () => producer('agent-checkpoints')),
+    inspectCheckpointIndexes: jest.fn().mockImplementation(async () => indexInspection()),
     close: jest.fn().mockResolvedValue(undefined),
   };
   return {
@@ -147,6 +178,354 @@ function capture() {
     text: () => Buffer.concat(chunks).toString('utf8'),
   };
 }
+
+describe('finite checkpoint index inspection', () => {
+  test('the narrow source entry exports the existing inspector without opening clients or timers', () => {
+    // Reuse the unchanged built Redis class so this config suite needs no API path-alias remapping.
+    jest.doMock('../packages/api/src/stream/implementations/RedisJobStore', () => ({
+      RedisJobStore,
+    }));
+    try {
+      jest.isolateModules(() => {
+        const mongoose = require('mongoose');
+        const connect = jest.spyOn(mongoose, 'connect');
+        const create = jest.spyOn(mongoose, 'createConnection');
+        const interval = jest.spyOn(global, 'setInterval');
+        const timeout = jest.spyOn(global, 'setTimeout');
+        try {
+          const entry = require('../packages/api/src/upload-activation');
+          expect(entry.inspectCheckpointIndexPopulation).toBe(
+            require('../packages/api/src/agents/checkpoints/storage')
+              .inspectCheckpointIndexPopulation,
+          );
+          expect(connect).not.toHaveBeenCalled();
+          expect(create).not.toHaveBeenCalled();
+          expect(interval).not.toHaveBeenCalled();
+          expect(timeout).not.toHaveBeenCalled();
+        } finally {
+          connect.mockRestore();
+          create.mockRestore();
+          interval.mockRestore();
+          timeout.mockRestore();
+        }
+      });
+    } finally {
+      jest.dontMock('../packages/api/src/stream/implementations/RedisJobStore');
+    }
+  });
+  test('accepts only the closed inspection envelope without gateway authority', () => {
+    expect(validateEnvelope(inspectionRequest(), NOW)).toEqual(inspectionRequest());
+    for (const extra of ['stores', 'currentConfig', 'mongoUri', 'complete']) {
+      expect(() => validateEnvelope({ ...inspectionRequest(), [extra]: [] }, NOW)).toThrow();
+    }
+    for (const originalDeadline of [
+      new Date(NOW - 1).toISOString(),
+      new Date(NOW + 300001).toISOString(),
+      NOW + 1,
+    ]) {
+      expect(() => validateEnvelope({ ...inspectionRequest(), originalDeadline }, NOW)).toThrow();
+    }
+    expect(() =>
+      validateEnvelope({ ...inspectionRequest(), historicalLineageSha256: 'bad' }, NOW),
+    ).toThrow();
+  });
+
+  test.each([true, false])(
+    'prints a compact exact report with complete=%s and the matching exit code',
+    async (complete) => {
+      const { runtime, boundary } = livePorts();
+      const report = indexInspection();
+      report.complete = complete;
+      if (!complete) {
+        report.collections[0].duplicateGroups = 1;
+        report.collections[0].duplicateExcessRows = 2;
+        report.collections[0].indexStatus = 'conflicting';
+      }
+      runtime.inspectCheckpointIndexes.mockResolvedValue(report);
+      const captured = capture();
+      const exit = await main({
+        input: Readable.from([canonical(inspectionRequest())]),
+        output: captured.output,
+        env: {},
+        now: boundary.now,
+        open: boundary.open,
+      });
+      expect(exit).toBe(complete ? 0 : 1);
+      const result = JSON.parse(captured.text());
+      expect(result).toMatchObject({
+        status: 'inspected',
+        complete,
+        inspectionEvidenceSha256: report.evidenceSha256,
+        counts: {
+          collections: 2,
+          rows: 6,
+          duplicateGroups: complete ? 0 : 1,
+          duplicateExcessRows: complete ? 0 : 2,
+          conflictingIndexCollections: complete ? 0 : 1,
+        },
+      });
+      const { evidenceSha256, ...unsigned } = result;
+      expect(evidenceSha256).toBe(digest(unsigned));
+      expect(captured.text()).not.toContain('private_');
+      expect(runtime.repository.initialize).not.toHaveBeenCalled();
+      expect(runtime.repository.activateReconciled).not.toHaveBeenCalled();
+      expect(runtime.inspectReplay).not.toHaveBeenCalled();
+      expect(runtime.inspectCheckpoints).not.toHaveBeenCalled();
+      expect(runtime.close).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test.each([
+    [
+      'foreign target',
+      (r) => {
+        r.targetBindingSha256 = '0'.repeat(64);
+      },
+    ],
+    [
+      'foreign config',
+      (r) => {
+        r.configurationSha256 = '0'.repeat(64);
+      },
+    ],
+    [
+      'foreign lineage',
+      (r) => {
+        r.historicalLineageSha256 = '0'.repeat(64);
+      },
+    ],
+    [
+      'foreign owner',
+      (r) => {
+        r.owner = 'private-owner';
+      },
+    ],
+    [
+      'foreign deadline',
+      (r) => {
+        r.originalDeadline = new Date(NOW + 1).toISOString();
+      },
+    ],
+    [
+      'earlier observation',
+      (r) => {
+        r.observedFrom = new Date(NOW - 1).toISOString();
+      },
+    ],
+    [
+      'future observation',
+      (r) => {
+        r.observedThrough = new Date(NOW + 1).toISOString();
+      },
+    ],
+    [
+      'noncanonical time',
+      (r) => {
+        r.observedFrom = NOW;
+      },
+    ],
+    [
+      'unsafe count',
+      (r) => {
+        r.collections[0].rowCount = Number.MAX_SAFE_INTEGER + 1;
+      },
+    ],
+    [
+      'summed overflow',
+      (r) => {
+        r.collections.forEach((row) => {
+          row.rowCount = Number.MAX_SAFE_INTEGER;
+        });
+      },
+    ],
+    [
+      'negative count',
+      (r) => {
+        r.collections[0].malformedKeyRows = -1;
+      },
+    ],
+    [
+      'inconsistent complete',
+      (r) => {
+        r.complete = false;
+      },
+    ],
+    [
+      'owner value leak',
+      (r) => {
+        r.secret = 'private-owner-data';
+      },
+    ],
+  ])('rejects %s before emitting an inspection result', async (_name, change) => {
+    const { runtime, boundary } = livePorts();
+    const report = indexInspection();
+    change(report);
+    runtime.inspectCheckpointIndexes.mockResolvedValue(report);
+    const captured = capture();
+    expect(
+      await main({
+        input: Readable.from([canonical(inspectionRequest())]),
+        output: captured.output,
+        env: {},
+        now: boundary.now,
+        open: boundary.open,
+      }),
+    ).toBe(1);
+    expect(JSON.parse(captured.text())).toMatchObject({ schema: 1, status: 'error' });
+    expect(captured.text()).not.toMatch(/private|UNKNOWN_COMMIT/);
+    expect(runtime.close).toHaveBeenCalledTimes(1);
+  });
+
+  test('summarizes the full bounded owner population below 16KiB without exposing its metadata', async () => {
+    const { runtime, boundary } = livePorts();
+    const report = indexInspection();
+    report.collections = Array.from({ length: 64 }, (_, n) => ({
+      ...report.collections[n % 2],
+      collection: `private-${n}`,
+      indexes: Array.from({ length: 64 }, () => ({
+        name: 'private-index'.repeat(8),
+        building: false,
+      })),
+    }));
+    expect(Buffer.byteLength(canonical(report))).toBeGreaterThan(INPUT_LIMIT);
+    runtime.inspectCheckpointIndexes.mockResolvedValue(report);
+    const captured = capture();
+    expect(
+      await main({
+        input: Readable.from([canonical(inspectionRequest())]),
+        output: captured.output,
+        env: {},
+        now: boundary.now,
+        open: boundary.open,
+      }),
+    ).toBe(0);
+    expect(Buffer.byteLength(captured.text())).toBeLessThan(INPUT_LIMIT);
+    expect(captured.text()).not.toContain('private');
+    expect(JSON.parse(captured.text()).counts).toMatchObject({ collections: 64, rows: 192 });
+  });
+
+  test.each(['read', 'close', 'unknown-commit'])(
+    'sanitizes %s failure without pending commit semantics',
+    async (failure) => {
+      const { runtime, boundary } = livePorts();
+      const error = Object.assign(
+        new Error('private-uri'),
+        failure === 'unknown-commit' ? { code: 'UNKNOWN_COMMIT' } : {},
+      );
+      (failure === 'close' ? runtime.close : runtime.inspectCheckpointIndexes).mockRejectedValue(
+        error,
+      );
+      const captured = capture();
+      expect(
+        await main({
+          input: Readable.from([canonical(inspectionRequest())]),
+          output: captured.output,
+          env: {},
+          now: boundary.now,
+          open: boundary.open,
+        }),
+      ).toBe(1);
+      expect(JSON.parse(captured.text())).toEqual({
+        schema: 1,
+        status: 'error',
+        code: 'UNAVAILABLE',
+      });
+      expect(runtime.close).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  test('joins closure before inspection stdout', async () => {
+    const { runtime, boundary } = livePorts();
+    let release;
+    let closing;
+    const began = new Promise((resolve) => {
+      closing = resolve;
+    });
+    runtime.close.mockImplementation(() => {
+      closing();
+      return new Promise((resolve) => {
+        release = resolve;
+      });
+    });
+    const captured = capture();
+    const result = main({
+      input: Readable.from([canonical(inspectionRequest())]),
+      output: captured.output,
+      env: {},
+      now: boundary.now,
+      open: boundary.open,
+    });
+    await began;
+    expect(captured.text()).toBe('');
+    release();
+    expect(await result).toBe(0);
+  });
+
+  test('aborts a pending inspection and joins its runtime before returning failure', async () => {
+    jest.useFakeTimers();
+    const { runtime, boundary } = livePorts();
+    let inspecting;
+    const began = new Promise((resolve) => {
+      inspecting = resolve;
+    });
+    boundary.open.mockImplementation(async (_target, { signal }) => {
+      runtime.inspectCheckpointIndexes.mockImplementation(
+        () =>
+          new Promise((_resolve, reject) => {
+            signal.addEventListener('abort', () => reject(new Error('private abort')), {
+              once: true,
+            });
+            inspecting();
+          }),
+      );
+      return runtime;
+    });
+    const result = runActivation(inspectionRequest(), boundary);
+    const checked = result.catch((error) => error);
+    try {
+      await began;
+      await jest.advanceTimersByTimeAsync(28000);
+      await expect(checked).resolves.toMatchObject({ code: 'UNAVAILABLE' });
+      expect(runtime.close).toHaveBeenCalledTimes(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('bounds a stalled inspection stdout write after runtime closure', async () => {
+    jest.useFakeTimers();
+    const { runtime, boundary } = livePorts();
+    let beganWrite;
+    let finishWrite;
+    const writing = new Promise((resolve) => {
+      beganWrite = resolve;
+    });
+    const output = new Writable({
+      write(_chunk, _encoding, done) {
+        finishWrite = done;
+        beganWrite();
+      },
+    });
+    const result = main({
+      input: Readable.from([canonical(inspectionRequest())]),
+      output,
+      env: {},
+      now: boundary.now,
+      open: boundary.open,
+    }).catch((error) => error);
+    try {
+      await writing;
+      expect(runtime.close).toHaveBeenCalledTimes(1);
+      await jest.advanceTimersByTimeAsync(2000);
+      await expect(result).resolves.toMatchObject({ code: 'UNAVAILABLE' });
+      expect(jest.getTimerCount()).toBe(0);
+    } finally {
+      if (finishWrite) finishWrite();
+      output.destroy();
+      jest.useRealTimers();
+    }
+  });
+});
 
 describe('finite initial activation envelope', () => {
   test('missing independent gateway context rejects before opening a client', async () => {
@@ -198,9 +577,9 @@ describe('finite initial activation envelope', () => {
   test('bounds bytes rather than characters and destroys an oversized input', async () => {
     const input = new PassThrough();
     const pending = readEnvelope(input, { timeoutMs: 100 });
-    const rejected = expect(pending).rejects.toMatchObject({ code: 'INVALID_INPUT' });
+    const rejected = pending.catch((error) => error);
     input.end(Buffer.alloc(INPUT_LIMIT + 1, 120));
-    await rejected;
+    await expect(rejected).resolves.toMatchObject({ code: 'INVALID_INPUT' });
     expect(input.destroyed).toBe(true);
   });
 
@@ -218,9 +597,9 @@ describe('finite initial activation envelope', () => {
     const input = new PassThrough();
     try {
       const pending = readEnvelope(input, { timeoutMs: 25 });
-      const rejected = expect(pending).rejects.toMatchObject({ code: 'INPUT_TIMEOUT' });
+      const rejected = pending.catch((error) => error);
       await jest.advanceTimersByTimeAsync(25);
-      await rejected;
+      await expect(rejected).resolves.toMatchObject({ code: 'INPUT_TIMEOUT' });
       expect(input.destroyed).toBe(true);
       expect(jest.getTimerCount()).toBe(0);
     } finally {
@@ -798,7 +1177,7 @@ describe('owner observations and immutable activation proof', () => {
     const { runtime, boundary } = livePorts();
     const captured = capture();
     runtime.repository.activateReconciled.mockRejectedValue(
-      new Error('mongodb://secret:password@private.invalid/content'),
+      new Error('mongodb://secret:test-password@private.invalid/content'),
     );
     const result = await main({
       input: Readable.from([Buffer.from(canonical(value))]),
@@ -860,7 +1239,7 @@ describe('one-shot adapter uses public owners and independently checked runtime 
       CORTEX_UPLOAD_ACTIVATION_CHECKPOINTER: '{}',
       REDIS_KEY_PREFIX: 'cortex',
       MONGO_URI:
-        'mongodb://synthetic:never-used@mongo.example.invalid/LibreChat?replicaSet=cortex-rs',
+        'mongodb://synthetic:test-never-used@mongo.example.invalid/LibreChat?replicaSet=cortex-rs',
     };
     mongoose = {
       set: jest.fn(),
@@ -906,6 +1285,7 @@ describe('one-shot adapter uses public owners and independently checked runtime 
           inspectInitialSourcePopulation = (...args) => runtime.inspectReplay(...args);
         },
         inspectInitialCheckpointPopulation: (...args) => runtime.inspectCheckpoints(...args),
+        inspectCheckpointIndexPopulation: (...args) => runtime.inspectCheckpointIndexes(...args),
       }),
       { virtual: true },
     );
@@ -949,6 +1329,93 @@ describe('one-shot adapter uses public owners and independently checked runtime 
     });
     return { code, result: JSON.parse(captured.text()) };
   }
+
+  function inspectionEnvironment() {
+    delete env.CORTEX_UPLOAD_ACTIVATION_STORAGE_GATEWAYS;
+    delete env.REDIS_KEY_PREFIX;
+    env.CORTEX_UPLOAD_ACTIVATION_CHECKPOINT_LINEAGE = canonical(lineage());
+    models.mockImplementation(() => {
+      throw new Error('models must remain unopened');
+    });
+    require('librechat-data-provider').parseSharedState.mockImplementation(() => {
+      throw new Error('Redis must remain unopened');
+    });
+    require('@librechat/data-schemas').createUploadManagementRepository.mockImplementation(() => {
+      throw new Error('repository must remain unopened');
+    });
+  }
+
+  test('actual inspection branch needs only Mongo and trusted lineage, never activation owners', async () => {
+    inspectionEnvironment();
+    const { code, result } = await invoke(inspectionRequest());
+    expect(code).toBe(0);
+    expect(result.status).toBe('inspected');
+    expect(runtime.inspectCheckpointIndexes).toHaveBeenCalledWith({
+      originalDeadline: DEADLINE,
+      targetBindingSha256: digest(TARGET),
+      currentConfig: CONFIG,
+      historicalStorageLineage: { evidenceSha256: lineage().evidenceSha256, stores: [] },
+    });
+    expect(models).not.toHaveBeenCalled();
+    expect(redisClients).toHaveLength(0);
+    expect(initializeStore).not.toHaveBeenCalled();
+    expect(require('node:fs').openSync).not.toHaveBeenCalled();
+    expect(mongoose.connection.close).toHaveBeenCalledWith(true);
+  });
+
+  test.each([
+    'missing',
+    'foreign target',
+    'foreign config',
+    'foreign evidence',
+    'oversized',
+    'unknown field',
+  ])('rejects %s trusted lineage before connecting', async (kind) => {
+    inspectionEnvironment();
+    const context = lineage();
+    if (kind === 'foreign target') context.targetBindingSha256 = '0'.repeat(64);
+    if (kind === 'foreign config') context.configurationSha256 = '0'.repeat(64);
+    if (kind === 'foreign evidence') context.evidenceSha256 = '0'.repeat(64);
+    if (kind === 'oversized') context.stores = Array.from({ length: 33 }, () => ({}));
+    if (kind === 'unknown field') context.permission = true;
+    env.CORTEX_UPLOAD_ACTIVATION_CHECKPOINT_LINEAGE = canonical(context);
+    if (kind === 'missing') delete env.CORTEX_UPLOAD_ACTIVATION_CHECKPOINT_LINEAGE;
+    const { code, result } = await invoke(inspectionRequest());
+    expect(code).toBe(1);
+    expect(result.status).toBe('error');
+    let expected = 'INCOMPLETE';
+    if (kind.startsWith('foreign')) expected = 'TARGET_MISMATCH';
+    if (kind === 'unknown field') expected = 'INVALID_INPUT';
+    expect(result.code).toBe(expected);
+    expect(mongoose.connect).not.toHaveBeenCalled();
+  });
+
+  test.each(['replica', 'database'])(
+    'rejects an actual Mongo %s mismatch and closes without inspection',
+    async (kind) => {
+      inspectionEnvironment();
+      if (kind === 'database') mongoose.connection.name = 'foreign';
+      else mongoose.connection.db.admin = () => ({ command: async () => ({ setName: 'foreign' }) });
+      const { result } = await invoke(inspectionRequest());
+      expect(result.code).toBe('TARGET_MISMATCH');
+      expect(runtime.inspectCheckpointIndexes).not.toHaveBeenCalled();
+      expect(mongoose.connection.close).toHaveBeenCalledWith(true);
+    },
+  );
+
+  test('snapshots trusted lineage before the first connection await', async () => {
+    inspectionEnvironment();
+    mongoose.connect.mockImplementation(async () => {
+      env.CORTEX_UPLOAD_ACTIVATION_CHECKPOINT_LINEAGE = canonical({
+        ...lineage(),
+        stores: [{ private: 'changed' }],
+      });
+    });
+    expect((await invoke(inspectionRequest())).code).toBe(0);
+    expect(
+      runtime.inspectCheckpointIndexes.mock.calls[0][0].historicalStorageLineage.stores,
+    ).toEqual([]);
+  });
 
   test('real adapter composition opens only its finite Mongo/Sentinel clients and joins both', async () => {
     const { code, result } = await invoke();

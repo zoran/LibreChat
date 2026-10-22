@@ -1,12 +1,13 @@
 name: Backend Unit Tests
 on:
-  # push-to-dev runs are the post-merge safety net: gating only ever narrows pull_request
-  # synchronize runs, so every merged state still gets the full suite — which is also what
+  # Dev and release-branch pushes run the full suite: gating only ever narrows pull_request
+  # synchronize runs, so every merged or released state gets the full suite — which is what
   # keeps ground-truth recall telemetry alive for the codegraph shadow evaluator once
   # selection hides skipped tests from PR runs.
   push:
     branches:
       - dev
+      - fix/complete-assistant-history
     paths:
       - 'api/**'
       - 'packages/**'
@@ -305,7 +306,7 @@ jobs:
         run: npx tsc --noEmit -p packages/data-provider/tsconfig.json
 
       - name: Type check data-schemas
-        run: npx tsc --noEmit -p packages/data-schemas/tsconfig.json
+        run: npm run -w @librechat/data-schemas typecheck
 
       - name: Type check @librechat/api
         run: npx tsc --noEmit -p packages/api/tsconfig.json

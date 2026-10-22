@@ -7,7 +7,7 @@ const isMarkdownParserDependency = (id) =>
   );
 
 export default defineConfig({
-  entry: ['src/index.ts', 'src/admin/capabilities.ts'],
+  entry: ['src/index.ts', 'src/admin/capabilities.ts', 'src/admin/fileCoverageAdmin.ts'],
   format: ['esm', 'cjs'],
   platform: 'node',
   dts: { oxc: true },

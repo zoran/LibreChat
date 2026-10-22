@@ -12,6 +12,7 @@ import {
   getCredentialRuntimeState,
   getLegacyCredentialNames,
 } from '~/credentials';
+import { checkRagApiHealth } from '~/files/rag/transport';
 import { isEnabled, checkEmailConfig } from '~/utils';
 import { handleRateLimits } from './limits';
 
@@ -257,19 +258,17 @@ export async function checkCredentialDatabase(): Promise<void> {
 }
 
 /**
- * Checks the health of auxiliary API's by attempting a fetch request to their respective `/health` endpoints.
+ * Checks the RAG API through its authenticated TLS health owner.
  * Logs information or warning based on the API's availability and response.
  */
 export async function checkHealth(): Promise<void> {
   try {
-    const response = await fetch(`${process.env.RAG_API_URL}/health`);
-    if (response?.ok && response?.status === 200) {
-      logger.info(`RAG API is running and reachable at ${process.env.RAG_API_URL}.`);
+    const healthy = await checkRagApiHealth();
+    if (healthy) {
+      logger.info('RAG API is running and reachable.');
     }
   } catch {
-    logger.warn(
-      `RAG API is either not running or not reachable at ${process.env.RAG_API_URL}, you may experience errors with file uploads.`,
-    );
+    logger.warn('RAG API is either not running or not reachable; file uploads may be unavailable.');
   }
 }
 

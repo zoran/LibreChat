@@ -16,13 +16,12 @@ import type {
   UploadOperation,
   UploadUsage,
   UploadLease,
-  UploadCleanupProof,
   UploadErrorCode,
   UploadCleanupTask,
 } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
 import type { UploadManagementRepository, UploadPublicationPort } from './uploadManagementTypes';
-import type { StoredUpload, GlobalState, UploadStoreOptions } from './uploadManagementStore';
+import type { StoredUpload, UploadStoreOptions } from './uploadManagementStore';
 import {
   createUploadStore,
   principalFilter,
@@ -34,25 +33,33 @@ import {
   RESOURCE_MAX,
 } from './uploadManagementStore';
 import {
-  hasCurrentUploadSecurityApproval,
-  hasCompleteUploadSecurityExecution,
-  recordUploadSecuritySettlement,
-} from './uploadManagement.security';
-import {
   createUploadIntakeMethods,
   hasStoppedUploadPromotion,
   readStoredUploadPromotion,
 } from './uploadManagementIntake';
+import {
+  createUploadCleanupMethods,
+  actorCleanupFacts,
+  createUploadCleanupTransitions,
+} from './uploadManagementCleanup';
+import {
+  hasCurrentUploadSecurityApproval,
+  hasCompleteUploadSecurityExecution,
+} from './uploadManagement.security';
 import {
   createFileRetentionMethods,
   FileSourceCapacityError,
   FileSourceUnavailableError,
 } from './fileRetention';
 import { createUploadAdmissionMethods, readUploadAdmission } from './uploadManagementAdmission';
+import { createUploadHousekeepingProjection } from './uploadHousekeepingProjection';
 import { createUploadProcessingMethods } from './uploadManagementProcessing';
+import { createUploadCleanupReceiptMethods } from './uploadCleanupReceipts';
 import { createUploadMigrationMethods } from './uploadManagementMigration';
-import { createUploadCleanupMethods } from './uploadManagementCleanup';
 import { createUploadControlMethods } from './uploadManagementControl';
+import { createUploadHousekeepingMethods } from './uploadHousekeeping';
+import { createFileActivityRepository } from './fileActivity';
+import { createHousekeepingStore } from './housekeepingStore';
 import { touchActiveUserPrincipal } from './userPrincipal';
 export type { UploadManagementRepository } from './uploadManagementTypes';
 
@@ -61,8 +68,11 @@ export function createUploadManagementRepository(
   options: UploadStoreOptions & { recordOriginalPublication?: UploadPublicationPort } = {},
 ): UploadManagementRepository {
   const store = createUploadStore(mongoose, options);
+  const jobs = createHousekeepingStore(mongoose);
+  const projectHousekeeping = createUploadHousekeepingProjection(jobs);
   const lifecycle = createFileRetentionMethods(mongoose, {
     securityPolicySha256: options.securityPolicySha256,
+    extractionPolicySha256: options.extractionPolicySha256,
   });
   const securityPolicySha256 = options.securityPolicySha256;
   const principalOf = storedUploadPrincipal;
@@ -79,8 +89,11 @@ export function createUploadManagementRepository(
     securityExecution: row.securityExecution,
     securitySettlement: row.securitySettlement,
     promotion: readStoredUploadPromotion(row),
-    writerStopped: row.writerStopped === true && hasStoppedUploadPromotion(row),
-    localCopiesAbsent: row.stagingHeld === false,
+    writerStopped:
+      (row.writerStopped === true || actorCleanupFacts(row).writerStopped) &&
+      hasStoppedUploadPromotion(row) &&
+      (!row.securityExecution || hasCompleteUploadSecurityExecution(row)),
+    localCopiesAbsent: row.stagingHeld === false || actorCleanupFacts(row).localCopiesAbsent,
   });
   async function owned(
     principal: UploadPrincipal,
@@ -142,69 +155,7 @@ export function createUploadManagementRepository(
       nextReleaseBytes: releases[0]?.bytes ?? 0,
     };
   }
-  function terminal(
-    row: StoredUpload,
-    global: GlobalState,
-    state: StoredUpload['state'],
-    code?: UploadErrorCode,
-  ): void {
-    row.state = state;
-    row.error = code;
-    row.pendingBytes = 0;
-    row.generation++;
-    store.releaseQueue(row, global);
-    row.cleanupPending =
-      row.slot != null || row.stagingHeld || row.originalBytes > 0 || row.textBytes > 0;
-    if (row.attemptGeneration == null && row.acceptedAt == null) {
-      global.originalBytes -= row.originalBytes;
-      global.objectBytes -= row.originalBytes;
-      row.originalBytes = 0;
-      row.originalRemoved = true;
-      row.cleanupPending = false;
-    }
-  }
-  function applyCleanup(row: StoredUpload, proof: UploadCleanupProof, global: GlobalState): void {
-    const settlement =
-      proof.securitySettlement === undefined
-        ? undefined
-        : readUploadSecuritySettlement(proof.securitySettlement);
-    if (settlement === null) reject('invalid_request');
-    if ((row.workerGeneration ?? row.generation) !== proof.generation) reject('lease_lost');
-    if (settlement) recordUploadSecuritySettlement(row, settlement);
-    if (row.securityExecution && !hasCompleteUploadSecurityExecution(row)) reject('not_ready');
-    if (!hasStoppedUploadPromotion(row)) reject('not_ready');
-    if (!proof.writerStopped) reject('not_ready');
-    row.writerStopped = true;
-    if (row.slot && ['transferring', 'processing'].includes(row.state))
-      terminal(row, global, 'failed', 'processing_failed');
-    delete row.slot;
-    delete row.leaseExpiresAt;
-    if (proof.localCopiesAbsent) row.stagingHeld = false;
-    const removeOriginal = row.acceptedAt == null || ['deleted', 'expired'].includes(row.state);
-    if (proof.originalAbsent && removeOriginal) {
-      global.originalBytes -= row.originalBytes;
-      global.objectBytes -= row.originalBytes;
-      row.originalBytes = 0;
-      row.originalRemoved = true;
-    }
-    if (proof.textAndHistoryRemoved && row.state !== 'ready') {
-      global.textBytes -= row.textBytes;
-      row.textBytes = 0;
-      row.textRemoved = true;
-    }
-    row.cleanupPending =
-      row.stagingHeld || (removeOriginal && (row.originalBytes > 0 || row.textBytes > 0));
-    // Preserve the original Intake acknowledgement before a later processing claim replaces
-    // the active worker fields. This bit never attests that later processing generation.
-    if (
-      row.intake?.generation === proof.generation &&
-      row.attemptGeneration === proof.generation &&
-      row.intake.worker?.hostId === row.worker?.hostId &&
-      row.intake.worker?.instanceId === row.worker?.instanceId &&
-      proof.localCopiesAbsent
-    )
-      row.intake.cleanupAcknowledged = true;
-  }
+  const { terminal, applyCleanup } = createUploadCleanupTransitions(store);
   async function reserve(
     principal: UploadPrincipal,
     input: UploadReserveInput | UploadDerivedReserveInput,
@@ -343,6 +294,7 @@ export function createUploadManagementRepository(
         createdAt: now,
         generation: 0,
         cleanupPending: false,
+        cleanupCustody: { version: 1 },
         originalBytes: input.declaredBytes,
         textBytes: 0,
         recordBytes: UPLOAD_RECORD_BYTES,
@@ -357,6 +309,7 @@ export function createUploadManagementRepository(
       global.recordBytes += row.recordBytes;
       global.bundles++;
       await store.Operation.create([row], { session });
+      await projectHousekeeping(null, row, session);
       return project(row, now);
     });
   }
@@ -409,16 +362,25 @@ export function createUploadManagementRepository(
     owned,
     terminal,
     cleanupTask,
+    applyCleanup,
     usage,
     recordOriginalPublication: options.recordOriginalPublication,
   };
   return {
     ...createUploadProcessingMethods(context),
     ...createUploadCleanupMethods(context),
-    initialize: store.initialize,
+    ...createUploadHousekeepingMethods(context, jobs, projectHousekeeping),
+    ...createUploadCleanupReceiptMethods(context, jobs),
+    async initialize() {
+      await store.initialize();
+      await jobs.initialize();
+    },
+    fileReads: createFileActivityRepository(mongoose, store, options),
     ...createUploadControlMethods(store),
     ...createUploadMigrationMethods(store, securityPolicySha256),
-    ...createUploadActivationMethods(store),
+    ...createUploadActivationMethods(store, {
+      retrievalInventoryAuthority: options.retrievalInventoryAuthority,
+    }),
     ...createUploadAdmissionMethods(store),
     ...createUploadIntakeMethods(store, securityPolicySha256, applyCleanup),
     reserve: (principal, input, now) => reserve(principal, input, now),

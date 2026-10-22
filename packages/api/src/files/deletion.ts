@@ -1,4 +1,5 @@
 import type { DeleteFilesResponse } from 'librechat-data-provider';
+import type { ApplicationWorkPort } from '~/app/maintenance';
 
 /** What a delete pass reports back about the records it was given. */
 export type FileDeletionOutcome = {
@@ -197,3 +198,183 @@ export const deleteAgentResourceFiles = async <TFile>(
     destroyedFileIds: outcome?.deletedFileIds ?? [],
   };
 };
+
+/** The canonical File deletion owner supplies this custody result only after its private guard.
+ * Managed text publication's embedded flag never means a legacy vector namespace exists.
+ */
+export function requiresLegacyVectorDeletion(input: {
+  embedded?: boolean;
+  source: string;
+  vectorSource: string;
+  managedRetrievalSettled: boolean;
+}): boolean {
+  return (
+    !input.managedRetrievalSettled && input.embedded === true && input.source !== input.vectorSource
+  );
+}
+
+/** One admitted deletion keeps its real child effects until every promise settles. */
+export interface FileDeletionWorkScope {
+  effect<T>(start: () => Promise<T>): Promise<T>;
+  queued<T>(enqueue: (dispatched: () => void) => Promise<T>): Promise<T>;
+  markUncertain(): void;
+}
+
+export interface FileDeletionWorkOwner {
+  maintenance: ApplicationWorkPort;
+  run<T>(
+    work: (scope: FileDeletionWorkScope) => Promise<T>,
+    inheritedScope?: FileDeletionWorkScope,
+  ): Promise<T>;
+  stopAdmissions(): void;
+  drain(): Promise<void>;
+}
+
+/** This owner never interprets cancellation or a rejected write as proof of no effect. */
+export function createFileDeletionWorkOwner(): FileDeletionWorkOwner {
+  const active = new Map<FileDeletionWorkScope, Promise<unknown>>();
+  const children = new Map<FileDeletionWorkScope, Set<Promise<void>>>();
+  let pausedBy: string | null = null;
+  let stopped = false;
+  let uncertain = false;
+  let queued = 0;
+  let draining: Promise<void> | undefined;
+  const assertActive = (scope: FileDeletionWorkScope): void => {
+    if (!active.has(scope)) throw new Error('FILE_DELETION_SCOPE_INACTIVE');
+  };
+  const observe = <T>(
+    scope: FileDeletionWorkScope,
+    start: () => Promise<T>,
+    mutation: boolean,
+  ): Promise<T> => {
+    assertActive(scope);
+    let original: Promise<T>;
+    try {
+      original = Promise.resolve(start());
+    } catch (error) {
+      original = Promise.reject(error);
+    }
+    const observed = original.catch((error: unknown) => {
+      if (mutation) uncertain = true;
+      throw error;
+    });
+    const settled = observed.then(
+      () => undefined,
+      () => undefined,
+    );
+    const pending = children.get(scope)!;
+    pending.add(settled);
+    void settled.then(() => pending.delete(settled));
+    return observed;
+  };
+  const owner: FileDeletionWorkOwner = {
+    maintenance: {
+      pauseAdmissions(requestId) {
+        if (!requestId || (pausedBy !== null && pausedBy !== requestId)) return false;
+        pausedBy = requestId;
+        return true;
+      },
+      resumeAdmissions(requestId) {
+        if (stopped || uncertain || pausedBy !== requestId) return false;
+        pausedBy = null;
+        return true;
+      },
+      async getMaintenanceCensus(requestId) {
+        return {
+          admissionClosed: requestId !== null && pausedBy === requestId,
+          queuedContinuations: queued,
+          pendingWrites: active.size,
+          complete: !uncertain && (pausedBy === null || pausedBy === requestId),
+        };
+      },
+    },
+    run<T>(
+      work: (scope: FileDeletionWorkScope) => Promise<T>,
+      inheritedScope?: FileDeletionWorkScope,
+    ): Promise<T> {
+      if (inheritedScope) return observe(inheritedScope, () => work(inheritedScope), false);
+      if (stopped || pausedBy !== null) return Promise.reject(new Error('FILE_DELETION_QUIESCING'));
+      let mutated = false;
+      const scope: FileDeletionWorkScope = {
+        effect<TValue>(start: () => Promise<TValue>): Promise<TValue> {
+          assertActive(scope);
+          mutated = true;
+          return observe(scope, start, true);
+        },
+        queued<TValue>(enqueue: (dispatched: () => void) => Promise<TValue>): Promise<TValue> {
+          assertActive(scope);
+          queued++;
+          let waiting = true;
+          const dispatched = (): void => {
+            if (!waiting) return;
+            waiting = false;
+            queued--;
+          };
+          return scope.effect(() => {
+            try {
+              return enqueue(dispatched).finally(dispatched);
+            } catch (error) {
+              dispatched();
+              throw error;
+            }
+          });
+        },
+        markUncertain() {
+          assertActive(scope);
+          uncertain = true;
+        },
+      };
+      let resolve!: (value: T | PromiseLike<T>) => void;
+      let reject!: (error: unknown) => void;
+      const original = new Promise<T>((yes, no) => {
+        resolve = yes;
+        reject = no;
+      });
+      const pending = new Set<Promise<void>>();
+      active.set(scope, original);
+      children.set(scope, pending);
+      // Observe immediately: callers may await another admitted operation first.
+      void original.catch(() => undefined);
+      const execute = async (): Promise<T> => {
+        try {
+          return await work(scope);
+        } catch (error) {
+          if (mutated) uncertain = true;
+          throw error;
+        } finally {
+          // Children can start another child while their original promise settles.
+          while (pending.size) await Promise.all([...pending]);
+        }
+      };
+      const release = (): void => {
+        children.delete(scope);
+        active.delete(scope);
+      };
+      void execute().then(
+        (value) => {
+          resolve(value);
+          release();
+        },
+        (error: unknown) => {
+          reject(error);
+          release();
+        },
+      );
+      return original;
+    },
+    stopAdmissions() {
+      stopped = true;
+    },
+    drain() {
+      stopped = true;
+      draining ??= (async () => {
+        await Promise.allSettled([...active.values()]);
+        if (uncertain) throw new Error('FILE_DELETION_SETTLEMENT_UNCONFIRMED');
+      })();
+      return draining;
+    },
+  };
+  return owner;
+}
+
+export const fileDeletionWorkOwner: FileDeletionWorkOwner = createFileDeletionWorkOwner();

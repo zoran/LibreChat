@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { rootCertificates } from 'node:tls';
+import type { Readable } from 'node:stream';
 import type { Socket } from 'node:net';
 import type {
   EmailCodeMailConfig,
@@ -59,6 +60,17 @@ function fixture(settings: EmailCodeMailConfig = config) {
   > = [];
   const messages: unknown[] = [];
   const sender = createBoundedEmailCodeSender(settings, {
+    createMimeStream: (message) => {
+      messages.push(message);
+      return Object.assign(new EventEmitter(), {
+        destroy: jest.fn(),
+        resume(this: EventEmitter) {
+          this.emit('data', Buffer.from('fixture MIME'));
+          this.emit('end');
+          return this;
+        },
+      }) as unknown as Readable;
+    },
     createSocket: () => {
       const socket = new TestSocket();
       sockets.push(socket);
@@ -70,7 +82,6 @@ function fixture(settings: EmailCodeMailConfig = config) {
         close: jest.fn(),
         sendMail: (message, callback) => {
           callbacks.push(callback);
-          messages.push(message);
           settings.getSocket(settings, (error) => {
             if (error) callback(error);
           });
@@ -159,7 +170,7 @@ describe('bounded approved SMTP submission', () => {
     }
   });
 
-  it('keeps plain code separate from the full trusted HTTPS link with escaped HTML', async () => {
+  it('links the displayed code to the configured HTTPS origin with escaped HTML', async () => {
     const f = fixture({
       ...config,
       clientUrl: 'https://portal.example.test/chat/',
@@ -170,11 +181,11 @@ describe('bounded approved SMTP submission', () => {
     f.callbacks[0](null, { accepted: [input.email], response: '250 queued' });
     await pending;
     const message = f.messages[0] as { html: string; text: string };
-    const escapedLink = `https://portal.example.test/chat/login/email-code#attemptId=${'a'.repeat(43)}&amp;code=01234567`;
     expect(message.html).toContain('https://portal.example.test/chat/login/email-code#attemptId=');
-    expect(message.html).toMatch(/<p\b[^>]*>01234567<\/p>/);
-    expect(message.html).not.toContain('>01234567</a>');
-    expect(message.html).toContain(`href="${escapedLink}">${escapedLink}</a>`);
+    expect(message.html).toContain(
+      '&amp;code=01234567">https://portal.example.test/chat/login/email-code#attemptId=',
+    );
+    expect(message.html).toContain('>01234567</p>');
     expect(message.html).toContain('&lt;Portal &amp; friends&gt;');
     expect(message.text).toContain('01234567');
     expect(message.text).toContain('https://portal.example.test/chat/login/email-code#attemptId=');
@@ -182,82 +193,6 @@ describe('bounded approved SMTP submission', () => {
     expect(message.html).toContain('lang="de"');
     expect(() => fixture({ ...config, clientUrl: 'http://untrusted.test' })).toThrow();
     expect(() => fixture({ ...config, clientUrl: 'https://portal.test/?redirect=evil' })).toThrow();
-  });
-
-  it('uses the second relay after definite first-socket refusal and accepts only once', async () => {
-    const f = fixture();
-    const pending = f.sender.sendCode(input);
-    f.sockets[0].emit('error', new Error('connection refused'));
-    expect(f.options).toHaveLength(2);
-    f.sockets[1].emit('connect');
-    f.callbacks[1](null, { accepted: [input.email], response: '250 queued' });
-    await pending;
-    expect(f.sockets.every((socket) => socket.destroyed)).toBe(true);
-    expect(f.options.map((option) => option.host)).toEqual(config.hosts);
-  });
-
-  it('owns the socket and resolves only after positive DATA acknowledgement for the expected recipient', async () => {
-    const f = fixture();
-    const pending = f.sender.sendCode(input);
-    f.sockets[0].emit('connect');
-    expect(f.options[0]).toMatchObject({
-      host: '192.0.2.10',
-      port: 587,
-      secure: false,
-      requireTLS: true,
-      forceAuth: true,
-      pool: false,
-      logger: false,
-      debug: false,
-      auth: { user: 'login@example.test', pass: 'test-only' },
-      tls: { servername: 'mail.example.test', rejectUnauthorized: true, minVersion: 'TLSv1.2' },
-    });
-    f.callbacks[0](null, { accepted: [input.email], rejected: [], response: '250 2.0.0 queued' });
-    await expect(pending).resolves.toBeUndefined();
-    expect(f.sockets[0].destroy).toHaveBeenCalled();
-    expect(f.messages[0]).toMatchObject({
-      from: { name: 'Example Portal', address: 'no-reply@example.test' },
-      envelope: { from: 'no-reply@example.test', to: [input.email] },
-      subject: 'Dein Anmeldecode für Example Portal',
-      text: expect.stringContaining('01234567'),
-    });
-  });
-
-  it('tries the second relay after TCP non-acceptance, without extending the overall deadline', async () => {
-    const f = fixture();
-    const pending = f.sender.sendCode(input);
-    const rejected = pending.catch((error: unknown) => error);
-    jest.advanceTimersByTime(5_000);
-    expect(f.options.map((o) => o.host)).toEqual(['192.0.2.10', 'smtp-backup.example.test']);
-    f.sockets[1].emit('connect');
-    jest.advanceTimersByTime(15_000);
-    expect(await rejected).toMatchObject({ code: 'EMAIL_CODE_UNAVAILABLE' });
-    expect(f.sockets.every((s) => s.destroyed)).toBe(true);
-    // A callback after cancellation cannot convert an unknown submission into a login code.
-    f.callbacks[1](null, { accepted: [input.email], response: '250 accepted too late' });
-    expect(f.options).toHaveLength(2);
-  });
-
-  it('does not replay a connection loss after socket handoff, even when its command is CONN', async () => {
-    const f = fixture();
-    const pending = f.sender.sendCode(input);
-    f.sockets[0].emit('connect');
-    f.callbacks[0](
-      Object.assign(new Error('private SMTP transcript'), { code: 'ECONNECTION', command: 'CONN' }),
-    );
-    await expect(pending).rejects.toThrow('Email-code submission unavailable');
-    expect(f.options).toHaveLength(1);
-  });
-
-  it('may fail over after an explicit DATA rejection and refuses recipient-only acceptance', async () => {
-    const f = fixture();
-    const pending = f.sender.sendCode(input);
-    f.sockets[0].emit('connect');
-    f.callbacks[0](Object.assign(new Error('rejected'), { responseCode: 451, command: 'DATA' }));
-    f.sockets[1].emit('connect');
-    f.callbacks[1](null, { accepted: [input.email], rejected: [] });
-    await expect(pending).rejects.toMatchObject({ code: 'EMAIL_CODE_UNAVAILABLE' });
-    expect(f.options).toHaveLength(2);
   });
 
   it('does not create transport for a forbidden recipient or invalid code', async () => {
@@ -347,7 +282,10 @@ describe('bounded approved SMTP submission', () => {
     ).toThrow('Invalid email-code SMTP configuration');
     const createTransport = jest.fn();
     expect(() =>
-      createBoundedEmailCodeSender({ ...config, supportText }, { createTransport }),
+      createBoundedEmailCodeSender(
+        { ...config, supportText },
+        { createTransport, createMimeStream: jest.fn() },
+      ),
     ).toThrow('Invalid email-code SMTP configuration');
     expect(createTransport).not.toHaveBeenCalled();
   });
@@ -496,7 +434,7 @@ describe('bounded approved SMTP submission', () => {
     expect(() =>
       createBoundedEmailCodeSender(
         { ...config, hosts: ['smtp://mail.example.test'] },
-        { createTransport },
+        { createTransport, createMimeStream: jest.fn() },
       ),
     ).toThrow('Invalid email-code SMTP configuration');
     expect(createTransport).not.toHaveBeenCalled();

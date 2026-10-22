@@ -1,6 +1,8 @@
 /** One local attempt/cleanup journal per real writer incarnation; no processing or cleanup queue. */
+import { createHash } from 'node:crypto';
 import {
   readUploadIntakeRecovery,
+  canonicalStorageDeletionReceipt,
   UPLOAD_MAX_FILE_BYTES,
   readUploadSecurityExecution,
   matchesUploadSecurityExecution,
@@ -10,6 +12,7 @@ import type {
   UploadCleanupTask,
   UploadWorker,
   UploadSecurityExecution,
+  UploadOwnerCleanupReceipt,
 } from 'librechat-data-provider';
 import type {
   UploadAttemptBinding,
@@ -19,7 +22,7 @@ import type {
   UploadAttemptLocalGuard,
   UploadAttemptLocalReservation,
 } from './contract';
-import type { ApplicationWorkPort } from '~/app';
+import type { ApplicationWorkPort } from '../app/maintenance';
 import { uploadAttemptId } from './processing/paths';
 import { UploadManagementError } from './errors';
 
@@ -67,6 +70,7 @@ export function createUploadAttemptJournal(
     revision: number;
     securityExecution?: UploadSecurityExecution;
     invalidSecurity?: boolean;
+    cleanupReceipt?: UploadOwnerCleanupReceipt;
   };
   // The existing record is also the local reservation owner, including an
   // unbound claim whose outcome cannot yet be established.
@@ -133,6 +137,56 @@ export function createUploadAttemptJournal(
     });
     localChecks = flight.catch(() => undefined);
     return flight;
+  }
+
+  function consumeOwnerCleanup(record: Record, value: unknown): boolean {
+    const view = readUploadIntakeRecovery(value);
+    if (
+      !view?.cleanupReceipt ||
+      !view.acknowledged ||
+      !view.appWriterStopped ||
+      !record.binding ||
+      record.active ||
+      record.invalidSecurity ||
+      record.proof?.localWriterStopped !== true ||
+      record.proof.localCopiesAbsent !== true ||
+      view.operationId !== record.binding.operationId ||
+      view.transferGeneration !== record.binding.generation ||
+      !sameWorker(view.worker, worker) ||
+      (record.proof.storageOutcome !== undefined &&
+        record.proof.storageOutcome !== 'unknown' &&
+        record.proof.storageOutcome !== view.storageOutcome) ||
+      (record.securityExecution &&
+        !matchesUploadSecurityExecution(view.securityExecution, record.securityExecution))
+    )
+      return false;
+    const receipt = view.cleanupReceipt;
+    if (
+      createHash('sha256')
+        .update(canonicalStorageDeletionReceipt(receipt.receipt))
+        .digest('hex') !== receipt.receiptSHA256
+    )
+      return false;
+    if (
+      record.cleanupReceipt &&
+      (record.cleanupReceipt.receiptSHA256 !== receipt.receiptSHA256 ||
+        record.cleanupReceipt.consumerCommitId !== receipt.consumerCommitId)
+    )
+      return false;
+    const securityPending = view.securityExecution
+      ? !isCompleteUploadSecuritySettlement(view.securitySettlement, view.securityExecution)
+      : record.proof.securityPending === true;
+    if (securityPending) return false;
+    if (view.securityExecution) record.securityExecution = view.securityExecution;
+    record.cleanupReceipt = receipt;
+    record.proof = normalize({
+      ...record.proof,
+      ...(view.securityExecution ? { securityExecution: view.securityExecution } : {}),
+      securityPending: false,
+      acknowledgementPending: false,
+    });
+    record.revision++;
+    return true;
   }
 
   const attempts: UploadAttemptPort = {
@@ -234,6 +288,10 @@ export function createUploadAttemptJournal(
         return unknown();
       }
     },
+    acknowledgeOwnerCleanup(task, observation) {
+      const record = lookup(task);
+      return !!record && consumeOwnerCleanup(record, observation);
+    },
     recordCleanup(task, proof) {
       const record = lookup(task);
       if (!record || record.active) return;
@@ -257,7 +315,8 @@ export function createUploadAttemptJournal(
 
   function settled(record: Record): boolean {
     return (
-      record.proof?.writerStopped === true &&
+      !!record.proof &&
+      (record.proof.writerStopped === true || !!record.cleanupReceipt) &&
       localJoined(record) &&
       record.proof.localCopiesAbsent === true &&
       (!record.recover || record.proof.localWriterStopped === true) &&
@@ -331,6 +390,10 @@ export function createUploadAttemptJournal(
             record.proof!.storageOutcome !== view.storageOutcome
           )
             return;
+          if (view.cleanupReceipt) {
+            consumeOwnerCleanup(record, view);
+            return;
+          }
           if (view.securityExecution) {
             if (view.securityExecution.attemptId !== key) return;
             record.securityExecution = view.securityExecution;
@@ -340,7 +403,10 @@ export function createUploadAttemptJournal(
             };
           }
           const current = record.proof!;
-          if (view.storageOutcome === 'unknown') return;
+          if (view.storageOutcome === 'unknown') {
+            consumeOwnerCleanup(record, view);
+            return;
+          }
           const securityPending = view.securityExecution
             ? !isCompleteUploadSecuritySettlement(view.securitySettlement, view.securityExecution)
             : current.securityPending === true;

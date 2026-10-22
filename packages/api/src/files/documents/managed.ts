@@ -14,6 +14,7 @@ import {
 } from './managedStructure';
 import { readSafeZipEntries, ZipBombError } from './zipSafety';
 import { MANAGED_CSV_LIMITS, parseManagedCsv } from './csv';
+import { assertCanonicalDocxPackage } from './docxPackage';
 
 type Limits = {
   inputBytes: number;
@@ -242,6 +243,7 @@ export async function extractManagedDocument(input: {
       maxTotalBytes: limits.inflatedBytes,
       maxEntryBytes: limits.entryBytes,
       maxEntries: limits.archiveEntries,
+      strictEnvelope: input.mediaType === MANAGED_DOCUMENT_TYPES[2],
       select: (name) => name.endsWith('.xml') || name.endsWith('.rels'),
     });
   } catch (error) {
@@ -250,6 +252,11 @@ export async function extractManagedDocument(input: {
   // Relationships are inert. Visible hyperlinks are text only; external slide targets are refused.
   structure.warn('layout_unavailable');
   if (input.mediaType === MANAGED_DOCUMENT_TYPES[2]) {
+    try {
+      assertCanonicalDocxPackage(parts, xml);
+    } catch {
+      fail('invalid_document');
+    }
     const document = xml(parts.get('word/document.xml'));
     let styles: JSDOM | undefined;
     try {

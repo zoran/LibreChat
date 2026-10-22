@@ -2,11 +2,14 @@
 import mongoose from 'mongoose';
 import { v4 as uuid } from 'uuid';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import type { UploadLease, UploadPrincipal } from 'librechat-data-provider';
 import type { IMessage } from '~/types';
+import { createCheckpointSourceMethods, snapshotCheckpointSourceBinding } from './checkpointSource';
 import { FileSourceUnavailableError, touchFileSources } from './fileRetention';
 import { CLIENT_MESSAGE_SELECT, createMessageMethods } from './message';
-import { createCheckpointSourceMethods } from './checkpointSource';
+import { createUploadManagementRepository } from './uploadManagement';
 import { createUploadStore } from './uploadManagementStore';
+import { sourceSha256 } from './messageSource';
 import { createFileMethods } from './file';
 import { createModels } from '~/models';
 
@@ -23,13 +26,26 @@ describe('source-dependent message retention', () => {
     mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
     await mongoose.connect(mongo.getUri(), { monitorCommands: true });
     createModels(mongoose);
-    await Promise.all([mongoose.models.File.init(), mongoose.models.Message.init()]);
+    await Promise.all([
+      mongoose.models.File.init(),
+      mongoose.models.Message.init(),
+      mongoose.models.User.init(),
+    ]);
     files = createFileMethods(mongoose);
     messages = createMessageMethods(mongoose);
   });
   beforeEach(async () => {
     await mongoose.models.Message.deleteMany({});
     await mongoose.models.File.deleteMany({});
+    await mongoose.models.User.deleteMany({});
+    await mongoose.models.User.create({
+      _id: user,
+      tenantId: null,
+      name: 'Synthetic retained message owner',
+      email: 'retained-message@example.invalid',
+      provider: 'local',
+      emailVerified: true,
+    });
     if (mongoose.models.UploadCounter) await mongoose.models.UploadCounter.deleteMany({});
     await createUploadStore(mongoose, { enabled: true, reconciled: true }).initialize();
     conversationId = uuid();
@@ -69,6 +85,137 @@ describe('source-dependent message retention', () => {
   const context = () =>
     messages.resolveFileRetentionContext(owner, { fileIds: [sourceId], historyMessageIds: [] });
 
+  /** Managed fixtures retain the actual receipt and birth inventory from their owning lifecycle. */
+  async function managedSource(policy: string) {
+    await mongoose.models.File.deleteOne({ file_id: sourceId });
+    await mongoose.models.UploadOperation.deleteMany({});
+    const uploads = createUploadManagementRepository(mongoose, {
+      enabled: true,
+      reconciled: true,
+      securityPolicySha256: policy,
+    });
+    await uploads.initialize();
+    const principal: UploadPrincipal = {
+      tenantId: null,
+      userId: user,
+      authentication: 'guest',
+    };
+    const at = Date.now();
+    const worker = { hostId: 'fixture-host', instanceId: 'fixture-instance' };
+    const reservation = await uploads.reserve(
+      principal,
+      {
+        operationId: sourceId,
+        idempotencyKey: uuid(),
+        mediaType: 'text/plain',
+        declaredBytes: 6,
+        fingerprint: JSON.stringify([{ kind: 'personal' }, 'text/plain', 6]),
+      },
+      at,
+    );
+    const transfer = await uploads.claim({
+      kind: 'transfer',
+      principal,
+      operationId: reservation.id,
+      worker,
+      now: at,
+    });
+    if (!transfer) throw new Error('Managed fixture transfer was not admitted');
+    const execution = {
+      version: 2 as const,
+      custody: { kind: 'none' as const },
+      attemptId: `${sourceId}.${transfer.generation}`,
+      instanceId: uuid(),
+      executionId: uuid(),
+      expiresAt: new Date(at + 60000).toISOString(),
+    };
+    await uploads.bindSecurityExecution(transfer, execution, at);
+    await uploads.settleSecurityExecution(
+      transfer,
+      { execution, writerStopped: true, transientDataRemoved: true },
+      at,
+    );
+    await uploads.accept(
+      principal,
+      transfer,
+      {
+        outcome: 'durable',
+        bytes: 6,
+        source: 's3',
+        filepath: `/api/files/download/${sourceId}`,
+        storageKey: `managed-uploads/${user}/${sourceId}.${transfer.generation}__original`,
+        integrity: {
+          version: 1,
+          algorithm: 'sha256',
+          sha256: 'a'.repeat(64),
+          chunkBytes: 262144,
+          chunkSha256: ['b'.repeat(64)],
+        },
+      },
+      {
+        version: 1,
+        decision: 'approved',
+        policySha256: policy,
+        subject: {
+          userId: user,
+          tenantId: null,
+          operationId: sourceId,
+          transferGeneration: transfer.generation,
+          mediaType: 'text/plain',
+          bytes: 6,
+          sha256: 'a'.repeat(64),
+        },
+        scannerVersion: 'fixture-v1',
+        checkedAt: new Date(at).toISOString(),
+        coverage: { complete: true, pages: 1, parts: 1 },
+      },
+      { filename: 'A.txt' },
+      at,
+    );
+    const settleLocalCopies = (lease: UploadLease) =>
+      uploads.confirmCleanup(
+        {
+          operationId: lease.operationId,
+          generation: lease.generation,
+          writerStopped: true,
+          localCopiesAbsent: true,
+          originalAbsent: false,
+          textAndHistoryRemoved: false,
+        },
+        at,
+      );
+    await settleLocalCopies(transfer);
+    const processing = await uploads.claim({ kind: 'processing', worker, now: at });
+    if (!processing || processing.operationId !== sourceId)
+      throw new Error('Managed fixture processing was not admitted');
+    await uploads.bindProcessingExecution(
+      processing,
+      {
+        attemptId: `${sourceId}.${processing.generation}`,
+        instanceId: 'fixture-parser',
+        expiresAt: new Date(at + 60000).toISOString(),
+      },
+      at,
+    );
+    await uploads.publish(
+      processing,
+      {
+        text: 'secret',
+        writerStopped: true,
+        structure: {
+          version: 1,
+          source: { sha256: 'a'.repeat(64), bytes: 6, mediaType: 'text/plain' },
+          extractor: { name: 'fixture', version: '1' },
+          pages: [],
+          elements: [{ id: 'e1', kind: 'paragraph', start: 0, end: 6, page: null, parentId: null }],
+          quality: { status: 'complete', warnings: [] },
+        },
+      },
+      at,
+    );
+    await settleLocalCopies(processing);
+  }
+
   it('requires explicit null on managed guest sources while retaining ordinary tenantless files', async () => {
     await mongoose.models.File.collection.updateOne(
       { file_id: sourceId },
@@ -88,6 +235,7 @@ describe('source-dependent message retention', () => {
   });
 
   it('preserves pending managed File custody through account bulk delete and retains finalized tombstones', async () => {
+    await managedSource('c'.repeat(64));
     await expect(files.deleteFiles([], user)).rejects.toBeInstanceOf(FileSourceUnavailableError);
     expect(await mongoose.models.File.countDocuments({ file_id: sourceId })).toBe(1);
     await files.revokeFileSources(owner, [sourceId]);
@@ -665,45 +813,7 @@ describe('source-dependent message retention', () => {
       previousEnabled = process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED;
       process.env.UPLOAD_SECURITY_POLICY_SHA256 = policy;
       process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = 'true';
-      await mongoose.models.User.replaceOne(
-        { _id: user },
-        {
-          _id: user,
-          name: 'Synthetic quote owner',
-          email: 'quote@example.invalid',
-          provider: 'local',
-        },
-        { upsert: true },
-      );
-      await mongoose.models.File.collection.updateOne(
-        { file_id: sourceId },
-        {
-          $set: {
-            uploadOperationId: sourceId,
-            tenantId: null,
-            status: 'ready',
-            source: 's3',
-            storageKey: `managed-uploads/${user}/${sourceId}.1__original`,
-            securityApproval: {
-              version: 1,
-              decision: 'approved',
-              policySha256: policy,
-              subject: {
-                userId: user,
-                tenantId: null,
-                operationId: sourceId,
-                transferGeneration: 1,
-                mediaType: 'text/plain',
-                bytes: 6,
-                sha256: 'a'.repeat(64),
-              },
-              scannerVersion: 'explicit-synthetic/v1',
-              checkedAt: new Date().toISOString(),
-              coverage: { complete: true, pages: 1, parts: 1 },
-            },
-          },
-        },
-      );
+      await managedSource(policy);
     });
     afterEach(async () => {
       jest.restoreAllMocks();
@@ -767,6 +877,104 @@ describe('source-dependent message retention', () => {
       };
     };
 
+    it('holds retired v1 envelopes without rewriting their hash or expiry', async () => {
+      const fixture = await capturedQuote();
+      const current = fixture.captured.binding;
+      const payload = {
+        version: 1,
+        owner: current.owner,
+        files: current.files.map(({ fileId, expiresAt }) => ({
+          fileId,
+          approvalSha256: 'a'.repeat(64),
+          expiresAt,
+        })),
+        messages: current.messages,
+        expiresAt: current.expiresAt,
+      };
+      const historical = { ...payload, bindingSha256: sourceSha256(payload) };
+      const bytes = JSON.stringify(historical);
+      expect(() =>
+        snapshotCheckpointSourceBinding(owner, historical as unknown as typeof current),
+      ).toThrow(FileSourceUnavailableError);
+      expect(JSON.stringify(historical)).toBe(bytes);
+    });
+
+    it.each(['receipt', 'File'] as const)(
+      'rejects a missing actual %s at the current fence',
+      async (kind) => {
+        const fixture = await capturedQuote();
+        if (kind === 'receipt') await mongoose.models.UploadOperation.deleteOne({ _id: sourceId });
+        else await mongoose.models.File.deleteOne({ file_id: sourceId });
+        await expect(
+          transaction((session) =>
+            checkpoint.fenceCheckpointSources(owner, fixture.captured.binding, session),
+          ),
+        ).rejects.toBeInstanceOf(FileSourceUnavailableError);
+      },
+    );
+
+    it('allows a successful +7 read before the original envelope bound without renewing it', async () => {
+      const fixture = await capturedQuote();
+      const before = JSON.stringify(fixture.captured.binding);
+      const deadline = Date.parse(fixture.captured.binding.expiresAt);
+      const uploads = createUploadManagementRepository(mongoose, { securityPolicySha256: policy });
+      const principal: UploadPrincipal = { tenantId: null, userId: user, authentication: 'guest' };
+      const ticket = await uploads.fileReads.admitManagedFileRead(principal, {
+        fileId: sourceId,
+        representation: 'original',
+      });
+      const claim = await uploads.fileReads.claimManagedFileRead(principal, ticket, {
+        hostId: 'checkpoint-reader',
+        instanceId: 'checkpoint-reader-instance',
+      });
+      await uploads.fileReads.completeManagedFileRead(principal, claim, {
+        version: 1,
+        representation: 'original',
+        sourceBindingSha256: claim.sourceBindingSha256,
+        contentSha256: 'a'.repeat(64),
+        verifiedBytes: 6,
+      });
+      const current = await mongoose.models.File.findOne({ file_id: sourceId }).lean<{
+        expiredAt: Date;
+      }>();
+      expect(current!.expiredAt.getTime()).toBe(deadline + 7 * 86400000);
+      await expect(
+        transaction((session) =>
+          checkpoint.fenceCheckpointSources(owner, fixture.captured.binding, session),
+        ),
+      ).resolves.toBeUndefined();
+      await expect(
+        messages.resolveFileRetentionContext(owner, fixture.input),
+      ).resolves.toMatchObject({
+        sourceFileIds: [sourceId],
+      });
+      expect(JSON.stringify(fixture.captured.binding)).toBe(before);
+      const clock = jest.spyOn(Date, 'now').mockReturnValue(deadline);
+      try {
+        await expect(
+          transaction((session) =>
+            checkpoint.fenceCheckpointSources(owner, fixture.captured.binding, session),
+          ),
+        ).rejects.toBeInstanceOf(FileSourceUnavailableError);
+      } finally {
+        clock.mockRestore();
+      }
+      expect(JSON.stringify(fixture.captured.binding)).toBe(before);
+    });
+
+    it('rejects original receipt substitution with unchanged File approval and deadline', async () => {
+      const fixture = await capturedQuote();
+      await mongoose.models.UploadOperation.updateOne(
+        { _id: sourceId },
+        { $set: { 'original.etag': 'substituted-storage-version' } },
+      );
+      await expect(
+        transaction((session) =>
+          checkpoint.fenceCheckpointSources(owner, fixture.captured.binding, session),
+        ),
+      ).rejects.toBeInstanceOf(FileSourceUnavailableError);
+    });
+
     it('accepts the exact quote after repeated native checkpoint touches and keeps every read in the fence transaction', async () => {
       const fixture = await capturedQuote();
       for (let i = 0; i < 3; i++)
@@ -828,7 +1036,7 @@ describe('source-dependent message retention', () => {
       selectedOwner.userId = new mongoose.Types.ObjectId().toString();
       selected.historyMessageIds.push(uuid());
       selected.historyQuoteSnapshots[0].quotes[0] = 'Changed after entry';
-      binding.files[0].approvalSha256 = 'e'.repeat(64);
+      binding.files[0].bindingSha256 = 'e'.repeat(64);
       await expect(pending).resolves.toMatchObject({ sourceFileIds: [sourceId] });
     });
 

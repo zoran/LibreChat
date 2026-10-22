@@ -27,9 +27,9 @@ import {
 import { getDownloadFilename, logger, sortPagesByRelevance, triggerDownload } from '~/utils';
 import CopyButton from '~/components/Messages/Content/CopyButton';
 import { useFileMapContext, useShareContext } from '~/Providers';
+import DocumentSourceView from './DocumentSourceView';
 import { useLocalize } from '~/hooks';
 import store from '~/store';
-import DocumentSourceView from './DocumentSourceView';
 
 interface FilePreviewDialogProps {
   open: boolean;
@@ -131,6 +131,7 @@ export default function FilePreviewDialog({
       enabled: open && showExtractedText && !!fileId,
     },
     shareId,
+    'content',
   );
   // Downloads own URLs; previews share bytes and create only their display URL.
   const { refetch: downloadOwned } = useFileDownload(user?.id ?? '', fileId, { direct: false });

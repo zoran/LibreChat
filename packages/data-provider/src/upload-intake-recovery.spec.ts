@@ -339,3 +339,73 @@ describe('private intake recovery contract', () => {
     expect(readUploadIntakeRecovery({ ...recovery(), acknowledged: false })).not.toBeNull();
   });
 });
+
+describe('persisted owner cleanup receipt recovery shape', () => {
+  const value = () => {
+    const owner = {
+      protocol: 1 as const,
+      requestId: 'request',
+      generation: '7',
+      authorityBindingSHA256: 'a'.repeat(64),
+      acceptedObjectSHA256: 'b'.repeat(64),
+      bucket: 'private-bucket',
+      key: `managed-uploads/user/${operationId}.7__original`,
+    };
+    return {
+      ...recovery(),
+      storageOutcome: 'unknown' as const,
+      cleanupReceipt: {
+        binding: owner,
+        receipt: {
+          ...owner,
+          state: 'durable_delete_complete' as const,
+          obligationId: 'obligation',
+          aggregateRevision: '1',
+          proofSHA256: 'c'.repeat(64),
+        },
+        receiptSHA256: 'd'.repeat(64),
+        consumerCommitId: 'commit',
+      },
+    };
+  };
+  it('copies a receipt-qualified unknown history without turning it into a durable PUT', () => {
+    const input = value();
+    const result = readUploadIntakeRecovery(input)!;
+    expect(result.storageOutcome).toBe('unknown');
+    expect(result.acknowledged).toBe(true);
+    input.cleanupReceipt.receipt.proofSHA256 = 'e'.repeat(64);
+    expect(result.cleanupReceipt!.receipt.proofSHA256).toBe('c'.repeat(64));
+  });
+  it.each([
+    'foreign-generation',
+    'foreign-key',
+    'binding',
+    'namespace',
+    'extra',
+    'missing-commit',
+    'scanner',
+  ])('rejects %s receipt observations', (change) => {
+    const input = value();
+    if (change === 'foreign-generation') input.cleanupReceipt.binding.generation = '8';
+    if (change === 'foreign-key')
+      input.cleanupReceipt.binding.key = 'managed-uploads/user/other.7__original';
+    if (change === 'binding') input.cleanupReceipt.receipt.requestId = 'different';
+    if (change === 'namespace')
+      Object.assign(input.cleanupReceipt.receipt, { state: 'namespace_absent' });
+    if (change === 'extra') Object.assign(input.cleanupReceipt, { localWriterStopped: true });
+    if (change === 'missing-commit')
+      delete (input.cleanupReceipt as Partial<typeof input.cleanupReceipt>).consumerCommitId;
+    if (change === 'scanner') input.securitySettlement!.transientDataRemoved = false;
+    expect(readUploadIntakeRecovery(input)).toBeNull();
+  });
+  it('rejects nested receipt getters without invoking them', () => {
+    const input = value();
+    const getter = jest.fn(() => '1');
+    Object.defineProperty(input.cleanupReceipt.receipt, 'aggregateRevision', {
+      enumerable: true,
+      get: getter,
+    });
+    expect(readUploadIntakeRecovery(input)).toBeNull();
+    expect(getter).not.toHaveBeenCalled();
+  });
+});

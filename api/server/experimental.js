@@ -43,6 +43,7 @@ const {
   configureServerTimeouts,
   setupGracefulShutdown,
   registerShutdownTask,
+  fileDeletionWorkOwner,
   getClusterShutdownBudgetMs,
   registerBackgroundTaskShutdown,
   configureMessageFilterRegexValidator,
@@ -53,14 +54,11 @@ const {
   startCodeEnvironmentLifecycleReconciler,
   waitForKeyvRedisClient,
   createCodeApiUploadRegistry,
-  cacheConfig,
-  createClusteredFileSweep,
 } = require('@librechat/api');
 const { connectDb, indexSync } = require('~/db');
 const initializeOAuthReconnectManager = require('./services/initializeOAuthReconnectManager');
 const { capabilityContextMiddleware } = require('./middleware/roles/capabilities');
 const createValidateImageRequest = require('./middleware/validateImageRequest');
-const { startExpiredFileSweep } = require('./services/Files/process');
 const { initializeGitHubSkillSync } = require('./services/Skills/sync');
 const { initializeAgentTriggerService } = require('./services/Agents/triggers');
 const { resumeAgentEventDetachedAction } = require('./services/Agents/detachedActionResume');
@@ -191,33 +189,9 @@ if (cluster.isMaster) {
   logger.info(`Spawning ${workers} workers to simulate multi-pod environment`);
 
   let activeWorkers = 0;
-  const listeningWorkers = new Set();
-  let retentionSweepWorkerId = null;
   const startTime = Date.now();
   let shuttingDown = false;
   let remainingShutdownWorkers = 0;
-
-  const assignRetentionSweepWorker = () => {
-    if (retentionSweepWorkerId && cluster.workers[retentionSweepWorkerId]) {
-      return;
-    }
-
-    const connectedWorkers = Object.values(cluster.workers).filter(
-      (worker) => worker && worker.isConnected(),
-    );
-    const availableWorkers = connectedWorkers.filter((worker) => listeningWorkers.has(worker.id));
-    const workerPool = availableWorkers.length > 0 ? availableWorkers : connectedWorkers;
-    const retentionSweepWorker = workerPool[workerPool.length - 1];
-    if (!retentionSweepWorker) {
-      return;
-    }
-
-    retentionSweepWorkerId = retentionSweepWorker.id;
-    logger.info(
-      wrapLogMessage(`Worker ${retentionSweepWorker.process.pid} assigned to file-retention sweep`),
-    );
-    retentionSweepWorker.send({ type: 'file-retention-sweep-worker' });
-  };
 
   /** Flush Redis cache before starting workers */
   flushRedisCache()
@@ -246,23 +220,8 @@ if (cluster.isMaster) {
     }
   });
 
-  cluster.on('listening', (worker) => {
-    listeningWorkers.add(worker.id);
-    if (
-      listeningWorkers.size === workers ||
-      (!retentionSweepWorkerId && activeWorkers >= workers)
-    ) {
-      assignRetentionSweepWorker();
-    }
-  });
-
   cluster.on('exit', (worker, code, signal) => {
     activeWorkers--;
-    listeningWorkers.delete(worker.id);
-    if (worker.id === retentionSweepWorkerId) {
-      retentionSweepWorkerId = null;
-      assignRetentionSweepWorker();
-    }
     logger.error(
       `Worker ${worker.process.pid} died (${activeWorkers}/${workers}). Code: ${code}, Signal: ${signal}`,
     );
@@ -359,6 +318,16 @@ if (cluster.isMaster) {
    * Each worker runs a full Express server instance
    */
   const app = express();
+
+  registerShutdownTask('file deletion admission', () => fileDeletionWorkOwner.stopAdmissions(), {
+    phase: 'pre-drain',
+    priority: 110,
+  });
+  registerShutdownTask('file deletion settlement', () => fileDeletionWorkOwner.drain(), {
+    phase: 'pre-drain',
+    priority: 90,
+  });
+
   app.locals.codeApiUploadRegistry = createCodeApiUploadRegistry();
   // The clustered entrypoint deliberately does not arm the v1 schedule engine,
   // but an already-fired scheduled generation can still reach HITL here. Settle
@@ -401,7 +370,6 @@ if (cluster.isMaster) {
   };
   // Tear down stream resources before shared caches and telemetry exporters shut down.
   registerShutdownTask('generation job manager', destroyGenerationJobManager, { priority: 100 });
-  const expiredFileSweep = createClusteredFileSweep(cacheConfig.USE_REDIS, startExpiredFileSweep);
   const SCHEDULE_ENGINE_OPTIONAL_METHODS = new Set(['GET', 'HEAD', 'OPTIONS', 'DELETE']);
 
   const rejectScheduleWritesUntilReady = (req, res, next) => {
@@ -427,12 +395,6 @@ if (cluster.isMaster) {
           logger.debug('Could not acknowledge the shutdown deadline to the primary:', err);
         }
       }
-    }
-  });
-  process.on('message', (msg) => {
-    if (msg.type === 'file-retention-sweep-worker') {
-      logger.info(wrapLogMessage(`Worker ${process.pid} is assigned file-retention sweep`));
-      expiredFileSweep.assign();
     }
   });
   const startServer = async () => {
@@ -510,7 +472,6 @@ if (cluster.isMaster) {
     await loadToolApprovalHooks(toolApproval?.enabled ? toolApproval.hooks : undefined, {
       basePath: path.resolve(__dirname, '../..'),
     });
-    expiredFileSweep.configure({ appConfig, loadAppConfig: getAppConfig });
     await runAsSystem(async () => {
       await performStartupChecks(appConfig);
       await updateInterfacePerms({ appConfig, getRoleByName, updateAccessPermissions });

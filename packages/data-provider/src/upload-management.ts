@@ -4,18 +4,19 @@ import type {
   UploadSecurityExecution,
   UploadSecuritySettlement,
 } from './upload-security';
+import type { ResourceScope as UploadScope } from './resource-ownership';
 import type { UploadPromotionRecord } from './upload-intake';
 import type { UploadDerivedIntent } from './upload-derived';
 
-export const UPLOAD_CONTRACT_VERSION = 1;
-export const UPLOAD_MAX_FILE_BYTES = 31_457_280;
-export const UPLOAD_USER_WINDOW_BYTES = 314_572_800;
-export const UPLOAD_WINDOW_MS = 30 * 86_400_000;
-export const UPLOAD_RETENTION_MS = 28 * 86_400_000;
-export const UPLOAD_REPLAY_MS = 31 * 86_400_000;
-export const UPLOAD_MAX_TEXT_BYTES = 15 * 1_048_576;
-export const UPLOAD_RECORD_BYTES = 32 * 1024;
-export const UPLOAD_INTEGRITY_CHUNK_BYTES = 262144;
+export const UPLOAD_CONTRACT_VERSION: number = 1;
+export const UPLOAD_MAX_FILE_BYTES: number = 31_457_280;
+export const UPLOAD_USER_WINDOW_BYTES: number = 314_572_800;
+export const UPLOAD_WINDOW_MS: number = 30 * 86_400_000;
+export const UPLOAD_RETENTION_MS: number = 28 * 86_400_000;
+export const UPLOAD_REPLAY_MS: number = 31 * 86_400_000;
+export const UPLOAD_MAX_TEXT_BYTES: number = 15 * 1_048_576;
+export const UPLOAD_RECORD_BYTES: number = 32 * 1024;
+export const UPLOAD_INTEGRITY_CHUNK_BYTES: number = 262144;
 
 /** Private identity of the received original; fixed blocks permit verification before delivery. */
 export type UploadOriginalIntegrity = {
@@ -102,7 +103,8 @@ export function isUploadPrincipal(value: unknown): value is UploadPrincipal {
         principal.tenantId !== '__SYSTEM__')
   );
 }
-export type UploadScope = { kind: 'personal' } | { kind: 'workspace'; workspaceId: string };
+/** Compatibility name only; ResourceScope is the sole scope contract. */
+export type { ResourceScope as UploadScope } from './resource-ownership';
 /** Filename enters durable application state only with the accepted original and security proof. */
 export type UploadAcceptedMetadata = { filename: string };
 
@@ -383,9 +385,41 @@ export type UploadAdmissionCommand = {
   /** Retained verbatim across retries; confirmation cannot grant a fresh mutation window. */
   originalDeadline: string;
 };
+export type FileRetentionMigrationRecord = Readonly<{
+  kind: 'file-retention';
+  subject: Readonly<{ tenantId: string | null; ownerUserId: string; fileId: string }>;
+  acceptedAt: string | null;
+  deadlineAt: string;
+  sourceBindingSha256: string | null;
+  custody: 'current' | 'cleanup-only';
+  retention:
+    | Readonly<{
+        kind: 'original';
+        version: 1;
+        baselineDeadlineAt: string;
+        trackedSince: string;
+        historyConfidence: 'complete' | 'since-tracking';
+        readCount: number;
+        processingCount: number;
+        lastSuccessfulReadAt: string | null;
+        lastSuccessfulProcessingAt: string | null;
+        deadlineGeneration: number;
+      }>
+    | Readonly<{
+        kind: 'derived';
+        version: 1;
+        ownDeadlineAt: string;
+        capBasis: 'admission' | 'legacy-baseline';
+        trackedSince: string;
+        deadlineGeneration: number;
+        /** Canonical v2 for current rows; exact historical custody or proven absent after cleanup. */
+        originSha256: string | null;
+      }>;
+}>;
+
 /** Private migration data is paged, never exposed by employee HTTP handlers. */
 export type UploadMigrationPage = {
-  version: 1;
+  version: 2;
   epoch: string;
   cursor: string | null;
   nextCursor: string | null;
@@ -400,12 +434,13 @@ export type UploadResourceTotals = {
 };
 /** Private trusted coordinator must obtain this directly from the retired source owner. */
 export type UploadMigrationReceipt = {
-  version: 1;
+  version: 2;
   epoch: string;
   sourceId: string;
   digest: string;
   operations: number;
   sourceRetired: true;
+  fileActivity: { version: 1; files: number; sha256: string };
 };
 /** Private reconciliation owner captures this before measuring all external populations. */
 export type UploadReconciliationSnapshot = {
@@ -429,3 +464,193 @@ export type UploadActivationProof = {
   /** Required for initial-empty. An exact committed active proof remains replayable after expiry. */
   originalDeadline?: string;
 };
+
+// This literal identifies behavior, not permission. Actual executable source/image provenance is
+// independently authenticated by the native owner and compared before any mutation.
+export const FILE_HOUSEKEEPING_COVERAGE_CONTRACT = {
+  id: 'file-housekeeping-coverage',
+  version: 1,
+  projection: 'atomic-file-job-v1',
+  population: 'all-files-and-file-jobs-v1',
+} as const;
+export type FileCoverageCompiledContract = typeof FILE_HOUSEKEEPING_COVERAGE_CONTRACT;
+
+export type FileCoverageSource = Readonly<{
+  sourceRevision: string; // exact baked 40 lower-case hex; never BUILD_COMMIT override
+  imageDigest: string; // sha256: followed by 64 lower-case hex
+  manifestSha256: string; // immutable CI owner/source manifest, authenticated by native owner
+}>;
+export type FileCoverageNativeBinding = Readonly<{
+  invocationId: string;
+  invocationGeneration: number;
+  originalRequestSha256: string;
+  namespaceUid: string;
+  mongoReplicaSet: string;
+  mongoDatabase: string;
+  writerCohortSha256: string;
+  oldTimerDrainSha256: string;
+}>;
+/** Data claims only. Possessing this object or knowing its hashes never authorizes a mutation. */
+export type FileCoverageRun = Readonly<{
+  version: 1;
+  requestId: string; // immutable UUID for the complete finite producer run
+  storeId: string; // exact existing GlobalState storeId
+  generation: number; // desired next generation at begin, unchanged for this entire run
+  originalDeadline: string; // canonical UTC milliseconds; no retry extension
+  contract: FileCoverageCompiledContract;
+  source: FileCoverageSource;
+  native: FileCoverageNativeBinding;
+}>;
+export type FileCoverageInvalidateReason =
+  | 'source_changed'
+  | 'writer_admission'
+  | 'migration'
+  | 'restore'
+  | 'owner_conflict';
+/** Closed discriminated input; JSON parsers reject extra keys, accessors and non-own data. */
+export type FileCoverageAction =
+  | Readonly<{ action: 'begin'; run: FileCoverageRun }>
+  | Readonly<{ action: 'advance'; run: FileCoverageRun; expectedCheckpoint: number }>
+  | Readonly<{ action: 'verify-seal'; run: FileCoverageRun; expectedCheckpoint: number }>
+  | Readonly<{
+      action: 'invalidate';
+      version: 1;
+      requestId: string;
+      storeId: string;
+      expectedGeneration: number;
+      originalDeadline: string;
+      reason: FileCoverageInvalidateReason;
+    }>
+  | Readonly<{
+      action: 'inspect';
+      version: 1;
+      storeId: string;
+      generation: number;
+      runSha256: string;
+    }>;
+export type FileCoveragePopulation = Readonly<{
+  filesSeen: number;
+  retainedFiles: number;
+  excludedFiles: number;
+  fileJobsSeen: number;
+  unclassifiedFiles: number;
+  unclassifiedJobs: number;
+}>;
+export type FileCoverageReceipt = Readonly<{
+  version: 1;
+  storeId: string;
+  generation: number;
+  runSha256: string; // canonical complete immutable FileCoverageRun, computed by data owner
+  contract: FileCoverageCompiledContract;
+  source: FileCoverageSource;
+  native: FileCoverageNativeBinding;
+  snapshot: Readonly<{
+    seconds: number;
+    increment: number; // exact Mongo Timestamp pair from the actual pinned read session
+    observedAt: string; // server observation; not wall-clock snapshot authority
+  }>;
+  population: FileCoveragePopulation & Readonly<{ unclassifiedFiles: 0; unclassifiedJobs: 0 }>;
+  filesSha256: string;
+  jobsSha256: string;
+  projectionSha256: string;
+  sealedAt: string; // actual database commit operation's server-time observation
+  receiptSha256: string; // canonical body excluding this field
+}>;
+export type FileCoverageFailureCode =
+  | 'invalid_input'
+  | 'native_unavailable'
+  | 'native_changed'
+  | 'store_changed'
+  | 'generation_conflict'
+  | 'checkpoint_conflict'
+  | 'migration_conflict'
+  | 'source_changed'
+  | 'unclassified'
+  | 'deadline'
+  | 'capacity'
+  | 'unavailable'
+  | 'unknown_commit';
+export type FileCoverageResult =
+  | Readonly<{
+      outcome: 'progress';
+      generation: number;
+      runSha256: string;
+      checkpoint: number;
+      lane: 'files' | 'jobs' | 'ready';
+      population: FileCoveragePopulation;
+    }>
+  | Readonly<{ outcome: 'sealed'; receipt: FileCoverageReceipt }>
+  | Readonly<{ outcome: 'invalidated'; generation: number; requestSha256: string }>
+  | Readonly<{
+      outcome: 'observed';
+      generation: number | null;
+      phase: 'absent' | 'invalid' | 'preparing' | 'sealed';
+      receipt: FileCoverageReceipt | null;
+    }>
+  | Readonly<{ outcome: 'refused' | 'unknown'; code: FileCoverageFailureCode }>;
+
+/** Diagnostic population observation. It never certifies writer exclusion or coverage. */
+export const FILE_HOUSEKEEPING_INVENTORY_CONTRACT = {
+  id: 'file-housekeeping-inventory',
+  version: 1,
+} as const;
+export type FileInventoryRequest = Readonly<{
+  action: 'inventory';
+  version: 1;
+  requestId: string;
+  source: FileCoverageSource;
+  target: Readonly<{
+    namespaceUid: string;
+    mongoReplicaSet: string;
+    mongoDatabase: string;
+  }>;
+  originalDeadline: string;
+  lookAheadMs: number; // Fixed diagnostic horizon, 0..300000; not a writer-hold grant.
+}>;
+export type FileInventoryCounts = Readonly<{
+  totalFiles: number;
+  managedMarker: number;
+  standaloneMarker: number;
+  inheritedDeadline: number;
+  otherFiles: number;
+  pastDueInheritedDeadline: number;
+  malformedExpiredAt: number;
+  deletionOrRetryMarkers: number;
+  missingOrMalformedIdentity: number;
+  expiresAtAbsentOrNull: number;
+  expiresAtScalarDate: number;
+  expiresAtArray: number;
+  expiresAtOther: number;
+}>;
+export type FileInventoryResult =
+  | Readonly<{
+      outcome: 'inventoried';
+      version: 1;
+      diagnosticOnly: true;
+      contract: typeof FILE_HOUSEKEEPING_INVENTORY_CONTRACT;
+      requestSha256: string;
+      collectionPresent: boolean;
+      collectionSha256: string;
+      indexSha256: string;
+      catalogStable: boolean; // Equal bracketing observations do not exclude intervening DDL.
+      primaryStable: boolean; // Equal primary identity and nondecreasing observed clock only.
+      intervalAssurance: 'unknown'; // Requires separate actual DDL/clock/writer custody.
+      serverTime: Readonly<{ from: string; through: string; horizon: string }>;
+      snapshot: Readonly<{ seconds: number; increment: number }>;
+      counts: FileInventoryCounts;
+      ttl: Readonly<{
+        semantics: 'absent' | 'supported-scalar' | 'unknown';
+        indexes: readonly Readonly<{
+          specSha256: string;
+          kind: 'expiresAt' | 'unsupported';
+          expireAfterSeconds: number | null;
+        }>[];
+        eligibleAtObservation: number | null;
+        becomingEligibleByHorizon: number | null;
+        afterHorizon: number | null;
+      }>;
+    }>
+  | Readonly<{
+      outcome: 'refused';
+      code: 'invalid_input' | 'deadline' | 'capacity' | 'unavailable';
+    }>;

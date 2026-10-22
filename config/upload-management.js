@@ -1,4 +1,4 @@
-/** Finite internal initial-empty activation; UploadStore remains the only accounting writer. */
+/** Finite internal inspection and initial-empty activation; UploadStore owns accounting writes. */
 'use strict';
 
 const { createHash } = require('node:crypto');
@@ -215,9 +215,17 @@ function snapshotFrom(preparation) {
   return Object.fromEntries(SNAPSHOT_KEYS.map((key) => [key, preparation[key]]));
 }
 function validateEnvelope(envelope, now = Date.now(), gatewayContext) {
+  requireValue(Number.isSafeInteger(now) && object(envelope));
+  if (envelope.action === 'inspect-checkpoint-indexes') {
+    shape(envelope, ['schema', 'action', 'target', 'originalDeadline', 'historicalLineageSha256']);
+    requireValue(envelope.schema === 1 && isHash(envelope.historicalLineageSha256));
+    validateTarget(envelope.target);
+    const deadline = timestamp(envelope.originalDeadline);
+    requireValue(deadline > now && deadline - now <= 300_000, 'EXPIRED');
+    return envelope;
+  }
   const { parseUploadActivationGatewayContext } = require('@librechat/api/upload-activation');
   const storageGateways = parseUploadActivationGatewayContext(gatewayContext);
-  requireValue(Number.isSafeInteger(now) && object(envelope));
   requireValue(envelope.action === 'prepare' || envelope.action === 'activate');
   shape(envelope, [
     'schema',
@@ -355,11 +363,21 @@ async function runActivation(envelope, ports = {}) {
       deadline,
       expiredReplay,
       signal: controller.signal,
+      action: envelope.action,
+      historicalLineageSha256: envelope.historicalLineageSha256,
     });
     live();
     validateTarget(runtime.target);
     requireValue(digest(runtime.target) === digest(envelope.target), 'TARGET_MISMATCH');
-    if (envelope.action === 'prepare') {
+    if (envelope.action === 'inspect-checkpoint-indexes') {
+      const started = now();
+      const inspection = await runtime.inspectCheckpointIndexes({
+        originalDeadline: envelope.originalDeadline,
+        targetBindingSha256: digest(envelope.target),
+      });
+      live();
+      result = summarizeCheckpointIndexes(inspection, envelope, runtime, started, now());
+    } else if (envelope.action === 'prepare') {
       await runtime.repository.initialize();
       live();
       const snapshot = await runtime.repository.reconciliationSnapshot(now());
@@ -412,11 +430,134 @@ async function runActivation(envelope, ports = {}) {
   }
   if (failed) {
     if (attempted) throw failure('UNKNOWN_COMMIT');
+    if (
+      envelope.action === 'inspect-checkpoint-indexes' &&
+      operationError?.code === 'UNKNOWN_COMMIT'
+    )
+      throw failure('UNAVAILABLE');
     throw operationError && ERROR_CODES.has(operationError.code)
       ? operationError
       : failure('UNAVAILABLE');
   }
   return result;
+}
+function summarizeCheckpointIndexes(value, envelope, runtime, started, now) {
+  shape(value, [
+    'schema',
+    'owner',
+    'originalDeadline',
+    'observedFrom',
+    'observedThrough',
+    'targetBindingSha256',
+    'configurationSha256',
+    'historicalLineageSha256',
+    'collections',
+    'complete',
+    'evidenceSha256',
+  ]);
+  requireValue(
+    value.schema === 1 &&
+      value.owner === 'agent-checkpoints' &&
+      typeof value.complete === 'boolean' &&
+      isHash(value.evidenceSha256),
+    'INCOMPLETE',
+  );
+  requireValue(
+    value.originalDeadline === envelope.originalDeadline &&
+      value.targetBindingSha256 === digest(envelope.target) &&
+      isHash(runtime.configurationSha256) &&
+      value.configurationSha256 === runtime.configurationSha256 &&
+      value.historicalLineageSha256 === envelope.historicalLineageSha256,
+    'TARGET_MISMATCH',
+  );
+  const from = timestamp(value.observedFrom);
+  const through = timestamp(value.observedThrough);
+  requireValue(
+    from >= started &&
+      through >= from &&
+      through <= now &&
+      through < timestamp(envelope.originalDeadline),
+    'INCOMPLETE',
+  );
+  requireValue(
+    Array.isArray(value.collections) &&
+      value.collections.length >= 2 &&
+      value.collections.length <= 64,
+    'INCOMPLETE',
+  );
+  const counts = {
+    collections: value.collections.length,
+    rows: 0,
+    malformedKeyRows: 0,
+    duplicateGroups: 0,
+    duplicateExcessRows: 0,
+    verifiedIndexCollections: 0,
+    missingIndexCollections: 0,
+    conflictingIndexCollections: 0,
+  };
+  for (const row of value.collections) {
+    shape(row, [
+      'collection',
+      'role',
+      'rowCount',
+      'malformedKeyRows',
+      'duplicateGroups',
+      'duplicateExcessRows',
+      'indexes',
+      'indexStatus',
+    ]);
+    requireValue(
+      typeof row.collection === 'string' &&
+        ['checkpoint', 'pending'].includes(row.role) &&
+        Array.isArray(row.indexes) &&
+        row.indexes.length <= 64 &&
+        ['verified', 'missing', 'conflicting'].includes(row.indexStatus),
+      'INCOMPLETE',
+    );
+    for (const [source, destination] of [
+      ['rowCount', 'rows'],
+      ['malformedKeyRows', 'malformedKeyRows'],
+      ['duplicateGroups', 'duplicateGroups'],
+      ['duplicateExcessRows', 'duplicateExcessRows'],
+    ]) {
+      requireValue(
+        Number.isSafeInteger(row[source]) &&
+          row[source] >= 0 &&
+          Number.isSafeInteger(counts[destination] + row[source]),
+        'INCOMPLETE',
+      );
+      counts[destination] += row[source];
+    }
+    requireValue(
+      row.malformedKeyRows <= row.rowCount &&
+        row.duplicateGroups <= row.duplicateExcessRows &&
+        row.duplicateExcessRows <= row.rowCount,
+      'INCOMPLETE',
+    );
+    counts[`${row.indexStatus}IndexCollections`]++;
+  }
+  requireValue(
+    value.complete ===
+      (counts.malformedKeyRows === 0 &&
+        counts.duplicateGroups === 0 &&
+        counts.verifiedIndexCollections === counts.collections),
+    'INCOMPLETE',
+  );
+  const result = {
+    schema: 1,
+    status: 'inspected',
+    action: envelope.action,
+    originalDeadline: value.originalDeadline,
+    observedFrom: value.observedFrom,
+    observedThrough: value.observedThrough,
+    targetBindingSha256: value.targetBindingSha256,
+    configurationSha256: value.configurationSha256,
+    historicalLineageSha256: value.historicalLineageSha256,
+    complete: value.complete,
+    counts,
+    inspectionEvidenceSha256: value.evidenceSha256,
+  };
+  return { ...result, evidenceSha256: digest(result) };
 }
 async function inspectCurrent(runtime, envelope, observedAt, now, live) {
   const options = {
@@ -471,7 +612,11 @@ function readTrust(filename) {
   }
 }
 /** One-shot adapter: same existing custody, no application cache, manager, listener or cleanup startup. */
-async function openRuntime(expected, { deadline, expiredReplay, signal }, env) {
+async function openRuntime(
+  expected,
+  { deadline, expiredReplay, signal, action, historicalLineageSha256 },
+  env,
+) {
   const target = publicContext(env.CORTEX_UPLOAD_ACTIVATION_TARGET);
   validateTarget(target);
   requireValue(digest(target) === digest(expected), 'TARGET_MISMATCH');
@@ -492,27 +637,57 @@ async function openRuntime(expected, { deadline, expiredReplay, signal }, env) {
       ),
     'TARGET_MISMATCH',
   );
-  const { parseSharedState } = require('librechat-data-provider');
-  const shared = parseSharedState(env);
-  requireValue(shared.mode === 'sentinel', 'TARGET_MISMATCH');
-  requireValue(!(env.REDIS_KEY_PREFIX_VAR && env.REDIS_KEY_PREFIX), 'TARGET_MISMATCH');
-  const prefix = (env[env.REDIS_KEY_PREFIX_VAR ?? ''] || env.REDIS_KEY_PREFIX || '') + '::';
-  requireValue(
-    shared.name === target.coordination.sentinelName &&
-      target.coordination.database === 0 &&
-      target.coordination.keyPrefix === prefix,
-    'TARGET_MISMATCH',
-  );
-  requireValue(typeof env.MONGO_URI === 'string' && env.MONGO_URI.length > 0, 'UNAVAILABLE');
-  const mongoose = require('mongoose');
-  const { createModels, createUploadManagementRepository } = require('@librechat/data-schemas');
   const {
     RedisJobStore,
     resolveCheckpointerConfig,
     inspectInitialCheckpointPopulation,
+    inspectCheckpointIndexPopulation,
   } = require('@librechat/api/upload-activation');
   const currentConfig = resolveCheckpointerConfig(cfg);
   const configurationSha256 = digest(currentConfig);
+  const inspection = action === 'inspect-checkpoint-indexes';
+  let lineage;
+  let shared;
+  let prefix;
+  if (inspection) {
+    requireValue(env.CORTEX_UPLOAD_ACTIVATION_CHECKPOINT_LINEAGE !== undefined, 'INCOMPLETE');
+    lineage = publicContext(env.CORTEX_UPLOAD_ACTIVATION_CHECKPOINT_LINEAGE);
+    shape(lineage, [
+      'schema',
+      'targetBindingSha256',
+      'configurationSha256',
+      'evidenceSha256',
+      'stores',
+    ]);
+    requireValue(
+      lineage.schema === 1 &&
+        isHash(lineage.evidenceSha256) &&
+        Array.isArray(lineage.stores) &&
+        lineage.stores.length <= 32,
+      'INCOMPLETE',
+    );
+    requireValue(currentConfig.type === 'mongo', 'INCOMPLETE');
+    requireValue(
+      lineage.targetBindingSha256 === digest(target) &&
+        lineage.configurationSha256 === configurationSha256 &&
+        lineage.evidenceSha256 === historicalLineageSha256,
+      'TARGET_MISMATCH',
+    );
+  } else {
+    const { parseSharedState } = require('librechat-data-provider');
+    shared = parseSharedState(env);
+    requireValue(shared.mode === 'sentinel', 'TARGET_MISMATCH');
+    requireValue(!(env.REDIS_KEY_PREFIX_VAR && env.REDIS_KEY_PREFIX), 'TARGET_MISMATCH');
+    prefix = (env[env.REDIS_KEY_PREFIX_VAR ?? ''] || env.REDIS_KEY_PREFIX || '') + '::';
+    requireValue(
+      shared.name === target.coordination.sentinelName &&
+        target.coordination.database === 0 &&
+        target.coordination.keyPrefix === prefix,
+      'TARGET_MISMATCH',
+    );
+  }
+  requireValue(typeof env.MONGO_URI === 'string' && env.MONGO_URI.length > 0, 'UNAVAILABLE');
+  const mongoose = require('mongoose');
   let redis;
   let closing;
   let store;
@@ -578,6 +753,22 @@ async function openRuntime(expected, { deadline, expiredReplay, signal }, env) {
       hello.setName === target.mongoReplicaSet && mongoose.connection.name === target.mongoDatabase,
       'TARGET_MISMATCH',
     );
+    if (inspection)
+      return {
+        target,
+        configurationSha256,
+        close,
+        inspectCheckpointIndexes: (options) =>
+          inspectCheckpointIndexPopulation({
+            ...options,
+            currentConfig,
+            historicalStorageLineage: {
+              evidenceSha256: lineage.evidenceSha256,
+              stores: lineage.stores,
+            },
+          }),
+      };
+    const { createModels, createUploadManagementRepository } = require('@librechat/data-schemas');
     createModels(mongoose);
     const repository = createUploadManagementRepository(mongoose);
     if (!expiredReplay) {
@@ -660,6 +851,7 @@ async function main({
       storageGateways: env.CORTEX_UPLOAD_ACTIVATION_STORAGE_GATEWAYS,
       open: open ?? ((target, options) => openRuntime(target, options, env)),
     });
+    if (result.status === 'inspected' && !result.complete) exitCode = 1;
   } catch (error) {
     const code = error && ERROR_CODES.has(error.code) ? error.code : 'UNAVAILABLE';
     result = { schema: 1, status: code === 'UNKNOWN_COMMIT' ? 'pending' : 'error', code };

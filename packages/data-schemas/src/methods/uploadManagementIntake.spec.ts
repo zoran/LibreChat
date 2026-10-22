@@ -2,6 +2,7 @@
 import mongoose from 'mongoose';
 import { createHash } from 'node:crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import { canonicalStorageDeletionReceipt } from 'librechat-data-provider';
 import type {
   UploadIntakeGrant,
   UploadLease,
@@ -10,7 +11,11 @@ import type {
   UploadSecurityApproval,
   UploadStorageReceipt,
 } from 'librechat-data-provider';
+import type { IntakeControlOptions } from '../../../api/src/uploads/intake/control';
 import type { StoredUpload } from './uploadManagementStore';
+import { createUploadActorSettlement } from '../../../api/src/uploads/actorSettlement';
+import { createIntakeControlHandlers } from '../../../api/src/uploads/intake/control';
+import { createUploadAttemptJournal } from '../../../api/src/uploads/attempts';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createModels } from '~/models';
 
@@ -24,7 +29,7 @@ describe('private Intake and App-promotion transaction fences', () => {
   let target: ReturnType<typeof createUploadManagementRepository>;
   const now = Date.now();
   const policy = 'c'.repeat(64);
-  const cap = createHash('sha256').update('synthetic-capability-fixture').digest('hex');
+  const cap = createHash('sha256').update('a'.repeat(43)).digest('hex');
   const otherCap = 'd'.repeat(64);
   const user = {
     tenantId: 'tenant-a',
@@ -189,6 +194,289 @@ describe('private Intake and App-promotion transaction fences', () => {
     await second.beginPromotion(lease, promotionId, appWorker, now);
     return lease;
   }
+
+  async function completeStorageCleanup(lease: UploadLease) {
+    const authority = {
+      operationId: lease.operationId,
+      principal: user,
+      generation: lease.generation,
+      attemptGeneration: lease.generation,
+    };
+    const pending = await first.prepareCleanupStorage(authority);
+    if (pending.state !== 'binding') throw Error('Expected original cleanup binding');
+    const binding = {
+      ...pending.request,
+      bucket: 'private-bucket',
+      key: receipt(lease).storageKey!,
+    };
+    await first.prepareCleanupStorage(authority, binding);
+    const terminal = {
+      ...binding,
+      state: 'durable_delete_complete' as const,
+      obligationId: 'obligation',
+      aggregateRevision: '1',
+      proofSHA256: 'e'.repeat(64),
+    };
+    const committed = await first.recordCleanupStorage(authority, { result: terminal });
+    if (committed.state !== 'consume') throw Error('Expected committed cleanup receipt');
+    await first.recordCleanupStorage(authority, {
+      consumption: {
+        state: 'recorded',
+        obligationId: terminal.obligationId,
+        receiptSHA256: createHash('sha256')
+          .update(canonicalStorageDeletionReceipt(terminal))
+          .digest('hex'),
+        consumerCommitId: committed.consumerCommitId,
+      },
+    });
+  }
+
+  it('joins actual control unknown PUT, original Intake recovery, actor settlement and committed owner receipt', async () => {
+    const env = { ...process.env };
+    Object.assign(process.env, {
+      AUTH_MODE: 'email_code',
+      EMAIL_CODE_TENANT_ID: user.tenantId,
+      EMAIL_CODE_ALLOWED_DOMAINS: 'employees.example.test',
+      EMAIL_CODE_HMAC_KEY: 'test-only-separate-key-'.repeat(3),
+      EMAIL_CODE_POLICY_VERSION: '1',
+    });
+    const appJournal = createUploadAttemptJournal(appWorker);
+    const intakeJournal = createUploadAttemptJournal(intakeWorker);
+    try {
+      const lease = await transfer();
+      await first.preparePromotion(input(lease), now);
+      const recoverBinding = {
+        version: 1 as const,
+        operationId: 'intake',
+        transferGeneration: lease.generation,
+        worker: intakeWorker,
+        capabilitySha256: cap,
+      };
+      const intakeRegistration = intakeJournal.attempts.begin(jest.fn());
+      intakeRegistration.bind({
+        ...intakeWorker,
+        operationId: 'intake',
+        generation: lease.generation,
+      });
+      intakeRegistration.recover!(async (proof) =>
+        first.confirmIntakeRecovery(
+          recoverBinding,
+          {
+            version: 1,
+            operationId: 'intake',
+            transferGeneration: lease.generation,
+            worker: intakeWorker,
+            localWriterStopped: true,
+            localCopiesAbsent: proof.localCopiesAbsent,
+          },
+          now,
+        ),
+      );
+      const handlers = createIntakeControlHandlers({
+        repository: first,
+        worker: appWorker,
+        attempts: appJournal.attempts,
+        now: () => now,
+        resources: { assertSafe: async () => {} },
+        management: {} as IntakeControlOptions['management'],
+        identityRepository: {
+          readEmailCodeIdentity: async () =>
+            ({
+              user: { email: 'person@employees.example.test' },
+              grant: {
+                ...grant(),
+                userId: user.userId,
+                tenantId: user.tenantId,
+                refreshGeneration: 4,
+                createdAt: now - 1000,
+                idleExpiresAt: now + 600_000,
+                absoluteExpiresAt: now + 900_000,
+              },
+            }) as never,
+        },
+        storage: {
+          put: async (value) => {
+            for await (const chunk of value.body)
+              expect(Buffer.from(chunk).toString()).toBe('document');
+            return { ...receipt(lease), outcome: 'unknown' };
+          },
+        },
+      });
+      const upload = await handlers.promote(
+        { operationId: 'intake', capability: 'a'.repeat(43), worker: intakeWorker },
+        promotionId,
+        8,
+        new AbortController().signal,
+      );
+      await upload.consume(
+        (async function* () {
+          yield Buffer.from('document');
+        })(),
+      );
+      await upload.close();
+      const appTask = { operationId: 'intake', generation: lease.generation, worker: appWorker };
+      expect(
+        await appJournal.attempts.stopAndJoin(appTask, new AbortController().signal),
+      ).toMatchObject({
+        localWriterStopped: true,
+        localCopiesAbsent: true,
+        writerStopped: false,
+        storageOutcome: 'unknown',
+      });
+      expect(await appJournal.recoverPending(new AbortController().signal)).toMatchObject({
+        settled: 0,
+        pending: 1,
+      });
+      await first.cancel(user, 'intake', now);
+      await first.sealIntakeRecovery(recoverBinding, now);
+      // A stale foreign incarnation cannot contribute strong stop/copy facts to this join.
+      await a.models.UploadOperation.updateOne(
+        { _id: 'intake' },
+        {
+          $set: {
+            actorSettlement: {
+              generation: lease.generation,
+              worker: { ...intakeWorker, instanceId: 'old-incarnation' },
+              writerStopped: true,
+              localCopiesAbsent: true,
+            },
+          },
+        },
+      );
+      intakeRegistration.settle({
+        writerStopped: false,
+        localWriterStopped: true,
+        localCopiesAbsent: true,
+        storageOutcome: 'unknown',
+        acknowledgementPending: true,
+      });
+      expect(await intakeJournal.recoverPending(new AbortController().signal)).toMatchObject({
+        settled: 0,
+        pending: 1,
+      });
+      expect((await row())!.actorSettlement).toMatchObject({
+        worker: intakeWorker,
+        generation: lease.generation,
+        localWriterStopped: true,
+        writerStopped: false,
+        localCopiesAbsent: true,
+      });
+      const actors = createUploadActorSettlement({
+        repository: first,
+        worker: appWorker,
+        attempts: appJournal.attempts,
+        stagingRoot: process.env.UPLOAD_TEST_TMPDIR!,
+        documents: { cancel: async () => ({ writerStopped: false }) } as never,
+        now: () => now,
+      });
+      await actors.reconcile(new AbortController().signal);
+      expect((await row())!.cleanupCustody!.promotionLocal).toMatchObject({
+        worker: appWorker,
+        generation: lease.generation,
+        promotionId,
+      });
+      const authority = {
+        operationId: 'intake',
+        principal: user,
+        generation: lease.generation,
+        attemptGeneration: lease.generation,
+      };
+      const prepared = await first.prepareCleanupStorage(authority);
+      if (prepared.state !== 'binding') throw Error('Expected binding');
+      const binding = {
+        ...prepared.request,
+        bucket: 'private-bucket',
+        key: receipt(lease).storageKey!,
+      };
+      await first.prepareCleanupStorage(authority, binding);
+      await first.recordCleanupStorage(authority, {
+        result: { ...binding, state: 'namespace_absent', obligationId: 'obligation' },
+      });
+      expect((await row())!.originalBytes).toBe(8);
+      expect(
+        await first.readActorCleanupRecovery({
+          operationId: 'intake',
+          attemptGeneration: lease.generation,
+          worker: appWorker,
+        }),
+      ).toBeNull();
+      const terminal = {
+        ...binding,
+        state: 'durable_delete_complete' as const,
+        obligationId: 'obligation',
+        aggregateRevision: '1',
+        proofSHA256: 'e'.repeat(64),
+      };
+      const committed = await first.recordCleanupStorage(authority, { result: terminal });
+      expect(committed.state).toBe('consume');
+      if (committed.state !== 'consume') throw Error('Expected consumer commit');
+      expect((await row())!.promotion).toMatchObject({
+        writerStopped: false,
+        state: 'writing',
+        receipt: { outcome: 'unknown' },
+      });
+      expect(
+        await first.readActorCleanupRecovery({
+          operationId: 'intake',
+          attemptGeneration: lease.generation + 1,
+          worker: appWorker,
+        }),
+      ).toBeNull();
+      expect(
+        await first.readActorCleanupRecovery({
+          operationId: 'intake',
+          attemptGeneration: lease.generation,
+          worker: { ...appWorker, instanceId: 'replacement' },
+        }),
+      ).toBeNull();
+      expect(await appJournal.recoverPending(new AbortController().signal)).toEqual({
+        attempted: 1,
+        settled: 1,
+        pending: 0,
+      });
+      expect(await intakeJournal.recoverPending(new AbortController().signal)).toEqual({
+        attempted: 1,
+        settled: 1,
+        pending: 0,
+      });
+      expect(
+        await appJournal.attempts.stopAndJoin(appTask, new AbortController().signal),
+      ).toMatchObject({
+        storageOutcome: 'unknown',
+        writerStopped: false,
+        localWriterStopped: true,
+        acknowledgementPending: false,
+      });
+      const consumption = {
+        state: 'recorded' as const,
+        obligationId: terminal.obligationId,
+        receiptSHA256: createHash('sha256')
+          .update(canonicalStorageDeletionReceipt(terminal))
+          .digest('hex'),
+        consumerCommitId: committed.consumerCommitId,
+      };
+      await first.recordCleanupStorage(authority, { consumption });
+      expect(await first.cleanupForWorker(appWorker, { limit: 16, cursor: null })).toMatchObject({
+        tasks: [],
+      });
+      // Durable owner observation survives retirement and an otherwise empty cleanup selection.
+      expect(
+        await first.readActorCleanupRecovery({
+          operationId: 'intake',
+          attemptGeneration: lease.generation,
+          worker: appWorker,
+        }),
+      ).toMatchObject({
+        acknowledged: true,
+        storageOutcome: 'unknown',
+        cleanupReceipt: { consumerCommitId: committed.consumerCommitId },
+      });
+      expect(await appJournal.close()).toEqual({ complete: true });
+      expect(await intakeJournal.close()).toEqual({ complete: true });
+    } finally {
+      process.env = env;
+    }
+  });
 
   it('stores only a private hash/grant, rotates waiting tickets, and snapshots the supplied grant', async () => {
     await reserve(false);
@@ -440,6 +728,13 @@ describe('private Intake and App-promotion transaction fences', () => {
     const result = await accept(lease);
     expect(await accept(lease)).toEqual(result);
     expect(await b.models.File.countDocuments({})).toBe(1);
+    expect(
+      await first.readActorCleanupRecovery({
+        operationId: 'intake',
+        attemptGeneration: lease.generation,
+        worker: appWorker,
+      }),
+    ).toBeNull();
     expect(await b.models.File.findOne({ file_id: 'intake' }).lean()).toMatchObject({
       filename: input(lease).metadata.filename,
     });
@@ -495,6 +790,8 @@ describe('private Intake and App-promotion transaction fences', () => {
       ).rejects.toMatchObject({ code: 'not_ready' });
       expect((await row())!.originalBytes).toBe(8);
       await first.confirmCleanup(cleanup(lease), later);
+      expect(await row()).toMatchObject({ originalBytes: 8, cleanupPending: true });
+      await completeStorageCleanup(lease);
       expect(await row()).toMatchObject({
         originalBytes: 0,
         stagingHeld: false,
@@ -509,7 +806,7 @@ describe('private Intake and App-promotion transaction fences', () => {
     },
   );
 
-  it('allows a joined no-receipt outcome to clean up, without promoting unknown storage', async () => {
+  it('requires storage receipt cleanup after a joined no-receipt outcome, without promoting unknown storage', async () => {
     const lease = await writing();
     await first.settlePromotion(
       {
@@ -526,6 +823,9 @@ describe('private Intake and App-promotion transaction fences', () => {
     expect(await first.settlePromotion(joined, now)).toEqual(done);
     await expect(accept(lease)).rejects.toMatchObject({ code: 'not_ready' });
     await first.confirmCleanup(cleanup(lease), now);
+    expect((await row())!.cleanupPending).toBe(true);
+    await first.cancel(user, 'intake', now);
+    await completeStorageCleanup(lease);
     expect((await row())!.cleanupPending).toBe(false);
   });
 
@@ -598,6 +898,10 @@ describe('private Intake and App-promotion transaction fences', () => {
     await first.confirmCleanup({ ...cleanup(lease), originalAbsent: false }, now);
     const page = await first.exportSnapshot({ epoch: 'move' });
     const stored = (await row())!;
+    // File owns accepted custody; migration must observe the real matching destination File.
+    await replacement.models.File.collection.insertMany(
+      await a.models.File.collection.find({ file_id: 'intake' }).toArray(),
+    );
     await target.importSnapshot(page);
     expect(await replacement.models.UploadOperation.findById('intake').lean()).toMatchObject({
       intake: stored.intake,

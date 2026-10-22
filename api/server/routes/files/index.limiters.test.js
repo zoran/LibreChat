@@ -1,7 +1,7 @@
 const express = require('express');
 const request = require('supertest');
 
-const hits = { uploadIp: 0, uploadUser: 0, usage: 0, multer: 0 };
+const hits = { uploadIp: 0, uploadUser: 0, usage: 0, multer: 0, admitted: 0, inspected: 0 };
 const originalAuthMode = process.env.AUTH_MODE;
 
 jest.mock('~/server/middleware', () => ({
@@ -51,6 +51,38 @@ const okRouter = (paths) => {
 jest.mock('./files', () => {
   const express = require('express');
   const router = express.Router();
+  const { createManagedFileHandlers, isCortexFileMode } = require('./managed');
+  const managed = createManagedFileHandlers({
+    getRuntime: () => ({
+      sources: {
+        authorize: async () => ({
+          tenantId: 'tenant-a',
+          userId: 'user-1',
+          authentication: 'verified-email',
+        }),
+      },
+      fileReads: {
+        admitManagedFileRead: async (_principal, input) => {
+          hits.admitted++;
+          return {
+            version: 1,
+            readId: 'A'.repeat(43),
+            ...input,
+            admittedAt: new Date().toISOString(),
+            notAfter: new Date(Date.now() + 120_000).toISOString(),
+          };
+        },
+        inspectManagedFileRead: async () => {
+          hits.inspected++;
+          return { status: 'completed', completedAt: new Date().toISOString() };
+        },
+      },
+    }),
+  });
+  router.get('/download-url/:userId/:file_id', (req, res) => {
+    if (isCortexFileMode()) return managed.downloadURL(req, res);
+    return res.json({ url: 'upstream-download' });
+  });
   router.post('/', (req, res) => res.status(200).json({ ok: true }));
   router.post('/usage', (req, res) => res.status(200).json({ ok: true }));
   return router;
@@ -83,10 +115,71 @@ describe('file route limiter wiring', () => {
     hits.uploadUser = 0;
     hits.usage = 0;
     hits.multer = 0;
+    hits.admitted = 0;
+    hits.inspected = 0;
   });
   afterAll(() => {
     if (originalAuthMode === undefined) delete process.env.AUTH_MODE;
     else process.env.AUTH_MODE = originalAuthMode;
+  });
+
+  test.each([
+    '/download-url/user-1/file-1',
+    '/download-url/user-1/file-1/',
+    '/DOWNLOAD-URL/user-1/file-1',
+  ])('meters managed admission on the actual non-strict GET route %s', async (path) => {
+    process.env.AUTH_MODE = 'transition';
+    const response = await request(app).get(`/api/files${path}?read=1&representation=original`);
+    expect(response.status).toBe(200);
+    expect(hits.admitted).toBe(1);
+    expect(hits.usage).toBe(1);
+    expect(hits.uploadIp).toBe(0);
+    expect(hits.uploadUser).toBe(0);
+  });
+
+  it('keeps same-identity inspection available without admitting or consuming fresh-admission quota', async () => {
+    process.env.AUTH_MODE = 'email_code';
+    const response = await request(app)
+      .get('/api/files/download-url/user-1/file-1/?read=1&representation=preview')
+      .set('X-Cortex-File-Read', 'A'.repeat(43));
+    expect(response.status).toBe(204);
+    expect(hits.inspected).toBe(1);
+    expect(hits.admitted).toBe(0);
+    expect(hits.usage).toBe(0);
+  });
+
+  it('cannot turn a malformed read header into an unmetered admission', async () => {
+    process.env.AUTH_MODE = 'transition';
+    const response = await request(app)
+      .get('/api/files/download-url/user-1/file-1?read=1&representation=original')
+      .set('X-Cortex-File-Read', 'invalid');
+    expect(response.status).toBe(400);
+    expect(hits.admitted).toBe(0);
+    expect(hits.inspected).toBe(0);
+    expect(hits.usage).toBe(0);
+  });
+
+  it('preserves default-mode preparation without managed admission quota', async () => {
+    const response = await request(app).get(
+      '/api/files/download-url/user-1/file-1?read=1&representation=original',
+    );
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ url: 'upstream-download' });
+    expect(hits.admitted).toBe(0);
+    expect(hits.usage).toBe(0);
+  });
+
+  it('rejects implicit preparation HEAD before any receipt can be written', async () => {
+    process.env.AUTH_MODE = 'transition';
+    const response = await request(app).head(
+      '/api/files/download-url/user-1/file-1/?read=1&representation=original',
+    );
+    expect(response.status).toBe(405);
+    expect(response.headers.allow).toBe('GET');
+    expect(hits.admitted).toBe(0);
+    expect(hits.inspected).toBe(0);
+    expect(hits.uploadIp).toBe(0);
+    expect(hits.uploadUser).toBe(0);
   });
 
   it('meters POST /usage with the usage limiter, never leaving it unlimited', async () => {

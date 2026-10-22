@@ -19,6 +19,9 @@ jest.mock('@librechat/api', () => ({
   createUploadWorkers: jest.fn(jest.requireActual('@librechat/api').createUploadWorkers),
   createUploadLiveHub: jest.fn(jest.requireActual('@librechat/api').createUploadLiveHub),
   createUploadRuntime: jest.fn(jest.requireActual('@librechat/api').createUploadRuntime),
+  createManagedFileRetrieval: jest.fn(
+    jest.requireActual('@librechat/api').createManagedFileRetrieval,
+  ),
 }));
 const {
   initializeS3,
@@ -28,6 +31,7 @@ const {
   createIntakeControlHandlers,
   createUploadLiveHub,
   createUploadRuntime,
+  createManagedFileRetrieval,
   createHttpUploadSecurityPort,
   UploadManagementError,
 } = require('@librechat/api');
@@ -229,7 +233,7 @@ describe('Cortex upload adapter trust boundaries', () => {
     },
   );
 
-  it('binds the native durable owner to the validated scanner policy and publication port', async () => {
+  it('binds native policy without forwarding per-File inventory from web startup configuration', async () => {
     Object.assign(process.env, {
       CORTEX_UPLOAD_MANAGEMENT_ENABLED: 'true',
       POD_NODE_NAME: 'cpu-2',
@@ -272,13 +276,21 @@ describe('Cortex upload adapter trust boundaries', () => {
       incarnation: '52345678-1234-4234-8234-123456789012',
     });
     const recordOriginalPublication = jest.fn();
-    await expect(initializeUploads({ identity, recordOriginalPublication })).rejects.toThrow(
-      'fixture-platform-stop',
-    );
+    const trustedFile = {
+      extractionPolicySha256: 'c'.repeat(64),
+      retrievalInventoryAuthority: { perFile: true },
+    };
+    await expect(
+      initializeUploads({ identity, trustedFile, recordOriginalPublication }),
+    ).rejects.toThrow('fixture-platform-stop');
     expect(createUploadManagementRepository).toHaveBeenCalledWith(require('mongoose'), {
       securityPolicySha256: security.policySha256,
+      extractionPolicySha256: trustedFile.extractionPolicySha256,
       recordOriginalPublication,
     });
+    expect(createUploadManagementRepository.mock.calls[0][1]).not.toHaveProperty(
+      'retrievalInventoryAuthority',
+    );
     expect(createUploadPlatform).toHaveBeenCalledWith({
       repository,
       worker: { hostId: 'cpu-2', instanceId: identity.incarnation },
@@ -323,26 +335,42 @@ describe('Cortex upload adapter trust boundaries', () => {
       AWS_SECRET_ACCESS_KEY: 'fixture-secret',
     };
     Object.assign(process.env, valid);
-    initializeS3.mockReturnValue({ fixture: true });
-    expect(managedStorageClient()).toEqual({ fixture: true });
-    for (const [key, value] of [
-      ['AWS_ACCESS_KEY_ID', ''],
-      ['AWS_SECRET_ACCESS_KEY', ''],
-      ['AWS_REGION', ''],
-      ['AWS_BUCKET_NAME', ''],
-      ['AWS_FORCE_PATH_STYLE', 'false'],
-      ['AWS_ENDPOINT_URL', 'http://storage:8333'],
-      ['AWS_ENDPOINT_URL', 'https://user:secret@storage:8333'],
-      ['AWS_ENDPOINT_URL', 'https://storage:8333/private?secret=value'],
-    ]) {
-      Object.assign(process.env, valid, { [key]: value });
-      initializeS3.mockClear();
-      expect(() => managedStorageClient()).toThrow('Managed storage configuration unavailable');
-      expect(initializeS3).not.toHaveBeenCalled();
+    const createClient = jest
+      .spyOn(require('@aws-sdk/client-s3'), 'S3Client')
+      .mockImplementation(() => ({ fixture: true }));
+    try {
+      expect(managedStorageClient()).toEqual({ fixture: true });
+      expect(createClient).toHaveBeenCalledWith({
+        region: valid.AWS_REGION,
+        endpoint: 'https://object-s3.example.test:8333/',
+        forcePathStyle: true,
+        requestChecksumCalculation: 'WHEN_REQUIRED',
+        credentials: {
+          accessKeyId: valid.AWS_ACCESS_KEY_ID,
+          secretAccessKey: valid.AWS_SECRET_ACCESS_KEY,
+        },
+      });
+      for (const [key, value] of [
+        ['AWS_ACCESS_KEY_ID', ''],
+        ['AWS_SECRET_ACCESS_KEY', ''],
+        ['AWS_REGION', ''],
+        ['AWS_BUCKET_NAME', ''],
+        ['AWS_FORCE_PATH_STYLE', 'false'],
+        ['AWS_ENDPOINT_URL', 'http://storage:8333'],
+        ['AWS_ENDPOINT_URL', 'https://user:secret@storage:8333'],
+        ['AWS_ENDPOINT_URL', 'https://storage:8333/private?secret=value'],
+      ]) {
+        Object.assign(process.env, valid, { [key]: value });
+        createClient.mockClear();
+        expect(() => managedStorageClient()).toThrow('Managed storage configuration unavailable');
+        expect(createClient).not.toHaveBeenCalled();
+      }
+    } finally {
+      createClient.mockRestore();
     }
   });
 
-  it('connects App promotion and processing while excluding the raw body handler', async () => {
+  it('connects App promotion and processing with the original web startup signal', async () => {
     process.env.EMAIL_CODE_TENANT_ID = 'tenant-a';
     const owner = { tenantId: 'tenant-a', userId: 'user-a', authentication: 'verified-email' };
     const failed = { id: 'operation', revision: 2, scope: { kind: 'personal' }, state: 'failed' };
@@ -389,6 +417,8 @@ describe('Cortex upload adapter trust boundaries', () => {
       expected: [{ node: 'cpu-1', pool: 'originals', signal: 'cpu' }],
       hardGuards: async () => ({ safe: true, durability: 'safe' }),
     };
+    const startupController = new AbortController();
+    const signal = startupController.signal;
     const composition = await createUploadComposition({
       repository,
       models: {},
@@ -401,8 +431,10 @@ describe('Cortex upload adapter trust boundaries', () => {
       stagingRoot: '/fixture/uploads',
       allowedOrigins: ['https://cortex.example'],
       principal: async () => owner,
+      signal,
     });
     try {
+      expect(createManagedFileRetrieval).toHaveBeenCalledWith(expect.objectContaining({ signal }));
       expect(createUploadLiveHub).toHaveBeenCalledWith(
         expect.objectContaining({ tenantId: 'tenant-a' }),
       );
@@ -445,8 +477,31 @@ describe('Cortex upload adapter trust boundaries', () => {
       );
       expect(text).not.toContain('tenant-a');
       expect(text).not.toContain('user-a');
+      let release;
+      const platformOriginal = new Promise((resolve) => {
+        release = resolve;
+      });
+      platform.start = jest.fn(() => platformOriginal);
+      const workers = createUploadWorkers.mock.results.at(-1).value;
+      const startWorkers = jest.spyOn(workers, 'start').mockImplementation(() => {});
+      const starting = composition.start();
+      const reason = new Error('Original web startup cancelled during platform start');
+      try {
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(platform.start).toHaveBeenCalledTimes(1);
+        expect(composition.start()).toBe(starting);
+        expect(startWorkers).not.toHaveBeenCalled();
+        startupController.abort(reason);
+      } finally {
+        release();
+      }
+      await expect(starting).rejects.toBe(reason);
+      expect(startWorkers).not.toHaveBeenCalled();
     } finally {
-      await composition.close(new AbortController().signal);
+      // This fixture lacks an actor reconciliation census; close must retain that uncertainty.
+      await expect(composition.close(new AbortController().signal)).rejects.toThrow(
+        'Upload shutdown has unresolved work',
+      );
     }
   });
 });

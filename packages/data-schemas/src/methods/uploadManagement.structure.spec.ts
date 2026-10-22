@@ -1,11 +1,13 @@
 /** Real Mongo publication, accounting and cleanup of one private original-bound derivation. */
 import mongoose from 'mongoose';
-import { UPLOAD_MAX_TEXT_BYTES } from 'librechat-data-provider';
+import { createHash } from 'node:crypto';
+import { UPLOAD_MAX_TEXT_BYTES, canonicalManagedJson } from 'librechat-data-provider';
 import type { StoredUpload, CounterRow } from './uploadManagementStore';
+import { createUploadStore, createUploadActivationMethods } from './uploadManagementStore';
 import { useUploadStructureFixture } from './uploadManagement.structure.fixture';
+import { captureManagedRetrievalInventoryEvidence } from './fileRetrieval';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createFileRetentionMethods } from './fileRetention';
-import { createUploadStore } from './uploadManagementStore';
 import { createFileMethods } from './file';
 import { createModels } from '~/models';
 describe('original-bound managed document structure', () => {
@@ -392,16 +394,91 @@ describe('original-bound managed document structure', () => {
     expect(await raw()).not.toHaveProperty('documentStructure');
   });
 
-  it('removes private structure through the existing retained File deletion and cleanup fence', async () => {
+  it('removes legacy private structure only after inventory reconciliation and cleanup', async () => {
     const lease = await processing();
     await fixture.repository.publish(lease, result(), now);
     await fixture.repository.confirmCleanup(localGone(lease), now);
+    const fresh = (await raw())!;
+    expect(fresh.retrievalCreation).toEqual({
+      version: 1,
+      owner: { tenantId: user.tenantId, userId: user.userId },
+      fileId: 'structure',
+      acceptedAt: now,
+      state: 'empty',
+    });
+    // Represent retained legacy data predating File birth custody. Only this isolated row
+    // loses its creation record; fresh production Files retain their known-empty proof.
+    const legacy = await db.models.File.collection.updateOne(
+      { _id: fresh._id },
+      { $unset: { retrievalCreation: '' } },
+    );
+    expect(legacy.modifiedCount).toBe(1);
+    expect(await raw()).not.toHaveProperty('retrievalCreation');
     await fixture.repository.delete(user, 'structure', now);
-    await createFileRetentionMethods(db).finalizeFileSourceDeletion(user, ['structure']);
+    const lifecycle = createFileRetentionMethods(db);
+    // Unknown legacy inventory must retain original evidence even in this no-indexing fixture.
+    expect(await lifecycle.finalizeFileSourceDeletion(user, ['structure'])).toEqual({
+      completedFileIds: [],
+    });
+    expect(await raw()).toHaveProperty('documentStructure');
+    const retained = (await raw())!;
+    expect(retained.managedRetrieval).toBeUndefined();
+    const evidence = captureManagedRetrievalInventoryEvidence(retained);
+    const hash = (value: unknown) =>
+      createHash('sha256').update(canonicalManagedJson(value)).digest('hex');
+    // This isolated fixture has no index dispatch/backend work. Its complete test topology
+    // explicitly attests zero obligations; configuration absence is never used as evidence.
+    const writer = { writerId: 'structure-fixture-writer', retired: true, pendingWork: 0 };
+    const payload = {
+      backendIdentity: 'structure-fixture-backend',
+      owner: evidence.owner,
+      fileId: evidence.fileId,
+      evidenceSha256: evidence.evidenceSha256,
+      observedAt: now,
+      complete: true as const,
+      obligations: [],
+    };
+    const inventoryReceiptSha256 = hash(payload);
+    const store = createUploadStore(db, { securityPolicySha256: policy });
+    await store.transaction(async (_session, global) => {
+      global.enabled = false;
+    });
+    const snapshot = await fixture.repository.reconciliationSnapshot(now);
+    const activation = createUploadActivationMethods(store, {
+      retrievalInventoryAuthority: {
+        topologySha256: hash({ writers: [writer.writerId], backends: [payload.backendIdentity] }),
+        writers: [{ writerId: writer.writerId, retirementReceiptSha256: hash(writer) }],
+        backends: [{ backendIdentity: payload.backendIdentity, inventoryReceiptSha256 }],
+      },
+    });
+    await activation.reconcileFileRetrievalInventory(
+      {
+        reconciliationId: 'structure-fixture-inventory',
+        storeId: snapshot.storeId,
+        revision: snapshot.revision,
+        observedAt: now,
+        owner: evidence.owner,
+        fileId: evidence.fileId,
+        evidenceSha256: evidence.evidenceSha256,
+        backends: [{ ...payload, inventoryReceiptSha256 }],
+      },
+      now,
+    );
+    expect((await raw())!.managedRetrieval).toMatchObject({
+      inventory: 'known',
+      obligations: [],
+      inventoryReceipt: { evidenceSha256: evidence.evidenceSha256 },
+    });
+    expect(await lifecycle.prepareFileSourceDeletion(user, ['structure'])).toEqual({
+      preparedFileIds: ['structure'],
+    });
     await fixture.repository.confirmCleanup(
       { ...localGone(lease), originalAbsent: true, textAndHistoryRemoved: true },
       now,
     );
+    expect(await lifecycle.finalizeFileSourceDeletion(user, ['structure'])).toEqual({
+      completedFileIds: ['structure'],
+    });
     expect(await raw()).not.toHaveProperty('documentStructure');
     expect(await raw()).not.toHaveProperty('text');
     expect((await fixture.repository.metrics(now)).textBytes).toBe(0);

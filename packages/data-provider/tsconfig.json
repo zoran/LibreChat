@@ -1,6 +1,7 @@
 {
   "compilerOptions": {
     "declaration": true,
+    "rootDir": "./src",
     "declarationDir": "./dist/types",
     "module": "esnext",
     "noImplicitAny": true,

@@ -13,6 +13,7 @@ import type {
 import type { ScheduleMCPOutcome, ScheduledMCPIdentity } from 'librechat-data-provider';
 import type { RunStep, StandardGraph } from '@librechat/agents';
 import type { QuoteSourceRef } from 'librechat-data-provider';
+import type { GenerationCleanupScope, SourceActorSettlement } from './SourceCleanup';
 import type { AgentEventDetachedTerminalEvidence } from '~/agents/triggers/types';
 import type { EarlyBufferOverflowState } from '../../types/earlyBufferRecovery';
 import type { ActivityPhaseSnapshot } from '~/agents/activityPhases/runtime';
@@ -23,6 +24,13 @@ import type { SerializedQuoteRetention } from '~/files/retention';
 import type { RecoveredSteerPayload } from '../SteerRecovery';
 import type { MCPRuntimeRequestBody } from '~/mcp/types';
 
+export interface SourceCleanupProjection {
+  jobs: SerializableJobData[];
+  cursor?: string;
+  complete: boolean;
+  /** A retained source copy has no current exact generation/provider custody. Never omit it. */
+  unresolvedRecovery?: boolean;
+}
 /**
  * Detached Event Actor execution guarantee advertised by a generation store.
  *
@@ -150,7 +158,7 @@ export function failInitialSourceInventory(): never {
 const INITIAL_INVENTORY_JOB_FIELDS: ReadonlySet<string> = new Set(
   (
     'sourceReplayIntent sourceReplayHeld sourceReplayChunkBytes sourceReplayChunkEntries ' +
-    'sourceRetention sourceRetentionRevokedAt sourceRetentionPurged sourceRetentionExpiresAt ' +
+    'sourceRetention sourceRetentionRevokedAt sourceRetentionPurged sourceRetentionExpiresAt sourceActorSettlement ' +
     'streamId userId tenantId status createdAt generationProtocolVersion checkpointNamespace ' +
     'completedAt conversationId error earlyBufferOverflow firstSubscriberAttachedAt activeSubscriberLeases ' +
     'durableEventCount idempotencyClientRequestId recoveredSteerId userMessage responseMessageId isRegenerate ' +
@@ -444,6 +452,7 @@ export function sourceSafeJobPatch(
     sourceRetention: _binding,
     sourceRetentionRevokedAt: _revoked,
     sourceRetentionPurged: _purged,
+    sourceActorSettlement: _actor,
     sourceReplayIntent: _intent,
     sourceReplayHeld: _held,
     sourceReplayChunkBytes: _bytes,
@@ -474,6 +483,7 @@ export interface SerializableJobData {
   sourceRetention?: GenerationSourceRetention;
   sourceRetentionRevokedAt?: number;
   sourceRetentionPurged?: boolean;
+  sourceActorSettlement?: SourceActorSettlement;
   streamId: string;
   userId: string;
   tenantId?: string;
@@ -1351,6 +1361,12 @@ export interface IJobStore {
 
   /** Optional only for source-free custom stores; source-bearing admission requires all source operations. */
   getSourceReplayJob?(streamId: string): Promise<SerializableJobData | null>;
+  captureSourceCleanupPage?(
+    scope: GenerationCleanupScope,
+    cursor?: string,
+  ): Promise<SourceCleanupProjection>;
+  /** Actual app actor only; never exposed by the generation cleanup control port. */
+  recordSourceActorSettlement?(receipt: SourceActorSettlement): Promise<boolean>;
   prepareSourceReplay?(intent: SourceReplayIntent): Promise<SourceReplayIntent>;
   commitSourceReplay?(intent: SourceReplayIntent): Promise<boolean>;
   listSourceReplayIntents?(): Promise<SourceReplayIntent[]>;

@@ -124,6 +124,8 @@ jest.mock('@librechat/api', () => {
     },
   );
   return {
+    requiresLegacyVectorDeletion: jest.requireActual('../../../../packages/api/src/files/deletion')
+      .requiresLegacyVectorDeletion,
     sanitizeFilename: jest.fn((n) => n),
     /** Grants both; these specs vary the capability set, not the role. */
     resolveToolRoleGrants: jest.fn(async () => ({ runCode: true, fileSearch: true })),
@@ -172,14 +174,9 @@ jest.mock('@librechat/api', () => {
       }
       return getRetentionExpiry(req);
     }),
-    sweepExpiredFiles: jest.fn().mockResolvedValue({ scanned: 0, deleted: 0, failed: 0 }),
-    startExpiredFileSweep: jest.fn().mockReturnValue('sweep-interval'),
-    createExpiredFileSweepRequest: jest.fn(({ appConfig, file, userId }) => ({
-      config: appConfig,
-      body: {},
-      user: { id: userId, tenantId: file.tenantId },
-    })),
-    isLeader: jest.fn().mockResolvedValue(true),
+    fileDeletionWorkOwner: jest
+      .requireActual('../../../../packages/api/src/files/deletion')
+      .createFileDeletionWorkOwner(),
     GenerationJobManager: { revokeFileSourceGenerations: jest.fn() },
     purgeFileSourceCheckpoints: jest.fn().mockResolvedValue(undefined),
   };
@@ -206,6 +203,7 @@ jest.mock('~/server/services/Tools/credentials', () => ({
 
 jest.mock('~/models', () => ({
   revokeFileSources: jest.fn(),
+  assertFileSourceDeletionReady: jest.fn().mockResolvedValue(undefined),
   prepareFileSourceDeletion: jest.fn(),
   getFileSourceDeletionCandidates: jest.fn(),
   redactFileSourceContent: jest.fn(),
@@ -262,12 +260,7 @@ jest.mock('./VectorDB/crud', () => ({
   uploadVectors: jest.fn().mockResolvedValue({ embedded: true, filename: 'embedded-upload.bin' }),
 }));
 
-const {
-  getRetentionExpiry,
-  getAgentFileRetentionExpiry,
-  sweepExpiredFiles: sweepExpiredFilesWithDeps,
-  startExpiredFileSweep: startExpiredFileSweepWithDeps,
-} = require('@librechat/api');
+const { getRetentionExpiry, getAgentFileRetentionExpiry } = require('@librechat/api');
 const {
   EModelEndpoint,
   EToolResources,
@@ -290,8 +283,6 @@ const {
   processFileUpload,
   processFileURL,
   retrieveAndProcessFile,
-  sweepExpiredFiles,
-  startExpiredFileSweep,
   filterFile,
 } = require('./process');
 const {
@@ -2852,67 +2843,6 @@ describe('processDeleteRequest', () => {
   });
 });
 
-describe('sweepExpiredFiles', () => {
-  beforeEach(() => {
-    jest.clearAllMocks();
-  });
-
-  it('delegates expired file sweeping to the shared package with backend dependencies', async () => {
-    const options = {
-      appConfig: { paths: { publicPath: '/tmp/public', uploads: '/tmp/uploads' } },
-      limit: 1,
-    };
-    sweepExpiredFilesWithDeps.mockResolvedValue({ scanned: 1, deleted: 1, failed: 0 });
-
-    const result = await sweepExpiredFiles(options);
-
-    expect(sweepExpiredFilesWithDeps).toHaveBeenCalledWith(
-      options,
-      expect.objectContaining({
-        getExpiredFiles: db.getExpiredFiles,
-        processDeleteRequest: expect.any(Function),
-        incrementFileDeletionAttempts: db.incrementFileDeletionAttempts,
-        deferExpiredFile: db.deferExpiredFile,
-        logger: expect.objectContaining({
-          error: expect.any(Function),
-          info: expect.any(Function),
-          warn: expect.any(Function),
-        }),
-      }),
-    );
-    expect(result).toEqual({ scanned: 1, deleted: 1, failed: 0 });
-  });
-});
-
-describe('startExpiredFileSweep', () => {
-  beforeEach(() => {
-    jest.clearAllMocks();
-  });
-
-  it('delegates background sweep startup to the shared package with system context', () => {
-    const options = {
-      appConfig: { paths: { publicPath: '/tmp/public', uploads: '/tmp/uploads' } },
-    };
-
-    const interval = startExpiredFileSweep(options);
-
-    expect(startExpiredFileSweepWithDeps).toHaveBeenCalledWith(
-      options,
-      expect.objectContaining({
-        sweepExpiredFiles: expect.any(Function),
-        runAsSystem: expect.any(Function),
-        isLeader: expect.any(Function),
-        logger: expect.objectContaining({
-          error: expect.any(Function),
-          info: expect.any(Function),
-          warn: expect.any(Function),
-        }),
-      }),
-    );
-    expect(interval).toBe('sweep-interval');
-  });
-});
-
 describe('uploads with no consumer on the agent record', () => {
   test('accepts a type the record shows no tool for', async () => {
     /* Skills contribute file search and code execution for a turn without being written
@@ -3589,6 +3519,49 @@ describe('upload ledger joins the existing File deletion owner', () => {
   });
   afterEach(() => getUploadRuntime.mockReturnValue(undefined));
 
+  it('composition deletes fresh managed text without legacy vectors even with a configured RAG endpoint', async () => {
+    const previous = process.env.RAG_API_URL;
+    process.env.RAG_API_URL = 'https://unavailable.invalid';
+    try {
+      const managed = { ...file, embedded: true };
+      db.getFileSourceDeletionCandidates.mockResolvedValue([managed]);
+      await expect(processDeleteRequest({ req, files: [managed] })).resolves.toEqual({
+        deletedFileIds: ['upload'],
+        failedFileIds: [],
+      });
+      expect(db.assertFileSourceDeletionReady).toHaveBeenCalledWith(
+        { userId: 'owner', tenantId: 'tenant' },
+        ['upload'],
+      );
+      expect(cleanup.removeFileOriginal).toHaveBeenCalledWith(task);
+      expect(getStrategyFunctions).not.toHaveBeenCalled();
+    } finally {
+      if (previous === undefined) delete process.env.RAG_API_URL;
+      else process.env.RAG_API_URL = previous;
+    }
+  });
+  it('composition preserves unknown inventory before original removal when retrieval is absent', async () => {
+    db.assertFileSourceDeletionReady.mockRejectedValueOnce(new Error('inventory unresolved'));
+    await expect(processDeleteRequest({ req, files: [file] })).rejects.toThrow(
+      'inventory unresolved',
+    );
+    expect(cleanup.removeFileOriginal).not.toHaveBeenCalled();
+    expect(getStrategyFunctions).not.toHaveBeenCalled();
+  });
+  it('composition fences generation before a failed managed purge and retains the original', async () => {
+    const retrieval = {
+      purge: jest.fn(async () => {
+        events.push('retrieval-purge');
+        throw new Error('purge pending');
+      }),
+    };
+    getUploadRuntime.mockReturnValue({ cleanup, retrieval });
+    await expect(processDeleteRequest({ req, files: [file] })).rejects.toThrow('purge pending');
+    expect(events).toEqual(['ledger-fence', 'file-revoke', 'generation-revoke', 'retrieval-purge']);
+    expect(cleanup.removeFileOriginal).not.toHaveBeenCalled();
+    expect(db.assertFileSourceDeletionReady).not.toHaveBeenCalled();
+  });
+
   it('completes managed cleanup for a bodyless account deletion', async () => {
     const bodylessReq = { config: req.config, user: req.user };
 
@@ -3720,19 +3693,12 @@ describe('upload ledger joins the existing File deletion owner', () => {
     expect(getStrategyFunctions).not.toHaveBeenCalled();
   });
 
-  it('calls managed recovery only through the existing File sweep dependency', async () => {
-    await sweepExpiredFiles({ appConfig: {}, limit: 3 });
-    const dependencies = sweepExpiredFilesWithDeps.mock.calls[0][1];
-    cleanup.sweep.mockImplementation(async ({ limit, deleteAcceptedFile }) => {
-      expect(limit).toBe(3);
-      expect(await deleteAcceptedFile(task)).toBe(true);
-      return { scanned: 1, cleaned: 1, pending: 0 };
+  it('keeps requested File deletion separate from managed policy discovery', async () => {
+    await expect(processDeleteRequest({ req, files: [file] })).resolves.toEqual({
+      deletedFileIds: ['upload'],
+      failedFileIds: [],
     });
-    await expect(dependencies.sweepManagedUploads()).resolves.toEqual({
-      scanned: 1,
-      cleaned: 1,
-      pending: 0,
-    });
+    expect(cleanup.sweep).not.toHaveBeenCalled();
     expect(cleanup.finishFileDeletion).toHaveBeenCalledWith(task, proof);
   });
 });
@@ -4069,5 +4035,230 @@ describe('checkpoint purge joins managed File deletion', () => {
     });
     expect(purge).not.toHaveBeenCalled();
     expect(db.revokeFileSources).not.toHaveBeenCalled();
+  });
+});
+
+describe('foreground File deletion promise census', () => {
+  const { createFileDeletionWorkOwner } = jest.requireActual(
+    '../../../../packages/api/src/files/deletion',
+  );
+  const { fileDeletionWorkOwner: owner } = require('@librechat/api');
+  const deferred = () => {
+    let resolve;
+    let reject;
+    const promise = new Promise((yes, no) => {
+      resolve = yes;
+      reject = no;
+    });
+    return { promise, resolve, reject };
+  };
+  const flush = async () => {
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+  };
+  const req = () => ({ body: {}, config: {}, user: { id: 'user-123', tenantId: 'tenant-a' } });
+  const file = (id, extra = {}) => ({
+    file_id: id,
+    filepath: '/uploads/' + id,
+    source: FileSources.local,
+    ...extra,
+  });
+  beforeEach(() => {
+    jest.clearAllMocks();
+    Object.assign(owner, createFileDeletionWorkOwner());
+    require('~/server/services/Uploads').getUploadRuntime.mockReturnValue(undefined);
+    db.deleteFiles.mockResolvedValue({ deletedCount: 1 });
+    db.removeAgentResourceFilesFromAllAgents.mockResolvedValue(undefined);
+    getStrategyFunctions.mockReset();
+  });
+  afterEach(() => jest.useRealTimers());
+
+  it('joins an earlier original after a later strategy scheduling failure', async () => {
+    const original = deferred();
+    getStrategyFunctions.mockImplementation((source) =>
+      source === FileSources.local ? { deleteFile: () => original.promise } : {},
+    );
+    let finished = false;
+    const run = processDeleteRequest({
+      req: req(),
+      files: [file('a'), file('b', { source: 'unsupported' })],
+    });
+    void run.catch(() => {
+      finished = true;
+    });
+    await flush();
+    owner.maintenance.pauseAdmissions('hold');
+    expect(finished).toBe(false);
+    expect(await owner.maintenance.getMaintenanceCensus('hold')).toMatchObject({
+      pendingWrites: 1,
+      complete: false,
+    });
+    original.resolve();
+    await expect(run).rejects.toThrow('Delete function not implemented');
+    expect(db.deleteFiles).not.toHaveBeenCalled();
+    expect(await owner.maintenance.getMaintenanceCensus('hold')).toMatchObject({
+      pendingWrites: 0,
+      complete: false,
+    });
+  });
+
+  it('joins another secondary original after the first secondary rejects', async () => {
+    const code = deferred();
+    getStrategyFunctions.mockImplementation((source) => {
+      if (source === FileSources.vectordb)
+        return { deleteFile: () => Promise.reject(new Error('vector reply lost')) };
+      if (source === FileSources.execute_code) return { deleteFile: () => code.promise };
+      return { deleteFile: async () => undefined };
+    });
+    let finished = false;
+    const run = processDeleteRequest({
+      req: req(),
+      files: [file('a', { embedded: true, metadata: { codeEnvRef: 'code' } })],
+    });
+    void run.then(() => {
+      finished = true;
+    });
+    await flush();
+    owner.maintenance.pauseAdmissions('hold');
+    expect(finished).toBe(false);
+    expect(await owner.maintenance.getMaintenanceCensus('hold')).toMatchObject({
+      pendingWrites: 1,
+    });
+    code.resolve();
+    await expect(run).resolves.toEqual({ deletedFileIds: [], failedFileIds: ['a'] });
+    expect(await owner.maintenance.getMaintenanceCensus('hold')).toMatchObject({
+      pendingWrites: 0,
+      complete: false,
+    });
+  });
+
+  it.each(['unknown first', 'absence first'])(
+    'preserves %s rejection order and retains any secondary uncertainty',
+    async (order) => {
+      const vector = deferred();
+      const code = deferred();
+      getStrategyFunctions.mockImplementation((source) => {
+        if (source === FileSources.vectordb) return { deleteFile: () => vector.promise };
+        if (source === FileSources.execute_code) return { deleteFile: () => code.promise };
+        return { deleteFile: async () => undefined };
+      });
+      const run = processDeleteRequest({
+        req: req(),
+        files: [file('a', { embedded: true, metadata: { codeEnvRef: 'code' } })],
+      });
+      await flush();
+      const absent = Object.assign(new Error('gone'), { code: 'ENOENT' });
+      if (order === 'unknown first') {
+        code.reject(new Error('reply lost'));
+        await flush();
+        vector.reject(absent);
+      } else {
+        vector.reject(absent);
+        await flush();
+        code.reject(new Error('reply lost'));
+      }
+      const result = await run;
+      expect(result).toEqual(
+        order === 'unknown first'
+          ? { deletedFileIds: [], failedFileIds: ['a'] }
+          : { deletedFileIds: ['a'], failedFileIds: [] },
+      );
+      expect(await owner.maintenance.getMaintenanceCensus(null)).toMatchObject({
+        pendingWrites: 0,
+        complete: false,
+      });
+    },
+  );
+
+  it.each(['metadata', 'agent references'])(
+    'retains original %s writes through pause',
+    async (phase) => {
+      const write = deferred();
+      getStrategyFunctions.mockReturnValue({ deleteFile: async () => undefined });
+      if (phase === 'metadata') db.deleteFiles.mockReturnValueOnce(write.promise);
+      else db.removeAgentResourceFilesFromAllAgents.mockReturnValueOnce(write.promise);
+      const run = processDeleteRequest({ req: req(), files: [file('a')] });
+      await flush();
+      owner.maintenance.pauseAdmissions('hold');
+      expect(await owner.maintenance.getMaintenanceCensus('hold')).toMatchObject({
+        pendingWrites: 1,
+        complete: true,
+      });
+      write.resolve();
+      await expect(run).resolves.toEqual({ deletedFileIds: ['a'], failedFileIds: [] });
+      expect(await owner.maintenance.getMaintenanceCensus('hold')).toMatchObject({
+        pendingWrites: 0,
+        complete: true,
+      });
+    },
+  );
+
+  it('counts the actual leaky-bucket callback before dispatch and through shutdown', async () => {
+    jest.useFakeTimers();
+    const remote = deferred();
+    require('~/server/utils/queue').LB_QueueAsyncCall.mockImplementation(
+      jest.requireActual('~/server/utils/queue').LB_QueueAsyncCall,
+    );
+    require('~/server/controllers/assistants/helpers').getOpenAIClient.mockResolvedValue({
+      openai: {},
+    });
+    getStrategyFunctions.mockReturnValue({ deleteFile: () => remote.promise });
+    const request = req();
+    request.config.endpoints = { [EModelEndpoint.assistants]: {} };
+    const run = processDeleteRequest({
+      req: request,
+      files: [file('a', { source: FileSources.openai })],
+    });
+    await flush();
+    owner.maintenance.pauseAdmissions('hold');
+    expect(await owner.maintenance.getMaintenanceCensus('hold')).toMatchObject({
+      queuedContinuations: 1,
+      pendingWrites: 1,
+    });
+    const drain = owner.drain();
+    await jest.advanceTimersByTimeAsync(17);
+    expect(await owner.maintenance.getMaintenanceCensus('hold')).toMatchObject({
+      queuedContinuations: 0,
+      pendingWrites: 1,
+    });
+    remote.resolve();
+    await expect(run).resolves.toEqual({ deletedFileIds: ['a'], failedFileIds: [] });
+    await drain;
+    await jest.advanceTimersByTimeAsync(17);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('keeps already-admitted foreground descendants live across maintenance pause', async () => {
+    const discovery = deferred();
+    getStrategyFunctions.mockReturnValue({ deleteFile: async () => undefined });
+    const run = owner.run(async (work) => {
+      await discovery.promise;
+      return processDeleteRequest({ req: req(), files: [file('a')], work });
+    });
+    owner.maintenance.pauseAdmissions('hold');
+    expect(await owner.maintenance.getMaintenanceCensus('hold')).toMatchObject({
+      pendingWrites: 1,
+    });
+    discovery.resolve();
+    await expect(run).resolves.toEqual({ deletedFileIds: ['a'], failedFileIds: [] });
+    expect(await owner.maintenance.getMaintenanceCensus('hold')).toMatchObject({
+      pendingWrites: 0,
+      complete: true,
+    });
+  });
+
+  it('preserves legacy absent-object success and does not manufacture uncertainty', async () => {
+    getStrategyFunctions.mockReturnValue({
+      deleteFile: async () => {
+        throw Object.assign(new Error('gone'), { code: 'ENOENT' });
+      },
+    });
+    await expect(processDeleteRequest({ req: req(), files: [file('a')] })).resolves.toEqual({
+      deletedFileIds: ['a'],
+      failedFileIds: [],
+    });
+    expect(await owner.maintenance.getMaintenanceCensus(null)).toMatchObject({
+      complete: true,
+      pendingWrites: 0,
+    });
   });
 });

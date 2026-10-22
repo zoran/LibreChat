@@ -1,4 +1,5 @@
 /** Private technical recovery snapshots. Shape never establishes peer authority or writer exit. */
+import type { StorageDeletionBinding, StorageDeletionTerminalReceipt } from './storage-deletion';
 import type { UploadSecurityExecution, UploadSecuritySettlement } from './upload-security';
 import type { UploadWorker } from './upload-management';
 import {
@@ -7,6 +8,7 @@ import {
   readUploadSecurityExecution,
   readUploadSecuritySettlement,
 } from './upload-security';
+import { isStorageDeletionBinding, isStorageDeletionResult } from './storage-deletion';
 
 export type UploadIntakeRecoveryBinding = {
   version: 1;
@@ -14,6 +16,14 @@ export type UploadIntakeRecoveryBinding = {
   transferGeneration: number;
   worker: UploadWorker;
   capabilitySha256: string;
+};
+
+/** Persisted owner accounting commit, never a caller's local-settlement assertion. */
+export type UploadOwnerCleanupReceipt = {
+  binding: StorageDeletionBinding;
+  receipt: StorageDeletionTerminalReceipt;
+  receiptSHA256: string;
+  consumerCommitId: string;
 };
 
 export type UploadIntakeRecovery = {
@@ -25,6 +35,7 @@ export type UploadIntakeRecovery = {
   acknowledged: boolean;
   storageOutcome: 'not_started' | 'absent' | 'durable' | 'unknown';
   appWriterStopped: boolean;
+  cleanupReceipt?: UploadOwnerCleanupReceipt;
   promotion?: { promotionId: string; worker: UploadWorker };
   securityExecution?: UploadSecurityExecution;
   securitySettlement?: UploadSecuritySettlement;
@@ -127,11 +138,53 @@ export function readUploadIntakeRecoveryBinding(
   return identity ? { ...identity, capabilitySha256: data.capabilitySha256 } : null;
 }
 
+function cleanupReceipt(value: unknown, target: Scope): UploadOwnerCleanupReceipt | null {
+  const data = closed(value, ['binding', 'receipt', 'receiptSHA256', 'consumerCommitId']);
+  if (!data) return null;
+  const keys = [
+    'protocol',
+    'requestId',
+    'generation',
+    'authorityBindingSHA256',
+    'acceptedObjectSHA256',
+    'bucket',
+    'key',
+  ];
+  const binding = closed(data.binding, keys);
+  const receipt = closed(data.receipt, [
+    ...keys,
+    'state',
+    'obligationId',
+    'aggregateRevision',
+    'proofSHA256',
+  ]);
+  if (
+    !binding ||
+    !receipt ||
+    !isStorageDeletionBinding(binding) ||
+    !isStorageDeletionResult(receipt, binding) ||
+    receipt.state !== 'durable_delete_complete' ||
+    binding.generation !== String(target.transferGeneration) ||
+    !binding.key.endsWith(`/${target.operationId}.${target.transferGeneration}__original`) ||
+    typeof data.receiptSHA256 !== 'string' ||
+    !/^[a-f0-9]{64}$/.test(data.receiptSHA256) ||
+    typeof data.consumerCommitId !== 'string' ||
+    !/^[a-zA-Z0-9_-]{1,128}$/.test(data.consumerCommitId)
+  )
+    return null;
+  return {
+    binding: { ...binding },
+    receipt: { ...receipt },
+    receiptSHA256: data.receiptSHA256,
+    consumerCommitId: data.consumerCommitId,
+  };
+}
+
 export function readUploadIntakeRecovery(value: unknown): UploadIntakeRecovery | null {
   const data = closed(
     value,
     [...SCOPE_KEYS, 'closed', 'acknowledged', 'storageOutcome', 'appWriterStopped'],
-    ['promotion', 'securityExecution', 'securitySettlement'],
+    ['promotion', 'securityExecution', 'securitySettlement', 'cleanupReceipt'],
   );
   if (
     !data ||
@@ -141,12 +194,18 @@ export function readUploadIntakeRecovery(value: unknown): UploadIntakeRecovery |
     (data.storageOutcome !== 'not_started' &&
       data.storageOutcome !== 'absent' &&
       data.storageOutcome !== 'durable' &&
-      data.storageOutcome !== 'unknown') ||
-    data.appWriterStopped !== (data.storageOutcome !== 'unknown')
+      data.storageOutcome !== 'unknown')
   )
     return null;
   const identity = scope(data);
   if (!identity) return null;
+  const cleanup =
+    'cleanupReceipt' in data ? cleanupReceipt(data.cleanupReceipt, identity) : undefined;
+  if (
+    cleanup === null ||
+    data.appWriterStopped !== (data.storageOutcome !== 'unknown' || !!cleanup)
+  )
+    return null;
   let promotion: UploadIntakeRecovery['promotion'];
   if ('promotion' in data) {
     const record = closed(data.promotion, ['promotionId', 'worker']);
@@ -178,7 +237,7 @@ export function readUploadIntakeRecovery(value: unknown): UploadIntakeRecovery |
   }
   if (
     data.acknowledged &&
-    (data.storageOutcome === 'unknown' ||
+    ((data.storageOutcome === 'unknown' && !cleanup) ||
       (securityExecution &&
         !isCompleteUploadSecuritySettlement(securitySettlement, securityExecution)))
   )
@@ -189,6 +248,7 @@ export function readUploadIntakeRecovery(value: unknown): UploadIntakeRecovery |
     acknowledged: data.acknowledged,
     storageOutcome: data.storageOutcome,
     appWriterStopped: data.appWriterStopped,
+    ...(cleanup ? { cleanupReceipt: cleanup } : {}),
     ...(promotion ? { promotion } : {}),
     ...(securityExecution ? { securityExecution } : {}),
     ...(securitySettlement ? { securitySettlement } : {}),

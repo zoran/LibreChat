@@ -1,12 +1,11 @@
 /** Private provenance for trusted upload consumers; never a public upload authorization. */
-import { UPLOAD_RETENTION_MS } from './upload-management';
-import { readUploadSecuritySubject } from './upload-security';
-import type { UploadScope } from './upload-management';
 import type { UploadSecuritySubject } from './upload-security';
+import type { UploadScope } from './upload-management';
+import { readUploadSecuritySubject } from './upload-security';
 
-export const UPLOAD_DERIVED_MAX_SOURCES = 64;
-export const UPLOAD_DERIVED_MAX_DESCENDANTS = 64;
-export const UPLOAD_DERIVED_MAX_ORIGIN_BYTES = 16 * 1024;
+export const UPLOAD_DERIVED_MAX_SOURCES: number = 64;
+export const UPLOAD_DERIVED_MAX_DESCENDANTS: number = 64;
+export const UPLOAD_DERIVED_MAX_ORIGIN_BYTES: number = 16 * 1024;
 
 export type UploadDerivedBinding = {
   purpose: 'workspace-draft';
@@ -20,10 +19,12 @@ export type UploadDerivedIntent = {
 export type UploadDerivedSource = {
   subject: UploadSecuritySubject;
   policySha256: string;
+  /** Immutable actual original-receipt binding; captured expiry is provenance only. */
+  sourceBindingSha256: string;
   expiresAt: number;
 };
 export type UploadDerivedOrigin = UploadDerivedIntent & {
-  version: 1;
+  version: 2;
   ancestors: UploadDerivedSource[];
 };
 
@@ -101,17 +102,39 @@ export function readUploadDerivedIntent(value: unknown): UploadDerivedIntent | n
   }
 }
 
+export type HistoricalUploadDerivedOrigin = UploadDerivedIntent & {
+  version: 1;
+  ancestors: Omit<UploadDerivedSource, 'sourceBindingSha256'>[];
+};
+
+/** Historical parsing grants custody only; all current authorization accepts v2 exclusively. */
+export function readHistoricalUploadDerivedOrigin(
+  value: unknown,
+): UploadDerivedOrigin | HistoricalUploadDerivedOrigin | null {
+  return parseOrigin(value, 2) ?? parseOrigin(value, 1);
+}
 export function readUploadDerivedOrigin(value: unknown): UploadDerivedOrigin | null {
+  return parseOrigin(value, 2) as UploadDerivedOrigin | null;
+}
+function parseOrigin(
+  value: unknown,
+  version: 1 | 2,
+): UploadDerivedOrigin | HistoricalUploadDerivedOrigin | null {
   try {
     const input = record(value, ['version', 'binding', 'directSourceFileIds', 'ancestors']);
-    if (!input || input.version !== 1) return null;
+    if (!input || input.version !== version) return null;
     const captured = intent(input.binding, input.directSourceFileIds);
     const sources = array(input.ancestors);
     if (!captured || !sources) return null;
     const ancestors: UploadDerivedSource[] = [];
     const ids = new Set<string>();
     for (const value of sources) {
-      const source = record(value, ['subject', 'policySha256', 'expiresAt']);
+      const source = record(value, [
+        'subject',
+        'policySha256',
+        'expiresAt',
+        ...(version === 2 ? ['sourceBindingSha256'] : []),
+      ]);
       if (!source) return null;
       const subject = readUploadSecuritySubject(source.subject);
       if (
@@ -120,6 +143,9 @@ export function readUploadDerivedOrigin(value: unknown): UploadDerivedOrigin | n
         typeof source.policySha256 !== 'string' ||
         source.policySha256.length !== 64 ||
         /[^a-f0-9]/.test(source.policySha256) ||
+        (version === 2 &&
+          (typeof source.sourceBindingSha256 !== 'string' ||
+            !/^[a-f0-9]{64}$/.test(source.sourceBindingSha256))) ||
         typeof source.expiresAt !== 'number' ||
         !Number.isSafeInteger(source.expiresAt) ||
         source.expiresAt <= 0 ||
@@ -135,7 +161,12 @@ export function readUploadDerivedOrigin(value: unknown): UploadDerivedOrigin | n
       )
         return null;
       ids.add(subject.operationId);
-      ancestors.push({ subject, policySha256: source.policySha256, expiresAt: source.expiresAt });
+      ancestors.push({
+        subject,
+        policySha256: source.policySha256,
+        expiresAt: source.expiresAt,
+        ...(version === 2 ? { sourceBindingSha256: source.sourceBindingSha256 as string } : {}),
+      } as UploadDerivedSource);
     }
     if (
       !captured.directSourceFileIds.every((id) => ids.has(id)) ||
@@ -146,7 +177,9 @@ export function readUploadDerivedOrigin(value: unknown): UploadDerivedOrigin | n
       if (a.subject.operationId < b.subject.operationId) return -1;
       return a.subject.operationId > b.subject.operationId ? 1 : 0;
     });
-    const origin: UploadDerivedOrigin = { version: 1, ...captured, ancestors };
+    const origin = { version, ...captured, ancestors } as
+      | UploadDerivedOrigin
+      | HistoricalUploadDerivedOrigin;
     return new TextEncoder().encode(JSON.stringify(origin)).length <=
       UPLOAD_DERIVED_MAX_ORIGIN_BYTES
       ? origin
@@ -170,12 +203,19 @@ export function uploadReservationFingerprint(
   return JSON.stringify(values);
 }
 
-export function uploadDerivedExpiresAt(acceptedAt: number, origin?: UploadDerivedOrigin): number {
-  const ownExpiry = acceptedAt + UPLOAD_RETENTION_MS;
-  if (!Number.isSafeInteger(acceptedAt) || acceptedAt < 0 || ownExpiry > 8_640_000_000_000_000)
-    throw new TypeError('Invalid upload acceptance time');
-  if (origin === undefined) return ownExpiry;
-  const snapshot = readUploadDerivedOrigin(origin);
-  if (!snapshot) throw new TypeError('Invalid derived upload origin');
-  return Math.min(ownExpiry, ...snapshot.ancestors.map((source) => source.expiresAt));
+/** Dates are capture provenance; current parent caps are resolved by the File owner. */
+export function sameUploadDerivedSource(a: UploadDerivedSource, b: UploadDerivedSource): boolean {
+  return (
+    a.sourceBindingSha256 === b.sourceBindingSha256 &&
+    a.policySha256 === b.policySha256 &&
+    JSON.stringify(a.subject) === JSON.stringify(b.subject)
+  );
+}
+export function sameUploadDerivedOrigin(a: UploadDerivedOrigin, b: UploadDerivedOrigin): boolean {
+  return (
+    JSON.stringify(a.binding) === JSON.stringify(b.binding) &&
+    JSON.stringify(a.directSourceFileIds) === JSON.stringify(b.directSourceFileIds) &&
+    a.ancestors.length === b.ancestors.length &&
+    a.ancestors.every((source, index) => sameUploadDerivedSource(source, b.ancestors[index]))
+  );
 }

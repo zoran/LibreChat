@@ -1,4 +1,6 @@
 import jwt from 'jsonwebtoken';
+import { validateManagedCapability } from 'librechat-data-provider';
+import type { ManagedCapability } from 'librechat-data-provider';
 
 export const AGENT_TRIGGER_SCOPE = 'agent_trigger';
 
@@ -49,3 +51,16 @@ export const isAgentTriggerRequest = (req?: AgentTriggerRequest): boolean => {
 /** Skip the shared loopback IP bucket while retaining per-user and concurrency limits. */
 export const exemptAgentTriggerFromIpLimiter = (req?: AgentTriggerRequest): boolean =>
   typeof req?._isAgentTrigger === 'boolean' ? req._isAgentTrigger : isAgentTriggerRequest(req);
+
+/** Sign only independently authorized managed claims with a dedicated backend key. */
+export function signManagedCapability(
+  value: unknown,
+  context: Parameters<typeof validateManagedCapability>[1],
+  signingKey: string,
+): string {
+  if (!/^[a-f0-9]{128}$/.test(signingKey)) {
+    throw new Error('Managed retrieval signing material is unavailable');
+  }
+  const claims: ManagedCapability = validateManagedCapability(value, context);
+  return jwt.sign(claims, signingKey, { algorithm: 'HS256', mutatePayload: false });
+}

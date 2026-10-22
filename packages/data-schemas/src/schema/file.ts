@@ -2,6 +2,7 @@ import mongoose, { Schema } from 'mongoose';
 import { FileContext, FileSources } from 'librechat-data-provider';
 import type { RunFileProvenance } from 'librechat-data-provider';
 import type { IMongoFile } from '~/types';
+import { fileRetentionActivitySchema } from './fileRetentionActivity';
 import { codeEnvRefMapSchema, codeEnvRefSchema } from './codeEnvRef';
 
 const runFileProvenanceSchema = new Schema<RunFileProvenance>(
@@ -212,7 +213,60 @@ const file: Schema<IMongoFile> = new Schema(
       index: true,
     },
     retentionAcceptedAt: { type: Date },
+    retentionCleanup: {
+      type: new Schema(
+        {
+          schema: { type: Number, required: true, enum: [1] },
+          revocationId: { type: String, required: true, maxlength: 256 },
+          jobId: { type: String, required: true, maxlength: 64 },
+          executionId: { type: String, required: true, maxlength: 64 },
+          capture: {
+            type: new Schema(
+              {
+                cursor: { type: String, default: null, maxlength: 128 },
+                complete: { type: Boolean, required: true },
+                recoveryUnresolved: { type: Boolean, required: true },
+              },
+              { _id: false, strict: 'throw' },
+            ),
+            required: true,
+          },
+          generationReceiptRef: { type: String, default: null, maxlength: 256 },
+          lifecycle: { type: Schema.Types.Mixed, default: undefined },
+        },
+        { _id: false, strict: 'throw' },
+      ),
+      select: false,
+      default: undefined,
+      validate: {
+        validator: (value: unknown) =>
+          value == null || Buffer.byteLength(JSON.stringify(value), 'utf8') <= 32768,
+        message: 'File cleanup custody exceeds its retained bound',
+      },
+    },
     retentionRevision: { type: Number },
+    retentionRevocationId: { type: String, maxlength: 36, select: false },
+    retentionActivity: { type: fileRetentionActivitySchema, default: undefined, select: false },
+    derivedRetention: {
+      type: new mongoose.Schema(
+        {
+          version: { type: Number, enum: [1], required: true },
+          ownDeadlineAt: { type: Date, required: true },
+          capBasis: { type: String, enum: ['admission', 'legacy-baseline'], required: true },
+          trackedSince: { type: Date, required: true },
+          deadlineGeneration: {
+            type: Number,
+            required: true,
+            min: 0,
+            validate: Number.isSafeInteger,
+          },
+          migrationEpoch: { type: String, maxlength: 128 },
+        },
+        { _id: false, strict: 'throw' },
+      ),
+      default: undefined,
+      select: false,
+    },
     retainedDerivativeBytes: { type: Number, default: 0, select: false },
     retainedDerivativeReservations: {
       type: [
@@ -230,6 +284,8 @@ const file: Schema<IMongoFile> = new Schema(
     uploadOperationId: { type: String },
     securityApproval: { type: mongoose.Schema.Types.Mixed, select: false },
     derivedOrigin: { type: mongoose.Schema.Types.Mixed, select: false },
+    managedRetrieval: { type: mongoose.Schema.Types.Mixed, select: false },
+    retrievalCreation: { type: mongoose.Schema.Types.Mixed, select: false },
     deletionRequestedAt: { type: Date },
     deletionCompletedAt: { type: Date },
     expiredAt: {
@@ -258,7 +314,12 @@ const file: Schema<IMongoFile> = new Schema(
         delete value.retainedDerivativeReservations;
         delete value.securityApproval;
         delete value.derivedOrigin;
+        delete value.derivedRetention;
+        delete value.retentionRevocationId;
+        delete value.retentionCleanup;
         delete value.documentStructure;
+        delete value.managedRetrieval;
+        delete value.retrievalCreation;
         delete value.library;
         return value;
       },
@@ -269,7 +330,12 @@ const file: Schema<IMongoFile> = new Schema(
         delete value.retainedDerivativeReservations;
         delete value.securityApproval;
         delete value.derivedOrigin;
+        delete value.derivedRetention;
+        delete value.retentionRevocationId;
+        delete value.retentionCleanup;
         delete value.documentStructure;
+        delete value.managedRetrieval;
+        delete value.retrievalCreation;
         delete value.library;
         return value;
       },
@@ -286,6 +352,14 @@ file.index(
   },
 );
 file.index({ expiredAt: 1 });
+file.index(
+  { 'retentionActivity.migrationEpoch': 1, file_id: 1 },
+  { name: 'file_original_migration' },
+);
+file.index(
+  { 'derivedRetention.migrationEpoch': 1, file_id: 1 },
+  { name: 'file_derived_migration' },
+);
 file.index(
   {
     user: 1,

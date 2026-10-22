@@ -20,15 +20,17 @@ import type {
 } from 'librechat-data-provider';
 import type { StoredUpload } from './uploadManagementStore';
 import type { IMongoFile } from '~/types';
+import { createFileRetentionMethods, FileSourceUnavailableError } from './fileRetention';
 import { createUploadManagementRepository } from './uploadManagement';
-import { createFileRetentionMethods } from './fileRetention';
+import { loadManagedFileSource } from './fileSourceAuthority';
+import { derivedSourceOf } from './fileDerivedRetention';
 import { createModels } from '~/models';
 
 describe('private derived upload reservations', () => {
   const db = new mongoose.Mongoose();
   let mongo: MongoMemoryReplSet;
   let repository: ReturnType<typeof createUploadManagementRepository>;
-  const now = Date.now();
+  let now = Date.now();
   const policy = 'c'.repeat(64);
   const user: UploadPrincipal = {
     authentication: 'verified-email',
@@ -91,7 +93,16 @@ describe('private derived upload reservations', () => {
     await db.models.File.init();
   });
   beforeEach(async () => {
-    for (const name of ['User', 'File', 'Message', 'UploadOperation', 'UploadCounter'])
+    now = Date.now();
+    for (const name of [
+      'User',
+      'File',
+      'Message',
+      'UploadOperation',
+      'UploadCounter',
+      'HousekeepingJob',
+      'FileReadReceipt',
+    ])
       if (db.models[name]) await db.models[name].deleteMany({});
     await db.models.User.create({
       _id: user.userId,
@@ -199,6 +210,21 @@ describe('private derived upload reservations', () => {
     await accept(lease, now - 1000);
     await process(lease, now - 1000);
   }
+  async function sourceReceipt(id: string) {
+    return derivedSourceOf(
+      await loadManagedFileSource(db, user, id, 'original', {
+        purpose: 'derived-parent',
+        securityPolicySha256: policy,
+      }),
+    );
+  }
+  async function readyDerived(id: string, sources: string[]) {
+    const derived = { ...intent(), directSourceFileIds: sources };
+    await repository.reserveDerived(user, { ...reservation(id, derived), derived }, now);
+    const lease = await transfer(id, now);
+    await accept(lease, now);
+    await process(lease, now);
+  }
   const operations = () =>
     db.connection.db!.collection<StoredUpload>(db.models.UploadOperation.collection.name);
   const raw = (id: string) => operations().findOne({ _id: id });
@@ -296,10 +322,10 @@ describe('private derived upload reservations', () => {
     ).rejects.toMatchObject({ code: 'principal_unavailable' });
   });
 
-  it('keeps ordinary exact28-day admission and rejects derived injection into its port', async () => {
+  it('keeps ordinary processing extension and rejects derived injection into its port', async () => {
     await source();
     expect((await repository.get(user, 'source', now)).expiresAt).toBe(
-      new Date(now - 1000 + UPLOAD_RETENTION_MS).toISOString(),
+      new Date(now - 1000 + UPLOAD_RETENTION_MS + 7 * 86400000).toISOString(),
     );
     await expect(repository.reserve(user, reservation('bad', intent()), now)).rejects.toMatchObject(
       { code: 'invalid_request' },
@@ -314,7 +340,13 @@ describe('private derived upload reservations', () => {
     const lease = await transfer('derived', now);
     const accepted = await accept(lease, now);
     expect(accepted.acceptedAt).toBe(new Date(now).toISOString());
-    expect(accepted.expiresAt).toBe(new Date(now - 1000 + UPLOAD_RETENTION_MS).toISOString());
+    expect(accepted.expiresAt).toBe(new Date(now + UPLOAD_RETENTION_MS).toISOString());
+    const acceptedFile = await db.models.File.findOne({ file_id: 'derived' })
+      .select('+derivedRetention')
+      .lean<IMongoFile>();
+    expect(acceptedFile!.derivedRetention!.ownDeadlineAt).toEqual(
+      new Date(now + UPLOAD_RETENTION_MS),
+    );
     await process(lease, now);
     const publicRow = await repository.get(user, 'derived', now);
     expect(publicRow.canUseInComposer).toBe(false);
@@ -358,37 +390,11 @@ describe('private derived upload reservations', () => {
     'validates %s transitive sources before lineage capacity without changing existing sources',
     async (ancestorState) => {
       await source();
-      const template = (await db.models.File.findOne({ file_id: 'source' })
-        .select('+securityApproval')
-        .lean<IMongoFile>())!;
       const ids = Array.from({ length: 64 }, (_, index) => `ancestor-${index}`);
-      const copy = (id: string) => ({
-        ...template,
-        _id: new mongoose.Types.ObjectId(),
-        file_id: id,
-        uploadOperationId: id,
-        filepath: `/api/files/managed/${id}`,
-        storageKey: `t/${user.tenantId}/managed-uploads/${user.userId}/${id}.${template.securityApproval!.subject.transferGeneration}__original`,
-        securityApproval: {
-          ...template.securityApproval,
-          subject: { ...template.securityApproval!.subject, operationId: id },
-        },
-      });
-      const heads = [ids.slice(0, 32), ids.slice(32)].map((group, index) => {
-        const derivedOrigin = {
-          version: 1,
-          binding: { purpose: 'workspace-draft', sourceId: 'draft', sourceRevision: 1 },
-          directSourceFileIds: group,
-          ancestors: group.map((id) => ({
-            subject: copy(id).securityApproval.subject,
-            policySha256: policy,
-            expiresAt: new Date(template.expiredAt!).getTime(),
-          })),
-        };
-        expect(readUploadDerivedOrigin(derivedOrigin)).not.toBeNull();
-        return { ...copy(`head-${index}`), derivedOrigin };
-      });
-      await db.models.File.collection.insertMany([...ids.map(copy), ...heads]);
+      for (const id of ids) await source(id);
+      const heads = ['head-0', 'head-1'];
+      await readyDerived(heads[0], ids.slice(0, 32));
+      await readyDerived(heads[1], ids.slice(32));
       if (ancestorState === 'missing') {
         await db.models.File.deleteOne({ file_id: ids[0] });
       } else if (ancestorState === 'malformed') {
@@ -399,7 +405,7 @@ describe('private derived upload reservations', () => {
       } else if (ancestorState === 'expired') {
         await db.models.File.updateOne({ file_id: ids[0] }, { expiredAt: new Date(now) });
       }
-      const derived = { ...intent(), directSourceFileIds: heads.map((head) => head.file_id) };
+      const derived = { ...intent(), directSourceFileIds: heads };
       const revisions = await db.models.File.find({}).select('file_id retentionRevision').lean();
       const counter = await db.models.UploadCounter.findById('global').lean();
       await expect(
@@ -417,48 +423,29 @@ describe('private derived upload reservations', () => {
         repository.reserveDerived(user, { ...reservation('revoked', derived), derived }, now),
       ).rejects.toMatchObject({ code: 'not_found' });
     },
+    180_000,
   );
   it('reports newly assembled origin byte capacity while keeping malformed stored origins unavailable', async () => {
     await source();
-    const template = (await db.models.File.findOne({ file_id: 'source' })
-      .select('+securityApproval')
-      .lean<IMongoFile>())!;
-    const ancestor = (id: string) => ({
-      subject: { ...template.securityApproval!.subject, operationId: id },
-      policySha256: policy,
-      expiresAt: new Date(template.expiredAt!).getTime(),
-    });
-    const ancestors = [ancestor('source')];
-    let previous = 'source';
-    let next: UploadDerivedOrigin | undefined;
-    for (let index = 1; index <= 64; index++) {
-      next = {
-        version: 1,
-        binding: intent().binding,
-        directSourceFileIds: [previous],
-        ancestors: [...ancestors],
-      };
-      if (!readUploadDerivedOrigin(next)) break;
-      const fileId = `lineage-${index}`;
-      await db.models.File.collection.insertOne({
-        ...template,
-        _id: new mongoose.Types.ObjectId(),
-        file_id: fileId,
-        uploadOperationId: fileId,
-        filepath: `/api/files/managed/${fileId}`,
-        storageKey: `t/${user.tenantId}/managed-uploads/${user.userId}/${fileId}.${template.securityApproval!.subject.transferGeneration}__original`,
-        securityApproval: { ...template.securityApproval!, subject: ancestor(fileId).subject },
-        derivedOrigin: next,
-      });
-      ancestors.push(ancestor(fileId));
-      previous = fileId;
-    }
+    const ids = Array.from({ length: 48 }, (_, index) => `byte-source-${index}`);
+    for (const id of ids) await source(id);
+    const heads = ['byte-head-left', 'byte-head-right'];
+    await readyDerived(heads[0], ids.slice(0, 24));
+    await readyDerived(heads[1], ids.slice(24));
+    const ancestors = await Promise.all([...ids, ...heads].map(sourceReceipt));
+    const next: UploadDerivedOrigin = {
+      version: 2,
+      binding: intent().binding,
+      directSourceFileIds: heads,
+      ancestors,
+    };
     expect(ancestors.length).toBeLessThanOrEqual(64);
     expect(readUploadDerivedOrigin(next)).toBeNull();
     expect(Buffer.byteLength(JSON.stringify(next), 'utf8')).toBeGreaterThan(
       UPLOAD_DERIVED_MAX_ORIGIN_BYTES,
     );
-    const derived = { ...intent(), directSourceFileIds: [previous] };
+    const derived = { ...intent(), directSourceFileIds: heads };
+    const previous = heads[1];
     const revisions = await db.models.File.find({}).select('file_id retentionRevision').lean();
     const counter = await db.models.UploadCounter.findById('global').lean();
     await expect(
@@ -469,7 +456,7 @@ describe('private derived upload reservations', () => {
     expect(await db.models.File.find({}).select('file_id retentionRevision').lean()).toEqual(
       revisions,
     );
-    await db.models.File.updateOne({ file_id: previous }, { 'derivedOrigin.version': 2 });
+    await db.models.File.updateOne({ file_id: previous }, { 'derivedOrigin.version': 1 });
     await expect(
       repository.reserveDerived(user, { ...reservation('malformed', derived), derived }, now),
     ).rejects.toMatchObject({ code: 'not_found' });
@@ -568,24 +555,15 @@ describe('private derived upload reservations', () => {
     await repository.reserveDerived(user, { ...reservation('derived', derived), derived }, now);
     const lease = await transfer('derived', now);
     await accept(lease, now);
-    let origin = readUploadDerivedOrigin({
-      version: 1,
-      ...derived,
-      ancestors: [
-        {
-          subject: { ...approval(lease, now).subject, operationId: 'source' },
-          policySha256: policy,
-          expiresAt: now + 1000,
-        },
-      ],
-    })!;
+    let origin = (await raw('derived'))!.derivedOrigin!;
+    const actualSource = await sourceReceipt('source');
     for (let count = 1; count <= 64; count++) {
       const ids = Array.from(
         { length: count },
         (_, index) => `${'x'.repeat(124)}${index.toString().padStart(4, '0')}`,
       );
       const candidate = readUploadDerivedOrigin({
-        version: 1,
+        version: 2,
         binding: {
           ...derived.binding,
           sourceId: 'x'.repeat(128),
@@ -593,9 +571,8 @@ describe('private derived upload reservations', () => {
         },
         directSourceFileIds: ids,
         ancestors: ids.map((id) => ({
-          subject: { ...approval(lease, now).subject, operationId: id },
-          policySha256: policy,
-          expiresAt: now + 1000,
+          ...actualSource,
+          subject: { ...actualSource.subject, operationId: id },
         })),
       });
       if (!candidate) break;
@@ -768,7 +745,7 @@ describe('private derived upload reservations', () => {
     expect(exported).toMatchObject({
       derivedOrigin: before!.derivedOrigin,
       fingerprint: before!.fingerprint,
-      expiresAt: now - 1000 + UPLOAD_RETENTION_MS,
+      expiresAt: now + UPLOAD_RETENTION_MS,
     });
     const targetDb = new mongoose.Mongoose();
     try {
@@ -779,14 +756,17 @@ describe('private derived upload reservations', () => {
         securityPolicySha256: policy,
       });
       await target.initialize();
+      await targetDb.models.File.collection.insertMany(
+        await db.models.File.collection.find({}).toArray(),
+      );
       const tampered = JSON.parse(JSON.stringify(page)) as typeof page;
       const record = tampered.records.find(
         (record) => record.type === 'operation' && (record.value as StoredUpload)._id === 'derived',
       )!.value as StoredUpload;
-      record.expiresAt = record.acceptedAt! + UPLOAD_RETENTION_MS;
-      await expect(target.importSnapshot(tampered)).rejects.toMatchObject({
-        code: 'migration_conflict',
-      });
+      record.expiresAt = record.acceptedAt! + UPLOAD_RETENTION_MS + 1;
+      await expect(target.importSnapshot(tampered)).rejects.toBeInstanceOf(
+        FileSourceUnavailableError,
+      );
       expect(await targetDb.models.UploadOperation.countDocuments()).toBe(0);
       await target.importSnapshot(page);
       expect(await targetDb.models.UploadOperation.findById('derived').lean()).toMatchObject({

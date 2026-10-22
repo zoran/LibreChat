@@ -1,8 +1,13 @@
 /** Upload domain ports. Adapters own credentials, storage engines, processes and transports. */
 import type {
+  StorageDeletionBinding,
+  StorageDeletionConsumption,
+  StorageDeletionConsumptionResult,
+  StorageDeletionRequest,
+  StorageDeletionResult,
   ManagedDocumentResult,
   UploadPrincipal,
-  UploadScope,
+  ResourceAuthorizationRequest,
   UploadReserveInput,
   UploadDerivedReserveInput,
   UploadOperation,
@@ -37,9 +42,10 @@ import type {
   UploadSecuritySettlement,
   UploadIntakeRecovery,
 } from 'librechat-data-provider';
+import type { UploadManagementRepository } from '@librechat/data-schemas';
 
 export interface IdentityPort {
-  authorize(principal: UploadPrincipal, scope: UploadScope): Promise<boolean>;
+  authorize(principal: UploadPrincipal, request: ResourceAuthorizationRequest): Promise<boolean>;
 }
 export interface ResourcePort {
   assertSafe(input: {
@@ -55,7 +61,26 @@ export interface TelemetryPort {
   /** The repository exposes coarse public rejection categories, not individual storage pools. */
   rejectQuota(reason: 'window' | 'queue' | 'capacity'): void | Promise<void>;
 }
+export type StorageDeletionInput = {
+  binding: StorageDeletionBinding;
+  operationId: string;
+  generation: number;
+  tenantId: string | null;
+  userId: string;
+  request: StorageDeletionRequest;
+  signal: AbortSignal;
+  deadlineAtMs: number;
+};
 export interface StoragePort {
+  /** Pure configured binding; persist before any deletion request. */
+  describeDeletion(
+    input: Omit<StorageDeletionInput, 'signal' | 'deadlineAtMs' | 'binding'>,
+  ): StorageDeletionBinding;
+  acknowledgeDeletionConsumed(
+    input: StorageDeletionInput & StorageDeletionConsumption,
+  ): Promise<StorageDeletionConsumptionResult>;
+  beginDeletion(input: StorageDeletionInput): Promise<StorageDeletionResult>;
+  observeDeletion(input: StorageDeletionInput): Promise<StorageDeletionResult>;
   put(input: {
     lease: UploadLease;
     filename: string;
@@ -160,12 +185,21 @@ export type UploadAttemptPort = {
     task: Pick<UploadCleanupTask, 'operationId' | 'generation' | 'worker'>,
     signal: AbortSignal,
   ): Promise<UploadAttemptSettlement>;
+  /** Consume only a strict persisted owner receipt after this journal's independently proven join. */
+  acknowledgeOwnerCleanup?(
+    task: Pick<UploadCleanupTask, 'operationId' | 'generation' | 'worker'>,
+    observation: UploadIntakeRecovery,
+  ): boolean;
   recordCleanup(
     task: Pick<UploadCleanupTask, 'operationId' | 'generation' | 'worker'>,
     proof: UploadAttemptSettlement,
   ): void;
 };
 export interface UploadRepository {
+  prepareCleanupStorage: UploadManagementRepository['prepareCleanupStorage'];
+  recordCleanupStorage: UploadManagementRepository['recordCleanupStorage'];
+  prepareHousekeepingCleanup: UploadManagementRepository['prepareHousekeepingCleanup'];
+  confirmHousekeepingCleanup: UploadManagementRepository['confirmHousekeepingCleanup'];
   initialize(): Promise<void>;
   /** Private operator port: reads never initialize; mutation retains its original deadline. */
   getAdmissionPolicy(): Promise<UploadAdmissionPolicy>;
@@ -229,6 +263,8 @@ export interface UploadRepository {
     now: number,
   ): Promise<void>;
   cleanupTasks(limit?: number): Promise<UploadCleanupTask[]>;
+  cleanupForWorker: UploadManagementRepository['cleanupForWorker'];
+  confirmActorCleanup: UploadManagementRepository['confirmActorCleanup'];
   cleanupForFile(
     owner: { tenantId: string | null; userId: string },
     fileId: string,

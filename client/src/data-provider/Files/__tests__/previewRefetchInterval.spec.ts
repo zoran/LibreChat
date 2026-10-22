@@ -1,3 +1,6 @@
+jest.mock('~/data-provider/Endpoints', () => ({
+  useGetStartupConfig: () => ({ data: { authMode: 'default' } }),
+}));
 import { FileSources } from 'librechat-data-provider';
 import type { TFilePreview } from 'librechat-data-provider';
 

@@ -4,7 +4,7 @@ import {
   readUploadDerivedIntent,
   readUploadDerivedOrigin,
   readUploadSecuritySubject,
-  uploadDerivedExpiresAt,
+  sameUploadDerivedOrigin,
 } from 'librechat-data-provider';
 import type {
   UploadDerivedBinding,
@@ -18,7 +18,9 @@ import {
   fileSourceScope,
   FileSourceUnavailableError,
 } from './fileRetention';
+import { loadManagedFileSource, currentFileDeadline } from './fileSourceAuthority';
 import { approvedFileFilter, uploadSecurityPolicySha256 } from './fileSecurity';
+import { projectDerivedFileDeadline } from './fileDerivedRetention';
 
 /** The trusted Workspace owner supplies this reference from its stored immutable revision. */
 export type WorkspaceFileReference = { fileId: string; binding: UploadDerivedBinding };
@@ -26,6 +28,7 @@ export type WorkspaceFileReference = { fileId: string; binding: UploadDerivedBin
 /** Internal only: original streaming still requires Upload receipt/integrity and final authorization. */
 export type WorkspaceFileSource = {
   file_id: string;
+  filename: string;
   uploadOperationId: string;
   user: string;
   tenantId: string | null;
@@ -39,6 +42,8 @@ export type WorkspaceFileSource = {
   expiredAt: Date;
   securityApproval: UploadSecurityApproval;
   derivedOrigin: UploadDerivedOrigin;
+  /** Immutable actual original-receipt binding; excludes mutable deadline/revision. */
+  sourceBindingSha256: string;
 };
 
 /** Existing deletion adapters need these routing fields, never content or authorization receipts. */
@@ -138,6 +143,9 @@ export function createFileWorkspaceMethods(
       deletionCompletedAt: null,
       status: 'ready',
       embedded: true,
+      'retentionActivity.migrationEpoch': { $exists: false },
+      'derivedRetention.migrationEpoch': { $exists: false },
+      $expr: { $gt: ['$expiredAt', '$$NOW'] },
       'derivedOrigin.binding.purpose': input.reference.binding.purpose,
       'derivedOrigin.binding.sourceId': input.reference.binding.sourceId,
       'derivedOrigin.binding.sourceRevision': input.reference.binding.sourceRevision,
@@ -147,7 +155,7 @@ export function createFileWorkspaceMethods(
     const row = await File.findOne(filter)
       .session(session)
       .select(
-        'file_id uploadOperationId user tenantId type bytes source storageKey filepath status retentionAcceptedAt expiredAt +securityApproval +derivedOrigin',
+        'file_id uploadOperationId user tenantId type bytes source storageKey filepath status retentionAcceptedAt expiredAt retentionRevision +securityApproval +derivedOrigin +derivedRetention +retentionActivity',
       )
       .lean<IMongoFile>();
     if (!row) throw new FileSourceUnavailableError();
@@ -170,7 +178,7 @@ export function createFileWorkspaceMethods(
       !Number.isSafeInteger(acceptedAt) ||
       acceptedAt < 0 ||
       acceptedAt > input.now ||
-      expiresAt !== uploadDerivedExpiresAt(acceptedAt, origin)
+      currentFileDeadline(row).kind !== 'derived'
     )
       throw new FileSourceUnavailableError();
     const actual = await lifecycle.captureManagedUploadOrigin(
@@ -179,15 +187,34 @@ export function createFileWorkspaceMethods(
       input.now,
       session,
     );
-    if (JSON.stringify(actual) !== JSON.stringify(origin)) throw new FileSourceUnavailableError();
+    if (
+      !sameUploadDerivedOrigin(actual, origin) ||
+      projectDerivedFileDeadline(
+        row.derivedRetention!.ownDeadlineAt,
+        actual.ancestors.map((source) => new Date(source.expiresAt)),
+      ).getTime() !== expiresAt
+    )
+      throw new FileSourceUnavailableError();
+    // The artifact itself must have the same actual durable receipt as its File metadata.
+    const current = await loadManagedFileSource(mongoose, input.owner, row.file_id, 'original', {
+      purpose: 'derived-parent',
+      securityPolicySha256: policy,
+      session,
+    });
+    if (
+      current.file.retentionRevision !== row.retentionRevision ||
+      current.file.expiredAt?.getTime() !== expiresAt
+    )
+      throw new FileSourceUnavailableError();
     const touched = await File.updateOne(
-      filter,
+      { ...filter, retentionRevision: row.retentionRevision, expiredAt: row.expiredAt },
       { $inc: { retentionRevision: 1 } },
       { session, timestamps: false },
     );
     if (touched.matchedCount !== 1) throw new FileSourceUnavailableError();
     return {
       file_id: row.file_id,
+      filename: current.file.filename,
       uploadOperationId: row.uploadOperationId!,
       user: scope.user,
       tenantId: scope.tenantId,
@@ -205,6 +232,7 @@ export function createFileWorkspaceMethods(
         coverage: { ...row.securityApproval!.coverage },
       },
       derivedOrigin: origin,
+      sourceBindingSha256: current.binding,
     };
   }
 

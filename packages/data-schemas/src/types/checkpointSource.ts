@@ -11,10 +11,11 @@ export type CheckpointSourceInput = Readonly<{
   fileIds: readonly string[];
 }>;
 
+/** Captured expiry is immutable envelope provenance, never the current File identity. */
 export type CheckpointSourceBinding = Readonly<{
-  version: 1;
+  version: 2;
   owner: Readonly<{ userId: string; tenantId: string | null }>;
-  files: readonly Readonly<{ fileId: string; approvalSha256: string; expiresAt: string }>[];
+  files: readonly Readonly<{ fileId: string; bindingSha256: string; expiresAt: string }>[];
   messages: readonly Readonly<{
     conversationId: string;
     messageId: string;

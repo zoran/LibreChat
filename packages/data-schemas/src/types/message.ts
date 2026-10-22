@@ -6,8 +6,8 @@ import type {
   UserSubmittedMessageFieldPath,
 } from 'librechat-data-provider';
 import type { Document } from 'mongoose';
-import type { RetainedTextAllocation } from './file';
 import type { IAgentEventActorContextMeta } from './convo';
+import type { RetainedTextAllocation } from './file';
 
 export type SubagentTaskControlAction =
   | 'steer'
@@ -46,7 +46,7 @@ export interface ISubagentTaskControlReceipt {
   messageTruncated?: boolean;
 }
 
-/** Server-derived body dependencies, never accepted from message request fields. */
+/** Current File authority resolved by its owner. Persisted copies require fresh resolution before reuse. */
 export type SourceRetentionContext = Readonly<{
   sourceFileIds: readonly string[];
   sourceExpiresAt: Date;
@@ -57,6 +57,7 @@ export type QuoteSourceRetention = {
   index: number;
   sourceRef: QuoteSourceRef;
   sourceFileIds: string[];
+  /** File observation at capture, separate from Message and admitted operation deadlines. */
   sourceExpiresAt: Date;
 };
 
@@ -98,6 +99,7 @@ export interface IMessage extends Document {
   quoteSourceRefs?: Array<QuoteSourceRef | null>;
   quoteSourceRetention?: QuoteSourceRetention[];
   sourceFileIds?: string[];
+  /** Captured File observation; current availability comes from the File owner. */
   sourceExpiresAt?: Date;
   sourceContentRemovedAt?: Date;
   /** Private receipts; only the transactional Message/File owners may resize these. */

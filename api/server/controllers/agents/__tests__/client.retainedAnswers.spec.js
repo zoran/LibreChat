@@ -716,7 +716,7 @@ describe('actual provider source retention admission', () => {
     expect(req._fileSourceRetention).toEqual(context);
   });
 
-  it('retains the union and earliest deadline when actual model callbacks overlap', async () => {
+  it('refreshes captured expiry while retaining the complete union when actual model callbacks overlap', async () => {
     const expiryA = new Date('2030-01-20');
     const expiryB = new Date('2030-01-29');
     const db = require('~/models');
@@ -737,6 +737,7 @@ describe('actual provider source retention admission', () => {
       body: {},
       config: {},
       _resumableStreamId: 'stream',
+      _fileSourceRetention: { sourceFileIds: ['a'], sourceExpiresAt: new Date(0) },
     };
     const client = {
       options: { req, attachments: files },
@@ -760,5 +761,38 @@ describe('actual provider source retention admission', () => {
     );
     expect(new Set(req._fileSourceRetention.sourceFileIds)).toEqual(new Set(['a', 'b']));
     expect(req._fileSourceRetention.sourceExpiresAt).toEqual(expiryA);
+    Object.assign(client, {
+      contentParts: [],
+      steerOffsetState: { offset: 0 },
+      appliedSteerParts: new Map(),
+    });
+    const item = {
+      steerId: 'quoted-steer',
+      text: 'Follow this source',
+      createdAt: 7,
+      quoteRetention: require('@librechat/api').serializeQuoteRetention({
+        quotes: ['Source C'],
+        sourceMessageConditions: [],
+        quoteSourceRetention: [
+          {
+            index: 0,
+            sourceRef: { messageId: 'quote-c' },
+            sourceFileIds: ['c'],
+            sourceExpiresAt: new Date(0),
+          },
+        ],
+      }),
+    };
+    const emitted = jest.spyOn(GenerationJobManager, 'emitChunk').mockResolvedValue(undefined);
+    db.resolveFileRetentionContext.mockRejectedValueOnce(new Error('File revoked'));
+    await expect(AgentClient.prototype.applySteerPart.call(client, 'stream', item)).rejects.toThrow(
+      'File revoked',
+    );
+    expect(client.contentParts).toEqual([]);
+    expect(emitted).not.toHaveBeenCalled();
+    await AgentClient.prototype.applySteerPart.call(client, 'stream', item);
+    expect(new Set(req._fileSourceRetention.sourceFileIds)).toEqual(new Set(['a', 'b', 'c']));
+    expect(req._fileSourceRetention.sourceExpiresAt).toEqual(expiryA);
+    expect(emitted).toHaveBeenCalledTimes(1);
   });
 });

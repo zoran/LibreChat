@@ -47,6 +47,7 @@ export type IntakeControlOptions = {
     | 'getPromotion'
     | 'sealIntakeRecovery'
     | 'confirmIntakeRecovery'
+    | 'readActorCleanupRecovery'
   >;
   identityRepository: Pick<EmailCodeRepository, 'readEmailCodeIdentity'>;
   management: Pick<
@@ -531,7 +532,13 @@ export function createIntakeControlHandlers(options: IntakeControlOptions): Inta
           if (!captured) fail('unavailable');
           return captured;
         } finally {
-          registration.settle({ writerStopped, localCopiesAbsent: true, storageOutcome: outcome });
+          registration.settle({
+            writerStopped,
+            localWriterStopped: true,
+            localCopiesAbsent: true,
+            storageOutcome: outcome,
+            acknowledgementPending: outcome === 'unknown',
+          });
           signal.removeEventListener('abort', abort);
         }
       })();
@@ -542,6 +549,16 @@ export function createIntakeControlHandlers(options: IntakeControlOptions): Inta
         ...appWorker,
         operationId: ctx.operationId,
         generation: record.lease.generation,
+      });
+      // This reader only observes the original persisted cleanup obligation; it never starts I/O.
+      const recoveryBinding = {
+        operationId: ctx.operationId,
+        attemptGeneration: record.lease.generation,
+        worker: { ...appWorker },
+      };
+      registration.recover?.(async (_proof, recoverySignal) => {
+        recoverySignal.throwIfAborted();
+        return repository.readActorCleanupRecovery(recoveryBinding);
       });
       beginAttempted = true;
       const begun = readUploadPromotionRecord(
@@ -562,8 +579,10 @@ export function createIntakeControlHandlers(options: IntakeControlOptions): Inta
       else {
         registration.settle({
           writerStopped: true,
+          localWriterStopped: true,
           localCopiesAbsent: true,
           storageOutcome: 'not_started',
+          acknowledgementPending: false,
         });
         signal.removeEventListener('abort', abort);
       }

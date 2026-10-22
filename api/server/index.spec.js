@@ -6,6 +6,177 @@ const request = require('supertest');
 const { MongoMemoryServer } = require('mongodb-memory-server');
 const mongoose = require('mongoose');
 
+describe('web startup original custody', () => {
+  const vm = require('node:vm');
+  const { Server } = require('node:http');
+  const shutdown = require('../../packages/api/src/app/shutdown');
+  const tick = () => new Promise((resolve) => setImmediate(resolve));
+  const noop = () => undefined;
+  const inert = new Proxy(noop, { get: (_target, key) => (key === 'then' ? undefined : inert) });
+  let exit;
+  function deferred() {
+    let resolve, reject;
+    const promise = new Promise((yes, no) => {
+      resolve = yes;
+      reject = no;
+    });
+    void promise.catch(noop);
+    return { promise, resolve, reject };
+  }
+  function execute({ application, mcps = jest.fn(async () => {}) }) {
+    const app = { locals: {} };
+    for (const method of ['disable', 'set', 'use', 'get', 'post', 'all'])
+      app[method] = jest.fn(() => app);
+    const server = new Server();
+    server.address = () => ({ address: '127.0.0.1', port: 0 });
+    app.listen = jest.fn((_port, _host, callback) => {
+      queueMicrotask(() => {
+        void callback();
+      });
+      return server;
+    });
+    const express = new Proxy(() => app, { get: () => inert });
+    const maintenance = {
+      identity: { source: 'a'.repeat(40) },
+      admissionMiddleware: noop,
+      listen: jest.fn(async () => {}),
+      close: jest.fn(async () => {}),
+    };
+    const api = new Proxy(
+      {
+        ...shutdown,
+        cacheConfig: {},
+        createAppMaintenance: () => maintenance,
+        createMetrics: () => ({ metricsMiddleware: noop, metricsRouter: noop, registry: {} }),
+        waitForRedisStartup: jest.fn(async () => {}),
+        fileDeletionWorkOwner: { stopAdmissions: noop, drain: noop, maintenance: {} },
+        GenerationJobManager: inert,
+        createPresentation: () => ({ fixedLanguage: 'de' }),
+        createSecurityHeaders: () => undefined,
+      },
+      { get: (target, key) => (key in target ? target[key] : inert) },
+    );
+    const localProcess = {
+      env: { BUILD_COMMIT: 'a'.repeat(40), PORT: '0', LOG_TO_FILE: 'false' },
+      execArgv: [],
+      on: jest.fn(),
+      exit,
+    };
+    const requires = {
+      '@librechat/api': api,
+      '@librechat/data-schemas': {
+        logger: { info: noop, warn: noop, error: noop },
+        runAsSystem: (work) => work(),
+      },
+      express,
+      fs: { readFileSync: () => '<html><head></head><body></body></html>' },
+      path,
+      'module-alias': () => {},
+      './services/start/runtime': {
+        initializeConnectedRuntime: jest.fn(async () => undefined),
+        initializeApplicationRuntime: application,
+      },
+      './services/initializeMCPs': mcps,
+      './services/Uploads': { getUploadRuntime: () => undefined },
+    };
+    vm.runInNewContext(
+      fs.readFileSync(path.join(__dirname, 'index.js'), 'utf8'),
+      {
+        require: (id) => (id in requires ? requires[id] : inert),
+        __dirname,
+        module: { exports: {} },
+        process: localProcess,
+        AbortSignal,
+        AbortController,
+        URL,
+        Buffer,
+        setTimeout,
+        clearTimeout,
+        queueMicrotask,
+      },
+      { filename: 'actual-web-index.js' },
+    );
+    return { app, server, maintenance, api };
+  }
+  beforeEach(() => {
+    shutdown.__resetShutdownStateForTests();
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'queueMicrotask'] });
+    exit = jest.spyOn(process, 'exit').mockImplementation(noop);
+  });
+  afterEach(() => {
+    shutdown.__resetShutdownStateForTests();
+    jest.useRealTimers();
+    exit.mockRestore();
+  });
+
+  it('supplies the original signal before runtime acquisition and joins a held original on shutdown', async () => {
+    const pending = deferred();
+    const application = jest.fn(() => pending.promise);
+    const { app } = execute({ application });
+    try {
+      await tick();
+      expect(application).toHaveBeenCalledTimes(1);
+      expect(application.mock.calls[0][0].signal).toBe(shutdown.getShutdownSignal());
+      void shutdown.requestGracefulShutdown('startup_failure');
+      await tick();
+      expect(exit).not.toHaveBeenCalled();
+      expect(app.listen).not.toHaveBeenCalled();
+    } finally {
+      pending.reject(new Error('Original startup settled'));
+    }
+    await tick();
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it('starts the existing failure deadline before a held configuration original settles', async () => {
+    const pending = deferred();
+    const application = jest.fn(() => pending.promise);
+    execute({ application });
+    try {
+      await tick();
+      const { onFailure, signal } = application.mock.calls[0][0];
+      expect(onFailure).toEqual(expect.any(Function));
+      onFailure(new Error('Known read failure before original close'));
+      expect(signal.aborted).toBe(true);
+      jest.advanceTimersByTime(59_999);
+      expect(exit).not.toHaveBeenCalled();
+      onFailure(new Error('Repeated failure cannot renew deadline'));
+      jest.advanceTimersByTime(1);
+      expect(exit).toHaveBeenCalledWith(1);
+    } finally {
+      pending.reject(new Error('Original close settled'));
+    }
+    await tick();
+  });
+
+  it('keeps post-listen startup inside the original and never starts uploads after abort', async () => {
+    const pending = deferred();
+    const uploads = { start: jest.fn(), configureSourceReplay: jest.fn() };
+    const application = jest.fn(async () => ({
+      appConfig: {
+        paths: { dist: '/fixture/dist', fonts: '/fixture/fonts', assets: '/fixture/assets' },
+      },
+      uploads,
+    }));
+    const mcps = jest.fn(() => pending.promise);
+    const { app } = execute({ application, mcps });
+    try {
+      await tick();
+      expect(app.listen).toHaveBeenCalledTimes(1);
+      expect(mcps).toHaveBeenCalledTimes(1);
+      void shutdown.requestGracefulShutdown('startup_failure');
+      await tick();
+      expect(exit).not.toHaveBeenCalled();
+      expect(uploads.start).not.toHaveBeenCalled();
+    } finally {
+      pending.resolve();
+    }
+    await tick();
+    expect(uploads.start).not.toHaveBeenCalled();
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+});
+
 jest.mock('~/server/services/Config', () => ({
   syncStaticTools: jest.fn().mockResolvedValue(undefined),
   mergeAppTools: jest.fn().mockResolvedValue(undefined),

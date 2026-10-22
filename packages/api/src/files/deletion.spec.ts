@@ -1,6 +1,7 @@
-import type { AgentResourceFileInput } from './deletion';
+import type { FileDeletionWorkScope, AgentResourceFileInput } from './deletion';
 import {
   buildDeleteFilesResponse,
+  createFileDeletionWorkOwner,
   deleteAgentResourceFiles,
   partitionAgentResourceFiles,
   PARTIAL_FILE_DELETION_MESSAGE,
@@ -275,5 +276,167 @@ describe('delete agent resource files', () => {
 
     expect(result.outcome).toEqual({ deletedFileIds: [], failedFileIds: ['owned'] });
     expect(deps.removeAgentResourceFiles).not.toHaveBeenCalled();
+  });
+});
+
+describe('foreground File deletion custody', () => {
+  const deferred = <T = void>() => {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason: unknown) => void;
+    const promise = new Promise<T>((yes, no) => {
+      resolve = yes;
+      reject = no;
+    });
+    return { promise, resolve, reject };
+  };
+
+  it('registers before invoking work and closes only new root admissions', async () => {
+    const owner = createFileDeletionWorkOwner();
+    const gate = deferred();
+    let scope!: FileDeletionWorkScope;
+    const run = owner.run(async (current) => {
+      scope = current;
+      await gate.promise;
+    });
+    expect(await owner.maintenance.getMaintenanceCensus(null)).toMatchObject({ pendingWrites: 1 });
+    expect(owner.maintenance.pauseAdmissions('hold')).toBe(true);
+    expect(owner.maintenance.pauseAdmissions('other')).toBe(false);
+    expect(owner.maintenance.resumeAdmissions('other')).toBe(false);
+    await expect(owner.run(async () => undefined)).rejects.toThrow('FILE_DELETION_QUIESCING');
+    await owner.run(async (child) => child.effect(async () => undefined), scope);
+    gate.resolve();
+    await run;
+    expect(await owner.maintenance.getMaintenanceCensus('hold')).toMatchObject({
+      pendingWrites: 0,
+      complete: true,
+    });
+    expect(owner.maintenance.resumeAdmissions('hold')).toBe(true);
+    expect(() => owner.run(async () => undefined, scope)).toThrow('FILE_DELETION_SCOPE_INACTIVE');
+    expect(() => createFileDeletionWorkOwner().run(async () => undefined, scope)).toThrow(
+      'FILE_DELETION_SCOPE_INACTIVE',
+    );
+  });
+
+  it('joins a started child after a later scheduling error and retains uncertainty', async () => {
+    const owner = createFileDeletionWorkOwner();
+    const child = deferred();
+    const error = new Error('later strategy unavailable');
+    let returned = false;
+    const run = owner.run(async (scope) => {
+      void scope.effect(() => child.promise);
+      throw error;
+    });
+    void run.catch(() => {
+      returned = true;
+    });
+    await Promise.resolve();
+    expect(returned).toBe(false);
+    owner.maintenance.pauseAdmissions('hold');
+    expect(await owner.maintenance.getMaintenanceCensus('hold')).toMatchObject({
+      pendingWrites: 1,
+      complete: false,
+    });
+    child.resolve();
+    await expect(run).rejects.toBe(error);
+    expect(await owner.maintenance.getMaintenanceCensus('hold')).toMatchObject({
+      pendingWrites: 0,
+      complete: false,
+    });
+    expect(owner.maintenance.resumeAdmissions('hold')).toBe(false);
+  });
+
+  it('observes a rejected child immediately and does not confuse caught errors with settlement proof', async () => {
+    const owner = createFileDeletionWorkOwner();
+    const tail = deferred();
+    const run = owner.run(async (scope) => {
+      void scope.effect(() => Promise.reject(new Error('lost reply')));
+      await tail.promise;
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(await owner.maintenance.getMaintenanceCensus(null)).toMatchObject({
+      pendingWrites: 1,
+      complete: false,
+    });
+    tail.resolve();
+    await run;
+    await expect(owner.drain()).rejects.toThrow('FILE_DELETION_SETTLEMENT_UNCONFIRMED');
+  });
+
+  it('retains queue callbacks after shutdown admission closes without inventing cancellation', async () => {
+    const owner = createFileDeletionWorkOwner();
+    const callback = deferred();
+    let dispatch!: () => void;
+    const run = owner.run((scope) =>
+      scope.queued((started) => {
+        dispatch = started;
+        return callback.promise;
+      }),
+    );
+    owner.maintenance.pauseAdmissions('hold');
+    const drain = owner.drain();
+    let drained = false;
+    void drain.then(() => {
+      drained = true;
+    });
+    expect(owner.drain()).toBe(drain);
+    expect(await owner.maintenance.getMaintenanceCensus('hold')).toMatchObject({
+      queuedContinuations: 1,
+      pendingWrites: 1,
+    });
+    dispatch();
+    dispatch();
+    expect(await owner.maintenance.getMaintenanceCensus('hold')).toMatchObject({
+      queuedContinuations: 0,
+      pendingWrites: 1,
+    });
+    expect(drained).toBe(false);
+    callback.resolve();
+    await run;
+    await drain;
+    expect(owner.maintenance.resumeAdmissions('hold')).toBe(false);
+    await expect(owner.run(async () => undefined)).rejects.toThrow('FILE_DELETION_QUIESCING');
+  });
+
+  it('settles failed enqueue bookkeeping without claiming a certain write', async () => {
+    const owner = createFileDeletionWorkOwner();
+    await expect(
+      owner.run((scope) =>
+        scope.queued(() => {
+          throw new Error('queue unavailable');
+        }),
+      ),
+    ).rejects.toThrow('queue unavailable');
+    expect(await owner.maintenance.getMaintenanceCensus(null)).toMatchObject({
+      queuedContinuations: 0,
+      pendingWrites: 0,
+      complete: false,
+    });
+  });
+
+  it('allows a read-only preflight failure to settle without a fabricated write', async () => {
+    const owner = createFileDeletionWorkOwner();
+    await expect(
+      owner.run(async () => {
+        throw new Error('read failed');
+      }),
+    ).rejects.toThrow('read failed');
+    expect(await owner.maintenance.getMaintenanceCensus(null)).toMatchObject({
+      complete: true,
+      pendingWrites: 0,
+    });
+    await owner.drain();
+  });
+
+  it('keeps an explicitly unconfirmed fulfilled outcome incomplete', async () => {
+    const owner = createFileDeletionWorkOwner();
+    await owner.run(async (scope) => {
+      scope.markUncertain();
+      return { failedFileIds: ['f'] };
+    });
+    expect(await owner.maintenance.getMaintenanceCensus(null)).toMatchObject({
+      complete: false,
+      pendingWrites: 0,
+    });
   });
 });

@@ -24,10 +24,28 @@
         "default": "./dist/credentials.cjs"
       }
     },
+    "./generation-cleanup": {
+      "require": {
+        "types": "./dist/generation-cleanup.d.cts",
+        "default": "./dist/generation-cleanup.cjs"
+      }
+    },
     "./upload-activation": {
       "require": {
         "types": "./dist/upload-activation.d.cts",
         "default": "./dist/upload-activation.cjs"
+      }
+    },
+    "./housekeeping": {
+      "require": {
+        "types": "./dist/housekeeping.d.cts",
+        "default": "./dist/housekeeping.cjs"
+      }
+    },
+    "./mail": {
+      "require": {
+        "types": "./dist/mail.d.cts",
+        "default": "./dist/mail.cjs"
       }
     }
   },

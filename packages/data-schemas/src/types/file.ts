@@ -10,8 +10,11 @@ import type {
   UploadPrincipal,
   UploadStorageReceipt,
   DocumentStructure,
+  ManagedRetrievalState,
   UploadDerivedOrigin,
 } from 'librechat-data-provider';
+import type { StoredFileRetentionActivity } from './fileActivity';
+import type { FileCleanupProgress } from './fileCleanup';
 
 /** One retained consumer's exact liability, committed alongside the existing File counter. */
 export type RetainedTextAllocation = { fileId: string; bytes: number };
@@ -96,6 +99,15 @@ export type FileOwnerScope = {
   tenantId?: string | null;
 };
 
+/** Selective current File observation; callers still fence all materialization dependencies. */
+export type FileSourceInspection = Readonly<
+  { fileId: string } & (
+    | { state: 'managed'; sourceExpiresAt: Date; sourceBindingSha256: string }
+    | { state: 'unmanaged'; sourceExpiresAt: Date | null }
+    | { state: 'unavailable' }
+  )
+>;
+
 export type FileRetentionAdmission = Readonly<{ acceptedAt: Date; expiredAt: Date }>;
 /** Private stream receipt or exact pre-reserve intent; release refunds only the stored amount. */
 export type FileSourceCopyReservation = {
@@ -105,11 +117,25 @@ export type FileSourceCopyReservation = {
   state: 'held' | 'released';
 };
 
+/** Private managed File creation custody; only first retrieval admission advances it. */
+export type FileRetrievalCreation = {
+  version: 1;
+  owner: { tenantId: string | null; userId: string };
+  fileId: string;
+  acceptedAt: number;
+  state: 'empty' | 'admitted';
+};
+
 export interface IMongoFile extends Omit<Document, 'model'> {
   /** Private organization metadata. Absence is revision zero, without a backfill. */
   library?: FileLibraryMetadata;
   retentionAcceptedAt?: Date;
   retentionRevision?: number;
+  /** Private successful activity summary and current deadline arithmetic. */
+  retentionActivity?: StoredFileRetentionActivity;
+  derivedRetention?: StoredDerivedFileRetention;
+  retentionRevocationId?: string;
+  retentionCleanup?: FileCleanupProgress;
   /** Includes liabilities whose Message has expired; released by this File's cleanup. */
   retainedDerivativeBytes?: number;
   retainedDerivativeReservations?: Array<Omit<FileSourceCopyReservation, 'fileId'>>;
@@ -120,6 +146,9 @@ export interface IMongoFile extends Omit<Document, 'model'> {
   derivedOrigin?: UploadDerivedOrigin;
   /** Private derived structure, bound to the immutable accepted original and File lifecycle. */
   documentStructure?: DocumentStructure;
+  /** Private File-owned index liabilities; never a client File projection. */
+  managedRetrieval?: ManagedRetrievalState;
+  retrievalCreation?: FileRetrievalCreation;
   deletionRequestedAt?: Date;
   deletionCompletedAt?: Date;
   user: Types.ObjectId;
@@ -223,6 +252,16 @@ export interface IMongoFile extends Omit<Document, 'model'> {
   tenantId?: string;
 }
 
+/** Derived retention projects parent constraints; it never counts user activity. */
+export type StoredDerivedFileRetention = {
+  version: 1;
+  ownDeadlineAt: Date;
+  capBasis: 'admission' | 'legacy-baseline';
+  trackedSince: Date;
+  deadlineGeneration: number;
+  migrationEpoch?: string;
+};
+
 export type ManagedUploadAcceptance = {
   principal: UploadPrincipal;
   operationId: string;
@@ -233,5 +272,4 @@ export type ManagedUploadAcceptance = {
   securityApproval: UploadSecurityApproval;
   derivedOrigin?: UploadDerivedOrigin;
   acceptedAt: number;
-  expiresAt: number;
 };

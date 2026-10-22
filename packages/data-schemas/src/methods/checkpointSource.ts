@@ -1,16 +1,13 @@
 /** Source custody joins the caller's native checkpoint transaction; no parallel store or reservation. */
-import { matchesUploadSecurityApproval, readUploadSecuritySubject } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
-import type { FileOwnerScope } from '~/types/file';
 import type {
   CapturedCheckpointSources,
   CheckpointSourceBinding,
   CheckpointSourceInput,
   CheckpointSourceMethods,
 } from '~/types/checkpointSource';
-import { FileSourceUnavailableError, fileSourceScope, touchFileSources } from './fileRetention';
-import { approvedFileFilter, uploadSecurityPolicySha256 } from './fileSecurity';
-import { touchActiveUserPrincipal } from './userPrincipal';
+import type { CompleteMessageSource } from './messageSource';
+import type { FileOwnerScope } from '~/types/file';
 import {
   encodeSourceValue,
   liveSourceDeadline,
@@ -20,7 +17,13 @@ import {
   sourceSha256,
   touchCompleteMessageSource,
 } from './messageSource';
-import type { CompleteMessageSource } from './messageSource';
+import {
+  FileSourceUnavailableError,
+  fileSourceScope,
+  inspectFileSources,
+  touchFileSources,
+} from './fileRetention';
+import { touchActiveUserPrincipal } from './userPrincipal';
 
 const MAX_BINDING_BYTES = 32768;
 const MAX_SOURCES = 64;
@@ -138,7 +141,7 @@ export function snapshotCheckpointSourceBinding(
   ]);
   const principal = record(binding.owner, ['userId', 'tenantId']);
   if (
-    binding.version !== 1 ||
+    binding.version !== 2 ||
     principal.userId !== owner.userId ||
     principal.tenantId !== owner.tenantId ||
     !hash(binding.bindingSha256) ||
@@ -150,8 +153,8 @@ export function snapshotCheckpointSourceBinding(
   )
     throw new FileSourceUnavailableError();
   const files = binding.files.map((value) => {
-    const file = record(value, ['fileId', 'approvalSha256', 'expiresAt']);
-    if (!sourceIdentifier(file.fileId) || !hash(file.approvalSha256))
+    const file = record(value, ['fileId', 'bindingSha256', 'expiresAt']);
+    if (!sourceIdentifier(file.fileId) || !hash(file.bindingSha256))
       throw new FileSourceUnavailableError();
     deadline(file.expiresAt);
     return file as CheckpointSourceBinding['files'][number];
@@ -240,36 +243,15 @@ export function createCheckpointSourceMethods(
     session: ClientSession,
   ): Promise<CheckpointSourceBinding['files']> {
     if (!ids.length || ids.length > MAX_SOURCES) throw new FileSourceUnavailableError();
-    const policy = uploadSecurityPolicySha256();
-    if (!policy) throw new FileSourceUnavailableError();
-    const rows = await mongoose.models.File.find({
-      ...fileSourceScope(owner),
-      file_id: { $in: ids },
-      retentionAcceptedAt: { $ne: null },
-      status: 'ready',
-      derivedOrigin: { $exists: false },
-      deletionRequestedAt: null,
-      deletionCompletedAt: null,
-      expiredAt: { $gt: new Date() },
-      ...approvedFileFilter(policy),
-    })
-      .select('file_id expiredAt +securityApproval')
-      .session(session)
-      .lean();
-    if (rows.length !== ids.length) throw new FileSourceUnavailableError();
-    return rows
-      .map((row) => {
-        const subject = readUploadSecuritySubject(row.securityApproval?.subject);
-        if (
-          !subject ||
-          !matchesUploadSecurityApproval(row.securityApproval, subject, policy, Date.now())
-        )
-          throw new FileSourceUnavailableError();
-        const expiresAt = new Date(liveSourceDeadline(row.expiredAt)).toISOString();
+    const observed = await inspectFileSources(mongoose, owner, ids, session);
+    if (observed.length !== ids.length) throw new FileSourceUnavailableError();
+    return observed
+      .map((file) => {
+        if (file.state !== 'managed') throw new FileSourceUnavailableError();
         return {
-          fileId: row.file_id as string,
-          approvalSha256: sourceSha256(row.securityApproval),
-          expiresAt,
+          fileId: file.fileId,
+          bindingSha256: file.sourceBindingSha256,
+          expiresAt: new Date(liveSourceDeadline(file.sourceExpiresAt)).toISOString(),
         };
       })
       .sort((a, b) => compareIds(a.fileId, b.fileId));
@@ -298,7 +280,7 @@ export function createCheckpointSourceMethods(
     const files = await filesFor(owner, [...ids].sort(), session);
     const messages = sources.map(messageWitness);
     const payload = {
-      version: 1 as const,
+      version: 2 as const,
       owner,
       files,
       messages,
@@ -342,7 +324,6 @@ export function createCheckpointSourceMethods(
       const current = messageWitness(source);
       if (
         current.bodySha256 !== reference.bodySha256 ||
-        current.expiresAt !== reference.expiresAt ||
         JSON.stringify(current.sourceFileIds) !== JSON.stringify(reference.sourceFileIds)
       )
         throw new FileSourceUnavailableError();
@@ -350,7 +331,15 @@ export function createCheckpointSourceMethods(
     }
     const ids = binding.files.map((file) => file.fileId);
     const files = await filesFor(owner, ids, session);
-    if (sourceSha256(files) !== sourceSha256(binding.files)) throw new FileSourceUnavailableError();
+    // Current liveness was checked by the owner; captured dates never become identity.
+    if (
+      files.some(
+        (file, index) =>
+          file.fileId !== binding.files[index].fileId ||
+          file.bindingSha256 !== binding.files[index].bindingSha256,
+      )
+    )
+      throw new FileSourceUnavailableError();
     for (const source of sources)
       await touchCompleteMessageSource(mongoose, owner, source, session);
     const context = await touchFileSources(mongoose, owner, ids, session);

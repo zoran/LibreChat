@@ -37,6 +37,11 @@ import type {
   InitialSourcePopulationOptions,
   InitialSourcePopulation,
 } from '~/stream/interfaces/IJobStore';
+import type {
+  GenerationCleanupScope,
+  SourceCleanupProjection,
+  SourceActorSettlement,
+} from '../sourceCleanup';
 import type { EarlyBufferOverflowState } from '../../types/earlyBufferRecovery';
 import type { ResolvedAskUserQuestion } from '~/agents/hitl/resume';
 import type { RecoveredSteerPayload } from '~/stream/SteerRecovery';
@@ -64,6 +69,12 @@ import {
   ACK_SOURCE_REPLAY_LUA,
 } from '../internal/sourceBudgetLua';
 import {
+  SOURCE_CLEANUP_JOB_FIELDS,
+  SOURCE_CLEANUP_PAGE_SIZE,
+  sourceActorSettlementMatches,
+  sourceCleanupOwnerMatches,
+} from '../sourceCleanup';
+import {
   MAX_COALESCED_BYTES,
   MAX_COALESCED_EVENTS,
   resolveCoalesceWindowMs,
@@ -90,7 +101,7 @@ import { evalScript } from '~/cache/redisScript';
 const CLIENT_REQUEST_ID_PATTERN = /^[A-Za-z0-9:_-]{1,128}$/;
 const INITIAL_INVENTORY_JSON_FIELDS: ReadonlySet<string> = new Set(
   (
-    'sourceReplayIntent sourceRetention earlyBufferOverflow activeSubscriberLeases userMessage mcpRequestBody ' +
+    'sourceReplayIntent sourceRetention sourceActorSettlement earlyBufferOverflow activeSubscriberLeases userMessage mcpRequestBody ' +
     'userSubmittedPaths userSubmittedMessageFieldPaths preResumeProvenance discoveredTools activityPhaseSnapshot ' +
     'compactionSemanticIndex contextMeta scheduleMCPCompletion scheduleMCPFailure agentEventDetachedTerminalEvidence ' +
     'agentEventExpectedAction agentEventSuspension pendingAction resolvedAskUserQuestions __replacedGenerations'
@@ -902,6 +913,7 @@ const TERMINAL_PERSISTENCE_FINALIZE_LUA =
  *   ARGV: [expectCreatedAt | "", expectMissing ("0" | "1")]
  */
 const JOB_DELETE_LUA =
+  'if redis.call("HEXISTS",KEYS[1],"sourceRetentionRevokedAt")==1 and redis.call("HEXISTS",KEYS[1],"sourceActorSettlement")==0 then return 0 end ' +
   'if redis.call("HEXISTS",KEYS[1],"sourceReplayIntent")==1 then return 0 end ' +
   'if ARGV[1] ~= "" and redis.call("HGET", KEYS[1], "createdAt") ~= ARGV[1] then return 0 end ' +
   'local existed = redis.call("EXISTS", KEYS[1]) ' +
@@ -3681,20 +3693,7 @@ export class RedisJobStore implements IJobStoreV2 {
 
   /** Cleanup and observations never load the potentially16MiB replay hash payload. */
   async getSourceReplayJob(streamId: string): Promise<SerializableJobData | null> {
-    const fields = [
-      'streamId',
-      'userId',
-      'tenantId',
-      'createdAt',
-      'status',
-      'providerDrained',
-      'terminalPersistencePending',
-      'terminalHostActionPending',
-      'sourceRetentionPurged',
-      'sourceRetentionRevokedAt',
-      'sourceReplayIntent',
-      'sourceReplayHeld',
-    ];
+    const fields = SOURCE_CLEANUP_JOB_FIELDS;
     const values = await this.redis.hmget(KEYS.job(streamId), ...fields);
     if (values[0] == null) return null;
     const row: Record<string, string> = {};
@@ -3766,6 +3765,132 @@ export class RedisJobStore implements IJobStoreV2 {
     );
   }
 
+  async recordSourceActorSettlement(receipt: SourceActorSettlement): Promise<boolean> {
+    const job = await this.getSourceReplayJob(receipt.streamId);
+    if (!job || !sourceActorSettlementMatches(job, receipt)) return false;
+    return (
+      (await this.redis.eval(
+        `
+      local row = cjson.decode(ARGV[1])
+      local key = KEYS[1]
+      if redis.call('HGET',key,'createdAt') ~= tostring(row.createdAt)
+        or redis.call('HGET',key,'providerExecutionId') ~= row.providerExecutionId
+        or redis.call('HGET',key,'sourceRetentionRevokedAt') ~= tostring(row.sourceRetentionRevokedAt)
+        or redis.call('HGET',key,'providerDrained') ~= '1'
+        or redis.call('HGET',key,'terminalPersistencePending') == '1'
+        or redis.call('HGET',key,'terminalHostActionPending') == '1' then return 0 end
+      local status = redis.call('HGET',key,'status')
+      if status ~= 'complete' and status ~= 'error' and status ~= 'aborted' then return 0 end
+      local raw = redis.call('HGET',key,'sourceRetention')
+      if not raw or #raw > 32768 then return 0 end
+      local source = cjson.decode(raw).sourceFileIds
+      table.sort(source)
+      if #source ~= #row.sourceFileIds then return 0 end
+      for i,id in ipairs(source) do if row.sourceFileIds[i] ~= id then return 0 end end
+      redis.call('HSET',key,'sourceActorSettlement',ARGV[1]) return 1`,
+        1,
+        KEYS.job(receipt.streamId),
+        JSON.stringify(receipt),
+      )) === 1
+    );
+  }
+
+  async captureSourceCleanupPage(
+    scope: GenerationCleanupScope,
+    cursor = '0:0',
+  ): Promise<SourceCleanupProjection> {
+    if (this.isCluster || !/^[012]:[0-9]{1,20}$/.test(cursor))
+      throw new Error('generation_cleanup_invalid_cursor');
+    const [phaseRaw, scanCursor] = cursor.split(':');
+    const phase = Number(phaseRaw);
+    const keys = scope.tenantId
+      ? [KEYS.userJobs(scope.userId, scope.tenantId), KEYS.userJobs(scope.userId)]
+      : [KEYS.userJobs(scope.userId)];
+    const jobs: SerializableJobData[] = [];
+    let unresolvedRecovery = false;
+    if (phase >= keys.length) {
+      // Existing source-intent producer enforces 32 epochs/16KiB per intent.
+      for (const intent of await this.listSourceReplayIntents()) {
+        if (
+          !sourceCleanupOwnerMatches(intent, scope) ||
+          !intent.sourceFileIds.some((id) => scope.sourceFileIds.includes(id))
+        )
+          continue;
+        const job = await this.getSourceReplayJob(intent.streamId);
+        if (job?.createdAt === intent.createdAt) jobs.push(job);
+        else unresolvedRecovery = true;
+      }
+      return { jobs, complete: true, unresolvedRecovery };
+    }
+    // COUNT is a hint: reject an oversized compact-set reply inside Redis, before transfer.
+    const page = (await this.redis.eval(
+      `
+      local page=redis.call('SSCAN',KEYS[1],ARGV[1],'COUNT',16)
+      if #page[2] > 128 then return {'overflow'} end
+      for _,id in ipairs(page[2]) do if #id > 256 then return {'overflow'} end end
+      return page`,
+      1,
+      keys[phase],
+      scanCursor,
+    )) as [string, string[]];
+    if (!Array.isArray(page[1]) || page[1].length > SOURCE_CLEANUP_PAGE_SIZE)
+      throw new Error('generation_cleanup_page_overflow');
+    for (const streamId of page[1]) {
+      const job = await this.getSourceReplayJob(streamId);
+      if (job && sourceCleanupOwnerMatches(job, scope)) jobs.push(job);
+      // Inspect source references server-side; source text/file payload never enters the worker.
+      const epochs = (await this.redis.eval(
+        `
+        local scope=cjson.decode(ARGV[1]) local ids={} local result={} local bytes=0
+        for _,id in ipairs(scope.sourceFileIds) do ids[id]=true end
+        local function inspect(raw)
+          bytes=bytes+#raw if bytes>16777216 then error('recovery_overflow') end
+          local row=cjson.decode(raw)
+          if row.userId~=scope.userId or (row.tenantId or '')~=(scope.tenantId or '') then return end
+          local items=row.item and {row.item} or (row.steers or {})
+          if #items>128 then error('recovery_overflow') end
+          for _,item in ipairs(items) do
+            local found=false
+            for _,file in ipairs(item.files or {}) do if ids[file.file_id] then found=true end end
+            local retention=item.quoteRetention or {}
+            for _,binding in ipairs(retention.quoteSourceRetention or {}) do
+              if binding and binding~=cjson.null then
+                for _,id in ipairs(binding.sourceFileIds or {}) do if ids[id] then found=true end end
+              end
+            end
+            if found then table.insert(result,tostring(row.generationCreatedAt or 'unknown')) end
+          end
+        end
+        if redis.call('STRLEN',KEYS[1])>16777216 or redis.call('HLEN',KEYS[2])>128 then return {'overflow'} end
+        local parked=redis.call('GET',KEYS[1]) if parked then inspect(parked) end
+        for _,field in ipairs(redis.call('HKEYS',KEYS[2])) do
+          if redis.call('HSTRLEN',KEYS[2],field)>16777216 then return {'overflow'} end
+          inspect(redis.call('HGET',KEYS[2],field))
+        end
+        return result`,
+        2,
+        KEYS.parkedSteers(streamId),
+        KEYS.steerReceipts(streamId),
+        JSON.stringify(scope),
+      )) as string[];
+      if (epochs.includes('overflow')) throw new Error('generation_cleanup_recovery_overflow');
+      for (const epoch of epochs) {
+        if (
+          !job ||
+          Number(epoch) !== job.createdAt ||
+          !job.sourceRetention?.sourceFileIds.some((id) => scope.sourceFileIds.includes(id))
+        )
+          unresolvedRecovery = true;
+      }
+    }
+    return {
+      jobs,
+      cursor: page[0] === '0' ? `${phase + 1}:0` : `${phase}:${page[0]}`,
+      complete: false,
+      unresolvedRecovery,
+    };
+  }
+
   async revokeSourceRetention(streamId: string, epoch: number): Promise<boolean> {
     return (
       (await this.redis.eval(
@@ -3792,7 +3917,7 @@ export class RedisJobStore implements IJobStoreV2 {
         'local receipts={} for i=1,#receiptRows,2 do local ok,value=pcall(cjson.decode,receiptRows[i+1]) if not ok then return 0 end receipts[#receipts+1]={receiptRows[i],value} end ' +
         'if revoked then if parked then for _,item in ipairs(parked.steers or {}) do redact(item) end redis.call("SET",KEYS[4],cjson.encode(parked),"KEEPTTL") end for _,entry in ipairs(receipts) do redact(entry[2].item) redis.call("HSET",KEYS[5],entry[1],cjson.encode(entry[2])) end end ' +
         'local ttl=redis.call("PTTL",KEYS[1]) for i=4,5 do local retained=redis.call("PTTL",KEYS[i]) if retained==-1 then ttl=-1 break end if ttl~=-1 then ttl=math.max(ttl,retained) end end if ttl==-1 then redis.call("PERSIST",KEYS[1]) elseif ttl>0 then redis.call("PEXPIRE",KEYS[1],ttl) end ' +
-        'local keep={streamId=true,userId=true,tenantId=true,conversationId=true,createdAt=true,status=true,completedAt=true,sourceRetention=true,sourceRetentionExpiresAt=true,sourceRetentionRevokedAt=true,providerExecutionId=true,providerDrained=true,sourceReplayIntent=true,sourceReplayHeld=true,sourceReplayChunkBytes=true,sourceReplayChunkEntries=true} ' +
+        'local keep={streamId=true,userId=true,tenantId=true,conversationId=true,createdAt=true,status=true,completedAt=true,sourceRetention=true,sourceRetentionExpiresAt=true,sourceRetentionRevokedAt=true,sourceActorSettlement=true,providerExecutionId=true,providerDrained=true,sourceReplayIntent=true,sourceReplayHeld=true,sourceReplayChunkBytes=true,sourceReplayChunkEntries=true} ' +
         'for _,key in ipairs(redis.call("HKEYS",KEYS[1])) do if not keep[key] then redis.call("HDEL",KEYS[1],key) end end ' +
         'redis.call("HSET",KEYS[1],"sourceRetentionPurged","1") redis.call("DEL",KEYS[2],KEYS[3]) return 1',
       5,
@@ -6165,6 +6290,8 @@ export class RedisJobStore implements IJobStoreV2 {
     if (job.sourceRetention)
       result.sourceRetentionExpiresAt = String(job.sourceRetention.sourceExpiresAt);
     for (const [key, value] of Object.entries(job)) {
+      // Only the actor's dedicated identity-fenced CAS may author this evidence.
+      if (key === 'sourceActorSettlement') continue;
       if (value === undefined) {
         continue;
       }
@@ -6203,6 +6330,9 @@ export class RedisJobStore implements IJobStoreV2 {
         ? Number(data.sourceRetentionRevokedAt)
         : undefined,
       sourceRetentionPurged: data.sourceRetentionPurged === '1',
+      sourceActorSettlement: data.sourceActorSettlement
+        ? JSON.parse(data.sourceActorSettlement)
+        : undefined,
       streamId: data.streamId,
       userId: data.userId,
       tenantId: data.tenantId || undefined,

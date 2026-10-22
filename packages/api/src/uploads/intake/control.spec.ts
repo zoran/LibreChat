@@ -137,6 +137,7 @@ function fixture(observeSecurityDispatch?: IntakeControlOptions['observeSecurity
     appWriterStopped: true,
   };
   const repository: IntakeControlOptions['repository'] = {
+    readActorCleanupRecovery: jest.fn(async () => null),
     sealIntakeRecovery: jest.fn(async () => copy(recovery)),
     confirmIntakeRecovery: jest.fn(async () => ({ ...copy(recovery), acknowledged: true })),
     readIntake: jest.fn(async (_id, hash) => {

@@ -18,7 +18,6 @@ const {
   apiNotFound,
   createMetrics,
   createAppMaintenance,
-  expiredFileSweepMaintenance,
   initializeMaintenanceGeneration,
   probeMaintenanceRedis,
   probeMaintenanceDatabase,
@@ -45,9 +44,12 @@ const {
   preAuthTenantMiddleware,
   requestContextMiddleware,
   registerShutdownTask,
+  fileDeletionWorkOwner,
   getRemainingShutdownMs,
   configureServerTimeouts,
   setupGracefulShutdown,
+  getShutdownSignal,
+  requestGracefulShutdown,
   configureMessageFilterRegexValidator,
   configureFileConfigRegexEngine,
   createAgentEventTerminalHandler,
@@ -78,6 +80,7 @@ const { checkMigrations } = require('./services/start/migration');
 const optionalJwtAuth = require('./middleware/optionalJwtAuth');
 const requireJwtAuth = require('./middleware/requireJwtAuth');
 const { getUploadRuntime } = require('./services/Uploads');
+const { fileLibraryMaintenance } = require('./services/Files/LibraryMaintenance');
 const {
   initializeApplicationRuntime,
   initializeConnectedRuntime,
@@ -107,6 +110,24 @@ const host = HOST || 'localhost';
 const trusted_proxy = Number(TRUST_PROXY) || 1; /* trust first proxy by default */
 
 const app = express();
+
+registerShutdownTask('file deletion admission', () => fileDeletionWorkOwner.stopAdmissions(), {
+  phase: 'pre-drain',
+  priority: 110,
+});
+registerShutdownTask('file deletion settlement', () => fileDeletionWorkOwner.drain(), {
+  phase: 'pre-drain',
+  priority: 90,
+});
+registerShutdownTask('file library admission', () => fileLibraryMaintenance.stopAdmissions(), {
+  phase: 'pre-drain',
+  priority: 110,
+});
+registerShutdownTask('file library settlement', () => fileLibraryMaintenance.drain(), {
+  phase: 'pre-drain',
+  priority: 90,
+});
+
 app.locals.codeApiUploadRegistry = createCodeApiUploadRegistry();
 let serverReady = false;
 /** @type {import('@librechat/api').ScheduleEngineState} */
@@ -125,7 +146,8 @@ const maintenance = createAppMaintenance({
     triggers: agentTriggerMaintenance,
     queuedTurns: agentQueuedTurnMaintenance,
     skillSync: skillSyncMaintenance,
-    fileRetention: expiredFileSweepMaintenance,
+    fileDeletion: fileDeletionWorkOwner.maintenance,
+    fileLibrary: fileLibraryMaintenance,
     uploads: {
       pauseAdmissions: (id) => getUploadRuntime()?.maintenance.pauseAdmissions(id) ?? true,
       resumeAdmissions: (id) => getUploadRuntime()?.maintenance.resumeAdmissions(id) ?? true,
@@ -181,6 +203,7 @@ const configureGenerationStreams = async () => {
     externalCensus: maintenance.externalCensus,
     configure: (options) => GenerationJobManager.configureGenerationAdmission(options),
   });
+  startupSignal.throwIfAborted();
   const streamServices = createStreamServices();
   GenerationJobManager.configure({
     ...streamServices,
@@ -221,7 +244,9 @@ const configureGenerationStreams = async () => {
 const SHUTDOWN_TEARDOWN_RESERVE_MS = 10_000;
 
 const startServer = async () => {
+  startupSignal.throwIfAborted();
   await waitForRedisStartup();
+  startupSignal.throwIfAborted();
   const { metricsMiddleware, metricsRouter, registry } = createMetrics({
     collectAgentEventActorStorageMetrics: () =>
       runAsSystem(async () => {
@@ -245,6 +270,7 @@ const startServer = async () => {
     mongoose,
     identity: maintenance.identity,
   });
+  startupSignal.throwIfAborted();
 
   app.disable('x-powered-by');
   app.set('trust proxy', trusted_proxy);
@@ -273,7 +299,10 @@ const startServer = async () => {
     recordOriginalPublication: statusUsage?.recordOriginalPublication,
     projectRoot: path.resolve(__dirname, '../..'),
     shutdownTeardownReserveMs: SHUTDOWN_TEARDOWN_RESERVE_MS,
+    signal: startupSignal,
+    onFailure: failStartup,
   });
+  startupSignal.throwIfAborted();
 
   /* Route modules build their rate limiters as they load, so they load only after the
    * startup checks have applied `rateLimits` from librechat.yaml. */
@@ -441,6 +470,7 @@ const startServer = async () => {
 
   if (isEnabled(ALLOW_SOCIAL_LOGIN)) {
     await configureSocialLogins(app, appConfig);
+    startupSignal.throwIfAborted();
   }
 
   /* Per-request capability cache — must be registered before any route that calls hasCapability */
@@ -483,6 +513,7 @@ const startServer = async () => {
   app.use('/api/config', preAuthTenantMiddleware, optionalJwtAuth, routes.config);
   app.use('/api/assistants', routes.assistants);
   app.use('/api/files', await routes.files.initialize());
+  startupSignal.throwIfAborted();
   app.use(
     '/images/',
     createValidateImageRequest({
@@ -521,96 +552,109 @@ const startServer = async () => {
   app.use(ErrorController);
 
   await configureGenerationStreams();
+  startupSignal.throwIfAborted();
   uploads?.configureSourceReplay(GenerationJobManager);
-  await maintenance.listen();
   registerShutdownTask('private maintenance listener', () => maintenance.close(), {
     priority: 110,
   });
+  await maintenance.listen();
+  startupSignal.throwIfAborted();
 
-  const server = app.listen(port, host, async (err) => {
-    if (err) {
-      logger.error('Failed to start server:', err);
-      process.exit(1);
-    }
-
-    if (host === '0.0.0.0') {
-      logger.info(
-        `Server listening on all interfaces at port ${port}. Use http://localhost:${port} to access it`,
-      );
-    } else {
-      logger.info(`Server listening at http://${host == '0.0.0.0' ? 'localhost' : host}:${port}`);
-    }
-
-    /**
-     * The listen callback is async, so any rejection from these awaits would
-     * otherwise be detached from `startServer().catch(...)` (which only
-     * catches errors that happen before `app.listen`). Without explicit
-     * handling, the global `unhandledRejection` handler would swallow init
-     * failures and leave the server listening but only partially
-     * initialized — passing liveness checks while serving broken requests.
-     */
-    try {
-      await runAsSystem(async () => {
-        await initializeMCPs();
-        await initializeOAuthReconnectManager();
-      });
-      await checkMigrations();
-
-      const inspectFlags = process.execArgv.some((arg) => arg.startsWith('--inspect'));
-      if (inspectFlags || isEnabled(process.env.MEM_DIAG)) {
-        memoryDiagnostics.start();
+  await new Promise((resolve, reject) => {
+    const server = app.listen(port, host, async (err) => {
+      if (err) {
+        logger.error('Failed to start server:', err);
+        reject(err);
+        return;
       }
-      await initializeAgentTriggerService({
-        address: server.address(),
-        completionResultBatchSize:
-          appConfig?.endpoints?.agents?.backgroundTasks?.completionResultBatchSize,
-        completionReceiptBatching:
-          appConfig?.endpoints?.agents?.backgroundTasks?.completionReceiptBatching,
-        idlePolling: appConfig?.endpoints?.agents?.eventDriven?.idlePolling,
-      });
-      const scheduleEngineArmed = (await initializeScheduleEngine()) != null;
-      scheduleEngineState = scheduleEngineArmed ? 'armed' : 'unavailable';
-      if (!scheduleEngineArmed) {
-        // Terminal, not transient: arming is attempted once, so schedule writes are refused
-        // for the life of this process. Logged at error level because the only other signal
-        // an operator gets is a 503 on every write — every other health signal stays green.
-        logger.error(
-          '[schedules] write routes are PERMANENTLY unavailable in this process: the engine did not arm. ' +
-            'Resolve the cause logged above and restart.',
+
+      if (host === '0.0.0.0') {
+        logger.info(
+          `Server listening on all interfaces at port ${port}. Use http://localhost:${port} to access it`,
         );
+      } else {
+        logger.info(`Server listening at http://${host == '0.0.0.0' ? 'localhost' : host}:${port}`);
       }
-      uploads?.start();
-      serverReady = true;
-      logger.info('Server readiness checks passing.');
-    } catch (initErr) {
-      serverReady = false;
-      logger.error('Post-listen initialization failed:', initErr);
-      process.exit(1);
-    }
-  });
 
-  configureServerTimeouts(server);
-  logger.info('HTTP server timeout configuration', {
-    keepAliveTimeout: server.keepAliveTimeout,
-    keepAliveTimeoutBuffer: server.keepAliveTimeoutBuffer,
-    headersTimeout: server.headersTimeout,
-    requestTimeout: server.requestTimeout,
-  });
+      // Join post-listen initialization to the same original startup operation.
+      try {
+        startupSignal.throwIfAborted();
+        await runAsSystem(async () => {
+          await initializeMCPs();
+          startupSignal.throwIfAborted();
+          await initializeOAuthReconnectManager();
+          startupSignal.throwIfAborted();
+        });
+        await checkMigrations();
+        startupSignal.throwIfAborted();
 
-  setupGracefulShutdown(server);
+        const inspectFlags = process.execArgv.some((arg) => arg.startsWith('--inspect'));
+        if (inspectFlags || isEnabled(process.env.MEM_DIAG)) {
+          memoryDiagnostics.start();
+        }
+        await initializeAgentTriggerService({
+          address: server.address(),
+          completionResultBatchSize:
+            appConfig?.endpoints?.agents?.backgroundTasks?.completionResultBatchSize,
+          completionReceiptBatching:
+            appConfig?.endpoints?.agents?.backgroundTasks?.completionReceiptBatching,
+          idlePolling: appConfig?.endpoints?.agents?.eventDriven?.idlePolling,
+        });
+        startupSignal.throwIfAborted();
+        const scheduleEngineArmed = (await initializeScheduleEngine()) != null;
+        startupSignal.throwIfAborted();
+        scheduleEngineState = scheduleEngineArmed ? 'armed' : 'unavailable';
+        if (!scheduleEngineArmed) {
+          // Terminal, not transient: arming is attempted once, so schedule writes are refused
+          // for the life of this process. Logged at error level because the only other signal
+          // an operator gets is a 503 on every write — every other health signal stays green.
+          logger.error(
+            '[schedules] write routes are PERMANENTLY unavailable in this process: the engine did not arm. ' +
+              'Resolve the cause logged above and restart.',
+          );
+        }
+        await uploads?.start();
+        startupSignal.throwIfAborted();
+        serverReady = true;
+        logger.info('Server readiness checks passing.');
+        resolve();
+      } catch (initErr) {
+        serverReady = false;
+        logger.error('Post-listen initialization failed:', initErr);
+        reject(initErr);
+      }
+    });
+
+    configureServerTimeouts(server);
+    logger.info('HTTP server timeout configuration', {
+      keepAliveTimeout: server.keepAliveTimeout,
+      keepAliveTimeoutBuffer: server.keepAliveTimeoutBuffer,
+      headersTimeout: server.headersTimeout,
+      requestTimeout: server.requestTimeout,
+    });
+
+    setupGracefulShutdown(server);
+  });
 };
 
-/**
- * Boot rejections (e.g. `connectDb`, `getAppConfig`, `performStartupChecks`)
- * must remain fail-fast: a half-initialized process with no listening HTTP
- * server should die immediately so the orchestrator restarts it, instead of
- * being kept alive by the `unhandledRejection` handler below until the
- * liveness probe eventually times out. Mirrors the pattern in
- * `experimental.js`.
- */
-startServer().catch((err) => {
+/** Install the existing shutdown owner before the original startup can acquire resources. */
+setupGracefulShutdown(null);
+const startupSignal = getShutdownSignal();
+const failStartup = () => {
+  serverReady = false;
+  void requestGracefulShutdown('startup_failure').catch(() => undefined);
+};
+const startupOriginal = Promise.resolve().then(startServer);
+registerShutdownTask(
+  'web startup original',
+  async () => {
+    await startupOriginal.catch(() => undefined);
+  },
+  { phase: 'pre-drain', priority: 95 },
+);
+void startupOriginal.catch((err) => {
   logger.error('Failed to start server:', err);
-  process.exit(1);
+  failStartup();
 });
 
 let messageCount = 0;

@@ -4,6 +4,7 @@ import {
   CHECKPOINT_STORAGE_COLLECTION,
   checkpointStorageKey,
   inspectInitialCheckpointPopulation,
+  inspectCheckpointIndexPopulation,
 } from './storage';
 import { resolveCheckpointerConfig } from './config';
 
@@ -100,6 +101,7 @@ describe('metadata-only checkpoint admission inventory', () => {
     for (const call of calls) {
       expect(call.options.maxTimeMS).toBeGreaterThan(0);
       expect(call.options.maxTimeMS).toBeLessThanOrEqual(2000);
+      expect(call.options.timeoutMS).toBe(call.options.maxTimeMS);
       expect(JSON.stringify(call.pipeline)).not.toMatch(/\$out|\$merge|checkpoint.*\$binary/);
     }
   });
@@ -183,5 +185,63 @@ describe('metadata-only checkpoint admission inventory', () => {
       ).rejects.toThrow(/inventory/i);
     }
     expect(calls).toEqual([]);
+  });
+
+  it('requires lineage for index qualification and keeps every census read finite and metadata-only', async () => {
+    const result = await inspectCheckpointIndexPopulation(options());
+    expect(result).toMatchObject({ complete: false, historicalLineageSha256: null });
+    for (const call of calls) {
+      expect(call.options).toMatchObject({
+        readPreference: 'primary',
+        readConcern: { level: 'majority' },
+        collation: { locale: 'simple' },
+        allowDiskUse: false,
+      });
+      expect(call.options.maxTimeMS).toBeGreaterThan(0);
+      expect(call.options.maxTimeMS).toBeLessThanOrEqual(2000);
+      expect(call.options.timeoutMS).toBe(call.options.maxTimeMS);
+    }
+  });
+
+  it('rejects counter overflow instead of returning an approximate production count', async () => {
+    rows.agent_checkpoints = [{ rowCount: Number.MAX_SAFE_INTEGER + 1, malformedKeyRows: 0 }];
+    await expect(inspectCheckpointIndexPopulation(options())).rejects.toThrow(/inventory/i);
+  });
+
+  it('rejects Mongo read failure without returning zero counts or its private error', async () => {
+    const spy = jest.spyOn(mongoose.connection.db!, 'collection').mockImplementationOnce(
+      () =>
+        ({
+          aggregate: () => ({
+            toArray: async () => {
+              throw new Error('private-namespace timeout');
+            },
+          }),
+        }) as never,
+    );
+    try {
+      await expect(inspectCheckpointIndexPopulation(options())).rejects.toThrow(
+        'Initial checkpoint inventory is unavailable or incomplete',
+      );
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('enforces the global deadline after a completed metadata read', async () => {
+    const input = options();
+    const started = Date.now();
+    const clock = jest
+      .spyOn(Date, 'now')
+      .mockReturnValueOnce(started)
+      .mockReturnValueOnce(started)
+      .mockReturnValueOnce(started)
+      .mockReturnValue(started + 10_001);
+    try {
+      await expect(inspectCheckpointIndexPopulation(input)).rejects.toThrow(/inventory/i);
+      expect(calls).toHaveLength(1);
+    } finally {
+      clock.mockRestore();
+    }
   });
 });

@@ -24,9 +24,21 @@ export * from './regexEngine';
 export * from './retention';
 export * from './speech';
 export * from './sse';
-export * from './sweep';
 export * from './usage';
 export * from './validation';
 export * from './text';
 export * from './list';
 export * from './managedSource';
+export { createManagedFileRetrieval, composeManagedFileMaintenance } from './rag/managed';
+export type {
+  TrustedManagedFileConfiguration,
+  ManagedFileRetrievalOperations,
+  ManagedFileRetrieval,
+} from './rag/managed';
+export * from './managedRoutes';
+export * from './workspaceOriginal';
+export { parseManagedFileDeploymentConfiguration } from './rag/configuration';
+export type { ManagedFileDeploymentExpectations } from './rag/configuration';
+export { loadManagedFileDeploymentConfiguration } from './rag/deployment';
+export type { ManagedFileDeploymentOptions } from './rag/deployment';
+export * from './managedDeletion';

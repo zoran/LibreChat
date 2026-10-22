@@ -324,10 +324,13 @@ describe('isolated Intake through native authority, scanner and App promotion', 
       repository,
       resources: appResources,
       identity: {
-        authorize: async (owner, scope) =>
+        authorize: async (owner, request) =>
           owner.tenantId === tenantId &&
           owner.authentication === 'verified-email' &&
-          scope.kind === 'personal',
+          request.owner.scope.kind === 'personal' &&
+          'ownerUserId' in request.owner &&
+          request.owner.ownerUserId === owner.userId &&
+          request.owner.tenantId === owner.tenantId,
       },
     });
     journal = createUploadAttemptJournal(appWorker);

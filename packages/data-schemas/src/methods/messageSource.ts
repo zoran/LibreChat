@@ -1,12 +1,12 @@
 /** Complete Message/quote custody shared by native artifact and checkpoint capture. */
-import { createHash } from 'node:crypto';
 import { types } from 'node:util';
+import { createHash } from 'node:crypto';
 import { UPLOAD_DERIVED_MAX_SOURCES } from 'librechat-data-provider';
 import type { ClientSession, Model } from 'mongoose';
-import type { IMessage } from '~/types/message';
-import type { FileOwnerScope } from '~/types/file';
 import type { CapturedCheckpointMessage } from '~/types/checkpointSource';
-import { FileSourceUnavailableError, fileSourceScope } from './fileRetention';
+import type { FileOwnerScope } from '~/types/file';
+import type { IMessage } from '~/types/message';
+import { FileSourceUnavailableError, fileSourceScope, resolveFileSources } from './fileRetention';
 import { activeExpirationFilter } from '~/utils/retention';
 
 export const MESSAGE_SOURCE_BYTES: number = 4 * 1024 * 1024;
@@ -134,7 +134,9 @@ export async function readCompleteMessageSource(
   )
     throw new FileSourceUnavailableError();
   const ids = new Set(messageSourceIds(row.sourceFileIds));
-  const deadlines = [liveSourceDeadline(row.sourceExpiresAt)];
+  // Captured File expiry is provenance; only the current File owner grants a new read.
+  if (!(row.sourceExpiresAt instanceof Date) || !Number.isFinite(row.sourceExpiresAt.getTime()))
+    throw new FileSourceUnavailableError();
   const quotes = row.quotes ?? [];
   const bindings = row.quoteSourceRetention ?? [];
   if (
@@ -164,12 +166,15 @@ export async function readCompleteMessageSource(
       indices.add(binding.index);
       const sourceFileIds = messageSourceIds(binding.sourceFileIds);
       sourceFileIds.forEach((id) => ids.add(id));
-      deadlines.push(liveSourceDeadline(binding.sourceExpiresAt));
+      if (
+        !(binding.sourceExpiresAt instanceof Date) ||
+        !Number.isFinite(binding.sourceExpiresAt.getTime())
+      )
+        throw new FileSourceUnavailableError();
       return {
         index: binding.index,
         sourceRef: binding.sourceRef,
         sourceFileIds,
-        sourceExpiresAt: binding.sourceExpiresAt.toISOString(),
       };
     })
     .sort((a, b) => a.index - b.index);
@@ -193,11 +198,16 @@ export async function readCompleteMessageSource(
   };
   const encoded = encodeSourceValue(snapshot);
   const sourceFileIds = [...ids].sort();
-  const sourceExpiresAt = new Date(Math.min(...deadlines));
+  const current = await resolveFileSources(mongoose, owner, sourceFileIds, session);
+  if (
+    sourceFileIds.some((id) => !current?.sourceFileIds.includes(id)) ||
+    (row.expiredAt && row.expiredAt.getTime() <= Date.now())
+  )
+    throw new FileSourceUnavailableError();
+  const sourceExpiresAt = new Date(liveSourceDeadline(current?.sourceExpiresAt));
   const bodySha256 = sourceSha256({
     snapshot,
     sourceFileIds,
-    sourceExpiresAt: sourceExpiresAt.toISOString(),
     quoteBindings,
     files: row.files?.map((value) => (value as { file_id: string }).file_id) ?? null,
     attachments: row.attachments?.map((value) => (value as { file_id: string }).file_id) ?? null,

@@ -63,10 +63,10 @@ function admission(): GenerationAdmissionInput {
 function sourceBinding(): CheckpointSourceBinding {
   // Fixed canonical digest fixture; this host unit suite makes no source authorization claim.
   return {
-    version: 1,
+    version: 2,
     owner: { userId: '111111111111111111111111', tenantId: 'tenant' },
     files: [
-      { fileId: 'file-one', approvalSha256: 'd'.repeat(64), expiresAt: '2035-01-01T00:00:00.000Z' },
+      { fileId: 'file-one', bindingSha256: 'd'.repeat(64), expiresAt: '2035-01-01T00:00:00.000Z' },
     ],
     messages: [
       {
@@ -79,7 +79,7 @@ function sourceBinding(): CheckpointSourceBinding {
       },
     ],
     expiresAt: '2035-01-01T00:00:00.000Z',
-    bindingSha256: 'f8da87caf2255e8c284e26346b39e81bf1ae452aee8cd0784d9ba077ea62e802',
+    bindingSha256: '6f7dde21289a90c45f9099f9796a170a41ba575d56449dfde92b6410d4db0b62',
   };
 }
 
@@ -212,7 +212,7 @@ it('captures and forwards the exact private source binding before the durable fa
       expect(Object.isFrozen(savedSource!.messages[0].sourceFileIds)).toBe(true);
       expect(savedAdmission!.continuation!.sourceBindingSha256).toBe(savedSource!.bindingSha256);
       Object.assign(input.durableCheckpointSourceBinding!.files[0], {
-        approvalSha256: 'f'.repeat(64),
+        bindingSha256: 'f'.repeat(64),
       });
       input.durableCheckpointSourceBinding = undefined;
       input.durableCheckpointAdmission!.continuation = {

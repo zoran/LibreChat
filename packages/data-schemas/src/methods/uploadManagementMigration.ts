@@ -9,14 +9,13 @@ import {
   isUploadOriginalIntegrity,
   isUploadStorageReceipt,
   readUploadAcceptedMetadata,
-  readUploadDerivedOrigin,
+  readHistoricalUploadDerivedOrigin,
   uploadReservationFingerprint,
-  uploadDerivedExpiresAt,
 } from 'librechat-data-provider';
 import type {
   UploadMigrationPage,
+  FileRetentionMigrationRecord,
   UploadMigrationReceipt,
-  UploadResourceTotals,
 } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
 import type {
@@ -28,38 +27,36 @@ import type {
   SnapshotHeader,
   MigrationState,
 } from './uploadManagementStore';
+import type { UploadMigrationMethods } from './uploadManagementTypes';
 import {
   uploadDigest,
+  invalidateFileHousekeepingCoverage,
   RESOURCE_MAX,
   MAX_QUEUE_BYTES,
   FALLBACK_LIMITS,
   hasValidUploadPublicationTime,
   reject,
 } from './uploadManagementStore';
+import {
+  prepareFileRetentionMigration,
+  verifyFrozenFileRetentionMigration,
+  assertFrozenFileRetentionPopulation,
+  thawFileRetentionMigrationPage,
+} from './fileRetentionMigration';
+import { validateUploadCleanupCustody, assertUploadCleanupCapacity } from './uploadCleanupReceipts';
 import { validateUploadMigrationSecurity } from './uploadManagement.security';
+import { projectUploadHousekeeping } from './uploadHousekeepingProjection';
 import { validateUploadMigrationIntake } from './uploadManagementIntake';
+import { validateUploadFileCleanupMigration } from './uploadFileCleanup';
 import { readUploadAdmission } from './uploadManagementAdmission';
-
-export type UploadMigrationMethods = {
-  exportSnapshot(input: {
-    epoch: string;
-    cursor?: string;
-    limit?: number;
-  }): Promise<UploadMigrationPage>;
-  importSnapshot(page: UploadMigrationPage): Promise<void>;
-  completeExport(epoch: string): Promise<UploadMigrationReceipt>;
-  completeImport(input: {
-    receipt: UploadMigrationReceipt;
-    baseline: UploadResourceTotals;
-    lifecycleReconciled: true;
-  }): Promise<void>;
-};
+import { uploadSecurityPolicySha256 } from './fileSecurity';
 
 /** One private replacement protocol; the existing File/storage owners reconcile their own data. */
 export function createUploadMigrationMethods(
   store: UploadStore,
   securityPolicySha256?: string,
 ): UploadMigrationMethods {
+  const policy = uploadSecurityPolicySha256(securityPolicySha256);
   const keys = Object.keys(RESOURCE_MAX) as (keyof ResourceTotals)[];
   const totalsOf = (source: ResourceTotals): ResourceTotals =>
     Object.fromEntries(keys.map((key) => [key, source[key]])) as ResourceTotals;
@@ -87,9 +84,17 @@ export function createUploadMigrationMethods(
   function validateRow(value: unknown): StoredUpload {
     if (!value || typeof value !== 'object' || Array.isArray(value)) reject('migration_conflict');
     const row = value as StoredUpload;
+    validateUploadCleanupCustody(row);
+    try {
+      assertUploadCleanupCapacity(row, mongo.BSON.calculateObjectSize);
+    } catch {
+      reject('migration_conflict');
+    }
     if (!hasValidUploadPublicationTime(row)) reject('migration_conflict');
     const origin =
-      row.derivedOrigin === undefined ? undefined : readUploadDerivedOrigin(row.derivedOrigin);
+      row.derivedOrigin === undefined
+        ? undefined
+        : readHistoricalUploadDerivedOrigin(row.derivedOrigin);
     if (origin === null) reject('migration_conflict');
     if (
       origin &&
@@ -105,8 +110,7 @@ export function createUploadMigrationMethods(
         (source) =>
           source.subject.operationId === row._id ||
           source.subject.userId !== row.userId ||
-          source.subject.tenantId !== row.tenantId ||
-          (row.acceptedAt != null && source.expiresAt <= row.acceptedAt),
+          source.subject.tenantId !== row.tenantId,
       )
     )
       reject('migration_conflict');
@@ -182,7 +186,8 @@ export function createUploadMigrationMethods(
       if (
         !integer(row.acceptedAt, 8.64e15 - UPLOAD_RETENTION_MS) ||
         row.acceptedAt < row.createdAt ||
-        row.expiresAt !== uploadDerivedExpiresAt(row.acceptedAt, origin) ||
+        !integer(row.expiresAt, 8.64e15) ||
+        row.expiresAt <= row.acceptedAt ||
         row.actualBytes !== row.declaredBytes ||
         row.fileId !== row._id ||
         !row.attemptGeneration ||
@@ -224,9 +229,19 @@ export function createUploadMigrationMethods(
     validateUploadMigrationIntake(row);
     return row;
   }
-  async function prepareExportRow(row: StoredUpload, session: ClientSession): Promise<void> {
+  async function prepareExportRow(
+    row: StoredUpload,
+    epoch: string,
+    frozenAt: number,
+    session: ClientSession,
+  ): Promise<FileRetentionMigrationRecord | null> {
+    const fresh = await store.Operation.findById(row._id).session(session).lean<StoredUpload>();
+    if (!fresh || !policy) reject('migration_conflict');
+    Object.assign(row, fresh);
     const origin =
-      row.derivedOrigin === undefined ? undefined : readUploadDerivedOrigin(row.derivedOrigin);
+      row.derivedOrigin === undefined
+        ? undefined
+        : readHistoricalUploadDerivedOrigin(row.derivedOrigin);
     if (origin === null) reject('migration_conflict');
     const fingerprint = uploadReservationFingerprint(
       row,
@@ -257,8 +272,19 @@ export function createUploadMigrationMethods(
       validateUploadMigrationIntake(row);
       delete row.intake;
     }
+    await validateUploadFileCleanupMigration(store.mongoose, row, session);
+    const file = await prepareFileRetentionMigration(
+      store.mongoose,
+      row,
+      epoch,
+      frozenAt,
+      session,
+      policy,
+      true,
+    );
     validateRow(row);
     if (uploadDigest(row) !== previous) await store.save(row, session);
+    return file;
   }
   async function exactTotals(global: GlobalState, session: ClientSession): Promise<void> {
     const sum = await store.totals(session);
@@ -271,12 +297,13 @@ export function createUploadMigrationMethods(
   }
   function seal(state: MigrationState): UploadMigrationReceipt {
     return {
-      version: 1,
+      version: 2,
       epoch: state.epoch,
       sourceId: state.header.sourceId,
       digest: state.digest,
       operations: state.operations,
       sourceRetired: true,
+      fileActivity: { ...state.fileActivity },
     };
   }
   return {
@@ -299,6 +326,11 @@ export function createUploadMigrationMethods(
           validateTotals(global);
           validateTotals(global.baseline);
           await exactTotals(global, session);
+          invalidateFileHousekeepingCoverage(
+            global,
+            uploadDigest(['file-coverage-migration', global.storeId, epoch]),
+            'migration',
+          );
           global.migration = {
             epoch,
             role: 'export',
@@ -306,8 +338,10 @@ export function createUploadMigrationMethods(
             cursor: null,
             digest: '',
             operations: 0,
+            fileActivity: { version: 1, files: 0, sha256: '' },
             pages: {},
             header: {
+              retentionFrozenAt: Date.now(),
               sourceId: global.storeId,
               totals: totalsOf(global),
               baseline: { ...global.baseline },
@@ -338,7 +372,11 @@ export function createUploadMigrationMethods(
           .session(session)
           .lean<StoredUpload[]>();
         const selected = rows.slice(0, limit);
-        for (const row of selected) await prepareExportRow(row, session);
+        const fileRecords: FileRetentionMigrationRecord[] = [];
+        for (const row of selected) {
+          const file = await prepareExportRow(row, epoch, state.header.retentionFrozenAt, session);
+          if (file) fileRecords.push(file);
+        }
         const principalIds = [
           ...new Set(selected.map((row) => JSON.stringify([row.tenantId, row.userId]))),
         ];
@@ -351,12 +389,13 @@ export function createUploadMigrationMethods(
         if (principalIds.some((key) => !integer(turns.get(key), state.header.turn)))
           reject('migration_conflict');
         const page: UploadMigrationPage = {
-          version: 1,
+          version: 2,
           epoch,
           cursor: cursor ?? null,
           nextCursor: rows.length > limit ? selected[selected.length - 1]._id : null,
           records: [
             ...(!cursor ? [{ type: 'global', value: state.header }] : []),
+            ...fileRecords,
             ...selected.map((value) => ({
               type: 'operation',
               value,
@@ -370,6 +409,10 @@ export function createUploadMigrationMethods(
           state.pages[key] = { digest, nextCursor: page.nextCursor, limit };
           state.digest = uploadDigest([state.digest, digest]);
           state.operations += selected.length;
+          for (const file of fileRecords) {
+            state.fileActivity.files++;
+            state.fileActivity.sha256 = uploadDigest([state.fileActivity.sha256, file]);
+          }
           state.cursor = page.nextCursor;
           if (page.nextCursor == null) state.phase = 'complete';
         }
@@ -378,10 +421,10 @@ export function createUploadMigrationMethods(
     },
     async importSnapshot(page) {
       if (
-        page.version !== 1 ||
+        page.version !== 2 ||
         !id(page.epoch) ||
         !Array.isArray(page.records) ||
-        page.records.length > 101 ||
+        page.records.length > 201 ||
         (page.cursor != null && !id(page.cursor)) ||
         (page.nextCursor != null && !id(page.nextCursor))
       )
@@ -406,6 +449,7 @@ export function createUploadMigrationMethods(
           validateTotals(header.totals);
           validateTotals(header.baseline);
           if (
+            !integer(header.retentionFrozenAt, Date.now()) ||
             !id(header.sourceId) ||
             header.sourceId === global.storeId ||
             typeof header.reconciled !== 'boolean' ||
@@ -437,6 +481,11 @@ export function createUploadMigrationMethods(
             byteGrants: header.byteGrants.map((grant) => ({ ...grant })),
             admission,
           });
+          invalidateFileHousekeepingCoverage(
+            global,
+            uploadDigest(['file-coverage-migration', global.storeId, page.epoch]),
+            'migration',
+          );
           global.migration = {
             epoch: page.epoch,
             role: 'import',
@@ -445,6 +494,7 @@ export function createUploadMigrationMethods(
             cursor: null,
             digest: '',
             operations: 0,
+            fileActivity: { version: 1, files: 0, sha256: '' },
             pages: {},
           };
         }
@@ -461,7 +511,15 @@ export function createUploadMigrationMethods(
           Object.keys(state.pages).length >= 1000
         )
           reject('migration_conflict');
-        const records = page.cursor == null ? page.records.slice(1) : page.records;
+        const content = page.cursor == null ? page.records.slice(1) : page.records;
+        const fileRecords = content.filter(
+          (record) => record.kind === 'file-retention',
+        ) as FileRetentionMigrationRecord[];
+        const records = content.filter((record) => record.type === 'operation');
+        if (content.length !== records.length + fileRecords.length || fileRecords.length > 100)
+          reject('migration_conflict');
+        const proofs = new Map(fileRecords.map((record) => [record.subject.fileId, record]));
+        if (proofs.size !== fileRecords.length) reject('migration_conflict');
         if (records.length > 100 || (!records.length && page.nextCursor != null))
           reject('migration_conflict');
         let last = page.cursor;
@@ -481,6 +539,26 @@ export function createUploadMigrationMethods(
           )
             reject('migration_conflict');
           await store.Operation.create([row], { session });
+          await projectUploadHousekeeping(store.mongoose, null, row, session);
+          if (!policy) reject('migration_conflict');
+          await validateUploadFileCleanupMigration(store.mongoose, row, session);
+          const actualFile = await prepareFileRetentionMigration(
+            store.mongoose,
+            row,
+            page.epoch,
+            state.header.retentionFrozenAt,
+            session,
+            policy,
+            false,
+          );
+          const expected = proofs.get(row._id);
+          if (uploadDigest(actualFile) !== uploadDigest(expected ?? null))
+            reject('migration_conflict');
+          if (actualFile) {
+            proofs.delete(row._id);
+            state.fileActivity.files++;
+            state.fileActivity.sha256 = uploadDigest([state.fileActivity.sha256, actualFile]);
+          }
           const principalKey = JSON.stringify([row.tenantId, row.userId]);
           const existing = await store.Counter.findById(principalKey)
             .session(session)
@@ -495,6 +573,7 @@ export function createUploadMigrationMethods(
             record.principalTurn,
           );
         }
+        if (proofs.size) reject('migration_conflict');
         if (page.nextCursor != null && page.nextCursor !== last) reject('migration_conflict');
         state.pages[key] = { digest, nextCursor: page.nextCursor, limit: records.length };
         state.digest = uploadDigest([state.digest, digest]);
@@ -521,35 +600,88 @@ export function createUploadMigrationMethods(
       }, true);
     },
     async completeImport({ receipt, baseline, lifecycleReconciled }) {
-      await store.transaction(async (session, global) => {
-        await store.assertCurrentSecurityState(session);
-        const state = global.migration;
-        validateTotals(baseline);
-        if (
-          lifecycleReconciled === true &&
-          global.completedImport &&
-          uploadDigest(global.completedImport) === uploadDigest({ receipt, baseline })
-        )
-          return;
-        if (
-          !state ||
-          state.role !== 'import' ||
-          state.phase !== 'complete' ||
-          uploadDigest(receipt) !== uploadDigest(seal(state)) ||
-          keys.some((key) => baseline[key] !== state.header.baseline[key]) ||
-          lifecycleReconciled !== true ||
-          !state.header.reconciled
-        )
-          reject('migration_conflict');
-        // This attestation is private to the trusted migration coordinator, never an employee API.
-        global.completedImport = { receipt, baseline: { ...baseline } };
-        delete global.migration;
-        global.enabled = true;
-        global.reconciled = true;
-        global.mode = 'fallback';
-        global.limits = { ...FALLBACK_LIMITS };
-        delete global.migrationEpoch;
-      }, true);
+      for (let pass = 0; pass <= 2001; pass++) {
+        const complete = await store.transaction(async (session, global) => {
+          const state = global.migration;
+          validateTotals(baseline);
+          if (
+            lifecycleReconciled === true &&
+            global.completedImport &&
+            uploadDigest(global.completedImport) === uploadDigest({ receipt, baseline })
+          )
+            return true;
+          if (
+            !state ||
+            state.role !== 'import' ||
+            !['complete', 'validating', 'thawing'].includes(state.phase) ||
+            uploadDigest(receipt) !== uploadDigest(seal(state)) ||
+            keys.some((key) => baseline[key] !== state.header.baseline[key]) ||
+            lifecycleReconciled !== true ||
+            !state.header.reconciled ||
+            !policy
+          )
+            reject('migration_conflict');
+          if (state.phase !== 'thawing') {
+            state.phase = 'validating';
+            state.validation ??= { cursor: null, operations: 0, files: 0, sha256: '' };
+            const check = state.validation;
+            const rows = await store.Operation.find(
+              check.cursor ? { _id: { $gt: check.cursor } } : {},
+            )
+              .sort({ _id: 1 })
+              .limit(100)
+              .session(session)
+              .lean<StoredUpload[]>();
+            for (const row of rows) {
+              validateRow(row);
+              await validateUploadFileCleanupMigration(store.mongoose, row, session);
+              const file = await verifyFrozenFileRetentionMigration(
+                store.mongoose,
+                row,
+                state.epoch,
+                state.header.retentionFrozenAt,
+                session,
+                policy,
+              );
+              check.operations++;
+              check.cursor = row._id;
+              if (file) {
+                check.files++;
+                check.sha256 = uploadDigest([check.sha256, file]);
+              }
+            }
+            if (rows.length === 100) return false;
+            if (
+              check.operations !== state.operations ||
+              check.files !== receipt.fileActivity.files ||
+              check.sha256 !== receipt.fileActivity.sha256
+            )
+              reject('migration_conflict');
+            await assertFrozenFileRetentionPopulation(
+              store.mongoose,
+              state.epoch,
+              receipt.fileActivity.files,
+              session,
+            );
+            await exactTotals(global, session);
+            await store.assertCurrentSecurityState(session);
+            state.phase = 'thawing';
+            return false; // No File freeze is removed before this complete verified barrier commits.
+          }
+          if (await thawFileRetentionMigrationPage(store.mongoose, state.epoch, session))
+            return false;
+          global.completedImport = { receipt, baseline: { ...baseline } };
+          delete global.migration;
+          delete global.migrationEpoch;
+          global.enabled = true;
+          global.reconciled = true;
+          global.mode = 'fallback';
+          global.limits = { ...FALLBACK_LIMITS };
+          return true;
+        }, true);
+        if (complete) return;
+      }
+      reject('migration_conflict');
     },
   };
 }

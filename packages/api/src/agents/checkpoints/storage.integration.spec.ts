@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import { emptyCheckpoint, INTERRUPT } from '@langchain/langgraph-checkpoint';
 import type { RunnableConfig } from '@langchain/core/runnables';
-import type { Collection } from 'mongodb';
+import type { AggregationCursor, Collection } from 'mongodb';
 import {
   getAgentCheckpointer,
   __resetCheckpointerForTests,
@@ -10,11 +10,17 @@ import {
   LIBRECHAT_CHECKPOINT_STORAGE_OWNER_KEY,
 } from '../checkpointer';
 import {
+  checkpointStorageConfigs,
+  CHECKPOINT_STORAGE_COLLECTION,
+  checkpointStorageKey,
+  inspectCheckpointIndexPopulation,
+} from './storage';
+import {
   createCheckpointNamespace,
   checkpointOwnerNamespacePrefix,
 } from '../../stream/checkpoints';
 import { openCheckpointDeletion, createCheckpointDeletionReclaimer } from './deletion';
-import { checkpointStorageConfigs, CHECKPOINT_STORAGE_COLLECTION } from './storage';
+import { resolveCheckpointerConfig } from './config';
 
 let server: MongoMemoryServer;
 const cfg = {
@@ -23,7 +29,9 @@ const cfg = {
   checkpointWritesCollectionName: 'old_writes',
 };
 beforeAll(async () => {
-  server = await MongoMemoryServer.create();
+  server = await MongoMemoryServer.create({
+    instance: { args: ['--setParameter', 'enableTestCommands=1'] },
+  });
   await mongoose.connect(server.getUri());
 }, 60000);
 afterAll(async () => {
@@ -34,6 +42,276 @@ afterEach(async () => {
   jest.restoreAllMocks();
   __resetCheckpointerForTests();
   await mongoose.connection.db!.dropDatabase();
+});
+
+describe('checkpoint index metadata inspection', () => {
+  const options = () => ({
+    originalDeadline: new Date(Date.now() + 60_000).toISOString(),
+    targetBindingSha256: 'a'.repeat(64),
+    currentConfig: resolveCheckpointerConfig(undefined),
+    historicalStorageLineage: { evidenceSha256: 'b'.repeat(64), stores: [] },
+  });
+  const checkpointKey = { thread_id: 1, checkpoint_ns: 1, checkpoint_id: -1 } as const;
+
+  test('settles a genuinely stalled native read and closes its cursor before the caller deadline', async () => {
+    const db = mongoose.connection.db!;
+    const collection = db.collection.bind(db);
+    const cursors: AggregationCursor[] = [];
+    let pending = 0;
+    jest.spyOn(db, 'collection').mockImplementation((name, ...args) => {
+      const result = collection(name, ...args);
+      const aggregate = result.aggregate.bind(result);
+      jest.spyOn(result, 'aggregate').mockImplementation((pipeline, opts) => {
+        const cursor = aggregate(pipeline, opts);
+        const toArray = cursor.toArray.bind(cursor);
+        jest.spyOn(cursor, 'toArray').mockImplementation(async () => {
+          pending++;
+          try {
+            return await toArray();
+          } finally {
+            pending--;
+          }
+        });
+        cursors.push(cursor);
+        return cursor;
+      });
+      return result;
+    });
+    await db.admin().command({
+      configureFailPoint: 'failCommand',
+      mode: { times: 1 },
+      data: { failCommands: ['aggregate'], blockConnection: true, blockTimeMS: 1500 },
+    });
+    const started = Date.now();
+    try {
+      await expect(
+        inspectCheckpointIndexPopulation({
+          ...options(),
+          originalDeadline: new Date(started + 600).toISOString(),
+        }),
+      ).rejects.toThrow('Initial checkpoint inventory is unavailable or incomplete');
+      expect(Date.now() - started).toBeLessThan(600);
+      expect(pending).toBe(0);
+      expect(cursors).toHaveLength(1);
+      expect(cursors.every((cursor) => cursor.closed)).toBe(true);
+      await db.admin().command({
+        waitForFailPoint: 'failCommand',
+        timesEntered: 1,
+        maxTimeMS: 1000,
+      });
+      expect(await db.admin().command({ ping: 1 })).toMatchObject({ ok: 1 });
+    } finally {
+      await db.admin().command({ configureFailPoint: 'failCommand', mode: 'off' });
+    }
+  });
+
+  test.each([true, undefined])(
+    'qualifies Mongo index metadata only after building=%s finishes',
+    async (building) => {
+      const db = mongoose.connection.db!;
+      const collection = db.collection.bind(db);
+      jest.spyOn(db, 'collection').mockImplementation((name, ...args) => {
+        const result = collection(name, ...args);
+        const aggregate = result.aggregate.bind(result);
+        jest.spyOn(result, 'aggregate').mockImplementation((pipeline = [], opts) => {
+          if (!pipeline[0]?.$indexStats) return aggregate(pipeline, opts);
+          const pending = name.endsWith('_writes');
+          const key = pending
+            ? { thread_id: 1, checkpoint_ns: 1, checkpoint_id: 1, task_id: 1, idx: 1 }
+            : checkpointKey;
+          const definition = {
+            name: pending ? 'lc_pending_slot_unique' : 'lc_checkpoint_slot_unique',
+            key,
+            spec: { key, unique: true },
+            ...(building === undefined ? {} : { building }),
+          };
+          // Mongo executes the actual inspector projection; only the indexStats source is controlled.
+          return db.aggregate([{ $documents: [definition] }, ...pipeline.slice(1)], opts);
+        });
+        return result;
+      });
+      const result = await inspectCheckpointIndexPopulation(options());
+      expect(result.complete).toBe(building !== true);
+      for (const row of result.collections) {
+        expect(row.indexStatus).toBe(building ? 'conflicting' : 'verified');
+        expect(row.indexes[0]).toMatchObject({ building: building === true });
+      }
+    },
+  );
+
+  test('counts empty default stores without creating a collection or an index', async () => {
+    const db = mongoose.connection.db!;
+    const before = await db.listCollections().toArray();
+    const result = await inspectCheckpointIndexPopulation(options());
+    expect(result.collections).toHaveLength(2);
+    for (const row of result.collections)
+      expect(row).toMatchObject({
+        rowCount: 0,
+        malformedKeyRows: 0,
+        duplicateGroups: 0,
+        duplicateExcessRows: 0,
+        indexes: [],
+        indexStatus: 'missing',
+      });
+    expect(result.complete).toBe(false);
+    expect(await db.listCollections().toArray()).toEqual(before);
+  });
+
+  test('qualifies exact physical indexes only with explicit historical lineage', async () => {
+    // The actual saver owns the physical definitions; the inspector consumes its real output.
+    await seed(
+      { configurable: { thread_id: 'native-index-owner', checkpoint_ns: '' } },
+      {
+        type: 'mongo',
+        checkpointCollectionName: options().currentConfig.checkpointCollectionName,
+        checkpointWritesCollectionName: options().currentConfig.checkpointWritesCollectionName,
+      },
+    );
+    expect(await inspectCheckpointIndexPopulation(options())).toMatchObject({ complete: true });
+    expect(
+      await inspectCheckpointIndexPopulation({ ...options(), historicalStorageLineage: undefined }),
+    ).toMatchObject({ complete: false, historicalLineageSha256: null });
+  });
+
+  test('includes current, registered and historical stores and preserves duplicate payloads', async () => {
+    const db = mongoose.connection.db!;
+    const owner = checkpointOwnerNamespacePrefix('private-owner');
+    const retained = {
+      type: 'mongo' as const,
+      checkpointCollectionName: 'retained_cp',
+      checkpointWritesCollectionName: 'retained_writes',
+    };
+    await db.collection(CHECKPOINT_STORAGE_COLLECTION).insertOne({
+      _id: `${owner}${checkpointStorageKey(retained)}`,
+      owner,
+      storage: retained,
+    } as never);
+    const payload = {
+      thread_id: 'private-thread',
+      checkpoint_ns: 'private-namespace',
+      checkpoint_id: 'private-checkpoint',
+      lc_owner: owner,
+      checkpoint: Buffer.alloc(1024, 77),
+    };
+    await db.collection('retained_cp').insertMany([{ ...payload }, { ...payload }, { ...payload }]);
+    const before = await db.collection('retained_cp').find().toArray();
+    const input = options();
+    const result = await inspectCheckpointIndexPopulation({
+      ...input,
+      currentConfig: resolveCheckpointerConfig(cfg),
+      historicalStorageLineage: {
+        ...input.historicalStorageLineage,
+        stores: [
+          {
+            type: 'mongo',
+            checkpointCollectionName: 'historical_cp',
+            checkpointWritesCollectionName: 'historical_writes',
+          },
+        ],
+      },
+    });
+    expect(result.collections).toHaveLength(8);
+    expect(result.collections.find((row) => row.collection === 'retained_cp')).toMatchObject({
+      rowCount: 3,
+      malformedKeyRows: 0,
+      duplicateGroups: 1,
+      duplicateExcessRows: 2,
+    });
+    const wire = JSON.stringify(result);
+    for (const secret of [owner, 'private-thread', 'private-namespace', 'private-checkpoint'])
+      expect(wire).not.toContain(secret);
+    expect(await db.collection('retained_cp').countDocuments()).toBe(3);
+    expect(await db.collection('retained_cp').find().toArray()).toEqual(before);
+    expect(result.complete).toBe(false);
+  });
+
+  test('counts malformed pending keys while preserving empty namespace and negative integral slots', async () => {
+    const base = { thread_id: 'thread', checkpoint_ns: '', checkpoint_id: 'cp', task_id: 'task' };
+    await mongoose.connection
+      .db!.collection('agent_checkpoint_writes')
+      .insertMany([
+        { ...base, idx: -1 },
+        { ...base, idx: -2 },
+        { ...base, idx: 0 },
+        { ...base, idx: 1.5 },
+        { ...base, idx: '1' },
+        { ...base, idx: null },
+        { ...base, idx: 2, task_id: ['array'] },
+        { ...base },
+      ]);
+    const result = await inspectCheckpointIndexPopulation(options());
+    expect(result.collections.find((row) => row.role === 'pending')).toMatchObject({
+      rowCount: 8,
+      malformedKeyRows: 5,
+      duplicateGroups: 1,
+      duplicateExcessRows: 1,
+    });
+    expect(
+      await mongoose.connection.db!.collection('agent_checkpoint_writes').countDocuments(),
+    ).toBe(8);
+  });
+
+  test.each(['nonunique', 'sparse', 'partial', 'collation', 'key'] as const)(
+    'reports a %s physical-index conflict without changing its definition',
+    async (kind) => {
+      const collection = mongoose.connection.db!.collection('agent_checkpoints');
+      await collection.createIndex(kind === 'key' ? { thread_id: 1 } : checkpointKey, {
+        name: 'lc_checkpoint_slot_unique',
+        unique: kind !== 'nonunique',
+        ...(kind === 'sparse' ? { sparse: true } : {}),
+        ...(kind === 'partial'
+          ? { partialFilterExpression: { thread_id: 'private-index-filter' } }
+          : {}),
+        ...(kind === 'collation' ? { collation: { locale: 'en', strength: 2 } } : {}),
+      });
+      const before = await collection.indexes();
+      const result = await inspectCheckpointIndexPopulation(options());
+      expect(result.collections.find((row) => row.role === 'checkpoint')?.indexStatus).toBe(
+        'conflicting',
+      );
+      expect(result.complete).toBe(false);
+      expect(JSON.stringify(result)).not.toContain('private-index-filter');
+      expect(await collection.indexes()).toEqual(before);
+    },
+  );
+
+  test('rejects oversized index definitions without returning their private filter contents', async () => {
+    const collection = mongoose.connection.db!.collection('agent_checkpoints');
+    await collection.createIndex(checkpointKey, {
+      name: 'lc_checkpoint_slot_unique',
+      unique: true,
+      partialFilterExpression: { thread_id: { $in: ['private-filter-' + 'x'.repeat(5000)] } },
+    });
+    const before = await collection.indexes();
+    await expect(inspectCheckpointIndexPopulation(options())).rejects.toThrow(
+      'Initial checkpoint inventory is unavailable or incomplete',
+    );
+    expect(await collection.indexes()).toEqual(before);
+  });
+
+  test('refuses a truncated registry and an expired deadline without interpreting either as empty', async () => {
+    const storage = {
+      type: 'mongo' as const,
+      checkpointCollectionName: 'retained_cp',
+      checkpointWritesCollectionName: 'retained_writes',
+    };
+    await mongoose.connection.db!.collection(CHECKPOINT_STORAGE_COLLECTION).insertMany(
+      Array.from({ length: 257 }, (_, i) => {
+        const owner = `lcg:v2:${i.toString(16).padStart(64, '0')}:`;
+        return { _id: `${owner}${checkpointStorageKey(storage)}`, owner, storage } as never;
+      }),
+    );
+    await expect(inspectCheckpointIndexPopulation(options())).rejects.toThrow(/inventory/i);
+    await expect(
+      inspectCheckpointIndexPopulation({
+        ...options(),
+        originalDeadline: new Date(Date.now() - 1).toISOString(),
+      }),
+    ).rejects.toThrow(/inventory/i);
+    expect(
+      await mongoose.connection.db!.collection(CHECKPOINT_STORAGE_COLLECTION).countDocuments(),
+    ).toBe(257);
+  });
 });
 
 async function seed(config: RunnableConfig, storage = cfg) {

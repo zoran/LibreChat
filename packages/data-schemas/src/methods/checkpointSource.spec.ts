@@ -1,21 +1,21 @@
 /** Real Mongo capture/retention fences; scanner and original-storage receipts are explicit fixtures. */
 import mongoose from 'mongoose';
-import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtemp, rm } from 'node:fs/promises';
 import { v4 as uuid } from 'uuid';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
-import { uploadDerivedExpiresAt } from 'librechat-data-provider';
+import type { UploadLease, UploadPrincipal } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
 import type { IMessage, IMongoFile } from '~/types';
 import { createCheckpointSourceMethods, snapshotCheckpointSourceBinding } from './checkpointSource';
-import { sourceSha256 } from './messageSource';
-import { createMessageMethods } from './message';
 import { createFileRetentionMethods, resizeRetainedDerivatives } from './fileRetention';
-import { createFileMethods } from './file';
-import { createUploadStore } from './uploadManagementStore';
+import { createUploadManagementRepository } from './uploadManagement';
 import { tenantStorage, runAsSystem } from '~/config/tenantContext';
+import { createUploadStore } from './uploadManagementStore';
+import { createMessageMethods } from './message';
+import { sourceSha256 } from './messageSource';
+import { createFileMethods } from './file';
 import { createModels } from '~/models';
 
 jest.mock('~/config/winston', () => ({
@@ -29,7 +29,7 @@ describe('atomic checkpoint source witnesses', () => {
   const db = new mongoose.Mongoose();
   const messages = createMessageMethods(db);
   const policy = 'c'.repeat(64);
-  const lifecycle = createFileRetentionMethods(db, { securityPolicySha256: policy });
+  createFileRetentionMethods(db, { securityPolicySha256: policy });
   const owner = { userId: new mongoose.Types.ObjectId().toString(), tenantId: 'artifact-source' };
   const run = <T>(action: () => Promise<T>) =>
     tenantStorage.run({ tenantId: owner.tenantId }, action);
@@ -55,84 +55,137 @@ describe('atomic checkpoint source witnesses', () => {
     }
   }
 
+  /** Managed fixtures retain the actual receipt and birth inventory from their owning lifecycle. */
+  async function managedSource(fileId: string, at: number) {
+    const uploads = createUploadManagementRepository(db, {
+      enabled: true,
+      reconciled: true,
+      securityPolicySha256: policy,
+    });
+    await uploads.initialize();
+    const principal: UploadPrincipal = {
+      tenantId: owner.tenantId,
+      userId: owner.userId,
+      authentication: 'verified-email',
+    };
+    const worker = { hostId: 'fixture-host', instanceId: 'fixture-instance' };
+    const reservation = await uploads.reserve(
+      principal,
+      {
+        operationId: fileId,
+        idempotencyKey: uuid(),
+        mediaType: 'text/plain',
+        declaredBytes: 6,
+        fingerprint: JSON.stringify([{ kind: 'personal' }, 'text/plain', 6]),
+      },
+      at,
+    );
+    const transfer = await uploads.claim({
+      kind: 'transfer',
+      principal,
+      operationId: reservation.id,
+      worker,
+      now: at,
+    });
+    if (!transfer) throw new Error('Managed fixture transfer was not admitted');
+    const execution = {
+      version: 2 as const,
+      custody: { kind: 'none' as const },
+      attemptId: `${fileId}.${transfer.generation}`,
+      instanceId: uuid(),
+      executionId: uuid(),
+      expiresAt: new Date(at + 60000).toISOString(),
+    };
+    await uploads.bindSecurityExecution(transfer, execution, at);
+    await uploads.settleSecurityExecution(
+      transfer,
+      { execution, writerStopped: true, transientDataRemoved: true },
+      at,
+    );
+    await uploads.accept(
+      principal,
+      transfer,
+      {
+        outcome: 'durable',
+        bytes: 6,
+        source: 's3',
+        filepath: `/api/files/download/${fileId}`,
+        storageKey: `t/${owner.tenantId}/managed-uploads/${owner.userId}/${fileId}.${transfer.generation}__original`,
+        integrity: {
+          version: 1,
+          algorithm: 'sha256',
+          sha256: 'a'.repeat(64),
+          chunkBytes: 262144,
+          chunkSha256: ['b'.repeat(64)],
+        },
+      },
+      {
+        version: 1,
+        decision: 'approved',
+        policySha256: policy,
+        subject: {
+          userId: owner.userId,
+          tenantId: owner.tenantId,
+          operationId: fileId,
+          transferGeneration: transfer.generation,
+          mediaType: 'text/plain',
+          bytes: 6,
+          sha256: 'a'.repeat(64),
+        },
+        scannerVersion: 'fixture-v1',
+        checkedAt: new Date(at).toISOString(),
+        coverage: { complete: true, pages: 1, parts: 1 },
+      },
+      { filename: 'A.txt' },
+      at,
+    );
+    const settleLocalCopies = (lease: UploadLease) =>
+      uploads.confirmCleanup(
+        {
+          operationId: lease.operationId,
+          generation: lease.generation,
+          writerStopped: true,
+          localCopiesAbsent: true,
+          originalAbsent: false,
+          textAndHistoryRemoved: false,
+        },
+        at,
+      );
+    await settleLocalCopies(transfer);
+    const processing = await uploads.claim({ kind: 'processing', worker, now: at });
+    if (!processing || processing.operationId !== fileId)
+      throw new Error('Managed fixture processing was not admitted');
+    await uploads.bindProcessingExecution(
+      processing,
+      {
+        attemptId: `${fileId}.${processing.generation}`,
+        instanceId: 'fixture-parser',
+        expiresAt: new Date(at + 60000).toISOString(),
+      },
+      at,
+    );
+    await uploads.publish(
+      processing,
+      {
+        text: 'secret',
+        writerStopped: true,
+        structure: {
+          version: 1,
+          source: { sha256: 'a'.repeat(64), bytes: 6, mediaType: 'text/plain' },
+          extractor: { name: 'fixture', version: '1' },
+          pages: [],
+          elements: [{ id: 'e1', kind: 'paragraph', start: 0, end: 6, page: null, parentId: null }],
+          quality: { status: 'complete', warnings: [] },
+        },
+      },
+      at,
+    );
+    await settleLocalCopies(processing);
+  }
+
   async function source() {
     const id = uuid();
-    const now = Date.now();
-    const text = 'Synthetic approved source.\n';
-    const bytes = Buffer.byteLength(text);
-    const sha256 = createHash('sha256').update(text).digest('hex');
-    await transaction(async (session) => {
-      await lifecycle.acceptManagedUpload(
-        {
-          principal: { ...owner, authentication: 'verified-email' },
-          operationId: id,
-          filename: 'synthetic.txt',
-          mediaType: 'text/plain',
-          transferGeneration: 1,
-          acceptedAt: now,
-          expiresAt: uploadDerivedExpiresAt(now),
-          receipt: {
-            outcome: 'durable',
-            bytes,
-            source: 's3',
-            filepath: `/api/files/managed/${id}`,
-            storageKey: `t/${owner.tenantId}/managed-uploads/${owner.userId}/${id}.1__original`,
-            integrity: {
-              version: 1,
-              algorithm: 'sha256',
-              sha256,
-              chunkBytes: 262144,
-              chunkSha256: [sha256],
-            },
-          },
-          securityApproval: {
-            version: 1,
-            decision: 'approved',
-            policySha256: policy,
-            subject: {
-              ...owner,
-              operationId: id,
-              transferGeneration: 1,
-              mediaType: 'text/plain',
-              bytes,
-              sha256,
-            },
-            scannerVersion: 'explicit-synthetic-scanner/v1',
-            checkedAt: new Date(now).toISOString(),
-            coverage: { complete: true, pages: 1, parts: 1 },
-          },
-        },
-        session,
-      );
-      await lifecycle.claimManagedUploadProcessing(owner, id, 1, now, session);
-      await lifecycle.publishManagedUpload(
-        owner,
-        id,
-        1,
-        {
-          text,
-          structure: {
-            version: 1,
-            source: { sha256, bytes, mediaType: 'text/plain' },
-            extractor: { name: 'synthetic-fixture', version: '1' },
-            pages: [],
-            elements: [
-              {
-                id: 'e1',
-                kind: 'paragraph',
-                start: 0,
-                end: text.length,
-                page: null,
-                parentId: null,
-              },
-            ],
-            quality: { status: 'complete', warnings: [] },
-          },
-        },
-        now,
-        session,
-      );
-    });
+    await managedSource(id, Date.now());
     return id;
   }
 
@@ -201,6 +254,7 @@ describe('atomic checkpoint source witnesses', () => {
       await db.models.File.deleteMany({});
     });
     await db.models.UploadCounter.deleteMany({});
+    await db.models.UploadOperation.deleteMany({});
     for (const [key, value] of Object.entries(previous)) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
@@ -561,7 +615,7 @@ describe('atomic checkpoint source witnesses', () => {
     }));
 
   it.each(['unbound', 'unbound-quote', 'duplicate-quote', 'expired-quote', 'legacy-file'] as const)(
-    'does not infer unavailable provenance: %s',
+    'requires complete provenance and current authority: %s',
     async (kind) =>
       run(async () => {
         const id = await source();
@@ -602,7 +656,11 @@ describe('atomic checkpoint source witnesses', () => {
             { file_id: id },
             { $unset: { retentionAcceptedAt: '', securityApproval: '', uploadOperationId: '' } },
           );
-        await expect(capture(row)).rejects.toThrow();
+        if (kind === 'expired-quote')
+          await expect(capture(row)).resolves.toMatchObject({
+            binding: { files: [{ fileId: id }] },
+          });
+        else await expect(capture(row)).rejects.toThrow();
       }),
   );
 
@@ -672,8 +730,8 @@ describe('atomic checkpoint source witnesses', () => {
       expect(Object.isFrozen(snapshot.owner)).toBe(true);
       expect(Object.isFrozen(snapshot.files[0])).toBe(true);
       expect(Object.isFrozen(snapshot.messages[0].sourceFileIds)).toBe(true);
-      value.files[0].approvalSha256 = 'f'.repeat(64);
-      expect(snapshot.files[0].approvalSha256).toBe(binding.files[0].approvalSha256);
+      value.files[0].bindingSha256 = 'f'.repeat(64);
+      expect(snapshot.files[0].bindingSha256).toBe(binding.files[0].bindingSha256);
       expect(Reflect.set(snapshot.files, '1', binding.files[0])).toBe(false);
       const before = await revisions(row, id);
       await expect(

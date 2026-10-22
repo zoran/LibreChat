@@ -1,18 +1,19 @@
 /** Real Mongo capture/retention fences; scanner and original-storage receipts are explicit fixtures. */
 import mongoose from 'mongoose';
-import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { mkdtemp, rm } from 'node:fs/promises';
 import { v4 as uuid } from 'uuid';
+import { createHash } from 'node:crypto';
+import { mkdtemp, rm } from 'node:fs/promises';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
-import { uploadDerivedExpiresAt } from 'librechat-data-provider';
+import type { UploadLease } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
 import type { IMessage, IMongoFile } from '~/types';
-import { createMessageMethods } from './message';
-import { createFileRetentionMethods } from './fileRetention';
-import { createUploadStore } from './uploadManagementStore';
+import { createUploadManagementRepository } from './uploadManagement';
 import { tenantStorage, runAsSystem } from '~/config/tenantContext';
+import { createFileRetentionMethods } from './fileRetention';
+import { readCompleteMessageSource } from './messageSource';
+import { createMessageMethods } from './message';
 import { createModels } from '~/models';
 
 jest.mock('~/config/winston', () => ({
@@ -36,6 +37,7 @@ describe('atomic native artifact source capture', () => {
   };
   let mongo: MongoMemoryReplSet;
   let directory: string;
+  let uploads: ReturnType<typeof createUploadManagementRepository>;
 
   async function transaction<T>(action: (session: ClientSession) => Promise<T>): Promise<T> {
     const session = await db.startSession();
@@ -58,78 +60,116 @@ describe('atomic native artifact source capture', () => {
     const text = 'Synthetic approved source.\n';
     const bytes = Buffer.byteLength(text);
     const sha256 = createHash('sha256').update(text).digest('hex');
-    await transaction(async (session) => {
-      await lifecycle.acceptManagedUpload(
-        {
-          principal: { ...owner, authentication: 'verified-email' },
-          operationId: id,
-          filename: 'synthetic.txt',
-          mediaType: 'text/plain',
-          transferGeneration: 1,
-          acceptedAt: now,
-          expiresAt: uploadDerivedExpiresAt(now),
-          receipt: {
-            outcome: 'durable',
-            bytes,
-            source: 's3',
-            filepath: `/api/files/managed/${id}`,
-            storageKey: `t/${owner.tenantId}/managed-uploads/${owner.userId}/${id}.1__original`,
-            integrity: {
-              version: 1,
-              algorithm: 'sha256',
-              sha256,
-              chunkBytes: 262144,
-              chunkSha256: [sha256],
-            },
-          },
-          securityApproval: {
-            version: 1,
-            decision: 'approved',
-            policySha256: policy,
-            subject: {
-              ...owner,
-              operationId: id,
-              transferGeneration: 1,
-              mediaType: 'text/plain',
-              bytes,
-              sha256,
-            },
-            scannerVersion: 'explicit-synthetic-scanner/v1',
-            checkedAt: new Date(now).toISOString(),
-            coverage: { complete: true, pages: 1, parts: 1 },
-          },
-        },
-        session,
-      );
-      await lifecycle.claimManagedUploadProcessing(owner, id, 1, now, session);
-      await lifecycle.publishManagedUpload(
-        owner,
-        id,
-        1,
-        {
-          text,
-          structure: {
-            version: 1,
-            source: { sha256, bytes, mediaType: 'text/plain' },
-            extractor: { name: 'synthetic-fixture', version: '1' },
-            pages: [],
-            elements: [
-              {
-                id: 'e1',
-                kind: 'paragraph',
-                start: 0,
-                end: text.length,
-                page: null,
-                parentId: null,
-              },
-            ],
-            quality: { status: 'complete', warnings: [] },
-          },
-        },
-        now,
-        session,
-      );
+    const principal = { ...owner, authentication: 'verified-email' as const };
+    const worker = { hostId: 'message-fixture', instanceId: 'message-fixture' };
+    const reserved = await uploads.reserve(
+      principal,
+      {
+        operationId: id,
+        idempotencyKey: uuid(),
+        mediaType: 'text/plain',
+        declaredBytes: bytes,
+        fingerprint: JSON.stringify([{ kind: 'personal' }, 'text/plain', bytes]),
+      },
+      now,
+    );
+    const transfer = await uploads.claim({
+      kind: 'transfer',
+      principal,
+      operationId: reserved.id,
+      worker,
+      now,
     });
+    expect(transfer).not.toBeNull();
+    const execution = {
+      version: 2 as const,
+      custody: { kind: 'none' as const },
+      attemptId: `${id}.${transfer!.generation}`,
+      instanceId: uuid(),
+      executionId: uuid(),
+      expiresAt: new Date(now + 60_000).toISOString(),
+    };
+    await uploads.bindSecurityExecution(transfer!, execution, now);
+    await uploads.settleSecurityExecution(
+      transfer!,
+      { execution, writerStopped: true, transientDataRemoved: true },
+      now,
+    );
+    await uploads.accept(
+      principal,
+      transfer!,
+      {
+        outcome: 'durable',
+        bytes,
+        source: 's3',
+        filepath: `/api/files/download/${id}`,
+        storageKey: `t/${owner.tenantId}/managed-uploads/${owner.userId}/${id}.${transfer!.generation}__original`,
+        integrity: {
+          version: 1,
+          algorithm: 'sha256',
+          sha256,
+          chunkBytes: 262144,
+          chunkSha256: [sha256],
+        },
+      },
+      {
+        version: 1,
+        decision: 'approved',
+        policySha256: policy,
+        subject: {
+          ...owner,
+          operationId: id,
+          transferGeneration: transfer!.generation,
+          mediaType: 'text/plain',
+          bytes,
+          sha256,
+        },
+        scannerVersion: 'explicit-synthetic-scanner/v1',
+        checkedAt: new Date(now).toISOString(),
+        coverage: { complete: true, pages: 1, parts: 1 },
+      },
+      { filename: 'synthetic.txt' },
+      now,
+    );
+    const localGone = (lease: UploadLease) => ({
+      operationId: lease.operationId,
+      generation: lease.generation,
+      writerStopped: true,
+      localCopiesAbsent: true,
+      originalAbsent: false,
+      textAndHistoryRemoved: false,
+    });
+    await uploads.confirmCleanup(localGone(transfer!), now);
+    const processing = await uploads.claim({ kind: 'processing', worker, now });
+    expect(processing?.operationId).toBe(id);
+    await uploads.bindProcessingExecution(
+      processing!,
+      {
+        attemptId: `${id}.${processing!.generation}`,
+        instanceId: 'message-parser',
+        expiresAt: new Date(now + 60_000).toISOString(),
+      },
+      now,
+    );
+    await uploads.publish(
+      processing!,
+      {
+        text,
+        writerStopped: true,
+        structure: {
+          version: 1,
+          source: { sha256, bytes, mediaType: 'text/plain' },
+          extractor: { name: 'synthetic-fixture', version: '1' },
+          pages: [],
+          elements: [
+            { id: 'e1', kind: 'paragraph', start: 0, end: text.length, page: null, parentId: null },
+          ],
+          quality: { status: 'complete', warnings: [] },
+        },
+      },
+      now,
+    );
+    await uploads.confirmCleanup(localGone(processing!), now);
     return id;
   }
 
@@ -180,12 +220,29 @@ describe('atomic native artifact source capture', () => {
   beforeEach(async () => {
     process.env.UPLOAD_SECURITY_POLICY_SHA256 = policy;
     process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = 'true';
-    await createUploadStore(db, { enabled: true, reconciled: true }).initialize();
+    await run(async () =>
+      db.models.User.create({
+        _id: owner.userId,
+        tenantId: owner.tenantId,
+        email: 'message-source@example.test',
+        emailVerified: true,
+      }),
+    );
+    uploads = createUploadManagementRepository(db, {
+      enabled: true,
+      reconciled: true,
+      securityPolicySha256: policy,
+      baseline: { originalBytes: 0, objectBytes: 0, textBytes: 0, recordBytes: 0, bundles: 0 },
+    });
+    await uploads.initialize();
   });
   afterEach(async () => {
     await runAsSystem(async () => {
       await db.models.Message.deleteMany({});
       await db.models.File.deleteMany({});
+      await db.models.User.deleteMany({});
+      await db.models.UploadOperation.deleteMany({});
+      await db.models.FileReadReceipt.deleteMany({});
     });
     await db.models.UploadCounter.deleteMany({});
     for (const [key, value] of Object.entries(previous)) {
@@ -228,6 +285,140 @@ describe('atomic native artifact source capture', () => {
           (await db.models.File.findOne({ file_id: item.file_id }).lean<IMongoFile>())!
             .retentionRevision,
         ).toBe(item.retentionRevision! + 1);
+    }));
+
+  it('uses current File deadlines beyond captured Message and quote expiry without changing source identity', async () =>
+    run(async () => {
+      const id = await source();
+      const row = await message([id]);
+      const quoteRetention = await messages.resolveQuoteRetention(owner, [
+        { text: 'Bound quote', sourceRef: { messageId: row.messageId } },
+      ]);
+      const quoted = await message([id], { quotes: ['Bound quote'] });
+      await db.models.Message.collection.updateOne(
+        { messageId: quoted.messageId },
+        { $set: { quoteSourceRetention: quoteRetention.quoteSourceRetention } },
+      );
+      const before = await transaction((session) =>
+        readCompleteMessageSource(db, owner, inputFor(quoted), session),
+      );
+      const file = await db.models.File.findOne({ file_id: id }).lean<IMongoFile>();
+      const current = new Date(file!.expiredAt!.getTime() + 7 * 86_400_000);
+      const principal = { ...owner, authentication: 'verified-email' as const };
+      const ticket = await uploads.fileReads.admitManagedFileRead(principal, {
+        fileId: id,
+        representation: 'original',
+      });
+      const claim = await uploads.fileReads.claimManagedFileRead(principal, ticket, {
+        hostId: 'message-fixture',
+        instanceId: 'message-reader',
+      });
+      const original = 'Synthetic approved source.\n';
+      expect(
+        await uploads.fileReads.completeManagedFileRead(principal, claim, {
+          version: 1,
+          representation: 'original',
+          sourceBindingSha256: claim.sourceBindingSha256,
+          contentSha256: createHash('sha256').update(original).digest('hex'),
+          verifiedBytes: Buffer.byteLength(original),
+        }),
+      ).toMatchObject({ status: 'completed', firstCompletion: true });
+      expect((await db.models.File.findOne({ file_id: id }).lean<IMongoFile>())!.expiredAt).toEqual(
+        current,
+      );
+      await db.models.Message.collection.updateOne(
+        { messageId: quoted.messageId },
+        {
+          $set: {
+            sourceExpiresAt: new Date(0),
+            quoteSourceRetention: quoteRetention.quoteSourceRetention.map((binding) => ({
+              ...binding,
+              sourceExpiresAt: new Date(0),
+            })),
+          },
+        },
+      );
+      const after = await transaction((session) =>
+        readCompleteMessageSource(db, owner, inputFor(quoted), session),
+      );
+      expect(after.bodySha256).toBe(before.bodySha256);
+      expect(after.sourceExpiresAt).toEqual(current);
+      expect(
+        (await messages.getMessage({ user: owner.userId, messageId: quoted.messageId }))?.text,
+      ).toBe(quoted.text);
+      expect(
+        await messages.resolveFileRetentionContext(owner, {
+          fileIds: [],
+          historyMessageIds: [quoted.messageId],
+        }),
+      ).toEqual({ sourceFileIds: [id], sourceExpiresAt: current });
+      const refreshed = await messages.resolveQuoteRetention(owner, [
+        {
+          text: 'Selected quote',
+          sourceRef: { messageId: quoted.messageId, quoteIndex: 0, messageVersion: quoted.__v! },
+        },
+      ]);
+      expect(refreshed.quoteSourceRetention[0].sourceExpiresAt).toEqual(current);
+      await db.models.Message.collection.updateOne(
+        { messageId: row.messageId },
+        { $set: { sourceFileIds: [] } },
+      );
+      expect(
+        (await messages.getMessage({ user: owner.userId, messageId: row.messageId }))?.text,
+      ).toBe('');
+      await db.models.Message.collection.updateOne(
+        { messageId: quoted.messageId },
+        { $set: { sourceFileIds: [] } },
+      );
+      await expect(
+        messages.resolveFileRetentionContext(owner, {
+          fileIds: [],
+          historyMessageIds: [quoted.messageId],
+        }),
+      ).rejects.toThrow();
+      await expect(
+        messages.resolveQuoteRetention(owner, [
+          { text: 'No lineage', sourceRef: { messageId: quoted.messageId } },
+        ]),
+      ).rejects.toThrow();
+      await db.models.Message.collection.updateOne(
+        { messageId: quoted.messageId },
+        { $set: { sourceFileIds: [id] } },
+      );
+      await messages.saveMessage(
+        owner,
+        {
+          messageId: quoted.messageId,
+          conversationId: quoted.conversationId,
+          isCreatedByUser: false,
+          text: quoted.text,
+        },
+        {
+          sourceRetention: { sourceFileIds: [id], sourceExpiresAt: new Date(0) },
+        },
+      );
+      const written = (await db.models.Message.findOne({ messageId: quoted.messageId })
+        .select('+quoteSourceRetention')
+        .lean<IMessage>())!;
+      expect(written.sourceExpiresAt).toEqual(current);
+      expect(written.quoteSourceRetention![0].sourceExpiresAt).toEqual(current);
+      expect((await capture(written)).sourceExpiresAt).toEqual(current);
+      await db.models.Message.collection.updateOne(
+        { messageId: quoted.messageId },
+        { $set: { expiredAt: new Date(0) } },
+      );
+      await expect(
+        messages.resolveQuoteRetention(owner, [
+          { text: 'Expired Message', sourceRef: { messageId: quoted.messageId } },
+        ]),
+      ).rejects.toThrow();
+      await db.models.File.updateOne(
+        { file_id: id },
+        { $set: { deletionRequestedAt: new Date() } },
+      );
+      await expect(
+        messages.resolveFileRetentionContext(owner, { fileIds: [id], historyMessageIds: [] }),
+      ).rejects.toThrow();
     }));
 
   it('includes all native quote sources even when displayed coverage names only a body source', async () =>
@@ -328,9 +519,7 @@ describe('atomic native artifact source capture', () => {
     'empty-body',
     'unbound-quote',
     'duplicate-quote',
-    'expired-quote',
     'removed-body',
-    'expired-body',
     'expired-message',
     'unfinished',
     'private',
@@ -360,17 +549,8 @@ describe('atomic native artifact source capture', () => {
           await collection.updateOne(filter, {
             $set: { quotes: ['a', 'b'], quoteSourceRetention: [binding, binding] },
           });
-        if (kind === 'expired-quote')
-          await collection.updateOne(filter, {
-            $set: {
-              quotes: ['a'],
-              quoteSourceRetention: [{ ...binding, sourceExpiresAt: new Date(0) }],
-            },
-          });
         if (kind === 'removed-body')
           await collection.updateOne(filter, { $set: { sourceContentRemovedAt: new Date() } });
-        if (kind === 'expired-body')
-          await collection.updateOne(filter, { $set: { sourceExpiresAt: new Date(0) } });
         if (kind === 'expired-message')
           await collection.updateOne(filter, { $set: { expiredAt: new Date(0) } });
         if (kind === 'unfinished')
@@ -423,6 +603,15 @@ describe('atomic native artifact source capture', () => {
         if (kind === 'foreign-policy') process.env.UPLOAD_SECURITY_POLICY_SHA256 = 'd'.repeat(64);
         process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = 'false';
         await expect(capture(row)).rejects.toThrow();
+        expect(
+          (await messages.getMessage({ user: owner.userId, messageId: row.messageId }))?.text,
+        ).toBe('');
+        await expect(
+          messages.resolveFileRetentionContext(owner, {
+            fileIds: [],
+            historyMessageIds: [row.messageId],
+          }),
+        ).rejects.toThrow();
       }),
   );
 

@@ -2,9 +2,13 @@
 import http from 'http';
 import {
   setupGracefulShutdown,
+  requestGracefulShutdown,
   isShutdownInProgress,
   registerShutdownTask,
   getClusterShutdownBudgetMs,
+  getRemainingShutdownMs,
+  getShutdownElapsedMs,
+  getShutdownSignal,
   __resetShutdownStateForTests,
 } from './shutdown';
 
@@ -106,6 +110,124 @@ describe('setupGracefulShutdown', () => {
     }
     __resetShutdownStateForTests();
     jest.useRealTimers();
+  });
+
+  it('initializes without a listener and attaches exactly one actual server', () => {
+    const options = { timeoutMs: 120_000, deferHttpCloseUntilPreDrain: true };
+    setupGracefulShutdown(null, options);
+    setupGracefulShutdown(null, options);
+    expect(process.listenerCount('SIGTERM')).toBe(1);
+    setupGracefulShutdown(server, options);
+    setupGracefulShutdown(server, options);
+    setupGracefulShutdown(null, options);
+    expect(process.listenerCount('SIGTERM')).toBe(1);
+    expect(() => setupGracefulShutdown(http.createServer(), options)).toThrow();
+    expect(() => setupGracefulShutdown(null, { timeoutMs: 60_000 })).toThrow();
+    expect(getRemainingShutdownMs()).toBeNull();
+  });
+
+  it.each([undefined, {}, { close: () => undefined }])(
+    'rejects an implicit or fabricated listener %s before registering an owner',
+    (value) => {
+      expect(() => setupGracefulShutdown(value as never)).toThrow();
+      expect(process.listenerCount('SIGTERM')).toBe(0);
+      expect(getShutdownSignal().aborted).toBe(false);
+    },
+  );
+
+  it('rejects unconfigured or invalid startup failure requests', () => {
+    expect(() => requestGracefulShutdown('startup_failure')).toThrow();
+    setupGracefulShutdown(null);
+    expect(() => requestGracefulShutdown('SIGTERM' as never)).toThrow();
+    expect(getShutdownSignal().aborted).toBe(false);
+  });
+
+  it('retains the exact startup failure promise through reentrant abort and original acquisition', async () => {
+    let release!: () => void;
+    const original = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const close = jest.fn();
+    registerShutdownTask(
+      'acquisition',
+      async () => {
+        await original;
+        close();
+      },
+      { phase: 'pre-drain' },
+    );
+    setupGracefulShutdown(null, { timeoutMs: 120_000, deferHttpCloseUntilPreDrain: true });
+    let reentrant: Promise<void> | undefined;
+    getShutdownSignal().addEventListener('abort', () => {
+      reentrant = requestGracefulShutdown('startup_failure');
+    });
+    const pending = requestGracefulShutdown('startup_failure');
+    expect(reentrant).toBe(pending);
+    expect(requestGracefulShutdown('startup_failure')).toBe(pending);
+    expect(close).not.toHaveBeenCalled();
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(() =>
+      setupGracefulShutdown(server, { timeoutMs: 120_000, deferHttpCloseUntilPreDrain: true }),
+    ).toThrow();
+    expect(() => registerShutdownTask('late acquisition', close)).toThrow();
+    release();
+    await pending;
+    expect(close).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('promotes a signal-driven shutdown to failure without replacing its promise or deadline', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    let release!: () => void;
+    const original = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    registerShutdownTask('acquisition', () => original, { phase: 'pre-drain' });
+    setupGracefulShutdown(null, { timeoutMs: 120_000, deferHttpCloseUntilPreDrain: true });
+    triggerSignal('SIGTERM');
+    jest.advanceTimersByTime(30_000);
+    const pending = requestGracefulShutdown('startup_failure');
+    triggerSignal('SIGINT');
+    expect(requestGracefulShutdown('startup_failure')).toBe(pending);
+    expect(getRemainingShutdownMs()).toBe(90_000);
+    expect(jest.getTimerCount()).toBe(1);
+    release();
+    await pending;
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('keeps unresolved startup failure pending until the original force deadline', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    registerShutdownTask(
+      'failed original',
+      async () => {
+        throw new Error('Unknown custody');
+      },
+      { phase: 'pre-drain' },
+    );
+    const destructive = jest.fn();
+    registerShutdownTask('destructive close', destructive);
+    setupGracefulShutdown(null, { timeoutMs: 120_000, deferHttpCloseUntilPreDrain: true });
+    let resolved = false;
+    const pending = requestGracefulShutdown('startup_failure');
+    void pending.then(() => {
+      resolved = true;
+    });
+    await flush();
+    jest.advanceTimersByTime(119_999);
+    triggerSignal('SIGTERM');
+    expect(requestGracefulShutdown('startup_failure')).toBe(pending);
+    expect(getRemainingShutdownMs()).toBe(1);
+    expect(resolved).toBe(false);
+    expect(destructive).not.toHaveBeenCalled();
+    expect(exitSpy).not.toHaveBeenCalled();
+    jest.advanceTimersByTime(1);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(resolved).toBe(false);
   });
 
   it('registers handlers for SIGTERM, SIGINT, SIGQUIT, and SIGHUP', () => {
@@ -235,6 +357,232 @@ describe('setupGracefulShutdown', () => {
     triggerSignal('SIGTERM');
     jest.advanceTimersByTime(60_000);
     expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('keeps the explicit 120-second deadline after options mutation and repeated setup', () => {
+    jest.useFakeTimers();
+    jest.spyOn(server, 'close').mockImplementation(() => server);
+    const options = { timeoutMs: 120_000 };
+    setupGracefulShutdown(server, options);
+    options.timeoutMs = 1;
+    expect(getRemainingShutdownMs()).toBeNull();
+    triggerSignal('SIGTERM');
+    expect(getRemainingShutdownMs()).toBe(120_000);
+    jest.advanceTimersByTime(60_000);
+    expect(getRemainingShutdownMs()).toBe(60_000);
+    expect(exitSpy).not.toHaveBeenCalled();
+    setupGracefulShutdown(server, { timeoutMs: 120_000 });
+    triggerSignal('SIGINT');
+    expect(getShutdownElapsedMs()).toBe(60_000);
+    jest.advanceTimersByTime(59_999);
+    expect(getRemainingShutdownMs()).toBe(1);
+    expect(exitSpy).not.toHaveBeenCalled();
+    jest.advanceTimersByTime(1);
+    expect(getRemainingShutdownMs()).toBe(0);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it.each([0, -1, 1.5, NaN, Infinity, -Infinity, 120_001, '120000', null])(
+    'rejects an invalid shutdown timeout %s before registering any owner',
+    (timeoutMs) => {
+      expect(() => setupGracefulShutdown(server, { timeoutMs: timeoutMs as number })).toThrow();
+      for (const signal of ['SIGTERM', 'SIGINT', 'SIGQUIT', 'SIGHUP'] as NodeJS.Signals[])
+        expect(process.listenerCount(signal)).toBe(0);
+      expect(getRemainingShutdownMs()).toBeNull();
+      expect(isShutdownInProgress()).toBe(false);
+      expect(() => setupGracefulShutdown(server)).not.toThrow();
+    },
+  );
+
+  it('selects the server and budget once and never extends an active default deadline', () => {
+    jest.useFakeTimers();
+    const close = jest.spyOn(server, 'close').mockImplementation(() => server);
+    setupGracefulShutdown(server);
+    setupGracefulShutdown(server);
+    expect(process.listenerCount('SIGTERM')).toBe(1);
+    expect(() => setupGracefulShutdown(server, { timeoutMs: 120_000 })).toThrow();
+    expect(() => setupGracefulShutdown(server, { deferHttpCloseUntilPreDrain: true })).toThrow();
+    const replacement = http.createServer();
+    expect(() => setupGracefulShutdown(replacement)).toThrow();
+    triggerSignal('SIGTERM');
+    expect(getRemainingShutdownMs()).toBe(60_000);
+    jest.advanceTimersByTime(30_000);
+    expect(() => setupGracefulShutdown(server, { timeoutMs: 120_000 })).toThrow();
+    setupGracefulShutdown(server);
+    triggerSignal('SIGTERM');
+    expect(getRemainingShutdownMs()).toBe(30_000);
+    expect(close).toHaveBeenCalledTimes(1);
+    jest.advanceTimersByTime(30_000);
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('keeps a real observation listener open until original deferred pre-drain work settles', async () => {
+    Reflect.deleteProperty(server, 'listening');
+    server.on('request', (_req, res) => res.end('observed'));
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address() as { port: number };
+    let settle!: () => void;
+    const original = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    const postDrain = jest.fn();
+    registerShutdownTask('original custody', () => original, { phase: 'pre-drain' });
+    registerShutdownTask('destructive close', postDrain);
+    setupGracefulShutdown(server, { timeoutMs: 120_000, deferHttpCloseUntilPreDrain: true });
+    triggerSignal('SIGTERM');
+    await flush();
+    const status = await new Promise<number | undefined>((resolve, reject) => {
+      http
+        .get({ host: '127.0.0.1', port: address.port, agent: false }, (res) => {
+          res.resume();
+          res.on('end', () => resolve(res.statusCode));
+        })
+        .on('error', reject);
+    });
+    expect(status).toBe(200);
+    expect(postDrain).not.toHaveBeenCalled();
+    expect(exitSpy).not.toHaveBeenCalled();
+    settle();
+    await flush();
+    await flush();
+    expect(server.listening).toBe(false);
+    expect(postDrain).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(0);
+  });
+
+  it('retains failed deferred custody and the original deadline without destructive post-drain', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    const close = jest.spyOn(server, 'close');
+    const postDrain = jest.fn();
+    registerShutdownTask(
+      'unresolved custody',
+      async () => {
+        throw new Error('Unresolved');
+      },
+      { phase: 'pre-drain' },
+    );
+    registerShutdownTask('destructive close', postDrain);
+    const options = { timeoutMs: 120_000, deferHttpCloseUntilPreDrain: true };
+    setupGracefulShutdown(server, options);
+    options.deferHttpCloseUntilPreDrain = false;
+    triggerSignal('SIGTERM');
+    await flush();
+    expect(close).not.toHaveBeenCalled();
+    expect(postDrain).not.toHaveBeenCalled();
+    expect(exitSpy).not.toHaveBeenCalled();
+    jest.advanceTimersByTime(105_000);
+    setupGracefulShutdown(server, { timeoutMs: 120_000, deferHttpCloseUntilPreDrain: true });
+    triggerSignal('SIGINT');
+    expect(getRemainingShutdownMs()).toBe(15_000);
+    jest.advanceTimersByTime(14_999);
+    expect(exitSpy).not.toHaveBeenCalled();
+    jest.advanceTimersByTime(1);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(close).not.toHaveBeenCalled();
+    expect(postDrain).not.toHaveBeenCalled();
+  });
+
+  it.each(['true', null])(
+    'rejects a nonboolean HTTP ordering option %s before registering an owner',
+    (deferred) => {
+      expect(() =>
+        setupGracefulShutdown(server, { deferHttpCloseUntilPreDrain: deferred as never }),
+      ).toThrow();
+      expect(process.listenerCount('SIGTERM')).toBe(0);
+    },
+  );
+
+  it('keeps the original deferred failure deadline referenced without a listening socket', async () => {
+    Object.defineProperty(server, 'listening', { value: false, configurable: true });
+    const timer = jest.spyOn(global, 'setTimeout');
+    registerShutdownTask(
+      'failed startup custody',
+      async () => {
+        throw new Error('Unresolved');
+      },
+      { phase: 'pre-drain' },
+    );
+    setupGracefulShutdown(server, { timeoutMs: 120_000, deferHttpCloseUntilPreDrain: true });
+    triggerSignal('SIGTERM');
+    await flush();
+    expect(timer).toHaveBeenCalledTimes(1);
+    expect((timer.mock.results[0].value as NodeJS.Timeout).hasRef()).toBe(true);
+    expect(exitSpy).not.toHaveBeenCalled();
+    timer.mockRestore();
+  });
+
+  it('awaits the original task through the custom budget and leaves the close reserve intact', async () => {
+    jest.useFakeTimers({ doNotFake: ['setImmediate'] });
+    jest.spyOn(server, 'close').mockImplementation((cb?: (err?: Error) => void) => {
+      cb?.();
+      return server;
+    });
+    let settle: (() => void) | undefined;
+    const original = new Promise<void>((resolve) => {
+      settle = resolve;
+    });
+    const postDrain = jest.fn();
+    registerShutdownTask('original effect', () => original, { phase: 'pre-drain' });
+    registerShutdownTask('close resources', postDrain);
+    setupGracefulShutdown(server, { timeoutMs: 120_000 });
+    triggerSignal('SIGTERM');
+    jest.advanceTimersByTime(105_000);
+    await flush();
+    expect(getShutdownSignal().aborted).toBe(true);
+    expect(getRemainingShutdownMs()).toBe(15_000);
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(postDrain).not.toHaveBeenCalled();
+    settle?.();
+    await flush();
+    await flush();
+    expect(postDrain).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(0);
+    jest.advanceTimersByTime(15_000);
+    expect(exitSpy).not.toHaveBeenCalledWith(1);
+  });
+
+  it('charges synchronous cancellation work to the original shutdown deadline', () => {
+    jest.useFakeTimers();
+    jest.spyOn(server, 'close').mockImplementation(() => server);
+    getShutdownSignal().addEventListener('abort', () => jest.advanceTimersByTime(1_000));
+    setupGracefulShutdown(server, { timeoutMs: 120_000 });
+    triggerSignal('SIGTERM');
+    expect(getShutdownElapsedMs()).toBe(1_000);
+    expect(getRemainingShutdownMs()).toBe(119_000);
+    jest.advanceTimersByTime(118_999);
+    expect(exitSpy).not.toHaveBeenCalled();
+    expect(getRemainingShutdownMs()).toBe(1);
+    jest.advanceTimersByTime(1);
+    expect(exitSpy).toHaveBeenCalledWith(1);
+  });
+
+  it('resets the custom budget, deadline and only its own signal handlers', () => {
+    jest.useFakeTimers();
+    jest.spyOn(server, 'close').mockImplementation(() => server);
+    const foreign = jest.fn();
+    process.on('SIGTERM', foreign);
+    setupGracefulShutdown(server, { timeoutMs: 120_000 });
+    const oldSignal = getShutdownSignal();
+    triggerSignal('SIGTERM');
+    jest.advanceTimersByTime(1_000);
+    __resetShutdownStateForTests();
+    expect(process.listeners('SIGTERM')).toEqual([foreign]);
+    expect(getRemainingShutdownMs()).toBeNull();
+    expect(getShutdownElapsedMs()).toBeNull();
+    expect(getShutdownSignal()).not.toBe(oldSignal);
+    expect(getShutdownSignal().aborted).toBe(false);
+    setupGracefulShutdown(server);
+    triggerSignal('SIGTERM');
+    expect(getRemainingShutdownMs()).toBe(60_000);
+    jest.advanceTimersByTime(60_000);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    __resetShutdownStateForTests();
+    jest.advanceTimersByTime(120_000);
+    expect(exitSpy).toHaveBeenCalledTimes(1);
+    process.off('SIGTERM', foreign);
   });
 
   it('runs registered tasks after server.close and before exit', async () => {

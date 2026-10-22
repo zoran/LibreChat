@@ -46,6 +46,7 @@ export * from './mcp/apps/limits';
 export * from './mcp/sandbox';
 export * from './mcp/catalog/store';
 export * from './mcp/catalog/recovery';
+export * from './acl/resourceAuthorization';
 export * from './mcp/authorization';
 export * from './mcp/authorizationRetry';
 export * from './mcp/assistants';
@@ -153,6 +154,16 @@ export * from './tools/approval';
 export * from './mcp/approval';
 
 export * from './auth/mailSender';
+export {
+  createBoundedRetentionMailSender,
+  getRetentionMailConfig,
+} from './files/retentionMailSender';
+export type {
+  RetentionMailConfig,
+  RetentionMailInput,
+  RetentionMailSender,
+  RetentionMailOutcome,
+} from './files/retentionMailSender';
 
 export * from './uploads/control';
 
@@ -161,3 +172,14 @@ export * from './uploads/metrics';
 export * from './uploads/workers';
 
 export * from './uploads/cleanup';
+export { createOutboundMailAdapter } from './mail/mime';
+export { composeRetentionMailSender } from './files/retentionMailComposition';
+export type { RetentionMailRuntime } from './files/retentionMailComposition';
+
+export { createHousekeepingApplication } from './housekeeping/application';
+export type {
+  HousekeepingApplication,
+  HousekeepingApplicationDependencies,
+} from './housekeeping/application';
+
+export { createManagedS3Client } from './storage/s3/managedClient';

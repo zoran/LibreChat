@@ -6,7 +6,16 @@ const { MongoMemoryReplSet } = require('mongodb-memory-server');
 const { createModels, createFileLibraryMethods } = require('@librechat/data-schemas');
 const { FileContext } = require('librechat-data-provider');
 const { createFileLibraryHandlers } = require('./library');
-const { createManagedSourceResolver } = jest.requireActual('@librechat/api');
+const { createFileLibraryMaintenance } = require('../../services/Files/LibraryMaintenance');
+const { createAppMaintenance, createManagedSourceResolver } = jest.requireActual('@librechat/api');
+
+const deferred = () => {
+  let resolve;
+  const promise = new Promise((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+};
 
 describe('File library HTTP and native Mongo composition', () => {
   const db = new mongoose.Mongoose();
@@ -19,6 +28,10 @@ describe('File library HTTP and native Mongo composition', () => {
   let mongo;
   let app;
   let original;
+  let runtime;
+  let libraryOwner;
+  let maintenance;
+  const identities = { owner, foreign, 'other-tenant': { ...owner, tenantId: 'foreign-tenant' } };
 
   const get = (query = '', identity = 'owner') =>
     request(app)
@@ -40,8 +53,7 @@ describe('File library HTTP and native Mongo composition', () => {
     await db.connect(mongo.getUri('file-library-http'));
     createModels(db);
     await Promise.all(['File', 'User', 'ChatProject'].map((name) => db.models[name].init()));
-    const identities = { owner, foreign, 'other-tenant': { ...owner, tenantId: 'foreign-tenant' } };
-    const runtime = {
+    runtime = {
       allowedOrigins: [origin],
       principal: async (req) => ({
         userId: req.user.id,
@@ -64,21 +76,6 @@ describe('File library HTTP and native Mongo composition', () => {
       allowedOrigins: runtime.allowedOrigins,
       principal: (req) => runtime.principal(req),
     });
-    const handlers = createFileLibraryHandlers({
-      methods: createFileLibraryMethods(db),
-      isManaged: () => true,
-      getRuntime: () => runtime,
-    });
-    app = express();
-    app.use(express.json());
-    app.use((req, res, next) => {
-      const principal = identities[req.headers.authorization?.replace(/^Bearer /, '')];
-      if (!principal) return res.sendStatus(401);
-      req.user = { id: principal.userId, tenantId: principal.tenantId };
-      next();
-    });
-    app.get('/api/files/library', handlers.list);
-    app.patch('/api/files/:file_id/library', handlers.update);
   });
 
   beforeEach(async () => {
@@ -135,6 +132,36 @@ describe('File library HTTP and native Mongo composition', () => {
       },
     };
     await db.models.File.collection.insertOne(original);
+    libraryOwner = createFileLibraryMaintenance();
+    maintenance = createAppMaintenance({
+      env: {},
+      requiredSharedState: false,
+      startupReady: () => true,
+      probeDatabase: async () => false,
+      probeSharedState: async () => false,
+      generation: {
+        closeGenerationAdmission: () => true,
+        reopenGenerationAdmission: () => true,
+      },
+      workOwners: { fileLibrary: libraryOwner },
+      unqualifiedOwners: ['Other application writers are outside this fixture'],
+    });
+    const handlers = createFileLibraryHandlers({
+      methods: createFileLibraryMethods(db),
+      isManaged: () => true,
+      getRuntime: () => runtime,
+      maintenance: libraryOwner,
+    });
+    app = express();
+    app.use(express.json());
+    app.use((req, res, next) => {
+      const principal = identities[req.headers.authorization?.replace(/^Bearer /, '')];
+      if (!principal) return res.sendStatus(401);
+      req.user = { id: principal.userId, tenantId: principal.tenantId };
+      next();
+    });
+    app.get('/api/files/library', handlers.list);
+    app.patch('/api/files/:file_id/library', handlers.update);
   });
 
   afterAll(async () => {
@@ -198,5 +225,123 @@ describe('File library HTTP and native Mongo composition', () => {
       'securityApproval',
     ])
       expect(saved[key]).toEqual(original[key]);
+    expect(libraryOwner.pauseAdmissions('known-results')).toBe(true);
+    expect((await libraryOwner.getMaintenanceCensus('known-results')).complete).toBe(true);
+    expect(libraryOwner.resumeAdmissions('known-results')).toBe(true);
+  });
+
+  it.each(['get', 'patch'])(
+    'retains the original %s library transaction after HTTP closure until session settlement',
+    async (method) => {
+      const held = deferred();
+      const release = deferred();
+      const closed = deferred();
+      const originalStart = db.startSession.bind(db);
+      const sessions = jest.spyOn(db, 'startSession').mockImplementationOnce(async (...args) => {
+        const session = await originalStart(...args);
+        const endSession = session.endSession.bind(session);
+        session.endSession = async () => {
+          held.resolve();
+          await release.promise;
+          return endSession();
+        };
+        return session;
+      });
+      const submit = (server) => {
+        const pending = request(server)
+          [method](method === 'get' ? '/api/files/library' : '/api/files/library-original/library')
+          .set('Authorization', 'Bearer owner')
+          .set('Origin', origin);
+        return method === 'get' ? pending : pending.send({ expectedRevision: 0, tags: ['Held'] });
+      };
+      const server = app.listen(0, '127.0.0.1');
+      await new Promise((resolve) => server.once('listening', resolve));
+      server.once('request', (_req, res) => res.once('close', closed.resolve));
+      const pending = submit(server);
+      const response = pending.then(
+        (value) => ({ value }),
+        (error) => ({ error }),
+      );
+      try {
+        await held.promise;
+        // Both GET and PATCH commit the principal version write before original session closure.
+        expect((await db.models.User.findById(owner.userId).lean()).__v).toBe(1);
+        expect(
+          maintenance.operation('begin', {
+            requestId: 'library-hold',
+            identity: maintenance.identity,
+            expectedRevision: 0,
+          }),
+        ).toBe(200);
+        expect(await maintenance.externalCensus()).toEqual({
+          queuedContinuations: 0,
+          pendingWrites: 1,
+          complete: false,
+        });
+        pending.abort();
+        await closed.promise;
+        expect(await response).toHaveProperty('error');
+        expect(await libraryOwner.getMaintenanceCensus('library-hold')).toEqual({
+          admissionClosed: true,
+          queuedContinuations: 0,
+          pendingWrites: 1,
+          complete: true,
+        });
+        expect((await submit(server)).status).toBe(503);
+        expect(sessions).toHaveBeenCalledTimes(1);
+        expect((await db.models.User.findById(owner.userId).lean()).__v).toBe(1);
+        let drained = false;
+        const draining = libraryOwner.drain().then(() => {
+          drained = true;
+        });
+        await Promise.resolve();
+        expect(drained).toBe(false);
+        release.resolve();
+        await draining;
+        expect(await maintenance.externalCensus()).toEqual({
+          queuedContinuations: 0,
+          pendingWrites: 0,
+          complete: false,
+        });
+      } finally {
+        release.resolve();
+        await response;
+        await libraryOwner.drain();
+        await new Promise((resolve) => server.close(resolve));
+        sessions.mockRestore();
+      }
+    },
+  );
+
+  it('keeps an original library session rejection uncertain after its HTTP response', async () => {
+    const originalStart = db.startSession.bind(db);
+    const sessions = jest.spyOn(db, 'startSession').mockImplementationOnce(async (...args) => {
+      const session = await originalStart(...args);
+      const endSession = session.endSession.bind(session);
+      session.endSession = async () => {
+        await endSession();
+        throw new Error('Injected original session-close failure');
+      };
+      return session;
+    });
+    try {
+      const response = await patch({ expectedRevision: 0, tags: ['Committed'] });
+      expect(response.status).toBe(503);
+      expect(response.body).toEqual({ code: 'unavailable' });
+      expect(
+        (await db.models.File.collection.findOne({ file_id: 'library-original' })).library.tags,
+      ).toEqual(['Committed']);
+      expect(libraryOwner.pauseAdmissions('failed-close')).toBe(true);
+      expect(await libraryOwner.getMaintenanceCensus('failed-close')).toEqual({
+        admissionClosed: true,
+        queuedContinuations: 0,
+        pendingWrites: 0,
+        complete: false,
+      });
+      expect(libraryOwner.resumeAdmissions('failed-close')).toBe(false);
+      await expect(libraryOwner.drain()).rejects.toThrow('FILE_LIBRARY_SETTLEMENT_UNCONFIRMED');
+    } finally {
+      sessions.mockRestore();
+    }
   });
 });

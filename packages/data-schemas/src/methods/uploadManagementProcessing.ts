@@ -10,7 +10,6 @@ import {
   readUploadAcceptedMetadata,
   readManagedDocumentResult,
   readUploadDerivedOrigin,
-  uploadDerivedExpiresAt,
 } from 'librechat-data-provider';
 import type { UploadLease, UploadClaimInput } from 'librechat-data-provider';
 import type { UploadManagementRepository, UploadManagementContext } from './uploadManagementTypes';
@@ -308,7 +307,6 @@ export function createUploadProcessingMethods(
         if (derivedOrigin === null) reject('not_found');
         row.acceptedAt = now;
         row.filename = acceptedMetadata.filename;
-        row.expiresAt = uploadDerivedExpiresAt(now, derivedOrigin);
         row.fileId = row._id;
         row.actualBytes = original.bytes;
         row.original = original;
@@ -321,7 +319,7 @@ export function createUploadProcessingMethods(
         delete row.slot;
         delete row.leaseExpiresAt;
         try {
-          await lifecycle.acceptManagedUpload(
+          const admission = await lifecycle.acceptManagedUpload(
             {
               principal,
               operationId: row._id,
@@ -331,11 +329,11 @@ export function createUploadProcessingMethods(
               receipt: original,
               securityApproval: row.securityApproval,
               acceptedAt: now,
-              expiresAt: row.expiresAt,
               ...(derivedOrigin ? { derivedOrigin } : {}),
             },
             session,
           );
+          row.expiresAt = admission.expiredAt.getTime();
         } catch (error) {
           if (error instanceof FileSourceCapacityError) reject('capacity_exceeded');
           throw error;
@@ -367,6 +365,7 @@ export function createUploadProcessingMethods(
       if (!document || actual > UPLOAD_MAX_TEXT_BYTES) reject('processing_failed');
       const digest = uploadDigest(JSON.stringify(document));
       return store.transaction(async (session, global) => {
+        const eligibilityNow = Math.max(now, Date.now());
         const row = await store.Operation.findById(lease.operationId)
           .session(session)
           .lean<StoredUpload>();
@@ -389,26 +388,26 @@ export function createUploadProcessingMethods(
           row.worker?.instanceId === lease.instanceId &&
           row.publishedDigest === digest
         ) {
-          requireUploadSecurityApproval(row, securityPolicySha256, now);
+          requireUploadSecurityApproval(row, securityPolicySha256, eligibilityNow);
           await lifecycle.assertManagedUploadProcessing(
             principalOf(row),
             row._id,
             lease.generation,
-            now,
+            eligibilityNow,
             session,
           );
           return project(row, now);
         }
-        assertLease(row, lease, now);
+        assertLease(row, lease, eligibilityNow);
         if (
           row.state !== 'processing' ||
           row.slot !== 'processing' ||
-          row.expiresAt! <= now ||
+          row.expiresAt! <= eligibilityNow ||
           !row.parserExecution
         )
           reject('lease_lost');
-        requireUploadSecurityApproval(row, securityPolicySha256, now);
-        await lifecycle.publishManagedUpload(
+        requireUploadSecurityApproval(row, securityPolicySha256, eligibilityNow);
+        const publication = await lifecycle.publishManagedUpload(
           principalOf(row),
           row._id,
           row.generation,
@@ -416,6 +415,7 @@ export function createUploadProcessingMethods(
           now,
           session,
         );
+        row.expiresAt = publication.expiredAtMs;
         global.textBytes -= row.textBytes - actual;
         row.textBytes = actual;
         row.state = 'ready';

@@ -19,6 +19,7 @@ const {
   updateInterfacePermissions,
   configureAgentEventRuntime,
   warnOnUnreachableDeliveryPaths,
+  loadManagedFileDeploymentConfiguration,
 } = require('@librechat/api');
 const { connectDb, indexSync } = require('~/db');
 const {
@@ -28,7 +29,6 @@ const {
   seedDatabase,
 } = require('~/models');
 const { initializeGitHubSkillSync } = require('../Skills/sync');
-const { startExpiredFileSweep } = require('../Files/process');
 const { initializeUploads } = require('../Uploads');
 const { configureSubagentTaskRouting } = require('../Endpoints/agents/subagentThreadStore');
 const { getAppConfig } = require('../Config');
@@ -38,8 +38,29 @@ async function initializeApplicationRuntime({
   recordOriginalPublication,
   projectRoot,
   shutdownTeardownReserveMs,
+  signal,
+  onFailure,
 }) {
+  signal.throwIfAborted();
+  const selected = {
+    imageDigest: process.env.CORTEX_RETRIEVAL_EXPECTED_IMAGE_DIGEST,
+    namespaceUid: process.env.CORTEX_RETRIEVAL_EXPECTED_NAMESPACE_UID,
+    configurationSha256: process.env.CORTEX_RETRIEVAL_EXPECTED_CONFIGURATION_SHA256,
+  };
+  const expected = Object.values(selected).every((value) => value === undefined)
+    ? undefined
+    : { sourceRevision: identity?.source, ...selected };
+  if (expected && expected.sourceRevision !== process.env.BUILD_COMMIT)
+    throw new Error('Managed retrieval configuration unavailable');
+  const trustedFile = await loadManagedFileDeploymentConfiguration({
+    expected,
+    signal,
+    mode: 'optional',
+    onFailure,
+  });
+  signal.throwIfAborted();
   await runAsSystem(seedDatabase);
+  signal.throwIfAborted();
   /* Recover stuck `status: 'pending'` records from a crash mid-render.
    * `runAsSystem` is required — `File` is tenant-isolated and strict
    * mode rejects unscoped queries. Lazy sweep in the preview endpoint
@@ -47,31 +68,50 @@ async function initializeApplicationRuntime({
   // Complete the only boot sweep before readiness or the maintenance listener.
   // An unknown write outcome prevents startup instead of reporting an idle owner.
   await runAsSystem(sweepOrphanedPreviews);
+  signal.throwIfAborted();
   const appConfig = await getAppConfig({ baseOnly: true });
+  signal.throwIfAborted();
   await configureSubagentTaskRouting(appConfig?.endpoints?.agents?.subagentActivity);
+  signal.throwIfAborted();
   registerBackgroundTaskShutdown({
     interruptGraceMs: appConfig?.endpoints?.agents?.backgroundTasks?.shutdownInterruptGraceMs,
   });
   configureAgentEventRuntime(appConfig?.endpoints?.agents?.eventDriven);
   warnOnUnreachableDeliveryPaths(appConfig);
   initializeFileStorage(appConfig);
-  const uploads = await initializeUploads({ registry, identity, recordOriginalPublication });
-  if (uploads) {
-    registerShutdownTask(
-      'managed upload workers',
-      () =>
-        uploads.close(
+  let uploadsOriginal;
+  registerShutdownTask(
+    'managed upload workers',
+    async () => {
+      const uploads = await uploadsOriginal;
+      if (uploads)
+        await uploads.close(
           AbortSignal.timeout(Math.max(1, getRemainingShutdownMs() - shutdownTeardownReserveMs)),
-        ),
-      { priority: 105 },
-    );
-  }
+        );
+    },
+    { priority: 105 },
+  );
+  // Register custody before starting the original; a late owner stays reachable during shutdown.
+  uploadsOriginal = Promise.resolve().then(() => {
+    signal.throwIfAborted();
+    return initializeUploads({
+      registry,
+      identity,
+      trustedFile,
+      recordOriginalPublication,
+      signal,
+      onFailure,
+    });
+  });
+  const uploads = await uploadsOriginal;
+  signal.throwIfAborted();
   // Plugin hooks execute only when the operator opts in via DEPLOYMENT_PLUGIN_HOOKS;
   // without it, declared hook documents load as parsed-but-inert with a warning.
   await initializeDeploymentPlugins({
     projectRoot,
     hookCapabilities: getDeploymentPluginHookCapabilities(),
   });
+  signal.throwIfAborted();
   // Hand the run seam its plugin-hook source without a packages/api-internal
   // agents -> plugins import (see agents/hooks/source.ts).
   setPluginHookSource({
@@ -83,8 +123,8 @@ async function initializeApplicationRuntime({
     projectRoot,
     additionalSkills: getDeploymentPluginSkills(),
   });
+  signal.throwIfAborted();
   initializeGitHubSkillSync(appConfig);
-  startExpiredFileSweep({ appConfig, loadAppConfig: getAppConfig });
   // Register any programmatic tool-approval policy hooks declared in
   // `endpoints.agents.toolApproval.hooks`. Honor the `enabled` kill switch: when tool
   // approval is off we pass no hooks, so a disabled endpoint imports/runs nothing (and any
@@ -95,10 +135,13 @@ async function initializeApplicationRuntime({
   await loadToolApprovalHooks(toolApproval?.enabled ? toolApproval.hooks : undefined, {
     basePath: projectRoot,
   });
+  signal.throwIfAborted();
   await runAsSystem(async () => {
     await performStartupChecks(appConfig);
+    signal.throwIfAborted();
     await updateInterfacePermissions({ appConfig, getRoleByName, updateAccessPermissions });
   });
+  signal.throwIfAborted();
 
   return { appConfig, uploads };
 }

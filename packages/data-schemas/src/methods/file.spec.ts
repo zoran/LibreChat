@@ -3,8 +3,12 @@ import { v4 as uuidv4 } from 'uuid';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import { EToolResources, FileContext } from 'librechat-data-provider';
 import type { IChatProject, IMongoFile } from '~/types';
+import { prepareStandaloneFileCoverage } from './fileRetentionMigration';
+import { advanceFileRetentionActivity } from './fileActivityTransition';
+import { projectFileHousekeeping } from './fileHousekeepingProjection';
 import { _resetStrictCache } from '~/models/plugins/tenantIsolation';
 import { tenantStorage, runAsSystem } from '~/config/tenantContext';
+import { createHousekeepingStore } from './housekeepingStore';
 import { createFileMethods } from './file';
 import { createModels } from '~/models';
 
@@ -1753,6 +1757,151 @@ describe('File Methods', () => {
   });
 
   describe('updateFile', () => {
+    describe('lifecycle fence', () => {
+      /** Pause only this real Mongo update; the competing owner commits before its predicate runs. */
+      async function interleave(
+        change: () => Promise<void>,
+        data: Parameters<typeof fileMethods.updateFile>[0],
+      ) {
+        const original = File.findOneAndUpdate.bind(File);
+        const boundary = jest.spyOn(File, 'findOneAndUpdate').mockImplementationOnce((...args) => {
+          const query = original(...args);
+          const execute = query.exec.bind(query);
+          query.exec = async () => {
+            await change();
+            return execute();
+          };
+          return query;
+        });
+        try {
+          return await fileMethods.updateFile(data);
+        } finally {
+          boundary.mockRestore();
+        }
+      }
+
+      async function retained() {
+        await createHousekeepingStore(mongoose).model.init();
+        const acceptedAt = new Date(Date.now() - 1000);
+        const expiredAt = new Date(Date.now() + 10 * 86400000);
+        const file = await fileMethods.createFile(
+          {
+            file_id: uuidv4(),
+            user: new mongoose.Types.ObjectId(),
+            filename: 'retained.txt',
+            filepath: '/uploads/retained.txt',
+            type: 'text/plain',
+            bytes: 10,
+            status: 'pending',
+          },
+          true,
+          { retention: { acceptedAt, expiredAt } },
+        );
+        return file!;
+      }
+
+      it('preserves a concurrent activity deadline and its jobs instead of writing the old expiry', async () => {
+        const file = await retained();
+        const current = (await mongoose.models.File.findOne({ file_id: file.file_id })
+          .select('+retentionActivity')
+          .lean<IMongoFile>())!;
+        const now = Date.now();
+        const activity = advanceFileRetentionActivity(
+          current.retentionActivity,
+          current.expiredAt,
+          'read',
+          now,
+          now,
+        );
+        const next = {
+          ...current,
+          expiredAt: activity.expiredAt,
+          retentionActivity: activity.activity,
+          retentionRevision: current.retentionRevision! + 1,
+        };
+        let committedJobs: unknown;
+        const result = await interleave(
+          async () => {
+            const session = await mongoose.startSession();
+            try {
+              await session.withTransaction(async () => {
+                await File.updateOne(
+                  { _id: current._id, retentionRevision: current.retentionRevision },
+                  {
+                    $set: { expiredAt: next.expiredAt, retentionActivity: next.retentionActivity },
+                    $inc: { retentionRevision: 1 },
+                  },
+                  { session, timestamps: false },
+                );
+                await projectFileHousekeeping(mongoose, current, next, session);
+              });
+            } finally {
+              await session.endSession();
+            }
+            committedJobs = await mongoose.models.HousekeepingJob.find({}).sort({ _id: 1 }).lean();
+          },
+          { file_id: file.file_id, expiredAt: file.expiredAt, status: 'ready' },
+        );
+        const actual = await mongoose.models.File.findOne({ file_id: file.file_id })
+          .select('+retentionActivity')
+          .lean<IMongoFile>();
+        expect(actual?.expiredAt).toEqual(next.expiredAt);
+        expect(actual?.retentionActivity).toEqual(next.retentionActivity);
+        expect(actual?.retentionRevision).toBe(next.retentionRevision);
+        expect(actual?.status).toBe('pending');
+        expect(result).toBeNull();
+        expect(await mongoose.models.HousekeepingJob.find({}).sort({ _id: 1 }).lean()).toEqual(
+          committedJobs,
+        );
+      });
+
+      it('refuses a concurrent standalone policy migration even when its deadline stays equal', async () => {
+        const file = await retained();
+        await File.updateOne({ file_id: file.file_id }, { $unset: { retentionActivity: '' } });
+        const result = await interleave(
+          async () => {
+            const session = await mongoose.startSession();
+            try {
+              await session.withTransaction(async () => {
+                const previous = (await mongoose.models.File.findOne({ file_id: file.file_id })
+                  .select('+retentionActivity')
+                  .session(session)
+                  .lean<IMongoFile>())!;
+                expect(
+                  await prepareStandaloneFileCoverage(mongoose, previous, new Date(), session),
+                ).toBe('retained');
+              });
+            } finally {
+              await session.endSession();
+            }
+          },
+          { file_id: file.file_id, expiredAt: file.expiredAt, status: 'ready' },
+        );
+        const actual = await mongoose.models.File.findOne({ file_id: file.file_id })
+          .select('+retentionActivity')
+          .lean<IMongoFile>();
+        expect(actual?.retentionActivity?.historyConfidence).toBe('since-tracking');
+        expect(actual?.expiredAt).toEqual(file.expiredAt);
+        expect(actual?.status).toBe('pending');
+        expect(result).toBeNull();
+      });
+
+      it('treats a redundant retained expiry as bookkeeping without modifying its input', async () => {
+        const file = await retained();
+        const stamp = new Date('2020-01-01T00:00:00.000Z');
+        await File.updateOne(
+          { file_id: file.file_id },
+          { $set: { updatedAt: stamp } },
+          { timestamps: false },
+        );
+        const input = { file_id: file.file_id, expiredAt: file.expiredAt };
+        const result = await fileMethods.updateFile(input);
+        expect(result?.expiredAt).toEqual(file.expiredAt);
+        expect(result?.updatedAt).toEqual(stamp);
+        expect(input.expiredAt).toEqual(file.expiredAt);
+      });
+    });
+
     it('should update file data and remove TTL', async () => {
       const fileId = uuidv4();
       const userId = new mongoose.Types.ObjectId();

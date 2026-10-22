@@ -33,11 +33,15 @@ export type UploadProcessingDependencies = {
   stagingRoot: string;
   attempts?: UploadAttemptPort;
   now?: () => number;
-  observe?(observation: {
-    stage: 'processing' | 'total';
-    seconds: number;
-    outcome: 'success' | 'failure' | 'cancelled';
-  }): void | Promise<void>;
+  observe?(
+    observation:
+      | {
+          stage: 'processing' | 'total' | 'extract';
+          seconds: number;
+          outcome: 'success' | 'failure' | 'cancelled';
+        }
+      | { stage: 'extract'; outcome: 'unknown' },
+  ): void | Promise<void>;
 };
 
 /** One claim, no local queue/timer daemon. The owning app chooses when to request work. */
@@ -59,6 +63,7 @@ export async function processNextManagedUpload(
   let claimStarted = false;
   let startedAt: number | undefined;
   let outcome: 'success' | 'failure' | 'cancelled' = 'failure';
+  let extraction: { outcome: 'success' | 'failure' | 'cancelled'; seconds: number } | undefined;
   const observe = (
     observation: Parameters<NonNullable<UploadProcessingDependencies['observe']>>[0],
   ): void => {
@@ -167,9 +172,26 @@ export async function processNextManagedUpload(
     // instance/attempt receipt; prepare alone cannot launch the parser.
     await deps.management.bindProcessingExecution(lease, execution);
     controller.signal.throwIfAborted();
-    const result = await deps.documents.extract({ execution, signal: controller.signal });
+    // Latch this call's outcome and duration before publication or cleanup can fail.
+    // Prepare/bind alone never counts as an extraction, and telemetry adds no dispatch.
+    const extractStartedAt = performance.now();
+    let result: Awaited<ReturnType<DocumentPort['extract']>>;
+    try {
+      result = await deps.documents.extract({ execution, signal: controller.signal });
+    } catch (error) {
+      extraction = {
+        outcome: controller.signal.aborted ? 'cancelled' : 'failure',
+        seconds: Math.max(0, performance.now() - extractStartedAt) / 1_000,
+      };
+      throw error;
+    }
+    extraction = {
+      outcome: 'failure',
+      seconds: Math.max(0, performance.now() - extractStartedAt) / 1_000,
+    };
     writerStopped = result.writerStopped === true;
     if (!writerStopped) throw new Error('Parser exit unconfirmed');
+    extraction.outcome = 'success';
     renewStopped = true;
     clearTimeout(timer);
     await heartbeat;
@@ -245,6 +267,15 @@ export async function processNextManagedUpload(
         .catch(() => undefined);
     }
     registration?.settle({ writerStopped, localCopiesAbsent });
+    if (extraction) {
+      // A joined cancellation proves the failed call is settled, never successful.
+      // The unconditional abort above must not overwrite the captured call outcome.
+      observe(
+        writerStopped
+          ? { stage: 'extract', ...extraction }
+          : { stage: 'extract', outcome: 'unknown' },
+      );
+    }
     if (startedAt !== undefined) {
       observe({
         stage: 'processing',

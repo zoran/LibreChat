@@ -1,7 +1,8 @@
+import { useEffect, useRef } from 'react';
 import { useRecoilValue } from 'recoil';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { FileSources, QueryKeys, DynamicQueryKeys, dataService } from 'librechat-data-provider';
-import type { QueryObserverResult, UseQueryOptions } from '@tanstack/react-query';
+import type { QueryClient, QueryObserverResult, UseQueryOptions } from '@tanstack/react-query';
 import type t from 'librechat-data-provider';
 import {
   addFileToCache,
@@ -9,8 +10,34 @@ import {
   registerDownloadFilename,
   unregisterDownloadFilename,
 } from '~/utils';
+import {
+  createManagedFileReadAction,
+  readManagedFile,
+  refreshManagedFileProjection,
+} from './managedRead';
+import { useGetStartupConfig } from '~/data-provider/Endpoints';
 import { isEphemeralAgent } from '~/common';
 import store from '~/store';
+
+/** Sibling content observers share one logical read; opaque tickets never enter query data/keys. */
+type PreviewReadOwner = {
+  action: ReturnType<typeof createManagedFileReadAction>;
+  observers: number;
+};
+const previewReadOwners = new WeakMap<QueryClient, Map<string, PreviewReadOwner>>();
+function previewReadOwner(client: QueryClient, identity: string): PreviewReadOwner {
+  let owners = previewReadOwners.get(client);
+  if (!owners) {
+    owners = new Map();
+    previewReadOwners.set(client, owners);
+  }
+  let owner = owners.get(identity);
+  if (!owner) {
+    owner = { action: createManagedFileReadAction(), observers: 0 };
+    owners.set(identity, owner);
+  }
+  return owner;
+}
 
 export const useGetFiles = <TData = t.TFile[] | boolean>(
   config?: UseQueryOptions<t.TFile[], unknown, TData>,
@@ -104,6 +131,14 @@ export const useFileDownload = (
   options: FileDownloadOptions = {},
 ): QueryObserverResult<string> => {
   const queryClient = useQueryClient();
+  const user = useRecoilValue(store.user);
+  const queriesEnabled = useRecoilValue(store.queriesEnabled);
+  const { data: startup } = useGetStartupConfig();
+  const managed = startup?.authMode !== undefined && startup.authMode !== 'default';
+  const identity = JSON.stringify([user?.tenantId, user?.id, file_id, options.purpose]);
+  const read = useRef({ identity, action: createManagedFileReadAction() });
+  if (read.current.identity !== identity)
+    read.current = { identity, action: createManagedFileReadAction() };
   return useQuery(
     [
       QueryKeys.fileDownload,
@@ -111,13 +146,17 @@ export const useFileDownload = (
       options.source ?? '',
       options.direct ?? true,
       options.purpose ?? 'download',
+      user?.tenantId ?? '',
+      user?.id,
     ],
-    async () => {
+    async ({ signal }) => {
       if (!userId || !file_id) {
         console.warn('No user ID provided for file download');
         return;
       }
-      if ((options.direct ?? true) && isDirectDownloadSource(options.source)) {
+      if (managed && (!queriesEnabled || userId !== user?.id))
+        throw new Error('Download identity unavailable');
+      if (!managed && (options.direct ?? true) && isDirectDownloadSource(options.source)) {
         try {
           const directDownload = await dataService.getFileDownloadURL(userId, file_id);
           if (directDownload.url) {
@@ -128,7 +167,19 @@ export const useFileDownload = (
         }
       }
 
-      const response = await dataService.getFileDownload(userId, file_id);
+      if (managed && read.current.action.completed)
+        read.current.action = createManagedFileReadAction();
+      const response = managed
+        ? await readManagedFile(read.current.action, {
+            userId,
+            tenantId: user?.tenantId,
+            fileId: file_id,
+            representation: 'original',
+            signal,
+            read: (options) => dataService.getFileDownload(userId, file_id, options),
+          })
+        : await dataService.getFileDownload(userId, file_id);
+      if (managed) await refreshManagedFileProjection(queryClient, file_id);
       const blob = response.data;
       const downloadURL = window.URL.createObjectURL(blob);
       try {
@@ -144,7 +195,7 @@ export const useFileDownload = (
           downloadURL,
           getDownloadFilename(metadata.filename, metadata.file_id, metadata.source),
         );
-        addFileToCache(queryClient, metadata);
+        if (!managed) addFileToCache(queryClient, metadata);
       } catch (e) {
         console.error('Error parsing file metadata, skipped updating file query cache', e);
       }
@@ -193,6 +244,14 @@ export const useFilePreviewBlob = (
   const user = useRecoilValue(store.user);
   const queriesEnabled = useRecoilValue(store.queriesEnabled);
   const previewUser = queriesEnabled && userId === user?.id ? user : undefined;
+  const queryClient = useQueryClient();
+  const { data: startup } = useGetStartupConfig();
+  const managed = !shareId && startup?.authMode !== undefined && startup.authMode !== 'default';
+  const identity = JSON.stringify([previewUser?.tenantId, previewUser?.id, fileId, shareId]);
+  const read = useRef({ identity, action: createManagedFileReadAction() });
+  if (read.current.identity !== identity)
+    read.current = { identity, action: createManagedFileReadAction() };
+
   return useQuery(
     shareId
       ? [
@@ -212,13 +271,25 @@ export const useFilePreviewBlob = (
           previewUser?.id,
           fileId,
         ],
-    async () => {
+    async ({ signal }) => {
       if (!fileId || (!shareId && (!queriesEnabled || !user?.id || userId !== user.id))) {
         throw new Error('Preview identity unavailable');
       }
-      const response = shareId
-        ? await dataService.getSharedFileDownload(shareId, fileId)
-        : await dataService.getFileDownload(userId!, fileId);
+      if (managed && read.current.action.completed)
+        read.current.action = createManagedFileReadAction();
+      let response: Awaited<ReturnType<typeof dataService.getFileDownload>>;
+      if (shareId) response = await dataService.getSharedFileDownload(shareId, fileId);
+      else if (managed) {
+        response = await readManagedFile(read.current.action, {
+          userId: userId!,
+          tenantId: user?.tenantId,
+          fileId,
+          representation: 'original',
+          signal,
+          read: (options) => dataService.getFileDownload(userId!, fileId, options),
+        });
+      } else response = await dataService.getFileDownload(userId!, fileId);
+      if (managed) await refreshManagedFileProjection(queryClient, fileId);
       return response.data;
     },
     { enabled: false, retry: false, cacheTime: 0 },
@@ -331,23 +402,76 @@ export const useFilePreview = (
   file_id: string | undefined,
   config?: UseQueryOptions<t.TFilePreview, unknown, t.TFilePreview>,
   shareId?: string,
+  purpose: 'metadata' | 'content' = 'metadata',
 ): QueryObserverResult<t.TFilePreview, unknown> => {
   const user = useRecoilValue(store.user);
   const queriesEnabled = useRecoilValue(store.queriesEnabled);
   const previewUser = queriesEnabled ? user : undefined;
+  const queryClient = useQueryClient();
+  const { data: startup } = useGetStartupConfig();
+  const managed = !shareId && startup?.authMode !== undefined && startup.authMode !== 'default';
+  const enabled = config?.enabled ?? true;
+  const identity = JSON.stringify([
+    previewUser?.tenantId,
+    previewUser?.id,
+    file_id,
+    shareId,
+    purpose,
+  ]);
+  const read = useRef({ identity, enabled, action: createManagedFileReadAction() });
+  if (read.current.identity !== identity || (!read.current.enabled && enabled)) {
+    read.current = { identity, enabled, action: createManagedFileReadAction() };
+  }
+  read.current.enabled = enabled;
+  const sharedRead =
+    managed && purpose === 'content' && enabled
+      ? previewReadOwner(queryClient, identity)
+      : undefined;
+  useEffect(() => {
+    if (!sharedRead) return;
+    sharedRead.observers++;
+    return () => {
+      if (
+        --sharedRead.observers === 0 &&
+        previewReadOwners.get(queryClient)?.get(identity) === sharedRead
+      )
+        previewReadOwners.get(queryClient)?.delete(identity);
+    };
+  }, [sharedRead, queryClient, identity]);
+
   const queryKey = shareId
-    ? [QueryKeys.filePreview, file_id, 'share', shareId, user?.tenantId ?? '', user?.id]
-    : [QueryKeys.filePreview, file_id, 'owner', previewUser?.tenantId ?? '', previewUser?.id];
-  return useQuery<t.TFilePreview, unknown, t.TFilePreview>(
+    ? [QueryKeys.filePreview, file_id, 'share', shareId, user?.tenantId ?? '', user?.id, purpose]
+    : [
+        QueryKeys.filePreview,
+        file_id,
+        'owner',
+        previewUser?.tenantId ?? '',
+        previewUser?.id,
+        purpose,
+      ];
+  const query = useQuery<t.TFilePreview, unknown, t.TFilePreview>(
     queryKey,
-    () => {
+    async ({ signal }) => {
       // `refetch()` bypasses enabled, so identity must also guard the actual fetch.
       if (!file_id || (!shareId && (!queriesEnabled || !user?.id))) {
         throw new Error('Preview identity unavailable');
       }
-      return shareId
-        ? fetchSharedFilePreview(shareId, file_id, queryKey)
-        : fetchFilePreview(file_id, queryKey);
+      if (shareId) return fetchSharedFilePreview(shareId, file_id, queryKey);
+      if (!managed || purpose === 'metadata') return fetchFilePreview(file_id, queryKey);
+      const action = sharedRead?.action ?? read.current.action;
+      // Focus/reconnect may revalidate metadata after expiry, never admit another logical read.
+      if (action.ticket && Date.parse(action.ticket.notAfter) <= Date.now())
+        return fetchFilePreview(file_id, queryKey);
+      const result = await readManagedFile(action, {
+        userId: user!.id,
+        tenantId: user?.tenantId,
+        fileId: file_id,
+        representation: 'preview',
+        signal,
+        read: (options) => dataService.getFilePreview(file_id, options),
+      });
+      await refreshManagedFileProjection(queryClient, file_id);
+      return result;
     },
     {
       refetchOnWindowFocus: false,
@@ -355,7 +479,7 @@ export const useFilePreview = (
       // Shared snapshots keep native defaults. Private previews must revalidate
       // on opening and focus even when another observer retains ready content.
       retry: false,
-      refetchInterval: previewRefetchInterval,
+      refetchInterval: managed && purpose === 'content' ? false : previewRefetchInterval,
       ...config,
       ...(!shareId && {
         cacheTime: 0,
@@ -371,4 +495,19 @@ export const useFilePreview = (
         !!file_id && (!!shareId || (queriesEnabled && !!user?.id)) && (config?.enabled ?? true),
     },
   );
+  return {
+    ...query,
+    refetch: (...args) => {
+      const action = sharedRead?.action ?? read.current.action;
+      if (
+        managed &&
+        purpose === 'content' &&
+        (action.completed || (action.ticket && Date.parse(action.ticket.notAfter) <= Date.now()))
+      ) {
+        if (sharedRead) sharedRead.action = createManagedFileReadAction();
+        else read.current.action = createManagedFileReadAction();
+      }
+      return query.refetch(...args);
+    },
+  };
 };

@@ -6,6 +6,8 @@ import { UPLOAD_ERROR_CODES, UPLOAD_MAX_FILE_BYTES } from 'librechat-data-provid
 import type { UploadWorker, UploadOriginalIntegrity } from 'librechat-data-provider';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import type { RetrievalLookupHandler } from './retrieval-lookup';
+import { readRetrievalLookup, encodeRetrievalLookup } from './retrieval-lookup';
 import { UploadManagementError, isUploadManagementError } from '../errors';
 import { verifyOriginalIntegrity } from '../storage/integrity';
 import { createPinnedServiceEndpoint } from './endpoint';
@@ -19,6 +21,8 @@ type TlsMaterial = { ca: Buffer | string; cert: Buffer | string; key: Buffer | s
 type ClientContext = { operationId: string; capability: string; signal: AbortSignal };
 export type IntakeChannelContext = Omit<ClientContext, 'signal'> & { worker: UploadWorker };
 export interface IntakeChannelHandlers {
+  /** Optional File-owner port. Absence never grants lookup authority. */
+  lookup?: RetrievalLookupHandler;
   control(context: IntakeChannelContext, command: unknown, signal: AbortSignal): Promise<unknown>;
   /** Body-free authorization and durable exclusive claim; no document input exists here. */
   promote(
@@ -111,7 +115,11 @@ function encoded(value: unknown): Buffer {
   if (result.length > JSON_BYTES) fail();
   return result;
 }
-async function readJson(message: IncomingMessage, signal: AbortSignal): Promise<unknown> {
+async function readJson(
+  message: IncomingMessage,
+  signal: AbortSignal,
+  canonical = false,
+): Promise<unknown> {
   if (
     header(message, 'content-type')?.split(';')[0] !== 'application/json' ||
     header(message, 'content-encoding') !== undefined
@@ -125,11 +133,13 @@ async function readJson(message: IncomingMessage, signal: AbortSignal): Promise<
     if (bytes > JSON_BYTES) fail();
     chunks.push(chunk);
   }
-  return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
+  const raw = new TextDecoder('utf-8', { fatal: true, ignoreBOM: canonical }).decode(
+    Buffer.concat(chunks),
+  );
+  return canonical ? readRetrievalLookup(raw) : JSON.parse(raw);
 }
-function respond(response: ServerResponse, status: number, data: unknown) {
+function respondBytes(response: ServerResponse, status: number, body: Buffer) {
   if (response.headersSent || response.destroyed) return;
-  const body = encoded(data);
   response.writeHead(status, {
     'Content-Type': 'application/json',
     'Cache-Control': 'no-store',
@@ -137,6 +147,9 @@ function respond(response: ServerResponse, status: number, data: unknown) {
     'Content-Length': body.length,
   });
   response.end(body);
+}
+function respond(response: ServerResponse, status: number, data: unknown) {
+  respondBytes(response, status, encoded(data));
 }
 function failure(response: ServerResponse, error: unknown) {
   const code = isUploadManagementError(error) ? error.code : 'unavailable';
@@ -293,7 +306,10 @@ export function createIntakeChannel(
 
 export async function startIntakeControlService(options: {
   tls: TlsMaterial;
-  peers: readonly { certificateSha256: string; role: 'intake'; hostIds: readonly string[] }[];
+  peers: readonly (
+    | { certificateSha256: string; role: 'intake'; hostIds: readonly string[] }
+    | { certificateSha256: string; role: 'retrieval-backend'; backendIdentity: string }
+  )[];
   handlers: IntakeChannelHandlers;
   host?: string;
   port?: number;
@@ -308,29 +324,54 @@ export async function startIntakeControlService(options: {
     'deadlineMs',
   ]) as unknown as typeof options;
   const tls = tlsMaterial(config.tls);
-  const peers = new Map<string, ReadonlySet<string>>();
+  const peers = new Map<
+    string,
+    | { role: 'intake'; hosts: ReadonlySet<string> }
+    | { role: 'retrieval-backend'; backendIdentity: string }
+  >();
   for (const input of entries(config.peers)) {
-    const peer = fields(input, ['certificateSha256', 'role', 'hostIds']);
+    const peer = fields(input, ['certificateSha256', 'role', 'hostIds', 'backendIdentity']);
     if (
       typeof peer.certificateSha256 !== 'string' ||
       !/^[a-f0-9]{64}$/.test(peer.certificateSha256) ||
       peers.has(peer.certificateSha256) ||
-      peer.role !== 'intake'
+      !['intake', 'retrieval-backend'].includes(peer.role as string)
     )
       fail();
+    if (peer.role === 'retrieval-backend') {
+      if (
+        Object.prototype.hasOwnProperty.call(peer, 'hostIds') ||
+        typeof peer.backendIdentity !== 'string' ||
+        !peer.backendIdentity.length ||
+        peer.backendIdentity.length > 256
+      )
+        fail();
+      peers.set(peer.certificateSha256, {
+        role: 'retrieval-backend',
+        backendIdentity: peer.backendIdentity,
+      });
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(peer, 'backendIdentity')) fail();
     const hosts = entries(peer.hostIds);
     if (
       hosts.some((host) => typeof host !== 'string' || !WORKER_IDENTIFIER.test(host)) ||
       new Set(hosts).size !== hosts.length
     )
       fail();
-    peers.set(peer.certificateSha256, new Set(hosts as string[]));
+    peers.set(peer.certificateSha256, { role: 'intake', hosts: new Set(hosts as string[]) });
   }
   const handlers = fields(config.handlers, [
     'control',
     'promote',
+    'lookup',
   ]) as unknown as IntakeChannelHandlers;
-  if (typeof handlers.control !== 'function' || typeof handlers.promote !== 'function') fail();
+  if (
+    typeof handlers.control !== 'function' ||
+    typeof handlers.promote !== 'function' ||
+    (handlers.lookup !== undefined && typeof handlers.lookup !== 'function')
+  )
+    fail();
   const host = config.host ?? '0.0.0.0';
   const port = config.port ?? 8444;
   if (
@@ -350,6 +391,7 @@ export async function startIntakeControlService(options: {
     response: ServerResponse,
     expectContinue: boolean,
     deadline: ReturnType<typeof clock>,
+    deadlineAt: number,
   ) {
     let promotion: Awaited<ReturnType<IntakeChannelHandlers['promote']>> | undefined;
     const disconnect = () => {
@@ -369,8 +411,45 @@ export async function startIntakeControlService(options: {
         .getPeerCertificate()
         .fingerprint256?.replaceAll(':', '')
         .toLowerCase();
-      const hosts = fingerprint && peers.get(fingerprint);
-      if (!hosts) fail('unauthorized');
+      const peer = fingerprint && peers.get(fingerprint);
+      if (!peer) fail('unauthorized');
+      if (peer.role === 'retrieval-backend') {
+        if (message.url !== '/v1/retrieval/lookup') fail('unauthorized');
+        if (expectContinue || message.method !== 'POST') fail();
+        for (const name of [
+          'authorization',
+          'cookie',
+          'content-encoding',
+          'transfer-encoding',
+          'expect',
+          'x-upload-worker-host',
+          'x-upload-worker-instance',
+          'x-upload-capability',
+          'x-upload-promotion',
+        ])
+          if (header(message, name) !== undefined) fail();
+        const length = header(message, 'content-length');
+        if (!length || !/^[1-9][0-9]{0,4}$/.test(length) || Number(length) > JSON_BYTES) fail();
+        let request;
+        try {
+          request = await readJson(message, deadline.signal, true);
+        } catch {
+          fail();
+        }
+        if (!handlers.lookup) fail('unavailable');
+        const body = request as Parameters<RetrievalLookupHandler>[0];
+        const result = await handlers.lookup(
+          body,
+          Object.freeze({ backendIdentity: peer.backendIdentity }),
+          deadline.signal,
+          deadlineAt,
+        );
+        deadline.signal.throwIfAborted();
+        respondBytes(response, 200, encodeRetrievalLookup(result, body, peer.backendIdentity));
+        return;
+      }
+      if (message.url?.startsWith('/v1/retrieval/')) fail('unauthorized');
+      const hosts = peer.hosts;
       const worker = workerIdentity({
         hostId: header(message, 'x-upload-worker-host'),
         instanceId: header(message, 'x-upload-worker-instance'),
@@ -435,10 +514,12 @@ export async function startIntakeControlService(options: {
   }
   function dispatch(message: IncomingMessage, response: ServerResponse, expectContinue: boolean) {
     message.pause();
+    // Body reading consumes this original budget; the File callback cannot start a fresh clock.
+    const deadlineAt = Date.now() + milliseconds;
     const deadline = clock(undefined, milliseconds);
     const record = { controller: deadline.controller, done: Promise.resolve() };
     active.add(record);
-    record.done = handle(message, response, expectContinue, deadline).finally(() =>
+    record.done = handle(message, response, expectContinue, deadline, deadlineAt).finally(() =>
       active.delete(record),
     );
     void record.done.catch(() => undefined);

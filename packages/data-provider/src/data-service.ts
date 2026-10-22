@@ -8,11 +8,13 @@ import type {
 } from './types/traces';
 import type { TInsightsAccessResponse, TInsightsParams, TInsightsResponse } from './types/insights';
 import type { ScheduleMCPConsentView, ConfirmScheduleMCPConsent } from './types/scheduleConsent';
+import type { ManagedFileReadTicket, ManagedFileReadRepresentation } from './file-read';
 import type { TFileConfig } from './file-config';
 import type { StatusSnapshot } from './status';
 import type * as tl from './types/tools';
 import type * as t from './types';
 import { TOOL_CALL_PREVIEWS_PARAM, TOOL_CALL_PREVIEWS_VERSION } from './previews';
+import { MANAGED_FILE_READ_HEADER, isManagedFileReadTicket } from './file-read';
 import { readStatusSnapshot, STATUS_LIMITS } from './status';
 import * as permissions from './accessPermissions';
 import * as endpoints from './api-endpoints';
@@ -605,8 +607,11 @@ export const getFiles = (params?: { limit?: number }): Promise<f.TFile[]> => {
  * Called from `useFilePreview`; React Query's `refetchInterval`
  * polls while `status === 'pending'` and stops on terminal status.
  */
-export const getFilePreview = (fileId: string): Promise<f.TFilePreview> => {
-  return request.get(endpoints.filePreview(fileId));
+export const getFilePreview = (
+  fileId: string,
+  read?: ManagedFileReadRequest,
+): Promise<f.TFilePreview> => {
+  return request.get(endpoints.filePreview(fileId), managedReadOptions(fileId, 'preview', read));
 };
 
 /** Preview status for a snapshotted file served through a shared link. */
@@ -904,13 +909,48 @@ export const uploadAgentAvatar = (data: m.AgentAvatarVariables): Promise<ag.Agen
   );
 };
 
-export const getFileDownload = async (userId: string, file_id: string): Promise<AxiosResponse> => {
-  return request.getResponse(`${endpoints.files()}/download/${userId}/${file_id}`, {
-    responseType: 'blob',
-    headers: {
-      Accept: 'application/octet-stream',
+export type ManagedFileReadRequest = {
+  ticket: ManagedFileReadTicket;
+  timeoutMs: number;
+  signal?: AbortSignal;
+};
+
+function managedReadOptions(
+  fileId: string,
+  representation: ManagedFileReadRepresentation,
+  read?: ManagedFileReadRequest,
+) {
+  if (!read) return undefined;
+  if (
+    !isManagedFileReadTicket(read.ticket) ||
+    read.ticket.fileId !== fileId ||
+    read.ticket.representation !== representation ||
+    !Number.isFinite(read.timeoutMs) ||
+    read.timeoutMs <= 0 ||
+    read.timeoutMs > 120_000
+  )
+    throw new Error('Invalid managed File read request');
+  return {
+    signal: read.signal,
+    timeout: Math.ceil(read.timeoutMs),
+    headers: { [MANAGED_FILE_READ_HEADER]: read.ticket.readId },
+  };
+}
+
+export const getFileDownload = async (
+  userId: string,
+  file_id: string,
+  read?: ManagedFileReadRequest,
+): Promise<AxiosResponse> => {
+  const options = managedReadOptions(file_id, 'original', read);
+  return request.getResponse(
+    `${endpoints.files()}/download/${encodeURIComponent(userId)}/${encodeURIComponent(file_id)}`,
+    {
+      ...options,
+      responseType: 'blob',
+      headers: { ...options?.headers, Accept: 'application/octet-stream' },
     },
-  });
+  );
 };
 
 export const getFileDownloadURL = async (
@@ -919,6 +959,46 @@ export const getFileDownloadURL = async (
 ): Promise<f.FileDownloadURLResponse> => {
   return request.get(`${endpoints.files()}/download-url/${userId}/${file_id}`);
 };
+
+/** Explicit user-read admission on the existing authenticated URL route. No direct storage URL. */
+export async function getManagedFileReadTicket(
+  userId: string,
+  fileId: string,
+  representation: ManagedFileReadRepresentation,
+  options: { signal?: AbortSignal; timeoutMs: number },
+): Promise<ManagedFileReadTicket> {
+  const value = await request.get<unknown>(
+    `${endpoints.files()}/download-url/${encodeURIComponent(userId)}/${encodeURIComponent(fileId)}?read=1&representation=${representation}`,
+    { signal: options.signal, timeout: options.timeoutMs },
+  );
+  if (
+    !isManagedFileReadTicket(value) ||
+    value.fileId !== fileId ||
+    value.representation !== representation
+  )
+    throw new Error('Invalid managed File read ticket');
+  return value;
+}
+
+/** An opaque identity is inspected, never silently replaced on uncertain delivery. */
+export async function inspectManagedFileRead(
+  userId: string,
+  read: ManagedFileReadRequest,
+): Promise<'completed' | 'pending' | 'unknown' | 'expired' | 'not_found'> {
+  const { ticket } = read;
+  const response = await request.getResponse(
+    `${endpoints.files()}/download-url/${encodeURIComponent(userId)}/${encodeURIComponent(ticket.fileId)}?read=1&representation=${ticket.representation}`,
+    {
+      ...managedReadOptions(ticket.fileId, ticket.representation, read),
+      validateStatus: (status) => [202, 204, 404, 410, 503].includes(status),
+    },
+  );
+  if (response.status === 204) return 'completed';
+  if (response.status === 202) return 'pending';
+  if (response.status === 410) return 'expired';
+  if (response.status === 404) return 'not_found';
+  return 'unknown';
+}
 
 /** Blob download for a snapshotted file served through a shared link. */
 export const getSharedFileDownload = async (

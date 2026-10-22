@@ -1,0 +1,207 @@
+{
+  "version": 1,
+  "revisionInput": {
+    "owner": {
+      "tenantId": "tenant-a",
+      "userId": "owner-a"
+    },
+    "fileId": "source-a",
+    "operationId": "source-a",
+    "document": {
+      "text": "Kosten: 1760 EUR. Größe 😀; \"Quelle\"\\Pfad\n",
+      "structure": {
+        "version": 1,
+        "source": {
+          "sha256": "559c8d100aca764ffe2e4582b6b1cd9b454f51f0868b387c1e41906a4efd7b2c",
+          "bytes": 46,
+          "mediaType": "text/plain"
+        },
+        "extractor": {
+          "name": "synthetic",
+          "version": "1"
+        },
+        "pages": [],
+        "elements": [
+          {
+            "id": "e1",
+            "kind": "paragraph",
+            "start": 0,
+            "end": 42,
+            "page": null,
+            "parentId": null
+          }
+        ],
+        "quality": {
+          "status": "complete",
+          "warnings": []
+        }
+      }
+    },
+    "approval": {
+      "version": 1,
+      "decision": "approved",
+      "policySha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "subject": {
+        "tenantId": "tenant-a",
+        "userId": "owner-a",
+        "operationId": "source-a",
+        "transferGeneration": 1,
+        "mediaType": "text/plain",
+        "bytes": 46,
+        "sha256": "559c8d100aca764ffe2e4582b6b1cd9b454f51f0868b387c1e41906a4efd7b2c"
+      },
+      "scannerVersion": "synthetic/1",
+      "checkedAt": "2026-10-18T00:00:00.000Z",
+      "coverage": {
+        "complete": true,
+        "pages": 1,
+        "parts": 1
+      }
+    },
+    "extractionPolicySha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "revision": {
+    "version": 1,
+    "sourceRevision": "e93eae2a29b6a5fe553050e65ab76c3d15a3104e9408349dc70bef9a2a627f2b",
+    "textSha256": "559c8d100aca764ffe2e4582b6b1cd9b454f51f0868b387c1e41906a4efd7b2c",
+    "structureSha256": "96944ff59b0c77382419892c62756d46a44fb2fd529b65747652752bf19a65a3",
+    "approvalSha256": "4d32307cd5dcfebad627581eb7bad925dd3f1b86558af2941de911d15df4e698",
+    "extractionPolicySha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "owner": {
+      "tenantId": "tenant-a",
+      "userId": "owner-a"
+    },
+    "source": {
+      "fileId": "source-a",
+      "operationId": "source-a",
+      "transferGeneration": 1,
+      "originalSha256": "559c8d100aca764ffe2e4582b6b1cd9b454f51f0868b387c1e41906a4efd7b2c",
+      "originalBytes": 46,
+      "mediaType": "text/plain"
+    },
+    "representationRevision": "8ff7908b8c0666513eb3202c3fc650ce337f19bf09d5f989afd625d595250424"
+  },
+  "indexProfile": {
+    "version": 1,
+    "schema": "cortex-managed-retrieval-v1",
+    "chunkingProfileSha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "embeddingProfileSha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "dimensions": 768,
+    "normalization": "l2",
+    "distance": "cosine"
+  },
+  "key": {
+    "sourceRevision": "e93eae2a29b6a5fe553050e65ab76c3d15a3104e9408349dc70bef9a2a627f2b",
+    "representationRevision": "8ff7908b8c0666513eb3202c3fc650ce337f19bf09d5f989afd625d595250424",
+    "indexGeneration": "716dd9b39c1a7a094b9f950d9f511ca8437a69d825312ab41be788047c38af41"
+  },
+  "obligation": {
+    "key": {
+      "sourceRevision": "e93eae2a29b6a5fe553050e65ab76c3d15a3104e9408349dc70bef9a2a627f2b",
+      "representationRevision": "8ff7908b8c0666513eb3202c3fc650ce337f19bf09d5f989afd625d595250424",
+      "indexGeneration": "716dd9b39c1a7a094b9f950d9f511ca8437a69d825312ab41be788047c38af41"
+    },
+    "backendIdentity": "rag-api-c4e5cbf-pgvector",
+    "operationId": "index-a",
+    "requestSha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "writerEpoch": 1,
+    "state": "unknown"
+  },
+  "purgeReceipt": {
+    "version": 1,
+    "purgeOperationId": "purge-a",
+    "keys": [
+      {
+        "sourceRevision": "e93eae2a29b6a5fe553050e65ab76c3d15a3104e9408349dc70bef9a2a627f2b",
+        "representationRevision": "8ff7908b8c0666513eb3202c3fc650ce337f19bf09d5f989afd625d595250424",
+        "indexGeneration": "716dd9b39c1a7a094b9f950d9f511ca8437a69d825312ab41be788047c38af41"
+      }
+    ],
+    "backendIdentity": "rag-api-c4e5cbf-pgvector",
+    "fenceEpoch": 2,
+    "state": "purged",
+    "remainingChunks": 0,
+    "activeWriters": 0,
+    "completedAt": 1792368002,
+    "receiptSha256": "3c28a1b9db5848e77e889b43726aafba64a553141bfbd5a3596d3fcd01c1351b"
+  },
+  "capability": {
+    "version": 1,
+    "iss": "cortex-librechat",
+    "aud": "cortex-rag",
+    "sub": "owner-a",
+    "owner": {
+      "tenantId": "tenant-a",
+      "userId": "owner-a"
+    },
+    "purpose": "query",
+    "jti": "request-a",
+    "iat": 1792368000,
+    "nbf": 1792368000,
+    "exp": 1792368060,
+    "backendIdentity": "rag-api-c4e5cbf-pgvector",
+    "requestSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "keys": [
+      {
+        "sourceRevision": "e93eae2a29b6a5fe553050e65ab76c3d15a3104e9408349dc70bef9a2a627f2b",
+        "representationRevision": "8ff7908b8c0666513eb3202c3fc650ce337f19bf09d5f989afd625d595250424",
+        "indexGeneration": "716dd9b39c1a7a094b9f950d9f511ca8437a69d825312ab41be788047c38af41"
+      }
+    ],
+    "allowedEntityIds": [],
+    "operationId": "query-a",
+    "writerEpoch": 1,
+    "workDeadline": 1792368060,
+    "routePolicySha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "capabilityContext": {
+    "purpose": "query",
+    "owner": {
+      "tenantId": "tenant-a",
+      "userId": "owner-a"
+    },
+    "backendIdentity": "rag-api-c4e5cbf-pgvector",
+    "requestSha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "operationId": "query-a",
+    "keys": [
+      {
+        "sourceRevision": "e93eae2a29b6a5fe553050e65ab76c3d15a3104e9408349dc70bef9a2a627f2b",
+        "representationRevision": "8ff7908b8c0666513eb3202c3fc650ce337f19bf09d5f989afd625d595250424",
+        "indexGeneration": "716dd9b39c1a7a094b9f950d9f511ca8437a69d825312ab41be788047c38af41"
+      }
+    ],
+    "writerEpoch": 1,
+    "workDeadline": 1792368060,
+    "routePolicySha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "now": 1792368000,
+    "sourceExpiresAt": 1792368060
+  },
+  "evidence": {
+    "sourceRevision": "e93eae2a29b6a5fe553050e65ab76c3d15a3104e9408349dc70bef9a2a627f2b",
+    "representationRevision": "8ff7908b8c0666513eb3202c3fc650ce337f19bf09d5f989afd625d595250424",
+    "elementId": "e1",
+    "unit": "utf16",
+    "start": 0,
+    "end": 42
+  },
+  "canonicalVectors": [
+    {
+      "input": {
+        "a": "Ä 😀\n\t\"\\ ",
+        "b": [null, true, false, 0, 9007199254740991, -9007199254740991]
+      },
+      "canonical": "{\"a\":\"Ä 😀\\n\\t\\\"\\\\ \",\"b\":[null,true,false,0,9007199254740991,-9007199254740991]}",
+      "sha256": "c9fd3bc4780df4e5348c736678831f4999cfcb85faaa3111593b28a14a2737ff"
+    }
+  ],
+  "admissionInvariant": {
+    "schedule": [
+      "purge-before-source-row",
+      "durable-full-key-tombstone-at-epoch-2",
+      "late-first-admission-at-epoch-1"
+    ],
+    "providerDispatchPermitted": false,
+    "missingRowIsTerminal": false
+  },
+  "receiptHashRule": "payload-excluding-receiptSha256"
+}

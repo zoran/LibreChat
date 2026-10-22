@@ -87,6 +87,43 @@ function fixture(telemetry?: TelemetryPort) {
 }
 
 describe('managed upload public boundary', () => {
+  it('does not reuse read permission for a state-changing retry', async () => {
+    const f = fixture();
+    f.authorize.mockImplementation(
+      async (_actor, target) => target.resourceId === operation.id && target.action === 'read',
+    );
+    await expect(f.management.get(principal, operation.id)).resolves.toEqual(operation);
+    await expect(f.management.retryProcessing(principal, operation.id)).rejects.toMatchObject({
+      code: 'forbidden',
+    });
+    expect(f.retryProcessing).not.toHaveBeenCalled();
+  });
+  it('rechecks bound action after the repository read and denies revoked transfer authority', async () => {
+    const f = fixture();
+    let active = true;
+    f.authorize.mockImplementation(
+      async (_actor, target) =>
+        active && target.resourceId === operation.id && target.action === 'upload',
+    );
+    f.get.mockImplementation(async () => {
+      active = false;
+      return operation;
+    });
+    await expect(
+      f.management.claimTransfer(principal, operation.id, { hostId: 'cpu-1', instanceId: 'test' }),
+    ).rejects.toMatchObject({ code: 'forbidden' });
+    expect(f.assertSafe).not.toHaveBeenCalled();
+  });
+  it('denies workspace operation reads even with a permissive identity adapter', async () => {
+    const f = fixture();
+    f.get.mockResolvedValue({
+      ...operation,
+      scope: { kind: 'workspace', workspaceId: '0123456789abcdef01234567' },
+    });
+    await expect(f.management.get(principal, operation.id)).rejects.toMatchObject({
+      code: 'forbidden',
+    });
+  });
   it('reserves canonical CSV without changing its MIME fingerprint or admission guards', async () => {
     const f = fixture();
     const csv = { ...request, mediaType: 'text/csv' };
@@ -96,7 +133,16 @@ describe('managed upload public boundary', () => {
       state: 'waiting',
       canUseInComposer: false,
     });
-    expect(f.authorize).toHaveBeenCalledWith(principal, { kind: 'personal' });
+    expect(f.authorize).toHaveBeenCalledWith(principal, {
+      owner: {
+        tenantId: principal.tenantId,
+        scope: { kind: 'personal' },
+        ownerUserId: principal.userId,
+      },
+      resourceType: 'upload',
+      resourceId: null,
+      action: 'upload',
+    });
     expect(f.assertSafe).toHaveBeenCalledWith({ phase: 'admission' });
     const fingerprint = JSON.stringify([{ kind: 'personal' }, 'text/csv', csv.declaredBytes]);
     expect(f.findReservation).toHaveBeenCalledWith(
@@ -148,7 +194,12 @@ describe('managed upload public boundary', () => {
     const f = fixture();
     const guest = { tenantId: null, userId: 'guest-a', authentication: 'guest' } as const;
     await expect(f.management.reserve(guest, request)).resolves.toEqual(operation);
-    expect(f.authorize).toHaveBeenCalledWith(guest, { kind: 'personal' });
+    expect(f.authorize).toHaveBeenCalledWith(guest, {
+      owner: { tenantId: null, scope: { kind: 'personal' }, ownerUserId: guest.userId },
+      resourceType: 'upload',
+      resourceId: null,
+      action: 'upload',
+    });
     f.authorize.mockResolvedValue(false);
     await expect(f.management.reserve(guest, request)).rejects.toMatchObject({ code: 'forbidden' });
   });

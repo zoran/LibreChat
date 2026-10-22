@@ -11,7 +11,7 @@ const { restoreTenantContextFromReq } = require('@librechat/api');
 const { avatar: asstAvatarRouter } = require('~/server/routes/assistants/v1');
 const { avatar: agentAvatarRouter } = require('~/server/routes/agents/v1');
 const { createMulterInstance } = require('./multer');
-const { rejectUnmanagedFileWrites } = require('./managed');
+const { isCortexFileMode, rejectUnmanagedFileWrites } = require('./managed');
 
 const files = require('./files');
 const images = require('./images');
@@ -34,6 +34,21 @@ const initialize = async () => {
 
   const { fileUploadIpLimiter, fileUploadUserLimiter } = createFileLimiters();
   const fileUsageLimiter = createFileUsageLimiter();
+
+  // Admission creates a finite File receipt. Match the existing route through
+  // Express so case and trailing-slash variants use the same limiter. Requests
+  // carrying a read identity only inspect it; HEAD is refused by the handler.
+  router.get('/download-url/:userId/:file_id', (req, res, next) => {
+    if (
+      req.method === 'GET' &&
+      isCortexFileMode() &&
+      req.query.read === '1' &&
+      req.headers['x-cortex-file-read'] === undefined
+    ) {
+      return fileUsageLimiter(req, res, next);
+    }
+    return next();
+  });
 
   /** Non-strict routing means `/usage/` reaches the same handler, so match the
    *  route the way Express does. An exact comparison would push a

@@ -96,7 +96,7 @@ export default function useAttachmentPreviewSync(
   const { shareId } = useShareContext();
   const enabled = !!fileId && baseStatus === 'pending';
 
-  const previewQuery = useFilePreview(fileId, { enabled }, shareId);
+  const previewQuery = useFilePreview(fileId, { enabled }, shareId, 'metadata');
 
   /* Effective status: prefer the polled record once it arrives, since
    * the SSE handler may have already moved the cache forward and the

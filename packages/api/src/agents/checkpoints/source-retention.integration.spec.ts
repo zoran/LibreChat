@@ -1,8 +1,8 @@
 /** Synthetic retained rows and real Mongo/File quota transactions; no source producer or model. */
 import mongoose from 'mongoose';
+import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
-import { join } from 'node:path';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import {
@@ -10,12 +10,8 @@ import {
   createUploadManagementRepository,
   tenantStorage,
 } from '@librechat/data-schemas';
-import type { Document } from 'mongodb';
 import type { CheckpointSourceBinding } from '@librechat/data-schemas';
-import { checkpointTestEnvironment } from './__tests__/helpers/mongo';
-import { checkpointOwnerNamespacePrefix } from '../../stream/checkpoints';
-import { CHECKPOINT_STORAGE_COLLECTION, checkpointStorageKey } from './storage';
-import { purgeCheckpointRows } from './source-retention';
+import type { Document } from 'mongodb';
 import {
   __resetCheckpointerForTests,
   deleteAgentEventCheckpointReference,
@@ -25,6 +21,10 @@ import {
   deleteOwnedAgentCheckpoints,
   purgeFileSourceCheckpoints,
 } from '../checkpointer';
+import { CHECKPOINT_STORAGE_COLLECTION, checkpointStorageKey } from './storage';
+import { checkpointOwnerNamespacePrefix } from '../../stream/checkpoints';
+import { checkpointTestEnvironment } from './__tests__/helpers/mongo';
+import { purgeCheckpointRows } from './source-retention';
 
 const owner = { userId: new mongoose.Types.ObjectId().toHexString(), tenantId: 'source-purge' };
 const prefix = checkpointOwnerNamespacePrefix(owner.userId, owner.tenantId);
@@ -56,9 +56,9 @@ function canonical(value: unknown): string {
 function binding(fileId: string): CheckpointSourceBinding {
   const expiresAt = '2025-01-01T00:00:00.000Z';
   const value = {
-    version: 1 as const,
+    version: 2 as const,
     owner,
-    files: [{ fileId, approvalSha256: 'a'.repeat(64), expiresAt }],
+    files: [{ fileId, bindingSha256: 'a'.repeat(64), expiresAt }],
     messages: [],
     expiresAt,
   };

@@ -110,6 +110,7 @@ function fixture() {
     file: jest.fn(async () => JSON.parse(JSON.stringify(record))),
     original: jest.fn(async () => JSON.parse(JSON.stringify(task))),
     policySha256: () => policy,
+    extractionPolicySha256: (): string | undefined => 'd'.repeat(64),
     storage: { read: jest.fn(), put: jest.fn(), remove: jest.fn() },
     now: () => clock,
   };
@@ -262,4 +263,44 @@ it('a missing managed runtime cannot fall back to caller-supplied text', async (
     }),
   ).rejects.toMatchObject({ code: 'unavailable' });
   expect(bindManagedContextSources(f.req, undefined, false)).toBeUndefined();
+});
+
+it('projects only a frozen revision from the authenticated source and original approval', async () => {
+  const f = fixture();
+  const access = await f.resolver.resolve(f.req, 'source-a', { text: true });
+  expect(access.revision?.owner).toEqual({
+    tenantId: principal.tenantId,
+    userId: principal.userId,
+  });
+  expect(access.revision?.source.transferGeneration).toBe(f.task.attemptGeneration);
+  expect(Object.isFrozen(access.revision)).toBe(true);
+  expect(Object.isFrozen(access.revision?.source)).toBe(true);
+  (f.record as unknown as Record<string, unknown>).retentionRevision = 700;
+  const second = await f.resolver.resolve(f.req, 'source-a', { text: true });
+  expect(second.revision).toEqual(access.revision);
+  await expect(f.resolver.revalidate(f.req, access)).resolves.toBeUndefined();
+  f.ports.extractionPolicySha256 = () => 'e'.repeat(64);
+  await expect(f.resolver.revalidate(f.req, access)).rejects.toThrow();
+});
+it('keeps full context available without inventing an absent extraction policy', async () => {
+  const f = fixture();
+  f.ports.extractionPolicySha256 = () => undefined;
+  const access = await f.resolver.resolve(f.req, 'source-a', { text: true });
+  expect(access.document?.text).toContain('1760 EUR');
+  expect(access.revision).toBeUndefined();
+});
+
+/** Retention advances without rewriting immutable content identity or resurrecting a revoked File. */
+it('revalidates current retention after another successful activity extends the deadline', async () => {
+  const f = fixture();
+  const access = await f.resolver.resolve(f.req, 'source-a', { text: true });
+  const binding = access.sourceBindingSha256;
+  f.record.expiredAt = new Date(epoch + 604860000);
+  f.operation.expiresAt = new Date(epoch + 604860000).toISOString();
+  f.setClock(epoch + 60001);
+  await expect(f.resolver.revalidate(f.req, access)).resolves.toBeUndefined();
+  expect(access.sourceBindingSha256).toBe(binding);
+  expect(access.expiresAt).toBe(epoch + 604860000);
+  f.record.deletionRequestedAt = new Date(epoch + 60001);
+  await expect(f.resolver.revalidate(f.req, access)).rejects.toThrow();
 });

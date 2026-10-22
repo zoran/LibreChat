@@ -1,3 +1,7 @@
+import React from 'react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+const mockQueryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+afterEach(() => mockQueryClient.clear());
 import { renderHook, act } from '@testing-library/react';
 
 /** This jsdom build lacks `Blob.prototype.text`, which browsers have had for years; the
@@ -131,6 +135,7 @@ jest.mock('../useFileDeletion', () => ({
 }));
 
 jest.mock('~/data-provider', () => ({
+  useGetStartupConfig: () => ({ data: { authMode: 'default' } }),
   useGetFiles: () => ({ data: mockState.fileList }),
   useDeleteFilesMutation: () => ({ mutateAsync: mockDeleteFiles }),
 }));
@@ -216,6 +221,9 @@ describe('usePastedTextEdit', () => {
           textAreaRef: { current: null },
         }),
       {
+        wrapper: ({ children }) => (
+          <QueryClientProvider client={mockQueryClient}>{children}</QueryClientProvider>
+        ),
         initialProps: {
           files:
             files ??

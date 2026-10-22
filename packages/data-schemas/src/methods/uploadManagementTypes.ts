@@ -1,3 +1,4 @@
+import type { UploadCleanupReceiptMethods } from './uploadCleanupReceipts';
 /** Public repository contract and private ports shared by the cohesive upload lifecycle owners. */
 import type {
   UploadPrincipal,
@@ -22,21 +23,68 @@ import type {
   UploadSecuritySettlement,
   UploadAcceptedMetadata,
   ManagedDocumentResult,
+  UploadMigrationPage,
+  UploadMigrationReceipt,
+  UploadResourceTotals,
 } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
-import type { StoredUpload, GlobalState, UploadActivationMethods } from './uploadManagementStore';
-import type { UploadMigrationMethods } from './uploadManagementMigration';
+import type {
+  DiscoveryPage,
+  HousekeepingCoverage,
+  JobClaim,
+  StepOutcome,
+} from '../types/housekeeping';
+import type { FileReadRepository } from '~/types/fileActivity';
+import type { UploadActivationMethods } from './uploadManagementStore';
 import type { UploadAdmissionMethods } from './uploadManagementAdmission';
 import type { UploadControlMethods } from './uploadManagementControl';
 import type { UploadIntakeMethods } from './uploadManagementIntake';
-import { createUploadStore, storedUploadPrincipal } from './uploadManagementStore';
-import { createFileRetentionMethods } from './fileRetention';
+export type UploadMigrationMethods = {
+  exportSnapshot(input: {
+    epoch: string;
+    cursor?: string;
+    limit?: number;
+  }): Promise<UploadMigrationPage>;
+  importSnapshot(page: UploadMigrationPage): Promise<void>;
+  completeExport(epoch: string): Promise<UploadMigrationReceipt>;
+  completeImport(input: {
+    receipt: UploadMigrationReceipt;
+    baseline: UploadResourceTotals;
+    lifecycleReconciled: true;
+  }): Promise<void>;
+};
+
+export type UploadCleanupClaim = JobClaim & {
+  work: Extract<JobClaim['work'], { handler: 'upload.cleanup' }>;
+};
+export type UploadCleanupPreparation =
+  | { state: 'ready'; task: UploadCleanupTask }
+  | { state: 'outcome'; outcome: StepOutcome };
+
+/** Exact actor facts survive independently of scanner, promotion and original deletion. */
+export type UploadActorCleanupTask = UploadCleanupTask & {
+  actorWriterStopped: boolean;
+  actorLocalWriterStopped: boolean;
+};
+export type UploadActorCleanupProof = Pick<
+  UploadCleanupProof,
+  'operationId' | 'generation' | 'writerStopped' | 'localCopiesAbsent' | 'securitySettlement'
+> & { localWriterStopped?: boolean };
 /** Upload repository contract and explicit internal composition ports. */
-export type UploadManagementRepository = UploadControlMethods &
+export type UploadManagementRepository = UploadCleanupReceiptMethods &
+  UploadControlMethods &
   UploadMigrationMethods &
   UploadAdmissionMethods &
   UploadIntakeMethods &
   UploadActivationMethods & {
+    readonly fileReads: FileReadRepository;
+    coverageUploadHousekeeping(
+      signal: AbortSignal,
+      session: ClientSession,
+    ): Promise<HousekeepingCoverage>;
+    discoverUploadHousekeeping(cursor: string | null): Promise<DiscoveryPage>;
+    prepareHousekeepingCleanup(claim: JobClaim): Promise<UploadCleanupPreparation>;
+    confirmHousekeepingCleanup(claim: JobClaim, proof: UploadCleanupProof): Promise<StepOutcome>;
     initialize(): Promise<void>;
     findReservation(
       principal: UploadPrincipal,
@@ -101,6 +149,15 @@ export type UploadManagementRepository = UploadControlMethods &
       now: number,
     ): Promise<void>;
     cleanupTasks(limit?: number): Promise<UploadCleanupTask[]>;
+    cleanupForWorker(
+      worker: UploadWorker,
+      page?: { limit?: number; cursor?: string | null },
+    ): Promise<{ tasks: UploadActorCleanupTask[]; cursor: string | null }>;
+    confirmActorCleanup(
+      worker: UploadWorker,
+      proof: UploadActorCleanupProof,
+      now: number,
+    ): Promise<UploadActorCleanupTask>;
     cleanupForFile(
       owner: { tenantId: string | null; userId: string },
       fileId: string,
@@ -116,27 +173,4 @@ export type UploadManagementRepository = UploadControlMethods &
     metrics(now: number): Promise<UploadMetricsSnapshot>;
   };
 
-/** Internal ports share the sole store, transaction and retention owners. */
-/** Observational side effect participates in the caller's existing transaction. */
-export type UploadPublicationPort = (
-  input: { tenantId: string | null; operationId: string; publishedAtMs: number },
-  session: ClientSession,
-) => Promise<void>;
-
-export interface UploadManagementContext {
-  mongoose: typeof import('mongoose');
-  store: ReturnType<typeof createUploadStore>;
-  lifecycle: ReturnType<typeof createFileRetentionMethods>;
-  securityPolicySha256?: string;
-  principalOf: typeof storedUploadPrincipal;
-  owned(principal: UploadPrincipal, id: string, session?: ClientSession): Promise<StoredUpload>;
-  terminal(
-    row: StoredUpload,
-    global: GlobalState,
-    state: StoredUpload['state'],
-    code?: UploadErrorCode,
-  ): void;
-  cleanupTask(row: StoredUpload): UploadCleanupTask;
-  usage(principal: UploadPrincipal, now: number, session?: ClientSession): Promise<UploadUsage>;
-  recordOriginalPublication?: UploadPublicationPort;
-}
+export type { UploadManagementContext, UploadPublicationPort } from './uploadManagementContext';

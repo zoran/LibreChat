@@ -7,35 +7,39 @@ import {
   readUploadSecurityExecution,
   isCompleteUploadSecuritySettlement,
   UPLOAD_RECORD_BYTES,
+  canonicalManagedJson,
 } from 'librechat-data-provider';
 import type {
   UploadPrincipal,
-  UploadDerivedOrigin,
-  UploadScope,
-  UploadState,
-  UploadErrorCode,
-  UploadWorker,
+  FileCoverageInvalidateReason,
   UploadLease,
   UploadOperation,
-  UploadStorageReceipt,
   UploadLimits,
   UploadControlMode,
-  UploadParserExecution,
   UploadMigrationReceipt,
   UploadReconciliationSnapshot,
   UploadActivationProof,
-  UploadSecurityApproval,
-  UploadSecurityExecution,
-  UploadSecuritySettlement,
-  UploadIntakeGrant,
-  UploadPromotionRecord,
 } from 'librechat-data-provider';
 import type { ClientSession, Model } from 'mongoose';
+import type {
+  ManagedRetrievalInventoryAuthority,
+  ManagedRetrievalInventoryProof,
+} from './fileRetrieval';
+import type { FileCoverageState, FileCoverageMigrationState } from './fileHousekeepingCoverage';
+import type { StoredUpload } from './uploadManagementState';
+import {
+  reject,
+  storedUploadPrincipal,
+  assertUploadCleanupCapacity,
+} from './uploadManagementState';
 import { tenantStorage, SYSTEM_TENANT_ID, runAsSystem } from '~/config/tenantContext';
+import { projectUploadHousekeeping } from './uploadHousekeepingProjection';
+import { issueManagedRetrievalInventory } from './fileRetrieval';
+
+export type { StoredUpload } from './uploadManagementState';
+export { WAIT_MS, PROCESS_MS, reject, storedUploadPrincipal } from './uploadManagementState';
 
 export const LEASE_MS = 45_000;
-export const WAIT_MS = 600_000;
-export const PROCESS_MS = 3_600_000;
 export const MAX_QUEUE_BYTES = 1_073_741_824;
 export const HARD_LIMITS: UploadLimits = {
   transferPermits: 6,
@@ -67,6 +71,7 @@ export type StoredUploadAdmissionPolicy = {
   lastRequestSha256?: string;
 };
 export type SnapshotHeader = {
+  retentionFrozenAt: number;
   sourceId: string;
   totals: ResourceTotals;
   baseline: ResourceTotals;
@@ -80,72 +85,14 @@ export type SnapshotHeader = {
 export type MigrationState = {
   epoch: string;
   role: 'export' | 'import';
-  phase: 'paging' | 'complete' | 'retired';
+  phase: 'paging' | 'complete' | 'retired' | 'validating' | 'thawing';
   header: SnapshotHeader;
   cursor: string | null;
   digest: string;
   operations: number;
+  fileActivity: { version: 1; files: number; sha256: string };
+  validation?: { cursor: string | null; operations: number; files: number; sha256: string };
   pages: Record<string, { digest: string; nextCursor: string | null; limit: number }>;
-};
-export type StoredUpload = {
-  _id: string;
-  tenantId: string | null;
-  userId: string;
-  scope: UploadScope;
-  idempotencyKey: string;
-  fingerprint: string;
-  derivedOrigin?: UploadDerivedOrigin;
-  filename?: string;
-  mediaType: string;
-  declaredBytes: number;
-  actualBytes?: number;
-  state: UploadState;
-  revision: number;
-  createdAt: number;
-  acceptedAt?: number;
-  expiresAt?: number;
-  fileId?: string;
-  error?: UploadErrorCode;
-  cleanupPending: boolean;
-  generation: number;
-  slot?: 'transfer' | 'processing';
-  worker?: UploadWorker;
-  leaseExpiresAt?: number;
-  attemptGeneration?: number;
-  original?: UploadStorageReceipt;
-  /** Trusted scanner receipt, private to the original transfer rather than processing attempts. */
-  securityApproval?: UploadSecurityApproval;
-  securityExecution?: UploadSecurityExecution;
-  securitySettlement?: UploadSecuritySettlement;
-  /** Private capability hash and native identity reference; never projected to ordinary clients. */
-  intake?: {
-    capabilitySha256: string;
-    grant: UploadIntakeGrant;
-    worker?: UploadWorker;
-    generation?: number;
-    closed?: true;
-    cleanupAcknowledged?: true;
-  };
-  /** App writer is independent of the Intake transfer and scanner execution. */
-  promotion?: UploadPromotionRecord;
-  originalBytes: number;
-  textBytes: number;
-  recordBytes: number;
-  queueCharged: boolean;
-  pendingBytes: number;
-  stagingHeld: boolean;
-  processingQueuedAt?: number;
-  byteLeaseUntil?: number;
-  workerGeneration?: number;
-  workerKind?: UploadLease['kind'];
-  writerStopped?: boolean;
-  byteLeaseGeneration?: number;
-  originalRemoved?: boolean;
-  textRemoved?: boolean;
-  parserExecution?: UploadParserExecution;
-  publishedDigest?: string;
-  /** Immutable first actual publication time; absent historical rows remain unknown. Private. */
-  firstPublishedAtMs?: number;
 };
 export type GlobalState = ResourceTotals & {
   revision: number;
@@ -165,7 +112,8 @@ export type GlobalState = ResourceTotals & {
   storeId: string;
   admission?: StoredUploadAdmissionPolicy;
   baseline: ResourceTotals;
-  migration?: MigrationState;
+  migration?: MigrationState | FileCoverageMigrationState;
+  fileHousekeepingCoverage?: FileCoverageState;
   cleanupCursor?: string;
   reconcileCursor?: string;
   completedImport?: { receipt: UploadMigrationReceipt; baseline: ResourceTotals };
@@ -174,8 +122,12 @@ export type GlobalState = ResourceTotals & {
 };
 export type CounterRow = { _id: string; revision: number; value: GlobalState | { turn: number } };
 export type UploadStoreOptions = {
+  /** Private reconciler only: externally authenticated and persisted retirement/census receipts. */
+  retrievalInventoryAuthority?: ManagedRetrievalInventoryAuthority;
   /** Missing/invalid policy closes dependent operations without preventing cleanup or startup. */
   securityPolicySha256?: string;
+  /** Trusted File composition supplies the admitted extraction policy, never request metadata. */
+  extractionPolicySha256?: string;
   /** Only the trusted activation/reconciliation owner may attest existing occupancy. */
   reconciled?: boolean;
   baseline?: Partial<ResourceTotals>;
@@ -235,10 +187,6 @@ export async function adjustRetainedTextBytes(
     { session },
   );
 }
-export function reject(code: UploadErrorCode): never {
-  const error = Object.assign(new Error(code), { name: 'UploadManagementError', code });
-  throw error;
-}
 /** Missing tenant data is never admitted as an explicit guest row. */
 export function principalFilter(principal: UploadPrincipal): {
   tenantId: string | null;
@@ -256,16 +204,6 @@ export function principalFilter(principal: UploadPrincipal): {
     userId: principal.userId,
     ...(principal.tenantId === null ? { $and: [{ tenantId: { $exists: true as const } }] } : {}),
   };
-}
-export function storedUploadPrincipal(
-  row: Pick<StoredUpload, 'tenantId' | 'userId'>,
-): UploadPrincipal {
-  const principal =
-    row.tenantId === null
-      ? { tenantId: null, userId: row.userId, authentication: 'guest' as const }
-      : { tenantId: row.tenantId, userId: row.userId, authentication: 'verified-email' as const };
-  if (!isUploadPrincipal(principal)) reject('unavailable');
-  return principal;
 }
 export function hasValidUploadPublicationTime(row: StoredUpload): boolean {
   return (
@@ -372,6 +310,30 @@ export function effectiveLimits(global: GlobalState, now: number): UploadLimits 
   return global.limits;
 }
 
+/** Invalidation never grants coverage; only existing owner transitions call this inside their CAS. */
+export function invalidateFileHousekeepingCoverage(
+  global: GlobalState,
+  requestSha256: string,
+  reason: FileCoverageInvalidateReason,
+): void {
+  const old = global.fileHousekeepingCoverage;
+  if (!old) return;
+  if (old.phase === 'invalid' && old.requestSha256 === requestSha256) return;
+  if (
+    !Number.isSafeInteger(old.generation) ||
+    old.generation < 0 ||
+    old.generation >= Number.MAX_SAFE_INTEGER - 1
+  )
+    reject('migration_conflict');
+  global.fileHousekeepingCoverage = {
+    version: 1,
+    phase: 'invalid',
+    generation: old.generation + 1,
+    requestSha256,
+    reason,
+  };
+}
+
 export type UploadStore = {
   mongoose: typeof import('mongoose');
   Operation: Model<StoredUpload>;
@@ -427,11 +389,13 @@ export function createUploadStore(
       fileId: String,
       error: String,
       cleanupPending: Boolean,
+      cleanupCustody: S.Types.Mixed,
       generation: Number,
       slot: String,
       worker: S.Types.Mixed,
       leaseExpiresAt: Number,
       writerStopped: Boolean,
+      actorSettlement: S.Types.Mixed,
       attemptGeneration: Number,
       original: S.Types.Mixed,
       securityApproval: S.Types.Mixed,
@@ -462,6 +426,13 @@ export function createUploadStore(
   operationSchema.index({ tenantId: 1, userId: 1, acceptedAt: 1 });
   operationSchema.index({ state: 1, createdAt: 1 });
   operationSchema.index({ cleanupPending: 1, _id: 1 });
+  operationSchema.index({ cleanupPending: 1, 'worker.hostId': 1, 'worker.instanceId': 1, _id: 1 });
+  operationSchema.index({
+    cleanupPending: 1,
+    'promotion.worker.hostId': 1,
+    'promotion.worker.instanceId': 1,
+    _id: 1,
+  });
   operationSchema.index({ slot: 1, 'worker.hostId': 1, 'worker.instanceId': 1 });
   operationSchema.index({ stagingHeld: 1, 'worker.hostId': 1, 'worker.instanceId': 1, _id: 1 });
   const counterSchema = new S<CounterRow>(
@@ -557,6 +528,7 @@ export function createUploadStore(
     }
   }
   async function save(row: StoredUpload, session: ClientSession): Promise<void> {
+    assertUploadCleanupCapacity(row, mongoose.mongo.BSON.calculateObjectSize);
     if (mongoose.mongo.BSON.calculateObjectSize(row) > UPLOAD_RECORD_BYTES)
       reject('capacity_exceeded');
     if (!hasValidUploadPublicationTime(row)) reject('unavailable');
@@ -581,9 +553,15 @@ export function createUploadStore(
                 : []),
             ],
           };
+    const previous = await Operation.findById(row._id)
+      .session(session)
+      .maxTimeMS(3_000)
+      .lean<StoredUpload>();
+    if (!previous) reject('unavailable');
     row.revision++;
     const saved = await Operation.replaceOne({ _id: row._id, ...publication }, row, { session });
     if (saved.matchedCount !== 1) reject('unavailable');
+    await projectUploadHousekeeping(mongoose, previous, row, session);
   }
   /** Activation cannot reinterpret old receipts or hide unresolved external custody. */
   async function assertCurrentSecurityState(session: ClientSession): Promise<void> {
@@ -719,11 +697,24 @@ export function uploadDigest(value: unknown): string {
 
 export type UploadActivationMethods = {
   reconciliationSnapshot(now: number): Promise<UploadReconciliationSnapshot>;
+  reconcileFileRetrievalInventory(
+    proof: ManagedRetrievalInventoryProof,
+    now: number,
+  ): Promise<void>;
   activateReconciled(proof: UploadActivationProof, now: number): Promise<void>;
 };
 
 /** Only the trusted inventory/lifecycle reconciliation composition may call this private port. */
-export function createUploadActivationMethods(store: UploadStore): UploadActivationMethods {
+export function createUploadActivationMethods(
+  store: UploadStore,
+  options: { retrievalInventoryAuthority?: ManagedRetrievalInventoryAuthority } = {},
+): UploadActivationMethods {
+  const retrievalInventoryAuthority =
+    options.retrievalInventoryAuthority === undefined
+      ? undefined
+      : (JSON.parse(
+          canonicalManagedJson(options.retrievalInventoryAuthority),
+        ) as ManagedRetrievalInventoryAuthority);
   const keys = Object.keys(RESOURCE_MAX) as (keyof ResourceTotals)[];
   function survivingSourceMessage(): Record<string, unknown> {
     // A binding alone is not surviving content: empty/redacted bodies and removed quotations
@@ -891,6 +882,58 @@ export function createUploadActivationMethods(store: UploadStore): UploadActivat
     });
   }
   return {
+    async reconcileFileRetrievalInventory(input, now) {
+      const proof = JSON.parse(canonicalManagedJson(input)) as ManagedRetrievalInventoryProof;
+      const authority = retrievalInventoryAuthority;
+      if (
+        !authority ||
+        !Number.isSafeInteger(now) ||
+        now < 0 ||
+        !Number.isSafeInteger(proof.observedAt) ||
+        proof.observedAt > now ||
+        now - proof.observedAt > 300_000
+      )
+        reject('not_ready');
+      // One bounded File per existing majority transaction. External writer retirement and the
+      // complete backend census must already be authenticated by the trusted lifecycle composition.
+      await store.transaction(async (session, global) => {
+        await quiescent(global, session);
+        if (
+          proof.storeId !== global.storeId ||
+          !global.reconciliationFence ||
+          proof.revision !== global.revision ||
+          proof.revision !== global.reconciliationFence.revision ||
+          proof.observedAt < global.reconciliationFence.observedAt
+        )
+          reject('not_ready');
+        const File = store.mongoose.models.File;
+        if (!File) reject('not_ready');
+        await runAsSystem(async () => {
+          const filter = {
+            file_id: proof.fileId,
+            user: proof.owner.userId,
+            tenantId:
+              proof.owner.tenantId === null ? { $eq: null, $exists: true } : proof.owner.tenantId,
+            retentionAcceptedAt: { $ne: null },
+          };
+          const row = await File.findOne(filter)
+            .select('+securityApproval +documentStructure +managedRetrieval')
+            .session(session)
+            .lean<Record<string, unknown>>();
+          if (!row || row.deletionCompletedAt) reject('not_ready');
+          const state = issueManagedRetrievalInventory(row, proof, authority);
+          const written = await File.updateOne(
+            { ...filter, _id: row._id },
+            { $set: { managedRetrieval: state }, $inc: { retentionRevision: 1 } },
+            { session, timestamps: false },
+          );
+          if (written.matchedCount !== 1) reject('not_ready');
+        });
+        // A new inventory observation is required for the next File or activation. An old proof
+        // cannot advance another File after the global revision changes.
+        delete global.reconciliationFence;
+      });
+    },
     async reconciliationSnapshot(now) {
       if (!Number.isSafeInteger(now) || now < 0) reject('invalid_request');
       return store.transaction(async (session, global) => {
@@ -995,6 +1038,7 @@ export function createUploadActivationMethods(store: UploadStore): UploadActivat
           global[key] = total;
         }
         global.baseline = { ...proof.baseline };
+        invalidateFileHousekeepingCoverage(global, uploadDigest(proof), 'writer_admission');
         global.activationProof = { ...proof, baseline: { ...proof.baseline } };
         global.reconciled = true;
         global.enabled = true;
@@ -1002,4 +1046,101 @@ export function createUploadActivationMethods(store: UploadStore): UploadActivat
       });
     },
   };
+}
+
+/** Same-transaction projection only: lifecycle, immutable admission and all quota debits stay intact. */
+export async function mirrorFileActivityDeadline(
+  mongoose: typeof import('mongoose'),
+  row: StoredUpload,
+  nextDeadline: number,
+  session: ClientSession,
+  intent: 'original-activity' | 'derived-projection' = 'original-activity',
+): Promise<void> {
+  if (
+    !session.inTransaction() ||
+    row.fileId !== row._id ||
+    !Number.isSafeInteger(nextDeadline) ||
+    !Number.isSafeInteger(row.expiresAt) ||
+    nextDeadline <= Date.now() ||
+    (intent === 'original-activity'
+      ? row.state !== 'ready' ||
+        row.derivedOrigin !== undefined ||
+        !hasValidUploadPublicationTime(row) ||
+        typeof row.publishedDigest !== 'string' ||
+        !/^[a-f0-9]{64}$/.test(row.publishedDigest) ||
+        nextDeadline !== row.expiresAt! + 7 * 86400000
+      : !['queued_processing', 'processing', 'ready', 'failed'].includes(row.state) ||
+        row.derivedOrigin === undefined ||
+        nextDeadline < row.expiresAt!)
+  )
+    reject('unavailable');
+  const result = await mongoose.models.UploadOperation.updateOne(
+    {
+      _id: row._id,
+      ...principalFilter(storedUploadPrincipal(row)),
+      state: row.state,
+      revision: row.revision,
+      fileId: row.fileId,
+      acceptedAt: row.acceptedAt,
+      expiresAt: row.expiresAt,
+      generation: row.generation,
+      attemptGeneration: row.attemptGeneration,
+      ...(intent === 'original-activity'
+        ? { publishedDigest: row.publishedDigest, derivedOrigin: { $exists: false } }
+        : { derivedOrigin: row.derivedOrigin }),
+    },
+    { $set: { expiresAt: nextDeadline }, $inc: { revision: 1 } },
+    { session },
+  );
+  if (!result.acknowledged || result.matchedCount !== 1) reject('unavailable');
+  await projectUploadHousekeeping(
+    mongoose,
+    row,
+    { ...row, expiresAt: nextDeadline, revision: row.revision + 1 },
+    session,
+  );
+}
+
+/** Migration alone may upgrade frozen origin provenance or reduce an inconsistent legacy cap. */
+export async function mirrorFileRetentionMigration(
+  mongoose: typeof import('mongoose'),
+  row: StoredUpload,
+  previousExpiry: number,
+  previousOrigin: StoredUpload['derivedOrigin'],
+  session: ClientSession,
+): Promise<void> {
+  if (
+    !session.inTransaction() ||
+    !Number.isSafeInteger(row.expiresAt) ||
+    row.expiresAt! > previousExpiry
+  )
+    reject('migration_conflict');
+  if (
+    row.expiresAt === previousExpiry &&
+    JSON.stringify(previousOrigin) === JSON.stringify(row.derivedOrigin)
+  )
+    return;
+  const previous = { ...row, expiresAt: previousExpiry, derivedOrigin: previousOrigin };
+  const changed = await mongoose.models.UploadOperation.updateOne(
+    {
+      _id: row._id,
+      ...principalFilter(storedUploadPrincipal(row)),
+      revision: row.revision,
+      expiresAt: previousExpiry,
+      ...(previousOrigin === undefined
+        ? { derivedOrigin: { $exists: false } }
+        : { derivedOrigin: previousOrigin }),
+    },
+    {
+      $set: {
+        expiresAt: row.expiresAt,
+        ...(row.derivedOrigin === undefined ? {} : { derivedOrigin: row.derivedOrigin }),
+      },
+      $inc: { revision: 1 },
+    },
+    { session },
+  );
+  if (changed.matchedCount !== 1) reject('migration_conflict');
+  row.revision++;
+  await projectUploadHousekeeping(mongoose, previous, row, session);
 }

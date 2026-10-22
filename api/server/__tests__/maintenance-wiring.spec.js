@@ -1,3 +1,7 @@
+jest.mock('@librechat/data-schemas', () => ({
+  logger: { info: jest.fn(), warn: jest.fn(), error: jest.fn() },
+}));
+
 /** Exercises actual facade and generation wiring without starting the application. */
 const fs = require('node:fs');
 const path = require('node:path');
@@ -31,15 +35,19 @@ test('wires all actual work facades, late browser load, and the same external ce
     getMaintenanceCensus: jest.fn(),
   });
   const browser = facade();
+  const uploads = facade();
   const context = {
     process: { env: {} },
     cacheConfig: { SHARED_STATE: {} },
     serverReady: true,
+    startupSignal: { throwIfAborted: jest.fn() },
     scheduleMaintenance: facade(),
     agentTriggerMaintenance: facade(),
     agentQueuedTurnMaintenance: facade(),
     skillSyncMaintenance: facade(),
-    expiredFileSweepMaintenance: facade(),
+    fileDeletionWorkOwner: { maintenance: facade() },
+    fileLibraryMaintenance: facade(),
+    getUploadRuntime: jest.fn(() => ({ maintenance: uploads })),
     legacyAuthMaintenance: facade(),
     createAppMaintenance: jest.fn(() => ({ externalCensus: jest.fn(), identity: {} })),
   };
@@ -66,12 +74,20 @@ test('wires all actual work facades, late browser load, and the same external ce
     'triggers',
     'queuedTurns',
     'skillSync',
-    'fileRetention',
+    'fileDeletion',
+    'fileLibrary',
     'uploads',
     'auth',
   ]);
   expect(deps.workOwners.skillSync).toBe(context.skillSyncMaintenance);
-  expect(deps.workOwners.fileRetention).toBe(context.expiredFileSweepMaintenance);
+  expect(deps.workOwners.fileDeletion).toBe(context.fileDeletionWorkOwner.maintenance);
+  expect(deps.workOwners.fileLibrary).toBe(context.fileLibraryMaintenance);
+  for (const method of ['pauseAdmissions', 'resumeAdmissions', 'getMaintenanceCensus']) {
+    const result = method === 'getMaintenanceCensus' ? Promise.resolve({ complete: false }) : false;
+    uploads[method].mockReturnValue(result);
+    expect(deps.workOwners.uploads[method]('op')).toBe(result);
+    expect(uploads[method]).toHaveBeenCalledWith('op');
+  }
   expect(deps.workOwners.auth).toBe(context.legacyAuthMaintenance);
   expect(deps.workOwners).not.toHaveProperty('history');
   expect(deps.unqualifiedOwners).toContain(
@@ -96,6 +112,104 @@ test('wires all actual work facades, late browser load, and the same external ce
   expect(source.indexOf('browserMaintenance = routes.auth.browserMaintenance')).toBeGreaterThan(
     source.indexOf("const routes = require('./routes')"),
   );
+});
+
+test('web runtime initializes existing owners without importing or starting a File timer', async () => {
+  const appConfig = {};
+  const api = new Proxy(
+    {},
+    {
+      get(target, key) {
+        return (target[key] ??= jest.fn());
+      },
+    },
+  );
+  const initializeUploads = jest.fn().mockResolvedValue(undefined);
+  const modules = {
+    axios: {},
+    '@librechat/data-schemas': { runAsSystem: (run) => run() },
+    '@librechat/api': api,
+    '~/db': {},
+    '~/models': { seedDatabase: jest.fn(), sweepOrphanedPreviews: jest.fn() },
+    '../Skills/sync': { initializeGitHubSkillSync: jest.fn() },
+    '../Uploads': { initializeUploads },
+    '../Endpoints/agents/subagentThreadStore': { configureSubagentTaskRouting: jest.fn() },
+    '../Config': { getAppConfig: jest.fn().mockResolvedValue(appConfig) },
+    '../status/usage': {},
+  };
+  const module = { exports: {} };
+  vm.runInNewContext(runtimeSource, {
+    module,
+    require(id) {
+      if (!(id in modules)) throw new Error(`Unexpected startup dependency: ${id}`);
+      return modules[id];
+    },
+  });
+  const identity = { incarnation: 'web' };
+  await expect(
+    module.exports.initializeApplicationRuntime({ identity, projectRoot: '/unused' }),
+  ).resolves.toEqual({ appConfig, uploads: undefined });
+  expect(initializeUploads).toHaveBeenCalledWith({
+    registry: undefined,
+    identity,
+    recordOriginalPublication: undefined,
+  });
+  expect(modules['~/models'].sweepOrphanedPreviews).toHaveBeenCalledTimes(1);
+  expect(api.initializeFileStorage).toHaveBeenCalledWith(appConfig);
+});
+
+test('cluster startup and replacement leave retention scheduling to Housekeeping', async () => {
+  const { EventEmitter } = require('node:events');
+  const clusterSource = fs.readFileSync(path.join(__dirname, '../experimental.js'), 'utf8');
+  const start = clusterSource.indexOf('if (cluster.isMaster) {');
+  const end = clusterSource.indexOf('} else {\n  /**\n   * Worker process', start);
+  expect(start).toBeGreaterThan(0);
+  expect(end).toBeGreaterThan(start);
+  const worker = (id) =>
+    Object.assign(new EventEmitter(), {
+      id,
+      process: { pid: id },
+      isConnected: () => true,
+      send: jest.fn(),
+      kill: jest.fn(),
+    });
+  const first = worker(1);
+  const second = worker(2);
+  const cluster = Object.assign(new EventEmitter(), {
+    isMaster: true,
+    workers: { 1: first, 2: second },
+    fork: jest.fn(),
+  });
+  const process = Object.assign(new EventEmitter(), { pid: 0, exit: jest.fn() });
+  vm.runInNewContext(clusterSource.slice(start, end + 1), {
+    cluster,
+    process,
+    workers: 2,
+    flushRedisCache: jest.fn().mockResolvedValue(undefined),
+    logger: { info: jest.fn(), error: jest.fn(), warn: jest.fn(), debug: jest.fn() },
+    wrapLogMessage: (message) => message,
+    CLUSTER_FORCE_EXIT_MS: 10_000,
+    setTimeout: jest.fn(),
+  });
+  await Promise.resolve();
+  expect(cluster.fork).toHaveBeenCalledTimes(2);
+  for (const current of [first, second]) {
+    cluster.emit('online', current);
+    cluster.emit('listening', current);
+  }
+  delete cluster.workers[1];
+  cluster.emit('exit', first, 1, null);
+  expect(cluster.fork).toHaveBeenCalledTimes(3);
+  expect(first.send).not.toHaveBeenCalled();
+  expect(second.send).not.toHaveBeenCalled();
+  process.emit('SIGTERM');
+  expect(second.send).toHaveBeenCalledWith(
+    { type: 'cluster-shutdown', deadlineAt: expect.any(Number) },
+    expect.any(Function),
+  );
+  expect(second.kill).not.toHaveBeenCalled();
+  second.emit('message', { type: 'cluster-shutdown-ack' });
+  expect(second.kill).toHaveBeenCalledTimes(1);
 });
 
 test('establishes auth admission before Passport and session setup', () => {
@@ -214,5 +328,109 @@ test.each(['index', 'runtime'])('registers models before %s startup consumers', 
     expect(
       trace.filter((name) => ['connect', 'usage', 'reconciler', 'indexSync'].includes(name)),
     ).toEqual(['connect', 'usage', 'reconciler', 'indexSync']);
+  }
+});
+
+test.each(['index.js', 'experimental.js'])(
+  'joins actual foreground File shutdown tasks in %s',
+  async (entry) => {
+    const { createFileDeletionWorkOwner } = jest.requireActual(
+      '../../../packages/api/src/files/deletion',
+    );
+    const fileDeletionWorkOwner = createFileDeletionWorkOwner();
+    const entrySource = fs.readFileSync(path.join(__dirname, '..', entry), 'utf8');
+    const tasks = [];
+    const statements = entrySource.match(
+      /registerShutdownTask\('file deletion (?:admission|settlement)'[\s\S]*?\n\s*}\);/g,
+    );
+    expect(statements).toHaveLength(2);
+    vm.runInNewContext(statements.join('\n'), {
+      fileDeletionWorkOwner,
+      registerShutdownTask: (name, fn, options) => tasks.push({ name, fn, ...options }),
+    });
+    expect(tasks.map(({ phase, priority }) => ({ phase, priority }))).toEqual([
+      { phase: 'pre-drain', priority: 110 },
+      { phase: 'pre-drain', priority: 90 },
+    ]);
+    let finish;
+    const write = new Promise((resolve) => {
+      finish = resolve;
+    });
+    const operation = fileDeletionWorkOwner.run((scope) => scope.effect(() => write));
+    tasks[0].fn();
+    await expect(fileDeletionWorkOwner.run(async () => undefined)).rejects.toThrow(
+      'FILE_DELETION_QUIESCING',
+    );
+    const drain = tasks[1].fn();
+    let drained = false;
+    void drain.then(() => {
+      drained = true;
+    });
+    await Promise.resolve();
+    expect(drained).toBe(false);
+    expect(drain).toBe(fileDeletionWorkOwner.drain());
+    finish();
+    await operation;
+    await drain;
+  },
+);
+
+test('foreground File shutdown retains original deletion through the actual shutdown coordinator', async () => {
+  const { Server } = require('node:http');
+  const { createFileDeletionWorkOwner } = jest.requireActual(
+    '../../../packages/api/src/files/deletion',
+  );
+  const shutdown = jest.requireActual('../../../packages/api/src/app/shutdown');
+  const fileDeletionWorkOwner = createFileDeletionWorkOwner();
+  shutdown.__resetShutdownStateForTests();
+  jest.useFakeTimers();
+  const exit = jest.spyOn(process, 'exit').mockImplementation(() => undefined);
+  const previous = new Set(process.listeners('SIGTERM'));
+  let finish;
+  const write = new Promise((resolve) => {
+    finish = resolve;
+  });
+  const operation = fileDeletionWorkOwner.run((scope) => scope.effect(() => write));
+  const teardown = jest.fn();
+  try {
+    const statements = source.match(
+      /registerShutdownTask\('file deletion (?:admission|settlement)'[\s\S]*?\n\s*}\);/g,
+    );
+    vm.runInNewContext(statements.join('\n'), {
+      fileDeletionWorkOwner,
+      registerShutdownTask: shutdown.registerShutdownTask,
+    });
+    shutdown.registerShutdownTask(
+      'generation prepare',
+      async () => {
+        await expect(fileDeletionWorkOwner.run(async () => undefined)).rejects.toThrow(
+          'FILE_DELETION_QUIESCING',
+        );
+      },
+      { phase: 'pre-drain', priority: 100 },
+    );
+    shutdown.registerShutdownTask('storage teardown', teardown, { priority: 105 });
+    shutdown.setupGracefulShutdown(new Server());
+    const signal = process.listeners('SIGTERM').find((listener) => !previous.has(listener));
+    signal('SIGTERM');
+    await jest.advanceTimersByTimeAsync(1000);
+    expect(shutdown.getShutdownSignal().aborted).toBe(true);
+    expect(shutdown.getRemainingShutdownMs()).toBe(59000);
+    expect(teardown).not.toHaveBeenCalled();
+    expect(exit).not.toHaveBeenCalled();
+    expect(await fileDeletionWorkOwner.maintenance.getMaintenanceCensus(null)).toMatchObject({
+      pendingWrites: 1,
+    });
+    finish();
+    await operation;
+    await jest.advanceTimersByTimeAsync(0);
+    expect(teardown).toHaveBeenCalledTimes(1);
+    expect(exit).toHaveBeenCalledWith(0);
+  } finally {
+    finish();
+    await operation;
+    shutdown.__resetShutdownStateForTests();
+    exit.mockRestore();
+    jest.useRealTimers();
   }
 });

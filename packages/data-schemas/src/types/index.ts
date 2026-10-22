@@ -58,3 +58,5 @@ export * from './mcpAuthority';
 export * from './generationAdmission';
 
 export type * from './checkpointSource';
+export type * from './fileActivity';
+export type * from './housekeeping';

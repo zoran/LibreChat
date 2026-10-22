@@ -108,7 +108,15 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
   }, 30_000);
 
   beforeEach(async () => {
-    for (const name of ['User', 'File', 'Message', 'UploadOperation', 'UploadCounter'])
+    for (const name of [
+      'User',
+      'File',
+      'Message',
+      'UploadOperation',
+      'UploadCounter',
+      'HousekeepingJob',
+      'FileReadReceipt',
+    ])
       if (db.models[name]) await db.models[name].deleteMany({});
     await db.models.User.create({
       _id: principal.userId,
@@ -132,11 +140,14 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
       repository,
       // Fixed test principal; repository ownership fences remain real on both Mongo clients.
       identity: {
-        authorize: async (owner, scope) =>
+        authorize: async (owner, request) =>
           owner.tenantId === principal.tenantId &&
           owner.userId === principal.userId &&
           owner.authentication === principal.authentication &&
-          scope.kind === 'personal',
+          request.owner.scope.kind === 'personal' &&
+          'ownerUserId' in request.owner &&
+          request.owner.ownerUserId === owner.userId &&
+          request.owner.tenantId === owner.tenantId,
       },
       // Trusted fixture admission only. This suite makes no native resource/isolation claim.
       resources: {
@@ -483,12 +494,13 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         derivedOrigin?: UploadDerivedOrigin;
       }>();
       expect(captured?.derivedOrigin).toMatchObject({
-        version: 1,
+        version: 2,
         directSourceFileIds: [source.id],
         ancestors: [
           {
             subject: sourceFile!.securityApproval!.subject,
             policySha256,
+            sourceBindingSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
             expiresAt: Date.parse(readySource.expiresAt!),
           },
         ],
@@ -527,11 +539,9 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         expect(ready).toMatchObject({
           state: 'ready',
           canUseInComposer: false,
-          expiresAt: readySource.expiresAt,
+          expiresAt: new Date(Date.parse(ready.acceptedAt!) + UPLOAD_RETENTION_MS).toISOString(),
         });
-        expect(Date.parse(ready.acceptedAt!) + UPLOAD_RETENTION_MS).toBeGreaterThan(
-          Date.parse(ready.expiresAt!),
-        );
+        expect(Date.parse(readySource.expiresAt!)).toBeGreaterThan(Date.parse(ready.expiresAt!));
         const file = await observer.models.File.findOne({ file_id: derived.id })
           .select('+derivedOrigin')
           .lean();
@@ -650,6 +660,18 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
       });
       const storage: StoragePort = {
         put,
+        describeDeletion() {
+          throw new Error('Unexpected housekeeping deletion in scanner admission');
+        },
+        async acknowledgeDeletionConsumed() {
+          throw new Error('Unexpected housekeeping deletion in scanner admission');
+        },
+        async beginDeletion() {
+          throw new Error('Unexpected housekeeping deletion in scanner admission');
+        },
+        async observeDeletion() {
+          throw new Error('Unexpected housekeeping deletion in scanner admission');
+        },
         async *read() {
           yield await readFile(ordinaryPath);
         },

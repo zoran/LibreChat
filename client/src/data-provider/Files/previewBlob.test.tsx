@@ -1,3 +1,6 @@
+jest.mock('~/data-provider/Endpoints', () => ({
+  useGetStartupConfig: () => ({ data: { authMode: 'default' } }),
+}));
 import React from 'react';
 import { RecoilRoot } from 'recoil';
 import { dataService } from 'librechat-data-provider';

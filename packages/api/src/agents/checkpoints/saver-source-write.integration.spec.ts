@@ -1,6 +1,7 @@
 /** Private native source writes with real Mongo fences and quota; no public source activation. */
 import mongoose from 'mongoose';
 import { join } from 'node:path';
+import { v4 as uuid } from 'uuid';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import { emptyCheckpoint, ERROR } from '@langchain/langgraph-checkpoint';
@@ -12,6 +13,7 @@ import {
   tenantStorage,
 } from '@librechat/data-schemas';
 import type { CheckpointSourceBinding, GenerationAdmissionInput } from '@librechat/data-schemas';
+import type { UploadLease, UploadPrincipal } from 'librechat-data-provider';
 import {
   createCheckpointNamespace,
   checkpointOwnerNamespacePrefix,
@@ -24,6 +26,7 @@ import { OwnedMongoSaver } from './saver';
 
 let mongo: MongoMemoryReplSet | undefined;
 let scratch: string;
+let sourceTextBytes = 0;
 const metadata = { source: 'input' as const, step: -1, parents: {} };
 const names = ['source_writer_checkpoints', 'source_writer_pending'];
 function ordinary() {
@@ -62,6 +65,7 @@ const savedManaged = process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED;
 const run = <T>(action: () => Promise<T>) =>
   tenantStorage.run({ tenantId: owner.tenantId }, action);
 beforeEach(async () => {
+  sourceTextBytes = 0;
   process.env.UPLOAD_SECURITY_POLICY_SHA256 = policy;
   process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = 'true';
   await createUploadManagementRepository(mongoose, {
@@ -113,40 +117,142 @@ it('rejects an ordinary upsert collision with a source-marked physical checkpoin
   expect(rows[0]).not.toHaveProperty('upserted_at');
 });
 
-async function prepare(ttl = 3600) {
-  const now = Date.now();
-  const fileId = '82c60bee-5296-4d5b-8abe-f09a6f3380d7';
-  // Actual File/User/source fences; security receipt and original storage are explicit fixtures.
-  await mongoose.models.File.collection.insertOne({
-    file_id: fileId,
-    uploadOperationId: fileId,
-    user: new mongoose.Types.ObjectId(owner.userId),
+/** Managed fixtures retain the actual receipt and birth inventory from their owning lifecycle. */
+async function managedSource(fileId: string, at: number) {
+  const uploads = createUploadManagementRepository(mongoose, {
+    enabled: true,
+    reconciled: true,
+    securityPolicySha256: policy,
+  });
+  await uploads.initialize();
+  const principal: UploadPrincipal = {
     tenantId: owner.tenantId,
-    status: 'ready',
-    source: 's3',
-    type: 'text/plain',
-    bytes: 8,
-    storageKey: `t/${owner.tenantId}/managed-uploads/${owner.userId}/${fileId}.1__original`,
-    retentionAcceptedAt: new Date(now),
-    expiredAt: new Date(now + 60000),
-    retainedDerivativeBytes: 0,
-    securityApproval: {
+    userId: owner.userId,
+    authentication: 'verified-email',
+  };
+  const worker = { hostId: 'fixture-host', instanceId: 'fixture-instance' };
+  const reservation = await uploads.reserve(
+    principal,
+    {
+      operationId: fileId,
+      idempotencyKey: uuid(),
+      mediaType: 'text/plain',
+      declaredBytes: 6,
+      fingerprint: JSON.stringify([{ kind: 'personal' }, 'text/plain', 6]),
+    },
+    at,
+  );
+  const transfer = await uploads.claim({
+    kind: 'transfer',
+    principal,
+    operationId: reservation.id,
+    worker,
+    now: at,
+  });
+  if (!transfer) throw new Error('Managed fixture transfer was not admitted');
+  const execution = {
+    version: 2 as const,
+    custody: { kind: 'none' as const },
+    attemptId: `${fileId}.${transfer.generation}`,
+    instanceId: uuid(),
+    executionId: uuid(),
+    expiresAt: new Date(at + 60000).toISOString(),
+  };
+  await uploads.bindSecurityExecution(transfer, execution, at);
+  await uploads.settleSecurityExecution(
+    transfer,
+    { execution, writerStopped: true, transientDataRemoved: true },
+    at,
+  );
+  await uploads.accept(
+    principal,
+    transfer,
+    {
+      outcome: 'durable',
+      bytes: 6,
+      source: 's3',
+      filepath: `/api/files/download/${fileId}`,
+      storageKey: `t/${owner.tenantId}/managed-uploads/${owner.userId}/${fileId}.${transfer.generation}__original`,
+      integrity: {
+        version: 1,
+        algorithm: 'sha256',
+        sha256: 'a'.repeat(64),
+        chunkBytes: 262144,
+        chunkSha256: ['b'.repeat(64)],
+      },
+    },
+    {
       version: 1,
       decision: 'approved',
       policySha256: policy,
       subject: {
-        ...owner,
+        userId: owner.userId,
+        tenantId: owner.tenantId,
         operationId: fileId,
-        transferGeneration: 1,
+        transferGeneration: transfer.generation,
         mediaType: 'text/plain',
-        bytes: 8,
+        bytes: 6,
         sha256: 'a'.repeat(64),
       },
-      scannerVersion: 'explicit-synthetic/v1',
-      checkedAt: new Date(now).toISOString(),
+      scannerVersion: 'fixture-v1',
+      checkedAt: new Date(at).toISOString(),
       coverage: { complete: true, pages: 1, parts: 1 },
     },
-  });
+    { filename: 'A.txt' },
+    at,
+  );
+  const settleLocalCopies = (lease: UploadLease) =>
+    uploads.confirmCleanup(
+      {
+        operationId: lease.operationId,
+        generation: lease.generation,
+        writerStopped: true,
+        localCopiesAbsent: true,
+        originalAbsent: false,
+        textAndHistoryRemoved: false,
+      },
+      at,
+    );
+  await settleLocalCopies(transfer);
+  const processing = await uploads.claim({ kind: 'processing', worker, now: at });
+  if (!processing || processing.operationId !== fileId)
+    throw new Error('Managed fixture processing was not admitted');
+  await uploads.bindProcessingExecution(
+    processing,
+    {
+      attemptId: `${fileId}.${processing.generation}`,
+      instanceId: 'fixture-parser',
+      expiresAt: new Date(at + 60000).toISOString(),
+    },
+    at,
+  );
+  await uploads.publish(
+    processing,
+    {
+      text: 'secret',
+      writerStopped: true,
+      structure: {
+        version: 1,
+        source: { sha256: 'a'.repeat(64), bytes: 6, mediaType: 'text/plain' },
+        extractor: { name: 'fixture', version: '1' },
+        pages: [],
+        elements: [{ id: 'e1', kind: 'paragraph', start: 0, end: 6, page: null, parentId: null }],
+        quality: { status: 'complete', warnings: [] },
+      },
+    },
+    at,
+  );
+  await settleLocalCopies(processing);
+}
+
+async function prepare(ttl = 3600) {
+  const now = Date.now();
+  const fileId = '82c60bee-5296-4d5b-8abe-f09a6f3380d7';
+  await managedSource(fileId, now);
+  sourceTextBytes = (await mongoose.models.UploadCounter.collection.findOne({
+    _id: 'global' as never,
+  }))!.value.textBytes;
+  expect(sourceTextBytes).toBeGreaterThan(0);
   const session = await mongoose.startSession();
   let binding: CheckpointSourceBinding;
   try {
@@ -208,8 +314,11 @@ async function prepare(ttl = 3600) {
 }
 const config = { configurable: { thread_id: scope.threadId, checkpoint_ns: '' } };
 async function charged() {
-  return (await mongoose.models.UploadCounter.collection.findOne({ _id: 'global' as never }))!.value
-    .textBytes as number;
+  const total = (await mongoose.models.UploadCounter.collection.findOne({
+    _id: 'global' as never,
+  }))!.value.textBytes as number;
+  expect(total).toBeGreaterThanOrEqual(sourceTextBytes);
+  return total - sourceTextBytes;
 }
 async function bytes() {
   let sum = 0;
@@ -241,6 +350,51 @@ async function bytes() {
   expect(file?.retainedDerivativeBytes).toBe(sum);
   return sum;
 }
+it.each(['missing', 'malformed'] as const)(
+  'holds an invalid prior recovery deadline: %s',
+  async (kind) =>
+    run(async () => {
+      const { saver } = await prepare(60);
+      const checkpoint = emptyCheckpoint();
+      await saver.put(config, checkpoint, metadata);
+      const rows = mongoose.connection.db!.collection(names[0]);
+      await rows.updateOne(
+        {},
+        kind === 'missing'
+          ? { $unset: { lc_source_expires_at: '' } }
+          : { $set: { lc_source_expires_at: 'unknown' } },
+      );
+      const before = await rows.findOne({});
+      const quota = await mongoose.models.UploadCounter.findById('global').lean();
+      await expect(saver.put(config, checkpoint, metadata)).rejects.toThrow();
+      expect(await rows.findOne({})).toEqual(before);
+      expect(await mongoose.models.UploadCounter.findById('global').lean()).toEqual(quota);
+    }),
+);
+
+it('keeps the original row recovery deadline when checkpoint and special pending slots are rewritten', async () =>
+  run(async () => {
+    const { saver, binding } = await prepare(60);
+    const checkpoint = emptyCheckpoint();
+    const saved = await saver.put(config, checkpoint, metadata);
+    await saver.putWrites(saved, [[ERROR, 'original']], 'special');
+    const db = mongoose.connection.db!;
+    const before = await Promise.all(names.map((name) => db.collection(name).findOne({})));
+    const clock = jest.spyOn(Date, 'now').mockReturnValue(Date.now() + 5000);
+    try {
+      await saver.put(config, checkpoint, metadata);
+      await saver.putWrites(saved, [[ERROR, 'changed']], 'special');
+    } finally {
+      clock.mockRestore();
+    }
+    const after = await Promise.all(names.map((name) => db.collection(name).findOne({})));
+    for (let index = 0; index < names.length; index++) {
+      expect(after[index]!.lc_source_expires_at).toEqual(before[index]!.lc_source_expires_at);
+      expect(after[index]!.lc_source_binding).toEqual(binding);
+    }
+    await bytes();
+  }));
+
 it('charges full checkpoint and pending BSON, preserves slot modes, and refunds exact receipts', async () =>
   run(async () => {
     const { saver, binding } = await prepare();
@@ -367,7 +521,7 @@ it('aborts quota exhaustion and holds the failed writer after capacity returns',
     await expect(saver.put(config, emptyCheckpoint(), metadata)).rejects.toThrow();
     await mongoose.models.UploadCounter.collection.updateOne(
       { _id: 'global' as never },
-      { $set: { 'value.textBytes': 0 } },
+      { $set: { 'value.textBytes': sourceTextBytes } },
     );
     await expect(saver.put(config, emptyCheckpoint(), metadata)).rejects.toThrow();
     expect(await bytes()).toBe(0);
@@ -431,29 +585,27 @@ it('rejects wrong binding, absent admission and missing digest, and snapshots ca
 it('conflicts with a revoke after the transaction source snapshot, without retaining any row', async () =>
   run(async () => {
     const { saver, fileId } = await prepare();
-    const original = mongoose.mongo.Collection.prototype.updateMany;
+    const original = mongoose.mongo.Collection.prototype.updateOne;
     let raced = false;
-    jest
-      .spyOn(mongoose.mongo.Collection.prototype, 'updateMany')
-      .mockImplementation(async function (
-        this: InstanceType<typeof mongoose.mongo.Collection>,
-        filter,
-        update,
-        options,
+    jest.spyOn(mongoose.mongo.Collection.prototype, 'updateOne').mockImplementation(async function (
+      this: InstanceType<typeof mongoose.mongo.Collection>,
+      filter,
+      update,
+      options,
+    ) {
+      if (
+        this.collectionName === mongoose.models.File.collection.collectionName &&
+        options?.session &&
+        !raced
       ) {
-        if (
-          this.collectionName === mongoose.models.File.collection.collectionName &&
-          options?.session &&
-          !raced
-        ) {
-          raced = true;
-          await mongoose.models.File.collection.updateOne(
-            { file_id: fileId },
-            { $set: { deletionRequestedAt: new Date() } },
-          );
-        }
-        return original.call(this, filter, update, options);
-      });
+        raced = true;
+        await mongoose.models.File.collection.updateOne(
+          { file_id: fileId },
+          { $set: { deletionRequestedAt: new Date() } },
+        );
+      }
+      return original.call(this, filter, update, options);
+    });
     await expect(saver.put(config, emptyCheckpoint(), metadata)).rejects.toThrow();
     expect(raced).toBe(true);
     expect(await bytes()).toBe(0);

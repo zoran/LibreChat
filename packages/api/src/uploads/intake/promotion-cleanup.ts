@@ -16,7 +16,8 @@ export async function settleUploadPromotionCleanup(options: {
   task: UploadCleanupTask;
   attempts: UploadAttemptPort;
   worker: UploadWorker;
-  repository: Pick<UploadManagementRepository, 'settlePromotion'>;
+  repository: Pick<UploadManagementRepository, 'settlePromotion'> &
+    Partial<Pick<UploadManagementRepository, 'recordPromotionLocalCleanup'>>;
   signal: AbortSignal;
   now?: () => number;
 }): Promise<boolean> {
@@ -45,7 +46,6 @@ export async function settleUploadPromotionCleanup(options: {
       return false;
     if (promotion.writerStopped) return true;
     if (
-      promotion.receipt?.outcome === 'unknown' ||
       promotion.worker.hostId !== field(worker, 'hostId') ||
       promotion.worker.instanceId !== field(worker, 'instanceId')
     )
@@ -59,6 +59,21 @@ export async function settleUploadPromotionCleanup(options: {
       signal,
     );
     const outcome = field(joined, 'storageOutcome');
+    if (
+      !signal.aborted &&
+      (field(joined, 'localWriterStopped') === true || field(joined, 'writerStopped') === true) &&
+      typeof repository.recordPromotionLocalCleanup === 'function'
+    ) {
+      await repository.recordPromotionLocalCleanup(
+        {
+          operationId: promotion.lease.operationId,
+          transferGeneration: promotion.lease.generation,
+          promotionId: promotion.promotionId,
+          worker: { ...promotion.worker },
+        },
+        now(),
+      );
+    }
     if (
       signal.aborted ||
       field(joined, 'writerStopped') !== true ||

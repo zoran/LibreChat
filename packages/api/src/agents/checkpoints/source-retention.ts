@@ -16,10 +16,10 @@ const SOURCE_FIELDS = [
   'lc_source_expires_at',
   'lc_retained_allocations',
 ] as const;
-export const SOURCE_FREE = Object.fromEntries(
+export const SOURCE_FREE: Record<string, { $exists: boolean }> = Object.fromEntries(
   SOURCE_FIELDS.map((field) => [field, { $exists: false }]),
 );
-export const SOURCE_PRESENT = {
+export const SOURCE_PRESENT: { $or: Record<string, { $exists: boolean }>[] } = {
   $or: SOURCE_FIELDS.map((field) => ({ [field]: { $exists: true } })),
 };
 const BATCH_ROWS = 16;
@@ -168,10 +168,16 @@ export async function writeCheckpointSourceRows(
     if (prior && prior.binding.bindingSha256 !== binding.bindingSha256) held();
     const update = operation.update as UpdateFilter<Document>;
     if (Array.isArray(update) || (!update.$set && !update.$setOnInsert)) held();
+    // The validated prior row and this update share one Mongo transaction: a rewrite
+    // cannot renew its admitted recovery deadline, including mutable special slots.
+    const rowExpiry = Math.min(
+      input.expiresAt.getTime(),
+      prior ? previous[0].meta!.lc_source_expires_at.getTime() : Infinity,
+    );
+    expiry = Math.min(expiry, rowExpiry);
+    if (expiry <= Date.now()) held();
     if (prior && update.$setOnInsert) {
-      // Native insert-only replay retains the original expiry as well as its payload and charge.
-      expiry = Math.min(expiry, previous[0].meta!.lc_source_expires_at.getTime());
-      if (expiry <= Date.now()) held();
+      // Native insert-only replay also retains its original payload and exact charge.
       continue;
     }
     const fields = { ...(update.$set ?? update.$setOnInsert) };
@@ -184,7 +190,7 @@ export async function writeCheckpointSourceRows(
           ...fields,
           lc_source_binding: binding,
           lc_source_file_ids: binding.files.map((file) => file.fileId),
-          lc_source_expires_at: input.expiresAt,
+          lc_source_expires_at: new Date(rowExpiry),
           lc_retained_allocations: [{ fileId: binding.files[0].fileId, bytes: 1 }],
         },
         $unset: { upserted_at: '' },

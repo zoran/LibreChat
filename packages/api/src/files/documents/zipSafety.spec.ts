@@ -1,6 +1,6 @@
 import JSZip from 'jszip';
 import { megabyte } from 'librechat-data-provider';
-import { assertSafeZipSize, ZipBombError } from './zipSafety';
+import { assertSafeZipSize, readSafeZipEntries, ZipBombError } from './zipSafety';
 
 /**
  * Build a ZIP archive whose entries inflate to exactly `decompressedBytes`
@@ -120,5 +120,195 @@ describe('assertSafeZipSize', () => {
     expect(buffer.length).toBeLessThan(1 * megabyte);
     /* And the validator catches it on default caps. */
     await expect(assertSafeZipSize(buffer)).rejects.toThrow(ZipBombError);
+  });
+});
+
+describe('opt-in DOCX ZIP envelope agreement', () => {
+  async function archive(streamFiles = false, compression: 'STORE' | 'DEFLATE' = 'STORE') {
+    const zip = new JSZip();
+    zip.file('word/document.xml', 'Native body 😀', { createFolders: false });
+    return zip.generateAsync({ type: 'nodebuffer', streamFiles, compression });
+  }
+  function positions(buffer: Buffer) {
+    const end = buffer.length - 22;
+    const central = buffer.readUInt32LE(end + 16);
+    const local = buffer.readUInt32LE(central + 42);
+    const data = local + 30 + buffer.readUInt16LE(local + 26) + buffer.readUInt16LE(local + 28);
+    return { end, central, local, data };
+  }
+  const strict = (buffer: Buffer) =>
+    readSafeZipEntries(buffer, { strictEnvelope: true, select: () => true });
+  it('rejects the DOS directory bit on a file name without a trailing slash', async () => {
+    const buffer = await archive();
+    const central = positions(buffer).central;
+    buffer.writeUInt32LE((buffer.readUInt32LE(central + 38) | 0x10) >>> 0, central + 38);
+    await expect(strict(buffer)).rejects.toThrow();
+  });
+  it.each([0, 0x10])('accepts a slash directory with DOS directory bit %i', async (attribute) => {
+    const zip = new JSZip();
+    zip.folder('word');
+    zip.file('word/document.xml', 'Native body', { createFolders: false });
+    const buffer = await zip.generateAsync({ type: 'nodebuffer' });
+    const central = positions(buffer).central;
+    expect(
+      buffer.subarray(central + 46, central + 46 + buffer.readUInt16LE(central + 28)).toString(),
+    ).toBe('word/');
+    buffer.writeUInt32LE(
+      ((buffer.readUInt32LE(central + 38) & ~0x10) | attribute) >>> 0,
+      central + 38,
+    );
+    expect((await strict(buffer)).get('word/document.xml')?.toString()).toBe('Native body');
+  });
+  it.each([false, true])('preserves native bytes with data descriptors=%s', async (streamFiles) => {
+    const result = await strict(await archive(streamFiles, 'DEFLATE'));
+    expect(result.get('word/document.xml')?.toString()).toBe('Native body 😀');
+  });
+  it.each([
+    [
+      'actual CRC',
+      (buffer: Buffer) => {
+        buffer[positions(buffer).data] ^= 1;
+      },
+    ],
+    [
+      'local CRC',
+      (buffer: Buffer) => {
+        buffer[positions(buffer).local + 14] ^= 1;
+      },
+    ],
+    [
+      'local compression',
+      (buffer: Buffer) => {
+        buffer.writeUInt16LE(8, positions(buffer).local + 8);
+      },
+    ],
+    [
+      'local name',
+      (buffer: Buffer) => {
+        buffer[positions(buffer).local + 30] = 120;
+      },
+    ],
+    [
+      'local size',
+      (buffer: Buffer) => {
+        buffer[positions(buffer).local + 18] ^= 1;
+      },
+    ],
+    [
+      'encryption',
+      (buffer: Buffer) => {
+        const p = positions(buffer);
+        buffer.writeUInt16LE(1, p.central + 8);
+        buffer.writeUInt16LE(1, p.local + 6);
+      },
+    ],
+    [
+      'unknown flags',
+      (buffer: Buffer) => {
+        const p = positions(buffer);
+        buffer.writeUInt16LE(16, p.central + 8);
+        buffer.writeUInt16LE(16, p.local + 6);
+      },
+    ],
+    [
+      'unsupported compression',
+      (buffer: Buffer) => {
+        const p = positions(buffer);
+        buffer.writeUInt16LE(99, p.central + 10);
+        buffer.writeUInt16LE(99, p.local + 8);
+      },
+    ],
+    [
+      'multi-disk envelope',
+      (buffer: Buffer) => {
+        buffer.writeUInt16LE(1, positions(buffer).end + 4);
+      },
+    ],
+    [
+      'invalid central directory size',
+      (buffer: Buffer) => {
+        buffer[positions(buffer).end + 12] ^= 1;
+      },
+    ],
+    [
+      'symlink entry',
+      (buffer: Buffer) => {
+        buffer.writeUInt32LE(0xa1ff0000, positions(buffer).central + 38);
+      },
+    ],
+  ])('refuses %s', async (_label, mutate) => {
+    const buffer = await archive();
+    (mutate as (buffer: Buffer) => void)(buffer);
+    await expect(strict(buffer)).rejects.toThrow();
+  });
+  it('keeps CRC enforcement opt-in for existing other-format callers', async () => {
+    const buffer = await archive();
+    buffer[positions(buffer).data] ^= 1;
+    await expect(assertSafeZipSize(buffer)).resolves.toBeUndefined();
+    await expect(strict(buffer)).rejects.toThrow('integrity');
+  });
+  it('rejects a falsified data descriptor', async () => {
+    const buffer = await archive(true);
+    buffer[positions(buffer).central - 12] ^= 1;
+    await expect(strict(buffer)).rejects.toThrow();
+  });
+  it.each([
+    'word/../document.xml',
+    'word//document.xml',
+    'word/%64ocument.xml',
+    'word\\document.xml',
+  ])('refuses aliased part name %s', async (name) => {
+    const zip = new JSZip();
+    zip.file(name, 'body', { createFolders: false });
+    await expect(strict(await zip.generateAsync({ type: 'nodebuffer' }))).rejects.toThrow();
+  });
+  it('rejects case aliases and file/directory collisions', async () => {
+    for (const extra of ['WORD/DOCUMENT.XML', 'word']) {
+      const zip = new JSZip();
+      zip.file('word/document.xml', 'body', { createFolders: false });
+      zip.file(extra, 'other', { createFolders: false });
+      await expect(strict(await zip.generateAsync({ type: 'nodebuffer' }))).rejects.toThrow();
+    }
+  });
+  it('rejects duplicate raw names even when both local and central names agree', async () => {
+    const zip = new JSZip();
+    zip.file('a.xml', 'first', { createFolders: false });
+    zip.file('b.xml', 'second', { createFolders: false });
+    const buffer = await zip.generateAsync({ type: 'nodebuffer' });
+    const first = positions(buffer).central;
+    const second = first + 46 + buffer.readUInt16LE(first + 28);
+    const local = buffer.readUInt32LE(second + 42);
+    buffer[second + 46] = 97;
+    buffer[local + 30] = 97;
+    await expect(strict(buffer)).rejects.toThrow();
+  });
+  it('rejects unaccounted prefix bytes that a generic ZIP reader can skip', async () => {
+    const original = await archive();
+    const prefix = Buffer.from('unaccounted');
+    const buffer = Buffer.concat([prefix, original]);
+    const end = buffer.length - 22;
+    const central = positions(original).central + prefix.length;
+    buffer.writeUInt32LE(central, end + 16);
+    buffer.writeUInt32LE(prefix.length, central + 42);
+    await expect(assertSafeZipSize(buffer)).resolves.toBeUndefined();
+    await expect(strict(buffer)).rejects.toThrow();
+  });
+  it('checks strict resource limits while inflating even unselected content', async () => {
+    const buffer = await archive(false, 'DEFLATE');
+    await expect(
+      readSafeZipEntries(buffer, { strictEnvelope: true, maxEntryBytes: 3, select: () => false }),
+    ).rejects.toBeInstanceOf(ZipBombError);
+    await expect(
+      readSafeZipEntries(buffer, { strictEnvelope: true, maxTotalBytes: 3, select: () => false }),
+    ).rejects.toBeInstanceOf(ZipBombError);
+  });
+  it('rejects archive comments and trailing bytes instead of ignoring unaccounted data', async () => {
+    const zip = new JSZip();
+    zip.file('body.xml', 'body');
+    Object.assign(zip, { comment: 'unaccounted' });
+    await expect(strict(await zip.generateAsync({ type: 'nodebuffer' }))).rejects.toThrow();
+    await expect(
+      strict(Buffer.concat([await archive(), Buffer.from('trailing')])),
+    ).rejects.toThrow();
   });
 });

@@ -6,7 +6,9 @@ import type { Request, Response, NextFunction, RequestHandler } from 'express';
 import type { Mongoose } from 'mongoose';
 import type { AgentStartupMilestone, AgentStartupResult } from '~/agents/phases';
 import type { LocatorTraversalFailure } from '../protection/diagnostics';
+import type { HousekeepingObservation } from '../housekeeping/runtime';
 import { agentStartupMilestones, agentStartupResults } from '~/agents/phases';
+import { attachHousekeepingMetrics } from '../housekeeping/metrics';
 import { attachStatusMetrics } from './statusMetrics';
 
 const PATH_NORMALIZATIONS: [RegExp, string][] = [
@@ -138,6 +140,8 @@ export interface PrometheusMetrics {
   registry: Registry;
   metricsMiddleware: (req: Request, res: Response, next: NextFunction) => void;
   metricsRouter: Router;
+  /** Detach only the local Housekeeping exporter after its original work has settled. */
+  detachHousekeepingMetrics(): void;
 }
 
 export interface AgentEventActorStorageMetricsSnapshot {
@@ -153,6 +157,7 @@ export interface AgentEventActorStorageMetricsSnapshot {
 }
 
 export interface MetricsOptions {
+  collectHousekeepingObservation?: () => HousekeepingObservation;
   collectAgentEventActorStorageMetrics?: () => Promise<AgentEventActorStorageMetricsSnapshot>;
 }
 
@@ -548,10 +553,14 @@ export function createMetrics(options: MetricsOptions = {}): PrometheusMetrics {
       registry: new Registry(),
       metricsMiddleware: (_req: Request, _res: Response, next: NextFunction) => next(),
       metricsRouter: createUnauthorizedMetricsRouter(),
+      detachHousekeepingMetrics: () => {},
     };
   }
 
   const registry = new Registry();
+  const housekeeping = options.collectHousekeepingObservation
+    ? attachHousekeepingMetrics(registry, options.collectHousekeepingObservation)
+    : undefined;
   attachStatusMetrics(registry);
   collectDefaultMetrics({ register: registry });
 
@@ -1085,7 +1094,10 @@ export function createMetrics(options: MetricsOptions = {}): PrometheusMetrics {
         agentEventActorDeliveries.set({ state: 'retry' }, snapshot.retryDeliveries);
         agentEventActorDeliveries.set({ state: 'dead' }, snapshot.deadDeliveries);
       })
-      .then(() => registry.metrics())
+      .then(() => {
+        housekeeping?.collect();
+        return registry.metrics();
+      })
       .then((metrics) => {
         res.set('Content-Type', registry.contentType);
         res.end(metrics);
@@ -1098,5 +1110,10 @@ export function createMetrics(options: MetricsOptions = {}): PrometheusMetrics {
 
   metricsRouter.get('/', metricsHandler);
 
-  return { metricsMiddleware, metricsRouter, registry };
+  return {
+    metricsMiddleware,
+    metricsRouter,
+    registry,
+    detachHousekeepingMetrics: () => housekeeping?.detach(),
+  };
 }

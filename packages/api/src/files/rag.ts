@@ -58,3 +58,9 @@ export async function deleteRagFile({ userId, file }: DeleteRagFileParams): Prom
     }
   }
 }
+
+export {
+  createManagedRagClient,
+  createManagedRagClientFromEnvironment,
+  createRagTlsTransport,
+} from './rag/transport';

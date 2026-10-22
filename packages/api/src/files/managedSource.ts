@@ -1,6 +1,8 @@
 /** Managed File source access shared by previews and normal chat context. No retrieval index. */
 import { createHash } from 'node:crypto';
 import {
+  buildManagedRevision,
+  buildManagedFileReadBinding,
   isUploadPrincipal,
   isUploadOriginalIntegrity,
   isUploadSecurityApproval,
@@ -9,6 +11,7 @@ import {
   matchesUploadSecurityApproval,
 } from 'librechat-data-provider';
 import type {
+  ManagedRevision,
   ManagedDocumentResult,
   UploadCleanupTask,
   UploadOperation,
@@ -19,7 +22,7 @@ import type {
 import type { StoragePort } from '~/uploads/contract';
 
 export const MANAGED_SOURCE_FILE_FIELDS =
-  'file_id uploadOperationId tenantId user filename type source bytes embedded llmDeliveryPath status expiredAt retentionAcceptedAt deletionRequestedAt deletionCompletedAt storageKey';
+  'file_id uploadOperationId tenantId user filename type source bytes embedded llmDeliveryPath status expiredAt retentionAcceptedAt deletionRequestedAt deletionCompletedAt storageKey +securityApproval';
 
 /** Repository adapter input; database-specific identity/date objects do not escape the resolver. */
 export type ManagedSourceRecord = {
@@ -59,6 +62,8 @@ type Options = {
   file(principal: UploadPrincipal, id: string, text: boolean): Promise<ManagedSourceRecord | null>;
   original(principal: UploadPrincipal, id: string): Promise<UploadCleanupTask | null>;
   policySha256(): string | undefined;
+  /** Explicit extraction profile digest; absence leaves retrieval admission unavailable. */
+  extractionPolicySha256?: () => string | undefined;
   storage: Pick<StoragePort, 'read'>;
   now?: () => number;
 };
@@ -77,7 +82,9 @@ export type ManagedSourceAccess = Readonly<{
     text?: string;
   }>;
   document?: ManagedDocumentResult;
+  revision?: Readonly<ManagedRevision>;
   receipt?: UploadStorageReceipt;
+  sourceBindingSha256?: string;
   expiresAt: number;
   storage: Pick<StoragePort, 'read'>;
 }>;
@@ -125,7 +132,8 @@ export function createManagedSourceResolver(options: Options): ManagedSourceReso
       user: UploadPrincipal;
       id: string;
       read: ReadOptions;
-      fingerprint: string;
+      fingerprint?: string;
+      representationRevision?: string;
       expiresAt: number;
     }
   >();
@@ -216,7 +224,8 @@ export function createManagedSourceResolver(options: Options): ManagedSourceReso
     let receipt: UploadStorageReceipt | undefined;
     let generation: number | undefined;
     const policy = options.policySha256();
-    if (input.original || document) {
+    const extractionPolicy = options.extractionPolicySha256?.();
+    if (input.original || input.text) {
       const task = await options.original(user, id);
       input.signal?.throwIfAborted();
       if (!isUploadStorageReceipt(task?.original)) throw unavailable();
@@ -277,20 +286,52 @@ export function createManagedSourceResolver(options: Options): ManagedSourceReso
     if (operation.actualBytes !== file.bytes) throw unavailable();
     if (policy !== options.policySha256() || Math.min(operationExpiry, expiry) <= now())
       throw unavailable();
-    const fingerprint = createHash('sha256')
-      .update(
-        JSON.stringify({
-          file,
-          document,
-          receipt,
-          generation,
-          approval,
-          storageKey,
-          policy,
-        }),
-      )
-      .digest('hex');
-    return { file, document, receipt, expiresAt: Math.min(operationExpiry, expiry), fingerprint };
+    if (extractionPolicy !== options.extractionPolicySha256?.()) throw unavailable();
+    const revision =
+      document && approval && extractionPolicy !== undefined
+        ? buildManagedRevision(
+            {
+              owner: { tenantId: user.tenantId, userId: user.userId },
+              fileId: id,
+              operationId: id,
+              document,
+              approval,
+              extractionPolicySha256: extractionPolicy,
+            },
+            (text) => createHash('sha256').update(text, 'utf8').digest('hex'),
+          )
+        : undefined;
+    const fingerprint =
+      receipt && (input.original || input.text)
+        ? buildManagedFileReadBinding(
+            {
+              owner: { tenantId: user.tenantId, userId: user.userId },
+              fileId: id,
+              operationId: id,
+              filename: file.filename,
+              mediaType: file.type,
+              source: file.source,
+              bytes: file.bytes,
+              storageKey: storageKey ?? '',
+              transferGeneration: generation ?? null,
+              original: receipt,
+              approval: approval ?? null,
+              representation: input.text ? 'preview' : 'original',
+              ...(input.text
+                ? { preview: { text: file.text!, structure: document?.structure ?? null } }
+                : {}),
+            },
+            (text) => createHash('sha256').update(text, 'utf8').digest('hex'),
+          )
+        : undefined;
+    return {
+      file,
+      document,
+      revision,
+      receipt,
+      expiresAt: Math.min(operationExpiry, expiry),
+      fingerprint,
+    };
   }
 
   async function resolve(request: SourceRequest, id: string, input: ReadOptions = {}) {
@@ -307,12 +348,15 @@ export function createManagedSourceResolver(options: Options): ManagedSourceReso
       id,
       read: selected,
       fingerprint: value.fingerprint,
+      representationRevision: value.revision?.representationRevision,
       expiresAt: value.expiresAt,
     };
     const access: ManagedSourceAccess = Object.freeze({
       file: value.file,
       document: freezeData(value.document),
+      revision: freezeData(value.revision),
       receipt: freezeData(value.receipt),
+      sourceBindingSha256: value.fingerprint,
       get expiresAt() {
         return binding.expiresAt;
       },
@@ -327,18 +371,15 @@ export function createManagedSourceResolver(options: Options): ManagedSourceReso
     if (!binding) throw unavailable();
     binding.read.signal?.throwIfAborted();
     const user = await authorize(request, binding.user);
-    if (binding.read.text) {
-      const current = await read(user, binding.id, binding.read);
-      if (current.fingerprint !== binding.fingerprint) throw unavailable();
-      binding.expiresAt = Math.min(binding.expiresAt, current.expiresAt);
-    } else {
-      const operation = await options.operation(user, binding.id);
-      binding.expiresAt = Math.min(
-        binding.expiresAt,
-        managedSourceExpiry(operation, binding.id, now()),
-      );
-      if (operation.actualBytes !== access.file.bytes) throw unavailable();
-    }
+    const current = await read(user, binding.id, binding.read);
+    if (
+      current.fingerprint !== binding.fingerprint ||
+      current.revision?.representationRevision !== binding.representationRevision
+    )
+      throw unavailable();
+    // Content identity is immutable. Retention is current authority and may advance independently;
+    // the managed read ticket and each caller's original work deadline remain separate hard bounds.
+    binding.expiresAt = current.expiresAt;
     binding.read.signal?.throwIfAborted();
     if (access.expiresAt <= now()) throw unavailable();
   }

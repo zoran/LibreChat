@@ -273,7 +273,12 @@ describe('managed useful extraction and hard limits', () => {
     ).resolves.toMatchObject({ text: 'This is a sample DOCX file.\n\n' });
   });
 
-  async function document(body: string, styles = '') {
+  async function document(
+    body: string,
+    styles = '',
+    mutate?: (zip: JSZip) => void,
+    transform?: (bytes: Buffer) => Promise<Buffer>,
+  ) {
     const zip = new JSZip();
     zip.file(
       '[Content_Types].xml',
@@ -294,11 +299,152 @@ describe('managed useful extraction and hard limits', () => {
         `<Relationships xmlns="${NS.package}"><Relationship Id="s1" Type="${NS.relationship}/styles" Target="styles.xml"/></Relationships>`,
       );
     }
+    mutate?.(zip);
     const filePath = path.join(root, 'structure.docx');
-    await writeFile(filePath, await zip.generateAsync({ type: 'nodebuffer' }));
+    const bytes = await zip.generateAsync({ type: 'nodebuffer' });
+    await writeFile(filePath, transform ? await transform(bytes) : bytes);
     return extractManagedDocument({ filePath, mediaType: MANAGED_DOCUMENT_TYPES[2] });
   }
   const paragraph = (value: string) => `<w:p><w:r><w:t>${value}</w:t></w:r></w:p>`;
+  it('rejects DOCX styles hidden from Mammoth by the DOS directory bit', async () => {
+    const body =
+      '<w:p><w:pPr><w:pStyle w:val="NativeTitle"/></w:pPr><w:r><w:t>Native title</w:t></w:r></w:p>';
+    const styles =
+      '<w:style w:type="paragraph" w:styleId="NativeTitle"><w:name w:val="Native title"/><w:pPr><w:outlineLvl w:val="0"/></w:pPr></w:style>';
+    const supported = await document(body, styles);
+    expect(supported.structure.elements[0]).toMatchObject({ kind: 'heading' });
+    await expect(
+      document(body, styles, undefined, async (bytes) => {
+        const end = bytes.length - 22;
+        let central = bytes.readUInt32LE(end + 16);
+        let changed = false;
+        while (central < end) {
+          const nameLength = bytes.readUInt16LE(central + 28);
+          const name = bytes.subarray(central + 46, central + 46 + nameLength).toString();
+          if (name === 'word/styles.xml') {
+            bytes.writeUInt32LE((bytes.readUInt32LE(central + 38) | 0x10) >>> 0, central + 38);
+            changed = true;
+            break;
+          }
+          central +=
+            46 + nameLength + bytes.readUInt16LE(central + 30) + bytes.readUInt16LE(central + 32);
+        }
+        expect(changed).toBe(true);
+        // Actual Mammoth ZIP backend: it renames this entry to styles.xml/ and discards the data.
+        const nativeZip = await JSZip.loadAsync(bytes);
+        expect(nativeZip.file('word/styles.xml')).toBeNull();
+        expect(nativeZip.files['word/styles.xml/'].dir).toBe(true);
+        return bytes;
+      }),
+    ).rejects.toMatchObject({ code: 'invalid_document' });
+  });
+  it('rejects an alternate main DOCX part before native extraction disagrees with structure', async () => {
+    await expect(
+      document(paragraph('Canonical body'), '', (zip) => {
+        zip.file(
+          '_rels/.rels',
+          `<Relationships xmlns="${NS.package}"><Relationship Id="r1" Type="${NS.relationship}/officeDocument" Target="word/alternate.xml"/></Relationships>`,
+        );
+        zip.file(
+          'word/alternate.xml',
+          `<w:document xmlns:w="${NS.word}"><w:body>${paragraph('Alternate body')}</w:body></w:document>`,
+        );
+      }),
+    ).rejects.toMatchObject({ code: 'invalid_document' });
+  });
+  it.each([
+    ['missing package relationships', (zip: JSZip) => zip.remove('_rels/.rels')],
+    ['missing content types', (zip: JSZip) => zip.remove('[Content_Types].xml')],
+    ['missing main part', (zip: JSZip) => zip.remove('word/document.xml')],
+    [
+      'unsupported archive envelope',
+      (zip: JSZip) => {
+        Object.assign(zip, { comment: 'unaccounted archive metadata' });
+      },
+    ],
+    [
+      'main path alias',
+      (zip: JSZip) =>
+        zip.file(
+          '_rels/.rels',
+          `<Relationships xmlns="${NS.package}"><Relationship Id="r1" Type="${NS.relationship}/officeDocument" Target="word/../word/document.xml"/></Relationships>`,
+        ),
+    ],
+    [
+      'external main',
+      (zip: JSZip) =>
+        zip.file(
+          '_rels/.rels',
+          `<Relationships xmlns="${NS.package}"><Relationship Id="r1" Type="${NS.relationship}/officeDocument" Target="word/document.xml" TargetMode="External"/></Relationships>`,
+        ),
+    ],
+    [
+      'duplicate main',
+      (zip: JSZip) =>
+        zip.file(
+          '_rels/.rels',
+          `<Relationships xmlns="${NS.package}"><Relationship Id="r1" Type="${NS.relationship}/officeDocument" Target="word/document.xml"/><Relationship Id="r2" Type="${NS.relationship}/officeDocument" Target="word/document.xml"/></Relationships>`,
+        ),
+    ],
+    [
+      'duplicate relationship ID',
+      (zip: JSZip) =>
+        zip.file(
+          '_rels/.rels',
+          `<Relationships xmlns="${NS.package}"><Relationship Id="r1" Type="${NS.relationship}/officeDocument" Target="word/document.xml"/><Relationship Id="r1" Type="${NS.relationship}/metadata/core-properties" Target="docProps/core.xml"/></Relationships>`,
+        ),
+    ],
+    [
+      'wrong relationships namespace',
+      (zip: JSZip) =>
+        zip.file(
+          '_rels/.rels',
+          `<Relationships><Relationship Id="r1" Type="${NS.relationship}/officeDocument" Target="word/document.xml"/></Relationships>`,
+        ),
+    ],
+    [
+      'wrong main content type',
+      (zip: JSZip) =>
+        zip.file(
+          '[Content_Types].xml',
+          '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document.xml" ContentType="application/xml"/></Types>',
+        ),
+    ],
+    [
+      'default main content type',
+      (zip: JSZip) =>
+        zip.file(
+          '[Content_Types].xml',
+          '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>',
+        ),
+    ],
+    [
+      'alternate styles relationship',
+      (zip: JSZip) => {
+        zip.file('word/alternate.xml', `<w:styles xmlns:w="${NS.word}"/>`);
+        zip.file(
+          'word/_rels/document.xml.rels',
+          `<Relationships xmlns="${NS.package}"><Relationship Id="s1" Type="${NS.relationship}/styles" Target="alternate.xml"/></Relationships>`,
+        );
+      },
+    ],
+  ])('rejects incoherent DOCX package: %s', async (_label, mutate) => {
+    await expect(
+      document(paragraph('Native body'), '', mutate as (zip: JSZip) => void),
+    ).rejects.toMatchObject({ code: 'invalid_document' });
+  });
+  it('accepts one canonical root-relative main relationship without changing native text', async () => {
+    const result = await document(paragraph('Canonical 😀'), '', (zip) => {
+      zip.file(
+        '_rels/.rels',
+        `<Relationships xmlns="${NS.package}"><Relationship Id="r1" Type="${NS.relationship}/officeDocument" Target="/word/document.xml" TargetMode="Internal"/></Relationships>`,
+      );
+    });
+    expect(result.text).toBe('Canonical 😀\n\n');
+    expect(result.structure.pages).toEqual([]);
+    expect(result.structure.elements[0]).toMatchObject({ start: 0, end: 12 });
+    expect(result.structure.quality.warnings).toEqual(['layout_unavailable']);
+  });
   it('keeps native DOCX text while recording explicit inherited headings, table spans and empty cells', async () => {
     const result = await document(
       '<w:p><w:pPr><w:pStyle w:val="CustomTitle"/></w:pPr><w:r><w:t>Titel 😀</w:t></w:r></w:p>' +
@@ -518,6 +664,14 @@ describe('managed useful extraction and hard limits', () => {
   });
   it('counts explicit DOCX page breaks before extracting text', async () => {
     const zip = new JSZip();
+    zip.file(
+      '[Content_Types].xml',
+      '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>',
+    );
+    zip.file(
+      '_rels/.rels',
+      `<Relationships xmlns="${NS.package}"><Relationship Id="r1" Type="${NS.relationship}/officeDocument" Target="word/document.xml"/></Relationships>`,
+    );
     zip.file(
       'word/document.xml',
       '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>first page</w:t><w:br w:type="page"/><w:t>second page</w:t></w:r></w:p></w:body></w:document>',

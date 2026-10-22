@@ -1,15 +1,20 @@
 /** Real Workspace/File transactions; scanner and storage receipts are explicit synthetic fixtures. */
 import mongoose from 'mongoose';
+import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
-import { uploadDerivedExpiresAt } from 'librechat-data-provider';
+import { uploadReservationFingerprint } from 'librechat-data-provider';
 import type { UploadDerivedIntent } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
-import { createModels } from '~/models';
-import { tenantStorage } from '~/config/tenantContext';
+import type { ManagedUploadAcceptance } from '~/types/file';
+import { createUploadManagementRepository } from './uploadManagement';
 import { createDocumentWorkspaceMethods } from './documentWorkspace';
+import { createHousekeepingStore } from './housekeepingStore';
 import { createFileRetentionMethods } from './fileRetention';
+import { tenantStorage } from '~/config/tenantContext';
 import { createUserMethods } from './user';
+import { createModels } from '~/models';
 
 describe('independent document workspace metadata and native File commits', () => {
   const db = new mongoose.Mongoose();
@@ -22,90 +27,148 @@ describe('independent document workspace metadata and native File commits', () =
   let mongo: MongoMemoryReplSet;
   let methods: ReturnType<typeof createDocumentWorkspaceMethods>;
   let lifecycle: ReturnType<typeof createFileRetentionMethods>;
+  let uploads: ReturnType<typeof createUploadManagementRepository>;
+  const worker = { hostId: 'fixture-host', instanceId: 'fixture-app' };
+  const previousEnabled = process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED;
 
-  async function tx<T>(action: (session: ClientSession) => Promise<T>) {
-    const session = await db.startSession();
-    try {
-      return await session.withTransaction(() => action(session));
-    } finally {
-      await session.endSession();
-    }
-  }
   async function approved(id: string, intent: UploadDerivedIntent, target = owner) {
-    return tx(async (session) => {
-      const origin = await lifecycle.captureManagedUploadOrigin(target, intent, at, session);
-      await lifecycle.acceptManagedUpload(
-        {
-          principal: { ...target, authentication: 'verified-email' },
+    const input: ManagedUploadAcceptance = {
+      principal: { ...target, authentication: 'verified-email' },
+      operationId: id,
+      filename: 'synthetisch.txt',
+      mediaType: 'text/plain',
+      transferGeneration: 1,
+      acceptedAt: at,
+      receipt: {
+        outcome: 'durable',
+        bytes: bytes.length,
+        source: 's3',
+        filepath: `/api/files/managed/${id}`,
+        storageKey: `t/${target.tenantId}/managed-uploads/${target.userId}/${id}.1__original`,
+        integrity: {
+          version: 1,
+          algorithm: 'sha256',
+          sha256,
+          chunkBytes: 262144,
+          chunkSha256: [sha256],
+        },
+      },
+      securityApproval: {
+        version: 1,
+        decision: 'approved',
+        policySha256: policy,
+        subject: {
+          ...target,
           operationId: id,
-          filename: 'synthetisch.txt',
-          mediaType: 'text/plain',
           transferGeneration: 1,
-          acceptedAt: at,
-          expiresAt: uploadDerivedExpiresAt(at, origin),
-          derivedOrigin: origin,
-          receipt: {
-            outcome: 'durable',
-            bytes: bytes.length,
-            source: 's3',
-            filepath: `/api/files/managed/${id}`,
-            storageKey: `t/${target.tenantId}/managed-uploads/${target.userId}/${id}.1__original`,
-            integrity: {
-              version: 1,
-              algorithm: 'sha256',
-              sha256,
-              chunkBytes: 262144,
-              chunkSha256: [sha256],
-            },
-          },
-          securityApproval: {
-            version: 1,
-            decision: 'approved',
-            policySha256: policy,
-            subject: {
-              ...target,
-              operationId: id,
-              transferGeneration: 1,
-              mediaType: 'text/plain',
-              bytes: bytes.length,
-              sha256,
-            },
-            scannerVersion: 'explicit-synthetic-fixture/v1',
-            checkedAt: new Date(at).toISOString(),
-            coverage: { complete: true, pages: 1, parts: 1 },
-          },
+          mediaType: 'text/plain',
+          bytes: bytes.length,
+          sha256,
         },
-        session,
-      );
-      await lifecycle.claimManagedUploadProcessing(target, id, 1, at, session);
-      await lifecycle.publishManagedUpload(
-        target,
-        id,
-        1,
+        scannerVersion: 'explicit-synthetic-fixture/v1',
+        checkedAt: new Date(at).toISOString(),
+        coverage: { complete: true, pages: 1, parts: 1 },
+      },
+    };
+    await ready(input, intent);
+  }
+  async function ready(
+    input: ManagedUploadAcceptance,
+    derived?: UploadDerivedIntent,
+  ): Promise<void> {
+    const id = input.operationId;
+    const now = input.acceptedAt;
+    const principal = input.principal;
+    derived ??= input.derivedOrigin && {
+      binding: input.derivedOrigin.binding,
+      directSourceFileIds: input.derivedOrigin.directSourceFileIds,
+    };
+    const key = createHash('sha256').update(id).digest('hex');
+    const request = {
+      operationId: id,
+      idempotencyKey: `${key.slice(0, 8)}-${key.slice(8, 12)}-4${key.slice(13, 16)}-8${key.slice(17, 20)}-${key.slice(20, 32)}`,
+      mediaType: input.mediaType,
+      declaredBytes: input.receipt.bytes,
+      fingerprint: uploadReservationFingerprint(
         {
-          text,
-          structure: {
-            version: 1,
-            source: { sha256, bytes: bytes.length, mediaType: 'text/plain' },
-            extractor: { name: 'synthetic-fixture', version: '1' },
-            pages: [],
-            elements: [
-              {
-                id: 'e1',
-                kind: 'paragraph',
-                start: 0,
-                end: text.length,
-                page: null,
-                parentId: null,
-              },
-            ],
-            quality: { status: 'complete', warnings: [] },
-          },
+          mediaType: input.mediaType,
+          declaredBytes: input.receipt.bytes,
+          scope: { kind: 'personal' },
         },
-        at,
-        session,
-      );
+        derived,
+      ),
+    };
+    if (derived) await uploads.reserveDerived(principal, { ...request, derived }, now);
+    else await uploads.reserve(principal, request, now);
+    const transfer = (await uploads.claim({
+      kind: 'transfer',
+      principal,
+      operationId: id,
+      worker,
+      now,
+    }))!;
+    expect(transfer.generation).toBe(input.transferGeneration);
+    const execution = {
+      version: 2 as const,
+      custody: { kind: 'none' as const },
+      attemptId: `${id}.${transfer.generation}`,
+      instanceId: '11111111-1111-4111-8111-111111111111',
+      executionId: '22222222-2222-4222-8222-222222222222',
+      expiresAt: new Date(now + 60_000).toISOString(),
+    };
+    await uploads.bindSecurityExecution(transfer, execution, now);
+    await uploads.settleSecurityExecution(
+      transfer,
+      { execution, writerStopped: true, transientDataRemoved: true },
+      now,
+    );
+    await uploads.accept(
+      principal,
+      transfer,
+      input.receipt,
+      input.securityApproval!,
+      { filename: input.filename },
+      now,
+    );
+    const gone = (lease: typeof transfer) => ({
+      operationId: id,
+      generation: lease.generation,
+      writerStopped: true,
+      localCopiesAbsent: true,
+      originalAbsent: false,
+      textAndHistoryRemoved: false,
     });
+    await uploads.confirmCleanup(gone(transfer), now);
+    const lease = (await uploads.claim({ kind: 'processing', worker, now }))!;
+    expect(lease.operationId).toBe(id);
+    await uploads.bindProcessingExecution(
+      lease,
+      {
+        attemptId: `${id}.${lease.generation}`,
+        instanceId: 'fixture-parser',
+        expiresAt: new Date(now + 60_000).toISOString(),
+      },
+      now,
+    );
+    await uploads.publish(
+      lease,
+      {
+        text,
+        writerStopped: true,
+        structure: {
+          version: 1,
+          source: { sha256, bytes: bytes.length, mediaType: 'text/plain' },
+          extractor: { name: 'synthetic-fixture', version: '1' },
+          pages: [],
+          elements: [
+            { id: 'e1', kind: 'paragraph', start: 0, end: text.length, page: null, parentId: null },
+          ],
+          quality: { status: 'complete', warnings: [] },
+        },
+      },
+      now,
+    );
+    await uploads.confirmCleanup(gone(lease), now);
   }
   const draft = () => methods.createDocumentWorkspace(owner);
   async function firstVersion(fileId = 'version-one', target = owner) {
@@ -118,11 +181,54 @@ describe('independent document workspace metadata and native File commits', () =
     await methods.commitDocumentWorkspaceVersion(target, workspace.workspaceId, 0, fileId);
     return workspace.workspaceId;
   }
+  let registeredMongo: Array<{
+    pid: number;
+    kind: string;
+    start: string;
+    port?: number;
+    dbPath?: string;
+  }> = [];
+  function registerMongo(status: 'running' | 'settled') {
+    if (!process.env.RETENTION_RUN_SCOPE || !process.env.RETENTION_RUN_KEY) return;
+    if (status === 'running')
+      registeredMongo = mongo.servers.flatMap((server) => {
+        const info = server.instanceInfo;
+        const instance = info?.instance as unknown as {
+          mongodProcess?: { pid?: number };
+          killerProcess?: { pid?: number };
+        };
+        return [
+          ['mongod', instance?.mongodProcess?.pid],
+          ['killer', instance?.killerProcess?.pid],
+        ].flatMap(([kind, pid]) =>
+          typeof pid === 'number'
+            ? [
+                {
+                  kind: String(kind),
+                  pid,
+                  start: readFileSync(`/proc/${pid}/stat`, 'utf8')
+                    .split(')')[1]
+                    .trim()
+                    .split(' ')[19],
+                  port: info?.port,
+                  dbPath: kind === 'mongod' ? info?.dbPath : undefined,
+                },
+              ]
+            : [],
+        );
+      });
+    execFileSync('python3', [
+      `${process.env.RETENTION_RUN_SCOPE}/runner/register-mongo.py`,
+      status,
+      JSON.stringify(registeredMongo),
+    ]);
+  }
   beforeAll(async () => {
     mongo = await MongoMemoryReplSet.create({
       binary: { version: '7.0.43', systemBinary: process.env.MONGOMS_SYSTEM_BINARY },
       replSet: { count: 1, storageEngine: 'wiredTiger' },
     });
+    registerMongo('running');
     await db.connect(mongo.getUri('workspace'), { serverSelectionTimeoutMS: 5000 });
     createModels(db);
     await Promise.all(
@@ -130,28 +236,46 @@ describe('independent document workspace metadata and native File commits', () =
         db.models[name].init(),
       ),
     );
+    await createHousekeepingStore(db).initialize();
     lifecycle = createFileRetentionMethods(db, { securityPolicySha256: policy });
     methods = createDocumentWorkspaceMethods(db, { securityPolicySha256: policy, now: () => at });
   });
   beforeEach(async () => {
+    process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = 'true';
     for (const name of [
       'DocumentWorkspaceRevision',
       'DocumentWorkspace',
       'File',
       'Message',
       'User',
+      'UploadCounter',
+      'UploadOperation',
+      'HousekeepingJob',
+      'FileReadReceipt',
     ])
-      await db.models[name].deleteMany({});
+      if (db.models[name]) await db.models[name].deleteMany({});
     await db.models.User.create({
       _id: owner.userId,
       tenantId: owner.tenantId,
       email: 'workspace@example.test',
       emailVerified: true,
     });
+    uploads = createUploadManagementRepository(db, {
+      enabled: true,
+      reconciled: true,
+      securityPolicySha256: policy,
+      baseline: { originalBytes: 0, objectBytes: 0, textBytes: 0, recordBytes: 0, bundles: 0 },
+    });
+    await uploads.initialize();
+  });
+  afterEach(() => {
+    if (previousEnabled === undefined) delete process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED;
+    else process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = previousEnabled;
   });
   afterAll(async () => {
     await db.disconnect();
     await mongo?.stop();
+    registerMongo('settled');
   });
 
   it('persists an empty private draft without content, File copies or Message lifecycle coupling', async () => {

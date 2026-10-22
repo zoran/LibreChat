@@ -24,6 +24,21 @@ export type {
 } from './methods/fileWorkspace';
 export { createUploadManagementRepository } from './methods/uploadManagement';
 export type { UploadManagementRepository } from './methods/uploadManagement';
+export {
+  createFileRetrievalOperationOwner,
+  parseFileRetrievalPolicySnapshot,
+} from './methods/fileRetrievalOperation';
+export type {
+  FileRetrievalOriginal,
+  FileRetrievalPolicy,
+  FileRetrievalPolicySnapshot,
+  FileRetrievalRequest,
+  FileRetrievalLookup,
+} from './methods/fileRetrievalOperation';
+export type {
+  ManagedRetrievalInventoryAuthority,
+  ManagedRetrievalInventoryProof,
+} from './methods/fileRetrieval';
 export { createEmailCodeMethods } from './methods/emailCode';
 export { createConfiguredAdministratorMethods } from './methods/configuredAdministrators';
 export type * from './types/emailCode';
@@ -153,3 +168,34 @@ export {
   dropSupersededPromptGroupIndexes,
   backfillMCPServerNormalizedNames,
 } from './migrations';
+
+export { createFileNoticePort } from './methods/fileNotice';
+export type { FileNoticeOptions } from './methods/fileNotice';
+export { createFileCleanupClaimMethods } from './methods/fileCleanupClaim';
+export { createFileHousekeepingDiscoveryMethods } from './methods/fileHousekeepingDiscovery';
+
+export type {
+  MessageSourceCleanupCursor,
+  MessageSourceCleanupOptions,
+  MessageSourceCleanupCounts,
+  MessageSourceCleanupResult,
+  MessageSourceCleanupMethod,
+} from './methods/messageSourceCleanup';
+
+export { createHousekeepingStore } from './methods/housekeepingStore';
+export type { HousekeepingStore } from './methods/housekeepingStore';
+export { createHousekeepingRepository } from './methods/housekeeping';
+export type { HousekeepingOwners, HousekeepingRepositoryOptions } from './methods/housekeeping';
+export { createFileCleanupProgressMethods } from './methods/fileCleanupProgress';
+export type { FileCleanupProgressResult, FileCleanupProgressMethods } from './types/fileCleanup';
+export { createFileCleanupLifecycleMethods } from './methods/fileCleanupLifecycle';
+export type {
+  FileCleanupLifecycleMethods,
+  AcceptedFileCleanupOwner,
+  FileCleanupRetentionOwner,
+  FileCleanupDerivativeOwners,
+} from './methods/fileCleanupLifecycle';
+export type { FileCleanupClaimMethods } from './methods/fileCleanupClaim';
+export { createUploadFileCleanupOwner } from './methods/uploadFileCleanup';
+export { createFileRetentionMethods } from './methods/fileRetention';
+export { createMessageMethods } from './methods/message';

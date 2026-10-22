@@ -1,79 +1,112 @@
-require('dotenv').config();
-const { optionalEnabled, instrumentMongooseQueryMetrics } = require('@librechat/api');
-const { logger } = require('@librechat/data-schemas');
+/** Import is inert. The default API wrapper acquires its existing dependencies on first use. */
+const owners = new WeakMap();
 
-const mongoose = require('mongoose');
-const MONGO_URI = process.env.MONGO_URI;
-
-instrumentMongooseQueryMetrics(mongoose);
-
-if (!MONGO_URI) {
-  throw new Error('Please define the MONGO_URI environment variable');
-}
-/** The maximum number of connections in the connection pool. */
-const maxPoolSize = parseInt(process.env.MONGO_MAX_POOL_SIZE) || undefined;
-/** The minimum number of connections in the connection pool. */
-const minPoolSize = parseInt(process.env.MONGO_MIN_POOL_SIZE) || undefined;
-/** The maximum number of connections that may be in the process of being established concurrently by the connection pool. */
-const maxConnecting = parseInt(process.env.MONGO_MAX_CONNECTING) || undefined;
-/** The maximum number of milliseconds that a connection can remain idle in the pool before being removed and closed. */
-const maxIdleTimeMS = parseInt(process.env.MONGO_MAX_IDLE_TIME_MS) || undefined;
-/** The maximum time in milliseconds that a thread can wait for a connection to become available. */
-const waitQueueTimeoutMS = parseInt(process.env.MONGO_WAIT_QUEUE_TIMEOUT_MS) || undefined;
-/** Set to false to disable automatic index creation for all models associated with this connection. */
-const autoIndex = optionalEnabled(process.env.MONGO_AUTO_INDEX);
-
-/** Set to `false` to disable Mongoose automatically calling `createCollection()` on every model created on this connection. */
-const autoCreate = optionalEnabled(process.env.MONGO_AUTO_CREATE);
-/**
- * Global is used here to maintain a cached connection across hot reloads
- * in development. This prevents connections growing exponentially
- * during API Route usage.
- */
-let cached = global.mongoose;
-
-if (!cached) {
-  cached = global.mongoose = { conn: null, promise: null };
-}
-
-mongoose.connection.on('error', (err) => {
-  logger.error('[connectDb] MongoDB connection error:', err);
-});
-
-async function connectDb() {
-  if (cached.conn && cached.conn?._readyState === 1) {
-    return cached.conn;
+/** Own exactly this Mongoose instance's default connection and its original acquisition. */
+function createDbConnector({
+  mongoose,
+  env,
+  instrumentMongooseQueryMetrics,
+  optionalEnabled,
+  logger,
+}) {
+  if (owners.has(mongoose)) throw new Error('MongoDB default connection already has an owner');
+  const connection = mongoose.connection;
+  if (!connection || connection.readyState !== 0)
+    throw new Error('MongoDB default connection is already active');
+  const uri = env.MONGO_URI;
+  if (!uri) throw new Error('Please define the MONGO_URI environment variable');
+  const opts = { bufferCommands: false };
+  for (const [name, key] of [
+    ['maxPoolSize', 'MONGO_MAX_POOL_SIZE'],
+    ['minPoolSize', 'MONGO_MIN_POOL_SIZE'],
+    ['maxConnecting', 'MONGO_MAX_CONNECTING'],
+    ['maxIdleTimeMS', 'MONGO_MAX_IDLE_TIME_MS'],
+    ['waitQueueTimeoutMS', 'MONGO_WAIT_QUEUE_TIMEOUT_MS'],
+  ]) {
+    const value = parseInt(env[key]) || undefined;
+    if (value) opts[name] = value;
   }
+  for (const [name, key] of [
+    ['autoIndex', 'MONGO_AUTO_INDEX'],
+    ['autoCreate', 'MONGO_AUTO_CREATE'],
+  ]) {
+    const value = optionalEnabled(env[key]);
+    if (value !== undefined) opts[name] = value;
+  }
+  const log = logger ?? require('@librechat/data-schemas').logger;
+  instrumentMongooseQueryMetrics(mongoose);
+  const onError = (error) => log.error('[connectDb] MongoDB connection error:', error);
+  connection.on('error', onError);
+  let opening;
+  let pending = false;
+  let closed = false;
+  let closing;
+  const connector = {
+    connect() {
+      if (closed) return Promise.reject(new Error('MongoDB connector is closed'));
+      if (opening && (pending || connection.readyState === 1)) return opening;
+      pending = true;
+      opening = Promise.resolve().then(() => {
+        log.info('Mongo Connection options');
+        log.info(JSON.stringify(opts, null, 2));
+        mongoose.set('strictQuery', true);
+        return mongoose.connect(uri, opts);
+      });
+      void opening.then(
+        () => {
+          pending = false;
+        },
+        () => {
+          pending = false;
+        },
+      );
+      return opening;
+    },
+    close() {
+      if (closing) return closing;
+      closed = true;
+      closing = (async () => {
+        await opening?.catch(() => undefined);
+        try {
+          await connection.close();
+        } finally {
+          connection.off('error', onError);
+        }
+      })();
+      return closing;
+    },
+  };
+  owners.set(mongoose, connector);
+  return connector;
+}
 
-  const disconnected = cached.conn && cached.conn?._readyState !== 1;
-  if (!cached.promise || disconnected) {
-    const opts = {
-      bufferCommands: false,
-      ...(maxPoolSize ? { maxPoolSize } : {}),
-      ...(minPoolSize ? { minPoolSize } : {}),
-      ...(maxConnecting ? { maxConnecting } : {}),
-      ...(maxIdleTimeMS ? { maxIdleTimeMS } : {}),
-      ...(waitQueueTimeoutMS ? { waitQueueTimeoutMS } : {}),
-      ...(autoIndex != undefined ? { autoIndex } : {}),
-      ...(autoCreate != undefined ? { autoCreate } : {}),
-      // useNewUrlParser: true,
-      // useUnifiedTopology: true,
-      // bufferMaxEntries: 0,
-      // useFindAndModify: true,
-      // useCreateIndex: true
-    };
-    logger.info('Mongo Connection options');
-    logger.info(JSON.stringify(opts, null, 2));
-    mongoose.set('strictQuery', true);
-    cached.promise = mongoose.connect(MONGO_URI, opts).then((mongoose) => {
-      return mongoose;
+function connectDb() {
+  require('dotenv').config();
+  const mongoose = require('mongoose');
+  const cached = global.mongoose ?? (global.mongoose = { conn: null, promise: null });
+  // Preserve a connection retained by the pre-existing default wrapper across hot reload.
+  if (cached.conn && mongoose.connection.readyState === 1) return Promise.resolve(cached.conn);
+  // The legacy wrapper retains its original acquisition across an in-process reload.
+  if (!cached.connector && cached.promise && mongoose.connection.readyState === 2) {
+    return cached.promise.then((connection) => {
+      cached.conn = connection;
+      return connection;
     });
   }
-  cached.conn = await cached.promise;
-
-  return cached.conn;
+  if (!cached.connector) {
+    const { optionalEnabled, instrumentMongooseQueryMetrics } = require('@librechat/api');
+    cached.connector = createDbConnector({
+      mongoose,
+      env: process.env,
+      optionalEnabled,
+      instrumentMongooseQueryMetrics,
+    });
+  }
+  cached.promise = cached.connector.connect();
+  return cached.promise.then((connection) => {
+    cached.conn = connection;
+    return connection;
+  });
 }
 
-module.exports = {
-  connectDb,
-};
+module.exports = { connectDb, createDbConnector };

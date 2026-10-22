@@ -20,6 +20,9 @@ import {
   liveFileFilter,
   fileSourceScope,
 } from './fileRetention';
+import { createFileCleanupCompletionMethods } from './fileCleanupCompletion';
+import { initialFileRetentionActivity } from './fileActivityTransition';
+import { projectFileHousekeeping } from './fileHousekeepingProjection';
 import { tenantSafeBulkWrite } from '~/utils/tenantBulkWrite';
 import { createFileWorkspaceMethods } from './fileWorkspace';
 import { escapeRegExp } from '~/utils/string';
@@ -304,7 +307,8 @@ function serializeRunArtifact(
 export function createFileMethods(mongoose: typeof import('mongoose')): ReturnType<
   typeof createFileRetentionMethods
 > &
-  ReturnType<typeof createFileWorkspaceMethods> & {
+  ReturnType<typeof createFileWorkspaceMethods> &
+  ReturnType<typeof createFileCleanupCompletionMethods> & {
     getRunFileCandidates: (
       fileIds: readonly string[],
       tenantId?: string | null,
@@ -1142,6 +1146,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
       expiresAt?: Date;
       retentionAcceptedAt?: Date;
       retentionRevision?: number;
+      retentionActivity?: IMongoFile['retentionActivity'];
     } = {
       ...data,
       expiresAt: new Date(Date.now() + 3600 * 1000),
@@ -1154,12 +1159,18 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
     for (const key of [
       'retentionAcceptedAt',
       'retentionRevision',
+      'retentionActivity',
+      'derivedRetention',
+      'retentionRevocationId',
+      'retentionCleanup',
       'deletionRequestedAt',
       'deletionCompletedAt',
       'uploadOperationId',
       'securityApproval',
       'derivedOrigin',
       'documentStructure',
+      'managedRetrieval',
+      'retrievalCreation',
       'library',
       'retainedDerivativeBytes',
       'retainedDerivativeReservations',
@@ -1190,9 +1201,27 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
       fileData.retentionAcceptedAt = acceptedAt;
       fileData.expiredAt = expiredAt;
       fileData.retentionRevision = 0;
+      fileData.retentionActivity = initialFileRetentionActivity(expiredAt, acceptedAt, 'complete');
       // Managed IDs are immutable. Duplicate creation cannot overwrite or resurrect a tombstone.
       try {
-        return (await File.create(fileData)).toObject();
+        const session = await mongoose.startSession();
+        try {
+          return await session.withTransaction(
+            async () => {
+              const [created] = await File.create([fileData], { session });
+              const row = created.toObject();
+              await projectFileHousekeeping(mongoose, null, row, session);
+              return row;
+            },
+            {
+              readConcern: { level: 'snapshot' },
+              writeConcern: { w: 'majority', wtimeout: 2000 },
+              timeoutMS: 3000,
+            },
+          );
+        } finally {
+          await session.endSession();
+        }
       } catch (error) {
         if ((error as { code?: number }).code === 11000) throw new FileSourceUnavailableError();
         throw error;
@@ -1245,15 +1274,22 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
     const File = mongoose.models.File as Model<IMongoFile>;
     const { file_id, ...update } = data;
     const current = await File.findOne({ file_id }).lean<IMongoFile>();
+    if (!current) return null;
     for (const key of [
       'retentionAcceptedAt',
       'retentionRevision',
+      'retentionActivity',
+      'derivedRetention',
+      'retentionRevocationId',
+      'retentionCleanup',
       'deletionRequestedAt',
       'deletionCompletedAt',
       'uploadOperationId',
       'securityApproval',
       'derivedOrigin',
       'documentStructure',
+      'managedRetrieval',
+      'retrievalCreation',
       'library',
       'retainedDerivativeBytes',
       'retainedDerivativeReservations',
@@ -1287,17 +1323,41 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
         )
           throw new FileSourceUnavailableError();
       }
-      if (update.expiredAt != null && new Date(update.expiredAt) > new Date(current.expiredAt!)) {
+      // Only the File activity/derived owner may change a retained deadline and its generation.
+      if (
+        update.expiredAt != null &&
+        new Date(update.expiredAt).getTime() !== new Date(current.expiredAt!).getTime()
+      ) {
         throw new FileSourceUnavailableError();
       }
       if ('expiredAt' in update && update.expiredAt == null) throw new FileSourceUnavailableError();
+      // An identical captured deadline is not a new owner decision or a content write.
+      delete update.expiredAt;
     }
+    // Bind validation to the exact File/lifecycle that was read. A concurrent activity or
+    // policy migration must be reobserved, including legacy absent fields becoming retained.
+    const lifecycle = Object.fromEntries(
+      (
+        [
+          '_id',
+          'user',
+          'tenantId',
+          'retentionAcceptedAt',
+          'uploadOperationId',
+          'retentionRevision',
+          'expiredAt',
+        ] as const
+      ).map((key) => [
+        key,
+        current[key] === undefined ? { $exists: false } : { $eq: current[key], $exists: true },
+      ]),
+    );
     const updateOperation = {
       $set: update,
       $unset: { expiresAt: '' },
     };
     const query: FilterQuery<IMongoFile> = extraFilter ? { file_id, ...extraFilter } : { file_id };
-    return File.findOneAndUpdate({ $and: [query, liveFileFilter()] }, updateOperation, {
+    return File.findOneAndUpdate({ $and: [query, lifecycle, liveFileFilter()] }, updateOperation, {
       new: true,
       timestamps: Object.keys(update).length > 0,
     }).lean<IMongoFile>();
@@ -1728,6 +1788,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
 
   return {
     ...createFileRetentionMethods(mongoose),
+    ...createFileCleanupCompletionMethods(mongoose),
     ...createFileWorkspaceMethods(mongoose),
     getRunFileCandidates,
     claimRunArtifactFile,

@@ -1,51 +1,50 @@
-const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
 jest.mock('@librechat/api', () => ({
-  getAuthMode: () => 'email_code',
-  getEmailCodeSettings: () => ({ domains: ['example.test'] }),
-  getEmailCodeMailConfig: () => ({ hosts: ['fixture.invalid'] }),
-  createBoundedEmailCodeSender: jest.fn((config) => config),
+  getAuthMode: jest.fn(),
+  getEmailCodeSettings: jest.fn(),
+  getEmailCodeMailConfig: jest.fn(),
+  createBoundedEmailCodeSender: jest.fn(),
 }));
-jest.mock('nodemailer', () => ({ createTransport: jest.fn() }));
-const paths = require('~/config/paths');
+jest.mock('./OutboundMail', () => ({
+  readLogo: jest.fn(),
+  createOutboundMailDependencies: jest.fn(),
+}));
+const api = require('@librechat/api');
+const outbound = require('./OutboundMail');
 const { createEmailCodeSender } = require('./EmailCodeSender');
 
-describe('deployment email logo boundary', () => {
-  const originalDist = paths.dist;
-  const originalSetting = process.env.EMAIL_CODE_LOGO_FILE;
-  let directory;
+describe('existing login composition through shared transport', () => {
+  const original = process.env.EMAIL_CODE_LOGO_FILE;
   beforeEach(() => {
-    directory = fs.mkdtempSync(path.join(os.tmpdir(), 'email-logo-'));
-    fs.mkdirSync(path.join(directory, 'assets'));
-    paths.dist = directory;
+    api.getAuthMode.mockReturnValue('email_code');
+    api.getEmailCodeSettings.mockReturnValue({ domains: ['example.test'] });
   });
   afterEach(() => {
-    paths.dist = originalDist;
-    if (originalSetting === undefined) delete process.env.EMAIL_CODE_LOGO_FILE;
-    else process.env.EMAIL_CODE_LOGO_FILE = originalSetting;
-    fs.rmSync(directory, { recursive: true, force: true });
+    if (original === undefined) delete process.env.EMAIL_CODE_LOGO_FILE;
+    else process.env.EMAIL_CODE_LOGO_FILE = original;
   });
-  it('reads the configured local basename once as bytes', () => {
-    const content = Buffer.alloc(40, 1);
-    fs.writeFileSync(path.join(directory, 'assets/logo.png'), content);
+  it('preserves default-auth and absent-SMTP gating', () => {
+    api.getAuthMode.mockReturnValue('default');
+    expect(createEmailCodeSender()).toBeUndefined();
+    expect(api.getEmailCodeMailConfig).not.toHaveBeenCalled();
+    api.getAuthMode.mockReturnValue('email_code');
+    api.getEmailCodeMailConfig.mockReturnValue(undefined);
+    expect(createEmailCodeSender()).toBeUndefined();
+    expect(outbound.readLogo).not.toHaveBeenCalled();
+  });
+  it('preserves login settings while using the sole shared MIME and SMTP composition', () => {
+    const config = { username: 'login@example.test' };
+    const logo = Buffer.from('test-only');
+    const deps = { createTransport: jest.fn(), createMimeStream: jest.fn() };
+    api.getEmailCodeMailConfig.mockReturnValue(config);
+    outbound.readLogo.mockReturnValue(logo);
+    outbound.createOutboundMailDependencies.mockReturnValue(deps);
     process.env.EMAIL_CODE_LOGO_FILE = 'logo.png';
-    expect(createEmailCodeSender().logoPng).toEqual(content);
-  });
-  it('refuses traversal, URLs, oversized files and symbolic links', () => {
-    for (const name of ['../secret.png', '/tmp/logo.png', 'https://x.test/logo.png']) {
-      process.env.EMAIL_CODE_LOGO_FILE = name;
-      expect(() => createEmailCodeSender()).toThrow();
-    }
-    fs.writeFileSync(path.join(directory, 'assets/large.png'), Buffer.alloc(65537));
-    fs.symlinkSync('large.png', path.join(directory, 'assets/link.png'));
-    for (const name of ['large.png', 'link.png']) {
-      process.env.EMAIL_CODE_LOGO_FILE = name;
-      expect(() => createEmailCodeSender()).toThrow();
-    }
-  });
-  it('preserves the upstream configuration when no logo is selected', () => {
-    delete process.env.EMAIL_CODE_LOGO_FILE;
-    expect(createEmailCodeSender().logoPng).toBeUndefined();
+    createEmailCodeSender();
+    expect(api.getEmailCodeMailConfig).toHaveBeenCalledWith(process.env, ['example.test']);
+    expect(outbound.readLogo).toHaveBeenCalledWith('logo.png');
+    expect(api.createBoundedEmailCodeSender).toHaveBeenCalledWith(
+      { ...config, logoPng: logo },
+      deps,
+    );
   });
 });

@@ -8,6 +8,7 @@ const {
   readFileLibraryItem,
   readFileLibraryPage,
 } = require('librechat-data-provider');
+const { fileLibraryMaintenance } = require('~/server/services/Files/LibraryMaintenance');
 const { isCortexFileMode, createManagedFileHandlers } = require('./managed');
 
 const failure = (code) => Object.assign(new Error(code), { code });
@@ -36,6 +37,7 @@ function createFileLibraryHandlers(options = {}) {
   const isManaged = options.isManaged ?? isCortexFileMode;
   const system = options.runAsSystem ?? runAsSystem;
   const now = options.now ?? Date.now;
+  const maintenance = options.maintenance ?? fileLibraryMaintenance;
   const managed = createManagedFileHandlers({ getRuntime });
 
   async function authorize(req, expected) {
@@ -114,7 +116,9 @@ function createFileLibraryHandlers(options = {}) {
       const access = await authorize(req);
       const query = readFileLibraryQuery(req.query);
       if (!query) throw failure('invalid_request');
-      const page = await system(() => methods.getFileLibraryPage(access.owner, query));
+      const page = await maintenance.run(() =>
+        system(() => methods.getFileLibraryPage(access.owner, query)),
+      );
       const current = await authorize(req, access);
       const files = [];
       // Storage bounds this page. Preserve its cursor even when approval hides a row.
@@ -140,7 +144,9 @@ function createFileLibraryHandlers(options = {}) {
       if (typeof fileId !== 'string' || !/^[A-Za-z0-9_.-]{1,128}$/.test(fileId))
         throw failure('not_found');
       await approve(access, fileId);
-      const result = await system(() => methods.updateFileLibrary(access.owner, fileId, update));
+      const result = await maintenance.run(() =>
+        system(() => methods.updateFileLibrary(access.owner, fileId, update)),
+      );
       const current = await authorize(req, access);
       await approve(current, fileId);
       if (result.kind === 'unavailable') throw failure('not_found');

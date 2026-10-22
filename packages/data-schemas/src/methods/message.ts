@@ -4,6 +4,7 @@ import {
   isForcedTemporaryRetention,
   readSourceCoverage,
   RetentionMode,
+  UPLOAD_DERIVED_MAX_SOURCES,
 } from 'librechat-data-provider';
 import type { DeleteResult, FilterQuery, Model, Types, UpdateQuery } from 'mongoose';
 import type { UserSubmittedMessageFieldPath } from 'librechat-data-provider';
@@ -18,6 +19,10 @@ import type {
   MessageArtifactSourceInput,
   CapturedMessageArtifactSource,
 } from '~/types/message';
+import type {
+  MessageSourceCleanupBudget,
+  MessageSourceCleanupMethod,
+} from './messageSourceCleanup';
 import type { FileOwnerScope, RetainedTextAllocation } from '~/types/file';
 import type { SchemaWithMeiliMethods } from '~/models/plugins/mongoMeili';
 import type { CheckpointSourceBinding } from '~/types/checkpointSource';
@@ -25,7 +30,7 @@ import type { AppConfig, IConversation, IMessage } from '~/types';
 import {
   FileSourceUnavailableError,
   fileSourceScope,
-  liveFileFilter,
+  inspectFileSources,
   resolveFileSources,
   touchFileSources,
   resizeRetainedDerivatives,
@@ -36,6 +41,7 @@ import { createChatExpirationDate, createTempChatExpirationDate } from '~/utils/
 import { activeExpirationFilter, createFallbackRetentionDate } from '~/utils/retention';
 import { createMessageArtifactSourceMethods } from './messageArtifactSource';
 import { fitBoundAppSnapshots, hasBoundAppSnapshots } from './appSnapshots';
+import { createMessageSourceCleanup } from './messageSourceCleanup';
 import { tenantSafeBulkWrite } from '~/utils/tenantBulkWrite';
 import { publicMessageProjection } from '~/schema/message';
 import { tenantStorage } from '~/config/tenantContext';
@@ -857,10 +863,7 @@ export interface MessageMethods {
       }[];
     },
   ): Promise<SourceRetentionContext | undefined>;
-  redactFileSourceContent(
-    owner: FileOwnerScope,
-    fileIds: readonly string[],
-  ): Promise<{ redactedMessages: number; detachedMessages: number }>;
+  redactFileSourceContent: MessageSourceCleanupMethod;
   getPersistedPrivateTextId(
     input: Parameters<MessageMethods['hasPersistedPrivateText']>[0],
   ): Promise<string | null>;
@@ -1281,31 +1284,37 @@ export function createMessageMethods(
     const quoteSourceRetention: QuoteSourceRetention[] = [];
     for (const [index, quote] of (row.quotes ?? []).entries()) {
       const binding = bindings.get(index);
-      if (binding && unavailable(binding)) continue;
+      if (binding && (!binding.sourceFileIds.length || unavailable(binding))) continue;
       if (binding) quoteSourceRetention.push({ ...binding, index: quotes.length });
       quotes.push(quote);
     }
     return { quotes, quoteSourceRetention };
   }
 
-  async function liveQuoteIds(
+  async function currentQuoteSources(
     owner: FileOwnerScope,
-    bindings: readonly QuoteSourceRetention[],
+    bindings: readonly Pick<QuoteSourceRetention, 'sourceFileIds'>[],
     session?: ClientSession,
-  ): Promise<Set<string>> {
+  ): Promise<Map<string, Date>> {
     const ids = [...new Set(bindings.flatMap((binding) => binding.sourceFileIds))];
-    if (!ids.length) return new Set();
-    const files = await mongoose.models.File.find({
-      $and: [
-        fileSourceScope(owner),
-        { file_id: { $in: ids }, retentionAcceptedAt: { $ne: null } },
-        liveFileFilter(),
-      ],
-    })
-      .session(session ?? null)
-      .select('file_id')
-      .lean();
-    return new Set(files.map((file) => file.file_id));
+    if (!ids.length) return new Map();
+    const live = new Map<string, Date>();
+    for (let offset = 0; offset < ids.length; offset += UPLOAD_DERIVED_MAX_SOURCES) {
+      const files = await inspectFileSources(
+        mongoose,
+        owner,
+        ids.slice(offset, offset + UPLOAD_DERIVED_MAX_SOURCES),
+        session,
+      );
+      for (const file of files)
+        if (
+          file.state !== 'unavailable' &&
+          file.sourceExpiresAt != null &&
+          file.sourceExpiresAt.getTime() > Date.now()
+        )
+          live.set(file.fileId, new Date(file.sourceExpiresAt.getTime()));
+    }
+    return live;
   }
 
   async function resolveQuoteRetention(
@@ -1324,9 +1333,13 @@ export function createMessageMethods(
       ...new Set(entries.flatMap(({ sourceRef }) => (sourceRef ? [sourceRef.messageId] : []))),
     ];
     const rows = ids.length
-      ? await mongoose.models.Message.find({ ...scope, messageId: { $in: ids } })
+      ? await mongoose.models.Message.find({
+          ...scope,
+          messageId: { $in: ids },
+          ...activeExpirationFilter<IMessage>(),
+        })
           .select(
-            'messageId __v quotes sourceFileIds sourceExpiresAt sourceContentRemovedAt +quoteSourceRetention',
+            'messageId __v quotes expiredAt sourceFileIds sourceExpiresAt sourceContentRemovedAt +quoteSourceRetention',
           )
           .lean<IMessage[]>()
       : [];
@@ -1338,7 +1351,6 @@ export function createMessageMethods(
       context?: SourceRetentionContext;
     }> = [];
     const conditions = new Map<string, { messageId: string; messageVersion: number | null }>();
-    const now = new Date();
     // Check the full quote shape for index refs: a read-only mask can already have reindexed it.
     const shapeIds: string[] = [];
     entries.forEach(({ sourceRef: ref }, index) => {
@@ -1364,12 +1376,12 @@ export function createMessageMethods(
         )
           throw new FileSourceUnavailableError();
         for (const binding of row.quoteSourceRetention ?? []) {
-          if (binding.sourceExpiresAt <= now) throw new FileSourceUnavailableError();
+          if (!binding.sourceFileIds.length) throw new FileSourceUnavailableError();
           shapeIds.push(...binding.sourceFileIds);
         }
         context = row.quoteSourceRetention?.find((item) => item.index === ref.quoteIndex);
       } else {
-        if (row.sourceContentRemovedAt || (row.sourceExpiresAt && row.sourceExpiresAt <= now))
+        if (row.sourceContentRemovedAt || (row.sourceExpiresAt && !row.sourceFileIds?.length))
           throw new FileSourceUnavailableError();
         if (row.sourceFileIds?.length)
           context = {
@@ -1384,7 +1396,20 @@ export function createMessageMethods(
       ...new Set([...shapeIds, ...selected.flatMap((item) => item.context?.sourceFileIds ?? [])]),
     ];
     const live = await resolveFileSources(mongoose, owner, fileIds);
-    if (fileIds.some((id) => !live?.sourceFileIds.includes(id)))
+    if (
+      fileIds.some((id) => !live?.sourceFileIds.includes(id)) ||
+      (live && live.sourceExpiresAt <= new Date()) ||
+      rows.some((row) => row.expiredAt && row.expiredAt <= new Date())
+    )
+      throw new FileSourceUnavailableError();
+    const deadlines = await currentQuoteSources(owner, [{ sourceFileIds: fileIds }]);
+    if (
+      selected.some(
+        ({ context }) =>
+          context &&
+          (!context.sourceFileIds.length || context.sourceFileIds.some((id) => !deadlines.has(id))),
+      )
+    )
       throw new FileSourceUnavailableError();
     return {
       quotes: entries.map((entry) => entry.text),
@@ -1395,7 +1420,9 @@ export function createMessageMethods(
                 index,
                 sourceRef: ref,
                 sourceFileIds: [...context.sourceFileIds],
-                sourceExpiresAt: new Date(context.sourceExpiresAt.getTime()),
+                sourceExpiresAt: new Date(
+                  Math.min(...context.sourceFileIds.map((id) => deadlines.get(id)!.getTime())),
+                ),
               },
             ]
           : [],
@@ -1444,9 +1471,13 @@ export function createMessageMethods(
     const resolve = async (session?: ClientSession) => {
       const Message = mongoose.models.Message as Model<IMessage>;
       const history = ids.length
-        ? await Message.find({ ...fileSourceScope(owner), messageId: { $in: ids } })
+        ? await Message.find({
+            ...fileSourceScope(owner),
+            messageId: { $in: ids },
+            ...activeExpirationFilter<IMessage>(),
+          })
             .select(
-              'conversationId messageId __v sourceFileIds sourceExpiresAt sourceContentRemovedAt quotes +quoteSourceRetention',
+              'conversationId messageId __v expiredAt sourceFileIds sourceExpiresAt sourceContentRemovedAt quotes +quoteSourceRetention',
             )
             .session(session ?? null)
             .lean<IMessage[]>()
@@ -1455,22 +1486,18 @@ export function createMessageMethods(
         history.length !== ids.length ||
         history.some(
           (row) =>
-            row.sourceContentRemovedAt ||
-            (row.sourceExpiresAt && row.sourceExpiresAt <= new Date()),
+            row.sourceContentRemovedAt || (row.sourceExpiresAt && !row.sourceFileIds?.length),
         )
       )
         throw new FileSourceUnavailableError();
-      const quoteLive = await liveQuoteIds(
+      const quoteLive = await currentQuoteSources(
         owner,
         history.flatMap((row) => row.quoteSourceRetention ?? []),
         session,
       );
       const inherited = history.flatMap((row) => {
-        const visible = filterQuotes(
-          row,
-          (binding) =>
-            binding.sourceExpiresAt <= new Date() ||
-            binding.sourceFileIds.some((id) => !quoteLive.has(id)),
+        const visible = filterQuotes(row, (binding) =>
+          binding.sourceFileIds.some((id) => !quoteLive.has(id)),
         );
         const witness = binding?.messages.find((entry) => entry.messageId === row.messageId);
         if (binding && (!witness || witness.conversationId !== row.conversationId)) {
@@ -1497,7 +1524,11 @@ export function createMessageMethods(
         [...fileIds, ...inherited],
         session,
       );
-      if (inherited.some((id) => !resolved?.sourceFileIds.includes(id)))
+      if (
+        inherited.some((id) => !resolved?.sourceFileIds.includes(id)) ||
+        (resolved && resolved.sourceExpiresAt <= new Date()) ||
+        history.some((row) => row.expiredAt && row.expiredAt <= new Date())
+      )
         throw new FileSourceUnavailableError();
       return resolved;
     };
@@ -1543,7 +1574,12 @@ export function createMessageMethods(
           if (options.expectedVersion !== undefined && current == null) {
             throw new MessageVersionConflictError();
           }
-          if (current?.sourceContentRemovedAt) throw new FileSourceUnavailableError();
+          if (
+            current?.sourceContentRemovedAt ||
+            (current?.expiredAt && current.expiredAt <= new Date()) ||
+            (current?.sourceExpiresAt && !current.sourceFileIds?.length)
+          )
+            throw new FileSourceUnavailableError();
           if (
             options.sourceCoverage &&
             (current?.isCreatedByUser === true ||
@@ -1558,6 +1594,7 @@ export function createMessageMethods(
               ...fileSourceScope(owner),
               messageId: options.nativeSource.messageId,
               __v: options.nativeSource.messageVersion,
+              ...activeExpirationFilter<IMessage>(),
             })
               .select(privateMessagePaths())
               .session(session)
@@ -1565,14 +1602,20 @@ export function createMessageMethods(
             if (
               !source ||
               source.sourceContentRemovedAt ||
-              (source.sourceExpiresAt && source.sourceExpiresAt <= new Date())
+              (source.sourceExpiresAt && !source.sourceFileIds?.length)
             )
               throw new FileSourceUnavailableError();
-            await Message.updateOne(
-              { _id: source._id, ...fileSourceScope(owner), __v: source.__v ?? null },
+            const touched = await Message.updateOne(
+              {
+                _id: source._id,
+                ...fileSourceScope(owner),
+                __v: source.__v ?? null,
+                ...activeExpirationFilter<IMessage>(),
+              },
               { $inc: { __v: 1 } },
               { session, timestamps: false },
             );
+            if (touched.matchedCount !== 1) throw new FileSourceUnavailableError();
             if (source.sourceFileIds?.length)
               sourceRetention = {
                 sourceFileIds: source.sourceFileIds,
@@ -1594,6 +1637,7 @@ export function createMessageMethods(
             JSON.stringify(current.quotes ?? []) === JSON.stringify(prepared.quotes) &&
             JSON.stringify(current.quoteSourceRetention) ===
               JSON.stringify(prepared.quoteSourceRetention);
+          let quoteSources: Map<string, Date> | undefined;
           let quoteFields:
             | { quotes: string[]; quoteSourceRetention: QuoteSourceRetention[] }
             | undefined;
@@ -1604,6 +1648,7 @@ export function createMessageMethods(
                   ...fileSourceScope(owner),
                   messageId: condition.messageId,
                   __v: condition.messageVersion,
+                  ...activeExpirationFilter<IMessage>(),
                 },
                 { $inc: { __v: 1 } },
                 { session, timestamps: false },
@@ -1615,20 +1660,27 @@ export function createMessageMethods(
               quoteSourceRetention: prepared.quoteSourceRetention,
             };
           } else if (current?.quoteSourceRetention != null) {
-            const allowed = await liveQuoteIds(owner, current.quoteSourceRetention, session);
-            quoteFields = filterQuotes(
-              current,
-              (binding) =>
-                binding.sourceExpiresAt <= new Date() ||
-                binding.sourceFileIds.some((id) => !allowed.has(id)),
+            const allowed = await currentQuoteSources(owner, current.quoteSourceRetention, session);
+            quoteSources = allowed;
+            quoteFields = filterQuotes(current, (binding) =>
+              binding.sourceFileIds.some((id) => !allowed.has(id)),
             );
           }
-          if (
-            quoteFields?.quoteSourceRetention.some(
-              (binding) => binding.sourceExpiresAt <= new Date(),
+          if (quoteFields?.quoteSourceRetention.length) {
+            quoteSources ??= await currentQuoteSources(
+              owner,
+              quoteFields.quoteSourceRetention,
+              session,
+            );
+            if (
+              quoteFields.quoteSourceRetention.some(
+                (binding) =>
+                  !binding.sourceFileIds.length ||
+                  binding.sourceFileIds.some((id) => !quoteSources!.has(id)),
+              )
             )
-          )
-            throw new FileSourceUnavailableError();
+              throw new FileSourceUnavailableError();
+          }
           const ids = [
             ...new Set([
               ...(current?.sourceFileIds ?? []),
@@ -1650,15 +1702,21 @@ export function createMessageMethods(
           const context = await resolveFileSources(mongoose, owner, ids, session);
           if (ids.length && context?.sourceFileIds.length !== ids.length)
             throw new FileSourceUnavailableError();
-          const deadline =
-            context &&
-            new Date(
-              Math.min(
-                context.sourceExpiresAt.getTime(),
-                current?.sourceExpiresAt?.getTime() ?? Infinity,
-              ),
-            );
-          if (deadline && deadline <= new Date()) throw new FileSourceUnavailableError();
+          const deadline = context?.sourceExpiresAt;
+          if (
+            (deadline && deadline <= new Date()) ||
+            (current?.expiredAt && current.expiredAt <= new Date())
+          )
+            throw new FileSourceUnavailableError();
+          if (quoteFields?.quoteSourceRetention.length) {
+            quoteFields.quoteSourceRetention = quoteFields.quoteSourceRetention.map((binding) => {
+              const sourceExpiresAt = new Date(
+                Math.min(...binding.sourceFileIds.map((id) => quoteSources!.get(id)!.getTime())),
+              );
+              if (sourceExpiresAt <= new Date()) throw new FileSourceUnavailableError();
+              return { ...binding, sourceExpiresAt };
+            });
+          }
           if (options.insertOnly && current) {
             result = quoteFields
               ? await Message.findOneAndUpdate(
@@ -1802,50 +1860,83 @@ export function createMessageMethods(
     const publicRow = (row: IMessage): IMessage => {
       return publicMessageProjection(Object.assign({}, row));
     };
-    if (!ids.length && !metadata.some((row) => row.sourceContentRemovedAt))
+    if (
+      !ids.length &&
+      !metadata.some(
+        (row) =>
+          row.sourceContentRemovedAt || row.sourceExpiresAt || row.quoteSourceRetention?.length,
+      )
+    )
       return projectedRows.map(publicRow);
-    const File = mongoose.models.File;
-    const files = ids.length
-      ? await File.find({ file_id: { $in: ids } })
-          .select(
-            'user tenantId file_id retentionAcceptedAt expiredAt deletionRequestedAt deletionCompletedAt',
-          )
-          .lean()
-      : [];
     const key = (user: unknown, tenant: unknown, id: string) =>
       JSON.stringify([String(user), tenant || null, id]);
-    const lookup = new Map(
-      files.map((file) => [key(file.user, file.tenantId, file.file_id), file]),
-    );
+    const groups = new Map<string, { owner: FileOwnerScope; ids: Set<string> }>();
+    for (const row of metadata) {
+      const owner = { userId: String(row.user), tenantId: row.tenantId ?? undefined };
+      const ownerKey = key(row.user, row.tenantId, '');
+      const group = groups.get(ownerKey) ?? { owner, ids: new Set<string>() };
+      for (const id of [
+        ...(row.sourceFileIds ?? []),
+        ...refs(row),
+        ...(row.quoteSourceRetention ?? []).flatMap((binding) => binding.sourceFileIds),
+      ])
+        group.ids.add(id);
+      groups.set(ownerKey, group);
+    }
+    const lookup = new Map<string, Awaited<ReturnType<typeof inspectFileSources>>[number]>();
+    for (const { owner, ids } of groups.values()) {
+      const values = [...ids];
+      for (let offset = 0; offset < values.length; offset += UPLOAD_DERIVED_MAX_SOURCES) {
+        const inspected = await inspectFileSources(
+          mongoose,
+          owner,
+          values.slice(offset, offset + UPLOAD_DERIVED_MAX_SOURCES),
+        );
+        for (const file of inspected)
+          lookup.set(key(owner.userId, owner.tenantId, file.fileId), file);
+        // Inspection chooses visible fields; the same File owner admits their complete live union.
+        const available = inspected.filter(
+          (file) =>
+            file.state !== 'unavailable' &&
+            (file.sourceExpiresAt === null || file.sourceExpiresAt.getTime() > Date.now()),
+        );
+        const current = await resolveFileSources(
+          mongoose,
+          owner,
+          available.map((file) => file.fileId),
+        );
+        if (
+          available.some(
+            (file) =>
+              file.state !== 'unavailable' &&
+              file.sourceExpiresAt !== null &&
+              !current?.sourceFileIds.includes(file.fileId),
+          )
+        )
+          throw new FileSourceUnavailableError();
+      }
+    }
     const now = new Date();
     return projectedRows.map((row) => {
       const meta = byId.get(String(row._id));
       if (!meta) throw new FileSourceUnavailableError();
       const unavailable = (id: string, required: boolean) => {
         const file = lookup.get(key(meta.user, meta.tenantId, id));
-        return file == null
-          ? required
-          : Boolean(
-              file.retentionAcceptedAt &&
-                (file.deletionRequestedAt ||
-                  file.deletionCompletedAt ||
-                  !file.expiredAt ||
-                  file.expiredAt <= now),
-            );
+        if (!file || file.state === 'unavailable') return true;
+        if (required && file.sourceExpiresAt === null) return true;
+        return file.sourceExpiresAt != null && file.sourceExpiresAt <= now;
       };
       const visibleQuotes =
         meta.quoteSourceRetention != null && Array.isArray(row.quotes)
           ? filterQuotes(
               { quotes: row.quotes, quoteSourceRetention: meta.quoteSourceRetention },
-              (binding) =>
-                binding.sourceExpiresAt <= now ||
-                binding.sourceFileIds.some((id) => unavailable(id, true)),
+              (binding) => binding.sourceFileIds.some((id) => unavailable(id, true)),
             )
           : undefined;
       const visible = Object.assign({}, row, visibleQuotes && { quotes: visibleQuotes.quotes });
       if (
         meta.sourceContentRemovedAt ||
-        (meta.sourceExpiresAt && meta.sourceExpiresAt <= now) ||
+        (meta.sourceExpiresAt && !meta.sourceFileIds?.length) ||
         meta.sourceFileIds?.some((id) => unavailable(id, true))
       ) {
         return publicRow(
@@ -1864,101 +1955,95 @@ export function createMessageMethods(
     });
   }
 
-  async function redactFileSourceContent(owner: FileOwnerScope, fileIds: readonly string[]) {
+  async function redactMessageSourceRow(
+    owner: FileOwnerScope,
+    ids: readonly string[],
+    initial: IMessage,
+    budget: MessageSourceCleanupBudget,
+  ): Promise<number> {
     const Message = mongoose.models.Message as Model<IMessage>;
-    const ids = [...new Set(fileIds)];
-    if (!ids.length) return { redactedMessages: 0, detachedMessages: 0 };
     const scope = fileSourceScope(owner);
-    // File revoke precedes this operation, so admitted source-body commits cannot race past it.
-    const files = await mongoose.models.File.find({
-      ...scope,
-      file_id: { $in: ids },
-      retentionAcceptedAt: { $ne: null },
-      deletionRequestedAt: { $ne: null },
-    })
-      .select('file_id')
-      .lean();
-    if (files.length !== ids.length) throw new FileSourceUnavailableError();
     let redactedMessages = 0;
-    const affected = {
-      ...scope,
-      $or: [
-        { sourceFileIds: { $in: ids }, sourceContentRemovedAt: null },
-        { 'quoteSourceRetention.sourceFileIds': { $in: ids } },
-      ],
-    };
-    const cursor = Message.find(affected).select(privateMessagePaths()).lean().cursor();
-    for await (const initial of cursor) {
-      let row: IMessage | null = initial as IMessage;
-      let settled = false;
-      for (let attempt = 0; attempt < MAX_PROVENANCE_CAS_ATTEMPTS; attempt++) {
-        if (!row) {
-          settled = true;
-          break;
-        }
-        const removeBody =
-          !row.sourceContentRemovedAt && row.sourceFileIds?.some((id) => ids.includes(id));
-        const removeQuotes = row.quoteSourceRetention?.some((binding) =>
-          binding.sourceFileIds.some((id) => ids.includes(id)),
-        );
-        if (!removeBody && !removeQuotes) {
-          settled = true;
-          break;
-        }
-        const quoteFields =
-          row.quoteSourceRetention != null
-            ? filterQuotes(row, (binding) => binding.sourceFileIds.some((id) => ids.includes(id)))
-            : undefined;
-        const replacement: Record<string, unknown> = {
-          ...(removeBody ? removedBody(row as unknown as Record<string, unknown>) : row),
-          ...quoteFields,
-          __v: (row.__v ?? 0) + 1,
-        };
-        // Preserve the existing tenant replacement guard's canonical absence representation.
-        if (replacement.tenantId == null) delete replacement.tenantId;
-        let result = { matchedCount: 0, modifiedCount: 0 };
-        const session = await mongoose.startSession();
-        try {
-          await session.withTransaction(
-            async () => {
-              result = await Message.replaceOne(
-                { _id: row!._id, ...scope, __v: row!.__v ?? null },
-                replacement,
-                { timestamps: false, session },
-              );
-              // Unknown legacy copies can still be physically redacted, but yield no credit.
-              if (result.matchedCount && row!.retainedTextAllocations != null)
-                await accountRetainedMessage(owner, row, row!._id, session);
-            },
-            { readConcern: { level: 'snapshot' }, writeConcern: { w: 'majority' } },
-          );
-        } finally {
-          await session.endSession();
-        }
-        if (result.matchedCount === 1) {
-          redactedMessages += result.modifiedCount;
-          settled = true;
-          break;
-        }
-        row = await Message.findOne({ _id: row._id, ...scope })
-          .select(privateMessagePaths())
-          .lean<IMessage>();
+    let row: IMessage | null = initial as IMessage;
+    let settled = false;
+    for (let attempt = 0; attempt < MAX_PROVENANCE_CAS_ATTEMPTS; attempt++) {
+      budget.remainingMS();
+      if (!row) {
+        settled = true;
+        break;
       }
-      if (!settled) throw new FileSourceUnavailableError();
+      const removeBody =
+        !row.sourceContentRemovedAt && row.sourceFileIds?.some((id) => ids.includes(id));
+      const removeQuotes = row.quoteSourceRetention?.some((binding) =>
+        binding.sourceFileIds.some((id) => ids.includes(id)),
+      );
+      if (!removeBody && !removeQuotes) {
+        settled = true;
+        break;
+      }
+      const quoteFields =
+        row.quoteSourceRetention != null
+          ? filterQuotes(row, (binding) => binding.sourceFileIds.some((id) => ids.includes(id)))
+          : undefined;
+      const replacement: Record<string, unknown> = {
+        ...(removeBody ? removedBody(row as unknown as Record<string, unknown>) : row),
+        ...quoteFields,
+        __v: (row.__v ?? 0) + 1,
+      };
+      // Preserve the existing tenant replacement guard's canonical absence representation.
+      if (replacement.tenantId == null) delete replacement.tenantId;
+      let result = { matchedCount: 0, modifiedCount: 0 };
+      // Reserve native time for the transaction, abort, and session cleanup.
+      const transactionMS = Math.max(1, Math.floor(budget.remainingMS() / 3));
+      const session = await mongoose.startSession({ defaultTimeoutMS: transactionMS });
+      try {
+        await session.withTransaction(
+          async () => {
+            budget.remainingMS();
+            result = await Message.replaceOne(
+              { _id: row!._id, ...scope, __v: row!.__v ?? null },
+              replacement,
+              {
+                timestamps: false,
+                session,
+                maxTimeMS: budget.remainingMS(),
+                signal: budget.signal,
+              },
+            );
+            // Unknown legacy copies can still be physically redacted, but yield no credit.
+            if (result.matchedCount && row!.retainedTextAllocations != null)
+              await accountRetainedMessage(owner, row, row!._id, session);
+            budget.remainingMS();
+          },
+          {
+            readConcern: { level: 'snapshot' },
+            writeConcern: { w: 'majority' },
+            timeoutMS: transactionMS,
+            maxCommitTimeMS: transactionMS,
+          },
+        );
+      } finally {
+        await session.endSession();
+      }
+      budget.remainingMS();
+      if (result.matchedCount === 1) {
+        redactedMessages += result.modifiedCount;
+        settled = true;
+        break;
+      }
+      row = await Message.findOne({ _id: row._id, ...scope })
+        .select(privateMessagePaths())
+        .setOptions(budget.queryOptions())
+        .lean<IMessage>();
     }
-    const detached = await Message.updateMany(
-      {
-        ...scope,
-        $or: [{ 'files.file_id': { $in: ids } }, { 'attachments.file_id': { $in: ids } }],
-      },
-      {
-        $pull: { files: { file_id: { $in: ids } }, attachments: { file_id: { $in: ids } } },
-        $inc: { __v: 1 },
-      },
-      { timestamps: false },
-    );
-    return { redactedMessages, detachedMessages: detached.modifiedCount };
+    if (!settled) throw new FileSourceUnavailableError();
+    return redactedMessages;
   }
+
+  const redactFileSourceContent = createMessageSourceCleanup(mongoose, {
+    privateMessagePaths,
+    redactRow: redactMessageSourceRow,
+  });
 
   /** The API constructs method adapters before it necessarily registers every model. */
   function privateMessagePaths(): string {
@@ -2274,7 +2359,6 @@ export function createMessageMethods(
           metadata.insertOnly === true ||
           !(retention?.sourceExpiresAt instanceof Date) ||
           !Number.isFinite(retention.sourceExpiresAt.getTime()) ||
-          retention.sourceExpiresAt <= new Date() ||
           !Array.isArray(retention.sourceFileIds) ||
           !retention.sourceFileIds.length ||
           sourceCoverage.entries.some((entry) => !retention.sourceFileIds.includes(entry.file_id))

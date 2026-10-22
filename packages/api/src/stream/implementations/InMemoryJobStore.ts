@@ -27,6 +27,11 @@ import type {
   InitialSourcePopulationOptions,
   InitialSourcePopulation,
 } from '~/stream/interfaces/IJobStore';
+import type {
+  GenerationCleanupScope,
+  SourceCleanupProjection,
+  SourceActorSettlement,
+} from '../sourceCleanup';
 import type { EarlyBufferOverflowState } from '../../types/earlyBufferRecovery';
 import type { RecoveredSteerPayload } from '~/stream/SteerRecovery';
 import type { SourceReplayIntent } from '../internal/sourceBudget';
@@ -53,6 +58,13 @@ import {
   createSourceReplayIntent,
   sourceChunkBytes,
 } from '../internal/sourceBudget';
+import {
+  SOURCE_CLEANUP_JOB_FIELDS,
+  SOURCE_CLEANUP_PAGE_SIZE,
+  sourceActorSettlementMatches,
+  sourceCleanupOwnerMatches,
+  sourceCleanupRecoveryEpochs,
+} from '../sourceCleanup';
 import {
   isRecoveredSteerPayload,
   recoveredSteerPayloadMatches,
@@ -1313,6 +1325,77 @@ export class InMemoryJobStore implements IJobStoreV2 {
     return true;
   }
 
+  async getSourceReplayJob(streamId: string): Promise<SerializableJobData | null> {
+    const job = this.jobs.get(streamId);
+    if (!job) return null;
+    return JSON.parse(
+      JSON.stringify(
+        Object.fromEntries(SOURCE_CLEANUP_JOB_FIELDS.map((field) => [field, job[field]])),
+      ),
+    ) as SerializableJobData;
+  }
+
+  async recordSourceActorSettlement(receipt: SourceActorSettlement): Promise<boolean> {
+    const job = this.jobs.get(receipt.streamId);
+    if (!job || !sourceActorSettlementMatches(job, receipt)) return false;
+    job.sourceActorSettlement = JSON.parse(JSON.stringify(receipt));
+    return true;
+  }
+
+  async captureSourceCleanupPage(
+    scope: GenerationCleanupScope,
+    cursor = '0:0',
+  ): Promise<SourceCleanupProjection> {
+    if (!/^[012]:[0-9]{1,10}$/.test(cursor)) throw new Error('generation_cleanup_invalid_cursor');
+    const [phase, offset] = cursor.split(':').map(Number);
+    const keys = scope.tenantId
+      ? [`${scope.tenantId}:${scope.userId}`, scope.userId]
+      : [scope.userId];
+    const jobs: SerializableJobData[] = [];
+    let unresolvedRecovery = false;
+    if (phase >= keys.length) {
+      for (const intent of this.sourceReplayIntents.values()) {
+        if (
+          !sourceCleanupOwnerMatches(intent, scope) ||
+          !intent.sourceFileIds.some((id) => scope.sourceFileIds.includes(id))
+        )
+          continue;
+        const job = await this.getSourceReplayJob(intent.streamId);
+        if (job?.createdAt === intent.createdAt) jobs.push(job);
+        else unresolvedRecovery = true;
+      }
+      return { jobs, complete: true, unresolvedRecovery };
+    }
+    const index = this.userJobMap.get(keys[phase]) ?? new Set<string>();
+    // In-memory is a bounded app/test adapter, never a worker fallback.
+    if (index.size > 10_000) throw new Error('generation_cleanup_index_overflow');
+    const members = [...index].slice(offset, offset + SOURCE_CLEANUP_PAGE_SIZE);
+    for (const streamId of members) {
+      const job = await this.getSourceReplayJob(streamId);
+      if (job && sourceCleanupOwnerMatches(job, scope)) jobs.push(job);
+      const parked = this.parkedSteers.get(streamId);
+      const recovery = [
+        ...(parked ? [JSON.parse(parked.payload)] : []),
+        ...[...(this.steerReceipts.get(streamId)?.values() ?? [])].map((entry) => entry.receipt),
+      ];
+      for (const epoch of sourceCleanupRecoveryEpochs(recovery, scope)) {
+        if (
+          !job ||
+          epoch !== job.createdAt ||
+          !job.sourceRetention?.sourceFileIds.some((id) => scope.sourceFileIds.includes(id))
+        )
+          unresolvedRecovery = true;
+      }
+    }
+    const next = offset + members.length;
+    return {
+      jobs,
+      cursor: next < index.size ? `${phase}:${next}` : `${phase + 1}:0`,
+      complete: false,
+      unresolvedRecovery,
+    };
+  }
+
   async revokeSourceRetention(streamId: string, epoch: number): Promise<boolean> {
     const job = this.jobs.get(streamId);
     if (!job || job.createdAt !== epoch || !job.sourceRetention) return false;
@@ -1363,6 +1446,7 @@ export class InMemoryJobStore implements IJobStoreV2 {
       'completedAt',
       'sourceRetention',
       'sourceRetentionRevokedAt',
+      'sourceActorSettlement',
       'providerExecutionId',
       'providerDrained',
       'sourceReplayIntent',
@@ -1390,7 +1474,11 @@ export class InMemoryJobStore implements IJobStoreV2 {
       job.status !== 'requires_action'
     )
       return this.purgeSourceRetention(streamId, job.createdAt);
-    if (job.sourceReplayIntent) return false;
+    if (
+      job.sourceReplayIntent ||
+      (job.sourceRetentionRevokedAt != null && !job.sourceActorSettlement)
+    )
+      return false;
     this.retainGenerationEpoch(streamId, job.createdAt);
     this.jobs.delete(streamId);
     this.contentState.delete(streamId);

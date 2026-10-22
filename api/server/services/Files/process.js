@@ -27,8 +27,11 @@ const {
   isSpeechProviderConfigured,
   getCustomEndpointProvider,
 } = require('librechat-data-provider');
-const { logger, runAsSystem } = require('@librechat/data-schemas');
+const { logger } = require('@librechat/data-schemas');
 const {
+  requiresLegacyVectorDeletion,
+  fileDeletionWorkOwner,
+  requestManagedFileDeletion,
   sanitizeFilename,
   parseText,
   processAudioFile,
@@ -45,14 +48,10 @@ const {
   sendUploadSuccess,
   getStorageMetadata,
   contentFilterBlockResponse,
-  sweepExpiredFiles: sweepExpiredFilesWithDeps,
-  startExpiredFileSweep: startExpiredFileSweepWithDeps,
-  createExpiredFileSweepRequest,
   resolveToolRoleGrants,
   createCodeApiRateLimitBudget,
   getCodeApiUploadOptions,
   withCodeApiUploadRecovery,
-  isLeader,
   GenerationJobManager,
 } = require('@librechat/api');
 const {
@@ -129,48 +128,57 @@ function enqueueDeleteOperation({
   resolvedFileIds,
   failedFileIds,
   openai,
+  work,
 }) {
   if (checkOpenAIStorage(file.source)) {
     // Enqueue to leaky bucket
     promises.push(
-      new Promise((resolve, reject) => {
-        LB_QueueAsyncCall(
-          () => deleteFile(req, file, openai),
-          [],
-          (err, result) => {
-            if (err) {
-              if (isMissingStorageError(err)) {
-                resolvedFileIds.add(file.file_id);
-                logger.warn('File storage was already missing during delete', err);
-                resolve(result);
-                return;
-              }
-              failedFileIds.add(file.file_id);
-              logger.error('Error deleting file from OpenAI source', err);
-              reject(err);
-            } else {
-              resolvedFileIds.add(file.file_id);
-              resolve(result);
-            }
-          },
-        );
-      }),
+      work.queued(
+        (dispatched) =>
+          new Promise((resolve, reject) => {
+            LB_QueueAsyncCall(
+              () => {
+                dispatched();
+                return deleteFile(req, file, openai);
+              },
+              [],
+              (err, result) => {
+                if (err) {
+                  if (isMissingStorageError(err)) {
+                    resolvedFileIds.add(file.file_id);
+                    logger.warn('File storage was already missing during delete', err);
+                    resolve(result);
+                    return;
+                  }
+                  failedFileIds.add(file.file_id);
+                  logger.error('Error deleting file from OpenAI source', err);
+                  reject(err);
+                } else {
+                  resolvedFileIds.add(file.file_id);
+                  resolve(result);
+                }
+              },
+            );
+          }),
+      ),
     );
   } else {
     // Add directly to promises
     promises.push(
-      deleteFile(req, file)
-        .then(() => resolvedFileIds.add(file.file_id))
-        .catch((err) => {
-          if (isMissingStorageError(err)) {
-            resolvedFileIds.add(file.file_id);
-            logger.warn('File storage was already missing during delete', err);
-            return;
-          }
-          failedFileIds.add(file.file_id);
-          logger.error('Error deleting file', err);
-          return Promise.reject(err);
-        }),
+      work.effect(() =>
+        deleteFile(req, file)
+          .then(() => resolvedFileIds.add(file.file_id))
+          .catch((err) => {
+            if (isMissingStorageError(err)) {
+              resolvedFileIds.add(file.file_id);
+              logger.warn('File storage was already missing during delete', err);
+              return;
+            }
+            failedFileIds.add(file.file_id);
+            logger.error('Error deleting file', err);
+            return Promise.reject(err);
+          }),
+      ),
     );
   }
 }
@@ -189,10 +197,23 @@ const getDeleteMethod = ({ source, deletionMethods }) => {
   return deleteFile;
 };
 
-const createDeleteFileWithSecondaryStorage = ({ source, deleteFile, deletionMethods }) => {
+const createDeleteFileWithSecondaryStorage = ({
+  source,
+  deleteFile,
+  deletionMethods,
+  managedRetrievalSettled = false,
+  work,
+}) => {
   return async (req, file, openai) => {
     const secondaryDeleteMethods = [];
-    if (file.embedded === true && source !== FileSources.vectordb) {
+    if (
+      requiresLegacyVectorDeletion({
+        embedded: file.embedded,
+        source,
+        vectorSource: FileSources.vectordb,
+        managedRetrievalSettled,
+      })
+    ) {
       secondaryDeleteMethods.push(
         getDeleteMethod({ source: FileSources.vectordb, deletionMethods }),
       );
@@ -212,9 +233,25 @@ const createDeleteFileWithSecondaryStorage = ({ source, deleteFile, deletionMeth
       logger.warn('Primary file storage was already missing during delete', err);
     }
 
-    await Promise.all(
-      secondaryDeleteMethods.map((secondaryDeleteFile) => secondaryDeleteFile(req, file)),
+    let failed = false;
+    let firstFailure;
+    await Promise.allSettled(
+      secondaryDeleteMethods.map((secondaryDeleteFile) =>
+        Promise.resolve()
+          .then(() => secondaryDeleteFile(req, file))
+          .catch((error) => {
+            // Preserve the original first rejection while joining every started effect.
+            // A later unknown failure still matters even if the first was legacy absence.
+            if (!isMissingStorageError(error)) work.markUncertain();
+            if (!failed) {
+              failed = true;
+              firstFailure = error;
+            }
+            throw error;
+          }),
+      ),
     );
+    if (failed) throw firstFailure;
   };
 };
 
@@ -234,82 +271,47 @@ const createDeleteFileWithSecondaryStorage = ({ source, deleteFile, deletionMeth
  * @returns {Promise<{ deletedFileIds: string[], failedFileIds: string[] }>}
  * @throws {Error} When storage deletion cannot be scheduled or file metadata cleanup fails.
  */
-const processDeleteRequest = async ({ req, files }) => {
+const processDeleteRequest = ({ req, files, work }) =>
+  fileDeletionWorkOwner.run(async (scope) => {
+    const { pendingManagedFileIds, ...result } = await performDeleteRequest({
+      req,
+      files,
+      work: scope,
+    });
+    if (
+      result.failedFileIds.some((id) => !pendingManagedFileIds.includes(id)) ||
+      files.some(
+        (file) =>
+          !result.deletedFileIds.includes(file.file_id) &&
+          !pendingManagedFileIds.includes(file.file_id),
+      )
+    ) {
+      scope.markUncertain();
+    }
+    return result;
+  }, work);
+
+const performDeleteRequest = async ({ req, files, work }) => {
   const appConfig = req.config;
   const { assistant_id, tool_resource } = req.body ?? {};
   const owner = { userId: req.user?.id, tenantId: req.user?.tenantId };
-  // Composition is initialized before the sole File sweep. Lazy lookup avoids a
-  // second lifecycle registry and the Uploads -> Files composition cycle.
-  const uploadCleanup = require('~/server/services/Uploads').getUploadRuntime()?.cleanup;
-  const uploadTasks = new Map();
-  const uploadProofs = new Map();
-  const begunFileIds = new Set();
-  for (const file of files) {
-    const task = uploadCleanup && (await uploadCleanup.beginFileDeletion(owner, file.file_id));
-    begunFileIds.add(file.file_id);
-    if (task) uploadTasks.set(file.file_id, task);
-    else if (file.uploadOperationId) throw new Error('MANAGED_UPLOAD_CLEANUP_UNAVAILABLE');
-  }
-  const requestedManagedIds = files
-    .filter((file) => file.retentionAcceptedAt != null || uploadTasks.has(file.file_id))
+  const managedIds = files
+    .filter((file) => file.retentionAcceptedAt != null || file.uploadOperationId != null)
     .map((file) => file.file_id);
-  let managedIds = requestedManagedIds;
-  const pendingManagedFiles = new Map();
-  let replayComplete = true;
-  let alreadyCompleted = [];
-  if (managedIds.length > 0) {
-    const revoked = await db.revokeFileSources(owner, managedIds);
-    if (
-      !Array.isArray(revoked?.revokedFileIds) ||
-      revoked.revokedFileIds.some((id) => typeof id !== 'string' || !id) ||
-      requestedManagedIds.some((id) => !revoked.revokedFileIds.includes(id))
-    ) {
-      throw new Error('MANAGED_FILE_REVOKE_UNCONFIRMED');
-    }
-    managedIds = [...new Set(revoked.revokedFileIds)];
-    // The atomic File fence includes every descendant. Fence all corresponding
-    // Upload operations before generation, provider or physical cleanup work.
-    for (const id of managedIds) {
-      if (begunFileIds.has(id)) continue;
-      const task = uploadCleanup && (await uploadCleanup.beginFileDeletion(owner, id));
-      begunFileIds.add(id);
-      if (task) uploadTasks.set(id, task);
-    }
-    // Ordinary reads hide revoked content. This owner alone can recover locators
-    // and private lineage, including descendants absent from the request.
-    const pending = await db.getFileSourceDeletionCandidates(owner, managedIds);
-    for (const file of pending) {
-      if (!managedIds.includes(file.file_id)) throw new Error('MANAGED_FILE_REVOKE_UNCONFIRMED');
-      if (file.uploadOperationId && !uploadTasks.has(file.file_id))
-        throw new Error('MANAGED_UPLOAD_CLEANUP_UNAVAILABLE');
-      pendingManagedFiles.set(file.file_id, file);
-    }
-    const receipt = await GenerationJobManager.revokeFileSourceGenerations(owner, managedIds);
-    replayComplete =
-      receipt?.complete === true && Array.isArray(receipt.pending) && receipt.pending.length === 0;
-    if (replayComplete) {
-      try {
-        const purgeCheckpoints = require('@librechat/api').purgeFileSourceCheckpoints;
-        if (typeof purgeCheckpoints !== 'function') throw new Error('Checkpoint purge unavailable');
-        const purge = purgeCheckpoints(
-          owner,
-          managedIds,
-          appConfig?.endpoints?.agents?.checkpointer,
-        );
-        if (purge == null || typeof purge.then !== 'function' || (await purge) !== undefined)
-          throw new Error('Checkpoint purge unconfirmed');
-      } catch {
-        replayComplete = false;
-        logger.warn('Managed checkpoint cleanup remains unconfirmed after source revocation');
-      }
-    }
-    await db.redactFileSourceContent(owner, managedIds);
-    const pendingIds = new Set(pending.map((file) => file.file_id));
-    alreadyCompleted = managedIds.filter((id) => !pendingIds.has(id));
-    files = [...files.filter((file) => !managedIds.includes(file.file_id)), ...pending];
-  }
-  const resolvedFileIds = new Set(alreadyCompleted);
-  const failedFileIds = new Set();
+  const managed = await requestManagedFileDeletion(
+    { owner, fileIds: managedIds, work },
+    {
+      revokeFileSources: db.revokeFileSources,
+      revokeFileSourceGenerations: (scope, ids) =>
+        GenerationJobManager.revokeFileSourceGenerations(scope, ids),
+      assertFileSourceDeletionReady: db.assertFileSourceDeletionReady,
+      observeFileCleanupCompletion: db.observeFileCleanupCompletion,
+      removeAgentResourceFilesFromAllAgents: db.removeAgentResourceFilesFromAllAgents,
+    },
+  );
+  files = files.filter((file) => !managedIds.includes(file.file_id));
+  const resolvedFileIds = new Set();
+  const failedFileIds = new Set(managed.failedFileIds);
   const deletionMethods = {};
   const promises = [];
 
@@ -341,9 +343,8 @@ const processDeleteRequest = async ({ req, files }) => {
 
   for (const file of files) {
     const source = file.source ?? FileSources.local;
-    const uploadTask = uploadTasks.get(file.file_id);
 
-    if (source === FileSources.text && !uploadTask) {
+    if (source === FileSources.text) {
       resolvedFileIds.add(file.file_id);
       continue;
     }
@@ -356,210 +357,67 @@ const processDeleteRequest = async ({ req, files }) => {
 
     if (assistant_id && tool_resource) {
       promises.push(
-        deleteResourceFileId({
-          req,
-          openai,
-          file_id: file.file_id,
-          assistant_id,
-          tool_resource,
-        }),
+        work.effect(() =>
+          deleteResourceFileId({
+            req,
+            openai,
+            file_id: file.file_id,
+            assistant_id,
+            tool_resource,
+          }),
+        ),
       );
     } else if (assistant_id) {
-      promises.push(openai.beta.assistants.files.del(assistant_id, file.file_id));
+      promises.push(
+        work.effect(() => openai.beta.assistants.files.del(assistant_id, file.file_id)),
+      );
     }
 
-    const deleteFile = uploadTask
-      ? async () => {
-          const proof = await uploadCleanup.removeFileOriginal(uploadTask);
-          if (!proof.writerStopped || !proof.originalAbsent)
-            throw new Error('MANAGED_UPLOAD_CLEANUP_PENDING');
-          uploadProofs.set(file.file_id, proof);
-        }
-      : getDeleteMethod({ source, deletionMethods });
+    const deleteFile = getDeleteMethod({ source, deletionMethods });
     enqueueDeleteOperation({
       req,
       file,
-      deleteFile: createDeleteFileWithSecondaryStorage({ source, deleteFile, deletionMethods }),
+      deleteFile: createDeleteFileWithSecondaryStorage({
+        source,
+        deleteFile,
+        deletionMethods,
+        managedRetrievalSettled: false,
+        work,
+      }),
       promises,
       resolvedFileIds,
       failedFileIds,
       openai,
+      work,
     });
-  }
-
-  // A completed File tombstone may outlive a lost quota-confirmation reply.
-  // Retry physical proof through the managed adapter, never the legacy marker delete.
-  for (const fileId of alreadyCompleted) {
-    const task = uploadTasks.get(fileId);
-    if (!task) continue;
-    promises.push(
-      uploadCleanup
-        .removeFileOriginal(task)
-        .then((proof) => {
-          if (!proof.writerStopped || !proof.originalAbsent)
-            throw new Error('MANAGED_UPLOAD_CLEANUP_PENDING');
-          uploadProofs.set(fileId, proof);
-        })
-        .catch((error) => {
-          failedFileIds.add(fileId);
-          throw error;
-        }),
-    );
   }
 
   await Promise.allSettled(promises);
   const deletedFileIds = [...resolvedFileIds];
-  const metadataDeletedFileIds = new Set();
-  const failManagedFile = (fileId) => {
-    failedFileIds.add(fileId);
-    const pending = pendingManagedFiles.get(fileId);
-    // A finalized replay row no longer supplies private lineage. Confirm it
-    // first; an unknown acknowledgement conservatively holds every requested root.
-    const ancestors = pending
-      ? (pending.derivedOrigin?.ancestors ?? []).map((source) => source.subject.operationId)
-      : requestedManagedIds;
-    for (const id of ancestors) {
-      if (managedIds.includes(id)) failedFileIds.add(id);
-    }
-  };
-  for (const id of managedIds) {
-    if (!replayComplete || failedFileIds.has(id)) failManagedFile(id);
-  }
-
-  const ordinaryIds = deletedFileIds.filter((id) => !managedIds.includes(id));
+  const metadataDeletedFileIds = new Set(managed.deletedFileIds);
+  const ordinaryIds = deletedFileIds;
   if (ordinaryIds.length > 0) {
     try {
-      await db.deleteFiles(ordinaryIds);
+      await work.effect(() => db.deleteFiles(ordinaryIds));
       ordinaryIds.forEach((id) => metadataDeletedFileIds.add(id));
     } catch (error) {
       logger.error('Error deleting file metadata after storage deletion', error);
       throw error;
     }
     try {
-      await db.removeAgentResourceFilesFromAllAgents({ file_ids: ordinaryIds });
+      await work.effect(() => db.removeAgentResourceFilesFromAllAgents({ file_ids: ordinaryIds }));
     } catch (error) {
       ordinaryIds.forEach((id) => failedFileIds.add(id));
       logger.error('Error cleaning up orphaned agent file references', error);
     }
   }
 
-  // Prepare deepest descendants without discarding lineage. Only an acknowledged
-  // Upload cleanup permits final completion; unknown replies remain discoverable.
-  const depth = (id) => {
-    const pending = pendingManagedFiles.get(id);
-    return pending ? (pending.derivedOrigin?.ancestors.length ?? 0) : Infinity;
-  };
-  const depths = [...new Set(managedIds.map(depth))].sort((a, b) => b - a);
-  for (const level of depths) {
-    const ids = managedIds.filter(
-      (id) => depth(id) === level && resolvedFileIds.has(id) && !failedFileIds.has(id),
-    );
-    if (!ids.length) continue;
-    let prepared;
-    try {
-      const result = await db.prepareFileSourceDeletion(owner, ids);
-      prepared = ids.filter((id) => result.preparedFileIds.includes(id));
-      for (const id of ids) {
-        if (!prepared.includes(id)) failManagedFile(id);
-      }
-    } catch (error) {
-      logger.error('Error deleting file metadata after storage deletion', error);
-      throw error;
-    }
-    if (!prepared.length) continue;
-    try {
-      await db.removeAgentResourceFilesFromAllAgents({ file_ids: prepared });
-    } catch (error) {
-      prepared.forEach(failManagedFile);
-      logger.error('Error cleaning up orphaned agent file references', error);
-      continue;
-    }
-    const confirmed = [];
-    for (const fileId of prepared) {
-      const task = uploadTasks.get(fileId);
-      try {
-        if (task) {
-          const proof = uploadProofs.get(fileId);
-          if (!proof) throw new Error('MANAGED_UPLOAD_CLEANUP_PENDING');
-          await uploadCleanup.finishFileDeletion(task, proof);
-        }
-        confirmed.push(fileId);
-      } catch (error) {
-        failManagedFile(fileId);
-        logger.error('Error confirming managed file resource cleanup', error);
-      }
-    }
-    if (!confirmed.length) continue;
-    const result = await db.finalizeFileSourceDeletion(owner, confirmed);
-    for (const fileId of confirmed) {
-      if (result.completedFileIds.includes(fileId)) metadataDeletedFileIds.add(fileId);
-      else failManagedFile(fileId);
-    }
-  }
   return {
-    deletedFileIds: [...metadataDeletedFileIds].filter(
-      (id) => !managedIds.includes(id) || !failedFileIds.has(id),
-    ),
+    deletedFileIds: [...metadataDeletedFileIds],
     failedFileIds: [...failedFileIds],
+    pendingManagedFileIds: managed.pendingManagedFileIds,
   };
 };
-
-/**
- * Deletes expired file storage before removing the corresponding File records.
- *
- * Mongo TTL indexes delete only the metadata document, so file retention uses
- * this application sweep for records with `expiredAt` instead.
- *
- * @param {object} params
- * @param {AppConfig} params.appConfig
- * @param {number} [params.limit]
- * @param {() => Promise<AppConfig>} [params.loadAppConfig]
- * @returns {Promise<{ scanned: number, deleted: number, failed: number }>}
- */
-async function sweepExpiredFiles(options = {}) {
-  return sweepExpiredFilesWithDeps(options, {
-    getExpiredFiles: db.getExpiredFiles,
-    processDeleteRequest,
-    incrementFileDeletionAttempts: db.incrementFileDeletionAttempts,
-    deferExpiredFile: db.deferExpiredFile,
-    sweepManagedUploads: async () => {
-      const cleanup = require('~/server/services/Uploads').getUploadRuntime()?.cleanup;
-      if (!cleanup) return { scanned: 0, cleaned: 0, pending: 0 };
-      return cleanup.sweep({
-        limit: Math.min(options.limit ?? 100, 100),
-        deleteAcceptedFile: async (task) => {
-          const file = {
-            file_id: task.fileId,
-            source: task.original?.source,
-            user: task.principal.userId,
-            tenantId: task.principal.tenantId,
-          };
-          const appConfig = options.appConfig ?? (await options.loadAppConfig?.()) ?? {};
-          const req = createExpiredFileSweepRequest({
-            appConfig,
-            file,
-            userId: task.principal.userId,
-          });
-          const result = await processDeleteRequest({ req, files: [file] });
-          return (
-            result.deletedFileIds.includes(task.fileId) &&
-            !result.failedFileIds.includes(task.fileId)
-          );
-        },
-      });
-    },
-    logger,
-  });
-}
-
-function startExpiredFileSweep(options = {}) {
-  return startExpiredFileSweepWithDeps(options, {
-    sweepExpiredFiles,
-    runAsSystem,
-    isLeader,
-    logger,
-  });
-}
 
 /**
  * Processes a file URL using a specified file handling strategy. This function accepts a strategy name,
@@ -1934,8 +1792,6 @@ module.exports = {
   saveBase64Image,
   processImageFile,
   uploadImageBuffer,
-  sweepExpiredFiles,
-  startExpiredFileSweep,
   processFileUpload,
   processDeleteRequest,
   processAgentFileUpload,

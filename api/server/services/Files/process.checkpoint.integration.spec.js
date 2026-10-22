@@ -1,16 +1,23 @@
 /**
  * Built-API deletion composition with real Mongo/File accounting and generation drain.
- * Existing retained originals, lineage and opaque checkpoint rows are synthetic fixtures;
- * only physical byte deletion is simulated. No positive upload, source writer or model runs.
+ * Existing originals, lineage, checkpoint rows and external census receipts are synthetic;
+ * physical byte deletion is simulated. No positive upload, source writer or model runs.
  */
 const mongoose = require('mongoose');
-const { createHash } = require('node:crypto');
+const { createHash, randomUUID } = require('node:crypto');
 const { join, resolve, isAbsolute } = require('node:path');
 const { mkdir, mkdtemp, rm, realpath } = require('node:fs/promises');
 const { MongoMemoryReplSet } = require('mongodb-memory-server');
 const schemas = require('@librechat/data-schemas');
 const api = require('@librechat/api');
-const { FileSources, readUploadDerivedOrigin } = require('librechat-data-provider');
+const {
+  createSourceReplayIntent,
+} = require('../../../../packages/api/src/stream/internal/sourceBudget');
+const {
+  captureManagedRetrievalInventoryEvidence,
+  issueManagedRetrievalInventory,
+} = require('../../../../packages/data-schemas/src/methods/fileRetrieval');
+const { FileSources, readHistoricalUploadDerivedOrigin } = require('librechat-data-provider');
 
 // These adapters belong to unrelated upload/provider paths. None may be invoked here.
 jest.mock('~/server/services/Files/images', () => ({}));
@@ -25,9 +32,13 @@ jest.mock('~/server/services/Files/Audio/STTService', () => ({}));
 jest.mock('~/server/services/Uploads', () => ({ getUploadRuntime: () => undefined }));
 jest.mock('~/server/services/Files/strategies', () => ({ getStrategyFunctions: jest.fn() }));
 // Preserve the real File, Message and Agent methods while excluding unrelated app composition.
-jest.mock('~/models', () => require('@librechat/data-schemas').createMethods(require('mongoose')));
+jest.mock('~/models', () => {
+  const schema = require('@librechat/data-schemas');
+  const connection = require('mongoose');
+  schema.createModels(connection);
+  return schema.createMethods(connection);
+});
 
-schemas.createModels(mongoose);
 const db = require('~/models');
 const { getStrategyFunctions } = require('./strategies');
 const { processDeleteRequest } = require('./process');
@@ -94,7 +105,7 @@ function canonical(value) {
 }
 
 function origin(ids, direct, expiresAt) {
-  const result = readUploadDerivedOrigin({
+  const result = readHistoricalUploadDerivedOrigin({
     version: 1,
     binding: { purpose: 'workspace-draft', sourceId: 'synthetic-workspace', sourceRevision: 0 },
     directSourceFileIds: [direct],
@@ -118,9 +129,9 @@ function origin(ids, direct, expiresAt) {
 async function seedCheckpoint(name, fileId, scope, expiresAt) {
   const prefix = api.checkpointOwnerNamespacePrefix(scope.userId, scope.tenantId);
   const value = {
-    version: 1,
+    version: 2,
     owner: scope,
-    files: [{ fileId, approvalSha256: 'a'.repeat(64), expiresAt }],
+    files: [{ fileId, bindingSha256: 'a'.repeat(64), expiresAt }],
     messages: [],
     expiresAt,
   };
@@ -177,17 +188,91 @@ async function seedFixture({ holdPhysical = false } = {}) {
       { retention: { acceptedAt: new Date(Date.now() - 1000), expiredAt: new Date(expires) } },
     );
   }
+  // Already-migrated legacy cleanup custody has no live Upload receipt authority.
+  // Re-entry retains the current deadline record and the original revocation identity.
+  const trackedSince = new Date();
+  for (const fileId of [...targets, 'unrelated', 'foreign']) {
+    await mongoose.models.File.collection.updateOne(
+      { file_id: fileId },
+      {
+        $set: {
+          retentionActivity: {
+            version: 1,
+            baselineDeadlineAt: new Date(expires),
+            trackedSince,
+            historyConfidence: 'since-tracking',
+            readCount: 0,
+            processingCount: 0,
+            deadlineGeneration: 0,
+          },
+          ...(targets.includes(fileId)
+            ? { deletionRequestedAt: trackedSince, retentionRevocationId: randomUUID() }
+            : {}),
+        },
+      },
+    );
+  }
   for (const [fileId, ancestors, direct] of [
     ['child', ['root'], 'root'],
     ['leaf', ['root', 'child'], 'child'],
   ]) {
     await mongoose.models.File.collection.updateOne(
       { file_id: fileId },
-      { $set: { derivedOrigin: origin(ancestors, direct, expires) } },
+      {
+        $set: {
+          derivedOrigin: origin(ancestors, direct, expires),
+          derivedRetention: {
+            version: 1,
+            ownDeadlineAt: new Date(expires),
+            capBasis: 'legacy-baseline',
+            trackedSince,
+            deadlineGeneration: 0,
+          },
+        },
+        $unset: { retentionActivity: '' },
+      },
     );
   }
   const rows = [];
   for (const fileId of [...targets, 'unrelated', 'foreign']) {
+    // Explicit historical census fixture: absence of an Upload runtime is no inventory proof.
+    const file = await rawFile(fileId);
+    const evidence = captureManagedRetrievalInventoryEvidence(file);
+    const observedAt = Date.now();
+    const backend = {
+      backendIdentity: 'synthetic-retired-backend',
+      owner: evidence.owner,
+      fileId,
+      evidenceSha256: evidence.evidenceSha256,
+      observedAt,
+      complete: true,
+      obligations: [],
+    };
+    const inventoryReceiptSha256 = createHash('sha256').update(canonical(backend)).digest('hex');
+    const inventory = issueManagedRetrievalInventory(
+      file,
+      {
+        reconciliationId: 'synthetic-checkpoint-census',
+        storeId: 'synthetic-retired-store',
+        revision: 0,
+        observedAt,
+        owner: evidence.owner,
+        fileId,
+        evidenceSha256: evidence.evidenceSha256,
+        backends: [{ ...backend, inventoryReceiptSha256 }],
+      },
+      {
+        topologySha256: '1'.repeat(64),
+        writers: [
+          { writerId: 'synthetic-retired-writer', retirementReceiptSha256: '2'.repeat(64) },
+        ],
+        backends: [{ backendIdentity: backend.backendIdentity, inventoryReceiptSha256 }],
+      },
+    );
+    await mongoose.models.File.collection.updateOne(
+      { file_id: fileId },
+      { $set: { managedRetrieval: inventory } },
+    );
     for (const name of collections) {
       rows.push(
         await seedCheckpoint(
@@ -250,12 +335,37 @@ async function seedFixture({ holdPhysical = false } = {}) {
   await manager.createJob('unrelated-stream', owner.userId, 'unrelated-conversation', {
     trustedTenantId: owner.tenantId,
   });
-  expect(
-    await manager.bindSourceRetention(job.streamId, job.createdAt, {
-      sourceFileIds: ['root'],
-      sourceExpiresAt: new Date(expires),
-    }),
-  ).toBe(true);
+  // Restore an existing charged replay obligation through its canonical store identity.
+  // Cleanup must not perform new live source admission for these historical rows.
+  const persistedJob = await store.getJob(job.streamId);
+  expect(persistedJob).not.toBeNull();
+  const retained = await store.prepareSourceReplay(
+    createSourceReplayIntent(persistedJob, ['root'], expires),
+  );
+  const receiptBytes = 256; // Existing File reservation receipt charge, retained until File cleanup.
+  await mongoose.models.File.collection.updateOne(
+    { file_id: 'root' },
+    {
+      $inc: { retainedDerivativeBytes: retained.receipt.bytes + receiptBytes },
+      $push: {
+        retainedDerivativeReservations: {
+          reservationId: retained.receipt.reservationId,
+          bytes: retained.receipt.bytes,
+          state: 'held',
+        },
+      },
+    },
+  );
+  await mongoose.models.UploadCounter.collection.updateOne(
+    { _id: 'global' },
+    {
+      $inc: {
+        'value.textBytes': retained.receipt.bytes + receiptBytes,
+        'value.baseline.textBytes': retained.receipt.bytes + receiptBytes,
+      },
+    },
+  );
+  expect(await store.commitSourceReplay(retained)).toBe(true);
   const executionId = job.metadata.providerExecutionId;
   expect(await manager.beginProviderExecution(job.streamId, job.createdAt, executionId)).toBe(true);
   const aborted = barrier();
@@ -349,6 +459,7 @@ beforeAll(async () => {
     replSet: { count: 1, storageEngine: 'wiredTiger' },
   });
   await mongoose.connect(mongo.getUri('files_checkpoint_composition'));
+  schemas.createModels(mongoose);
   await Promise.all(Object.values(mongoose.models).map((model) => model.init()));
 }, 60000);
 
@@ -358,7 +469,7 @@ beforeEach(async () => {
   provider = undefined;
   events = [];
   removedOriginals = new Set();
-  // Only this isolated fixture counter admits the real initial replay reservation.
+  // Only this isolated fixture counter restores the existing replay liability.
   // No application feature flag or positive checkpoint writer is enabled.
   await schemas
     .createUploadManagementRepository(mongoose, { enabled: true, reconciled: true })

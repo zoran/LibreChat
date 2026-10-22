@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef } from 'react';
 import { v4 } from 'uuid';
 import { useToastContext } from '@librechat/client';
+import { useQueryClient } from '@tanstack/react-query';
 import {
   dataService,
   EToolResources,
@@ -24,7 +25,12 @@ import {
   removeTabAttachmentPresence,
   retainFileDeletion,
 } from '~/utils';
-import { useDeleteFilesMutation, useGetFiles } from '~/data-provider';
+import {
+  createManagedFileReadAction,
+  readManagedFile,
+  refreshManagedFileProjection,
+} from '~/data-provider/Files/managedRead';
+import { useDeleteFilesMutation, useGetFiles, useGetStartupConfig } from '~/data-provider';
 import { useChatSettings } from '~/Providers/ChatSettingsContext';
 import { useChatContext, useChatFormContext } from '~/Providers';
 import useFileUploadRouter from './useFileUploadRouter';
@@ -61,6 +67,16 @@ export default function usePastedTextEdit({
   const localize = useLocalize();
   const { showToast } = useToastContext();
   const { user } = useAuthContext();
+  const queryClient = useQueryClient();
+  const { data: startup } = useGetStartupConfig();
+  const managed = startup?.authMode !== undefined && startup.authMode !== 'default';
+  const readIdentity = JSON.stringify([user?.tenantId, user?.id]);
+  const reads = useRef({
+    identity: readIdentity,
+    actions: new Map<string, ReturnType<typeof createManagedFileReadAction>>(),
+  });
+  if (reads.current.identity !== readIdentity)
+    reads.current = { identity: readIdentity, actions: new Map() };
   const { conversation, isSubmitting } = useChatContext();
   const methods = useChatFormContext();
   const routeFiles = useFileUploadRouter();
@@ -127,7 +143,21 @@ export default function usePastedTextEdit({
        * remaining source. */
       if (user?.id != null && (file.type ?? '').startsWith('text/')) {
         try {
-          const response = await dataService.getFileDownload(user.id, file.file_id);
+          let action = reads.current.actions.get(file.file_id);
+          if (!action || action.completed) {
+            action = createManagedFileReadAction();
+            reads.current.actions.set(file.file_id, action);
+          }
+          const response = managed
+            ? await readManagedFile(action, {
+                userId: user.id,
+                tenantId: user.tenantId,
+                fileId: file.file_id,
+                representation: 'original',
+                read: (options) => dataService.getFileDownload(user.id, file.file_id, options),
+              })
+            : await dataService.getFileDownload(user.id, file.file_id);
+          if (managed) await refreshManagedFileProjection(queryClient, file.file_id);
           const downloaded = await response.data.text();
           if (downloaded !== '') {
             return downloaded;
@@ -138,7 +168,7 @@ export default function usePastedTextEdit({
       }
       return null;
     },
-    [fileList, user?.id],
+    [fileList, user?.id, user?.tenantId, managed, queryClient],
   );
 
   /** Whether a file is still one of this composer's unsent chips. The map is not always keyed by

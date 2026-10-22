@@ -10,12 +10,15 @@ export * from './theme';
 export * from './langchain';
 export * from './filters';
 export * from './file-config';
+export * from './resource-ownership';
 export * from './upload-management';
 export * from './upload-intake';
 export * from './upload-intake-recovery';
 export * from './upload-security';
 export * from './upload-security-dispatch';
 export * from './document-structure';
+export * from './managed-retrieval';
+export * from './managed-retrieval-operations';
 export * from './source-coverage';
 export * from './upload-view';
 export * from './email-code';
@@ -53,6 +56,7 @@ export * from './types/content';
 export * from './types/tools';
 export * from './types/files';
 export * from './file-library';
+export * from './file-read';
 export * from './types/mcpServers';
 export * from './types/mutations';
 export * from './types/queries';
@@ -123,3 +127,25 @@ export * from './types/scheduleConsent';
 export * from './approval';
 export * from './upload-derived';
 export type * from './document-workspace';
+export * from './storage-deletion';
+
+export { canonicalSourceIds, generationCleanupEvidenceMatchesTarget } from './source-cleanup';
+export type {
+  GenerationCleanupScope,
+  GenerationCleanupTarget,
+  SourceActorSettlement,
+  GenerationCleanupEvidence,
+  GenerationCleanupResult,
+  GenerationCleanupPage,
+  GenerationCleanupPort,
+} from './source-cleanup';
+
+export { HOUSEKEEPING_HANDLERS, STATUS_HOUSEKEEPING_LIMITS } from './status-housekeeping';
+export type {
+  HousekeepingHandler,
+  StatusHousekeeping,
+  StatusHousekeepingObservation,
+  StatusHousekeepingInstance,
+  StatusHousekeepingSlot,
+  StatusHousekeepingHandler,
+} from './status-housekeeping';

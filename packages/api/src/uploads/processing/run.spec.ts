@@ -1,10 +1,11 @@
-import { documentResultFixture } from './result.helper';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { createHash } from 'node:crypto';
+import { performance } from 'node:perf_hooks';
 import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import type { UploadProcessingInput } from 'librechat-data-provider';
 import type { S3Client } from '@aws-sdk/client-s3';
+import { documentResultFixture } from './result.helper';
 import { createManagedS3Storage } from '../storage';
 import { processNextManagedUpload } from './run';
 import { IsolatedDocumentError } from './client';
@@ -286,7 +287,12 @@ describe('one managed processing claim', () => {
         textAndHistoryRemoved: false,
       }),
     );
-    expect(observe).toHaveBeenCalledTimes(2);
+    expect(observe).toHaveBeenCalledTimes(3);
+    expect(observe).toHaveBeenCalledWith({
+      stage: 'extract',
+      outcome: 'success',
+      seconds: expect.any(Number),
+    });
     expect(observe).toHaveBeenCalledWith({
       stage: 'processing',
       seconds: expect.any(Number),
@@ -299,7 +305,11 @@ describe('one managed processing claim', () => {
     const deps = fixture(
       jest.fn().mockRejectedValue(new IsolatedDocumentError('parser_unavailable', false)),
     );
-    await processNextManagedUpload(deps as never, new AbortController().signal);
+    const observe = jest.fn();
+    await processNextManagedUpload({ ...deps, observe } as never, new AbortController().signal);
+    expect(observe.mock.calls.filter(([event]) => event.stage === 'extract')).toEqual([
+      [{ stage: 'extract', outcome: 'unknown' }],
+    ]);
     expect(deps.management.publish).not.toHaveBeenCalled();
     expect(deps.management.confirmCleanup).not.toHaveBeenCalled();
     expect(deps.documents.cancel).toHaveBeenCalledWith(expect.objectContaining({ execution }));
@@ -310,7 +320,11 @@ describe('one managed processing claim', () => {
       jest.fn().mockRejectedValue(new IsolatedDocumentError('parser_unavailable', false)),
     );
     deps.documents.cancel.mockResolvedValueOnce({ writerStopped: true });
-    await processNextManagedUpload(deps as never, new AbortController().signal);
+    const observe = jest.fn();
+    await processNextManagedUpload({ ...deps, observe } as never, new AbortController().signal);
+    expect(observe.mock.calls.filter(([event]) => event.stage === 'extract')).toEqual([
+      [{ stage: 'extract', outcome: 'failure', seconds: expect.any(Number) }],
+    ]);
     expect(deps.management.confirmCleanup).toHaveBeenCalledWith(
       expect.objectContaining({ writerStopped: true, localCopiesAbsent: true }),
     );
@@ -325,7 +339,9 @@ describe('one managed processing claim', () => {
       new Error('unknown bind result') as never,
     );
     deps.documents.cancel.mockResolvedValueOnce({ writerStopped: true });
-    await processNextManagedUpload(deps as never, new AbortController().signal);
+    const observe = jest.fn();
+    await processNextManagedUpload({ ...deps, observe } as never, new AbortController().signal);
+    expect(observe).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'extract' }));
     expect(deps.documents.extract).not.toHaveBeenCalled();
     expect(deps.documents.cancel).toHaveBeenCalled();
   });
@@ -366,7 +382,7 @@ describe('one managed processing claim', () => {
       textAndHistoryRemoved: false,
     });
     expect(deps.storage.remove).not.toHaveBeenCalled();
-    expect(observe).toHaveBeenCalledTimes(1);
+    expect(observe).toHaveBeenCalledTimes(2);
     expect(observe).toHaveBeenCalledWith({
       stage: 'processing',
       seconds: expect.any(Number),
@@ -393,9 +409,59 @@ describe('one managed processing claim', () => {
       expect(deps.management.confirmCleanup).toHaveBeenCalledWith(
         expect.objectContaining({ textAndHistoryRemoved: false, originalAbsent: false }),
       );
+      expect(observe.mock.calls.filter(([event]) => event.stage === 'extract')).toEqual([
+        [{ stage: 'extract', outcome: 'success', seconds: expect.any(Number) }],
+      ]);
       expect(observe).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'total' }));
     },
   );
+  it('measures the extraction call separately from publication and cleanup', async () => {
+    let tick = 1_000;
+    const descriptor = Object.getOwnPropertyDescriptor(performance, 'now');
+    Object.defineProperty(performance, 'now', { configurable: true, value: () => tick });
+    try {
+      const deps = fixture(
+        jest.fn(async () => {
+          tick = 3_000;
+          return { ...documentResultFixture(), writerStopped: true as const };
+        }),
+      );
+      deps.management.publish.mockImplementationOnce(async () => {
+        tick = 40_000;
+        return { state: 'ready', createdAt: new Date(1_000).toISOString() };
+      });
+      const observe = jest.fn();
+      await processNextManagedUpload({ ...deps, observe } as never, new AbortController().signal);
+      expect(observe.mock.calls.filter(([event]) => event.stage === 'extract')).toEqual([
+        [{ stage: 'extract', outcome: 'success', seconds: 2 }],
+      ]);
+      expect(observe).toHaveBeenCalledWith({
+        stage: 'processing',
+        outcome: 'success',
+        seconds: 39,
+      });
+    } finally {
+      if (descriptor) Object.defineProperty(performance, 'now', descriptor);
+      else Reflect.deleteProperty(performance, 'now');
+    }
+  });
+  it('captures cancellation during the extraction call once, after confirmed settlement', async () => {
+    const external = new AbortController();
+    const deps = fixture(
+      jest.fn(async () => {
+        external.abort();
+        throw new IsolatedDocumentError('parser_unavailable', false);
+      }),
+    );
+    deps.documents.cancel.mockResolvedValueOnce({ writerStopped: true });
+    const observe = jest.fn();
+    await processNextManagedUpload({ ...deps, observe } as never, external.signal);
+    expect(observe.mock.calls.filter(([event]) => event.stage === 'extract')).toEqual([
+      [{ stage: 'extract', outcome: 'cancelled', seconds: expect.any(Number) }],
+    ]);
+    expect(deps.management.publish).not.toHaveBeenCalled();
+    expect(await readdir(root)).toEqual([]);
+  });
   it('registers a pending claim before await and joins a claim delivered after cancellation', async () => {
     const deps = fixture();
     let deliver!: (value: typeof lease) => void;
@@ -511,7 +577,13 @@ describe('one managed processing claim', () => {
       deps.management.publish.mockResolvedValueOnce({ state: 'ready', createdAt } as never);
       const observe = jest.fn();
       await processNextManagedUpload({ ...deps, observe } as never, new AbortController().signal);
-      expect(observe).toHaveBeenCalledTimes(1);
+      expect(observe).toHaveBeenCalledTimes(2);
+      expect(observe).toHaveBeenCalledWith({
+        stage: 'extract',
+        outcome: 'success',
+        seconds: expect.any(Number),
+      });
+      expect(observe).not.toHaveBeenCalledWith(expect.objectContaining({ stage: 'total' }));
       expect(observe).toHaveBeenCalledWith({
         stage: 'processing',
         outcome: 'success',

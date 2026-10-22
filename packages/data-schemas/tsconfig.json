@@ -1,6 +1,15 @@
 {
   "compilerOptions": {
     "target": "ES2019",
+    "lib": [
+      "ES2019",
+      "DOM",
+      "WebWorker.ImportScripts",
+      "ScriptHost",
+      "DOM.Iterable",
+      "DOM.AsyncIterable",
+      "ES2021.String"
+    ],
     "module": "ESNext",
     "moduleResolution": "bundler",
     "declaration": true,

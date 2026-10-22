@@ -1,14 +1,14 @@
-import { UPLOAD_RETENTION_MS } from './upload-management';
-import {
-  readUploadDerivedIntent,
-  readUploadDerivedOrigin,
-  uploadDerivedExpiresAt,
-  uploadReservationFingerprint,
-} from './upload-derived';
 import type {
   UploadDerivedIntent,
   UploadDerivedOrigin,
   UploadDerivedSource,
+} from './upload-derived';
+import {
+  readUploadDerivedIntent,
+  readUploadDerivedOrigin,
+  readHistoricalUploadDerivedOrigin,
+  sameUploadDerivedOrigin,
+  uploadReservationFingerprint,
 } from './upload-derived';
 
 const binding = { purpose: 'workspace-draft' as const, sourceId: 'workspace-1', sourceRevision: 0 };
@@ -24,10 +24,11 @@ const source = (id: string): UploadDerivedSource => ({
     sha256: 'a'.repeat(64),
   },
   policySha256: 'b'.repeat(64),
+  sourceBindingSha256: 'c'.repeat(64),
   expiresAt: now + 1000,
 });
 const origin = (): UploadDerivedOrigin => ({
-  version: 1,
+  version: 2,
   binding: { ...binding },
   directSourceFileIds: ['b', 'a'],
   ancestors: [source('b'), source('a')],
@@ -217,7 +218,7 @@ describe('private derived upload contract', () => {
     const withinCount = ids.slice(0, 64);
     expect(
       readUploadDerivedOrigin({
-        version: 1,
+        version: 2,
         binding,
         directSourceFileIds: withinCount,
         ancestors: withinCount.map(source),
@@ -225,18 +226,34 @@ describe('private derived upload contract', () => {
     ).toBeNull();
   });
 
-  test('source-free drafts retain normal expiry; derived expiry cannot renew a source', () => {
+  test('preserves source-free intent and captured provenance while comparing immutable identities', () => {
     const empty: UploadDerivedOrigin = {
-      version: 1,
+      version: 2,
       binding,
       directSourceFileIds: [],
       ancestors: [],
     };
     expect(readUploadDerivedOrigin(empty)).toEqual(empty);
-    expect(uploadDerivedExpiresAt(now)).toBe(now + UPLOAD_RETENTION_MS);
-    expect(uploadDerivedExpiresAt(now, empty)).toBe(now + UPLOAD_RETENTION_MS);
-    expect(uploadDerivedExpiresAt(now, origin())).toBe(now + 1000);
-    expect(uploadDerivedExpiresAt(now + 2000, origin())).toBe(now + 1000);
+    const captured = readUploadDerivedOrigin(origin())!;
+    const current = readUploadDerivedOrigin(origin())!;
+    current.ancestors[0].expiresAt += 7 * 86400000;
+    expect(sameUploadDerivedOrigin(captured, current)).toBe(true);
+    current.ancestors[0].sourceBindingSha256 = 'd'.repeat(64);
+    expect(sameUploadDerivedOrigin(captured, current)).toBe(false);
+  });
+
+  test('admits historical origin solely for migration custody, never current authority', () => {
+    const historical = {
+      ...origin(),
+      version: 1,
+      ancestors: origin().ancestors.map(({ sourceBindingSha256: _binding, ...source }) => source),
+    };
+    expect(readUploadDerivedOrigin(historical)).toBeNull();
+    expect(readHistoricalUploadDerivedOrigin(historical)?.version).toBe(1);
+    const missingBinding = origin();
+    delete (missingBinding.ancestors[0] as Partial<UploadDerivedSource>).sourceBindingSha256;
+    expect(readUploadDerivedOrigin(missingBinding)).toBeNull();
+    expect(readHistoricalUploadDerivedOrigin(missingBinding)).toBeNull();
   });
 
   test('preserves ordinary fingerprints and binds every derived intent field', () => {

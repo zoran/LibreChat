@@ -8,6 +8,8 @@ import {
 } from 'librechat-data-provider';
 import type {
   ManagedDocumentResult,
+  ResourceAction,
+  ResourceAuthorizationRequest,
   UploadPrincipal,
   UploadRequest,
   UploadDerivedRequest,
@@ -113,19 +115,40 @@ export interface UploadManagement {
 export function createUploadManagement(deps: UploadManagementDependencies): UploadManagement {
   const { repository, identity, resources } = deps;
   const now = deps.now ?? Date.now;
+  /** Current repository remains personal-only; never manufacture an owner's principal. */
+  function authorizationRequest(
+    principal: UploadPrincipal,
+    action: ResourceAction,
+    resourceId: string | null,
+    scope: UploadOperation['scope'] = { kind: 'personal' },
+  ): ResourceAuthorizationRequest {
+    if (!isUploadPrincipal(principal)) throw new UploadManagementError('unauthorized');
+    if (scope.kind !== 'personal') throw new UploadManagementError('forbidden');
+    return {
+      owner: { tenantId: principal.tenantId, scope, ownerUserId: principal.userId },
+      resourceType: 'upload',
+      resourceId,
+      action,
+    };
+  }
   async function authorize(
     principal: UploadPrincipal,
-    scope = { kind: 'personal' } as UploadOperation['scope'],
+    action: ResourceAction = 'read',
+    resourceId: string | null = null,
+    scope: UploadOperation['scope'] = { kind: 'personal' },
   ) {
-    if (!isUploadPrincipal(principal)) {
-      throw new UploadManagementError('unauthorized');
-    }
-    if (!(await identity.authorize(principal, scope))) throw new UploadManagementError('forbidden');
+    if (
+      !(await identity.authorize(
+        principal,
+        authorizationRequest(principal, action, resourceId, scope),
+      ))
+    )
+      throw new UploadManagementError('forbidden');
   }
-  async function get(principal: UploadPrincipal, id: string) {
-    await authorize(principal);
+  async function get(principal: UploadPrincipal, id: string, action: ResourceAction = 'read') {
+    await authorize(principal, action, id);
     const operation = await repository.get(principal, id, now());
-    await authorize(principal, operation.scope);
+    await authorize(principal, action, id, operation.scope);
     return operation;
   }
   function observe(callback: (telemetry: TelemetryPort) => void | Promise<void>): void {
@@ -201,7 +224,7 @@ export function createUploadManagement(deps: UploadManagementDependencies): Uplo
       (!['text/plain', 'text/csv'].includes(request.mediaType) || request.declaredBytes > 65_536)
     )
       throw new UploadManagementError('invalid_request');
-    await authorize(principal, scope);
+    await authorize(principal, 'upload', null, scope);
     if (!MEDIA_TYPES.has(request.mediaType)) throw new UploadManagementError('unsupported_type');
     const fingerprint = uploadReservationFingerprint({ ...request, scope }, derived ?? undefined);
     const previous = await repository.findReservation(
@@ -234,7 +257,16 @@ export function createUploadManagement(deps: UploadManagementDependencies): Uplo
       await authorize(principal);
       const rows = await repository.list(principal, now());
       const allowed: UploadOperation[] = [];
-      for (const row of rows) if (await identity.authorize(principal, row.scope)) allowed.push(row);
+      for (const row of rows) {
+        if (
+          row.scope.kind === 'personal' &&
+          (await identity.authorize(
+            principal,
+            authorizationRequest(principal, 'read', row.id, row.scope),
+          ))
+        )
+          allowed.push(row);
+      }
       return allowed;
     },
     async usage(principal: UploadPrincipal) {
@@ -242,7 +274,7 @@ export function createUploadManagement(deps: UploadManagementDependencies): Uplo
       return repository.usage(principal, now());
     },
     async claimTransfer(principal: UploadPrincipal, id: string, worker: UploadWorker) {
-      await get(principal, id);
+      await get(principal, id, 'upload');
       await resources.assertSafe({ phase: 'transfer', hostId: worker.hostId });
       return repository.claim({ kind: 'transfer', principal, operationId: id, worker, now: now() });
     },
@@ -257,21 +289,21 @@ export function createUploadManagement(deps: UploadManagementDependencies): Uplo
       const acceptedMetadata = readUploadAcceptedMetadata(metadata);
       if (!acceptedMetadata) throw new UploadManagementError('invalid_request');
       if (lease.operationId !== id) throw new UploadManagementError('lease_lost');
-      await get(principal, id);
+      await get(principal, id, 'upload');
       return emit(
         repository.accept(principal, lease, receipt, securityApproval, acceptedMetadata, now()),
       );
     },
     async cancel(principal: UploadPrincipal, id: string) {
-      await get(principal, id);
+      await get(principal, id, 'change');
       return emit(repository.cancel(principal, id, now()));
     },
     async delete(principal: UploadPrincipal, id: string) {
-      await get(principal, id);
+      await get(principal, id, 'remove');
       return emit(repository.delete(principal, id, now()));
     },
     async retryProcessing(principal: UploadPrincipal, id: string) {
-      const previous = await get(principal, id);
+      const previous = await get(principal, id, 'change');
       const operation = await emit(repository.retryProcessing(principal, id, now()));
       // Ordinary replays do not requeue. Concurrent callers can observe the same transition;
       // this diagnostic count is deliberately not a replacement for durable accounting.

@@ -7,13 +7,18 @@ import {
   UPLOAD_USER_WINDOW_BYTES,
   UPLOAD_WINDOW_MS,
   UPLOAD_RETENTION_MS,
+  canonicalManagedJson,
 } from 'librechat-data-provider';
 import type { UploadPrincipal, UploadLease, UploadMigrationPage } from 'librechat-data-provider';
 import type { StoredUpload, GlobalState } from './uploadManagementStore';
+import type { FileRetrievalOriginal } from './fileRetrievalOperation';
+import retrievalFixture from '../../../data-provider/src/__fixtures__/managed-retrieval-v1.json';
+import { createFileRetentionMethods, FileSourceUnavailableError } from './fileRetention';
+import { createFileRetrievalOperationOwner } from './fileRetrievalOperation';
 import { createUploadManagementRepository } from './uploadManagement';
-import { createFileRetentionMethods } from './fileRetention';
 import { tenantStorage } from '~/config/tenantContext';
 import { RESOURCE_MAX } from './uploadManagementStore';
+import { createFileMethods } from './file';
 import { createModels } from '~/models';
 
 /** Deterministic UUIDv4-shaped test keys keep operation labels out of the public key contract. */
@@ -135,7 +140,7 @@ describe('durable upload management', () => {
     mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
     await Promise.all([
       a.connect(mongo.getUri('uploads')),
-      b.connect(mongo.getUri('uploads')),
+      b.connect(mongo.getUri('uploads'), { monitorCommands: true }),
       replacement.connect(mongo.getUri('replacement')),
     ]);
     for (const db of [a, b, replacement]) createModels(db);
@@ -1824,6 +1829,472 @@ describe('durable upload management', () => {
     await target.importSnapshot(page);
     await expect(target.importSnapshot(altered)).rejects.toMatchObject({
       code: 'migration_conflict',
+    });
+  });
+
+  /** Real Mongo effects; controlled backend receipts do not claim external indexing or deletion. */
+  describe('managed retrieval Mongo lifecycle', () => {
+    let previousSecurityPolicy: string | undefined;
+    const fileOwner = { tenantId: user.tenantId, userId: user.userId };
+    const extractionPolicySha256 = 'd'.repeat(64);
+    const policy = {
+      backendIdentity: retrievalFixture.obligation.backendIdentity,
+      routePolicySha256: '1'.repeat(64),
+      rankingPolicySha256: '2'.repeat(64),
+      indexGeneration: retrievalFixture.key.indexGeneration,
+      writerEpoch: retrievalFixture.obligation.writerEpoch + 1,
+      provenanceSha256: '3'.repeat(64),
+    };
+    const peer = { backendIdentity: policy.backendIdentity };
+    const policySnapshot = {
+      version: 1 as const,
+      source: { provenanceSha256: policy.provenanceSha256 },
+      content: policy,
+      purge: [policy],
+    };
+    const digest = (value: unknown) =>
+      createHash('sha256').update(canonicalManagedJson(value)).digest('hex');
+    const scope = (id: string) => ({
+      tenantId: user.tenantId,
+      user: new mongoose.Types.ObjectId(user.userId),
+      file_id: id,
+    });
+    const originalScope = (id: string) => ({
+      tenantId: user.tenantId,
+      userId: user.userId,
+      'original.sources.fileId': id,
+    });
+    const storedFile = async (id: string) => {
+      const result = await b.models.File.collection.findOne(scope(id));
+      expect(result).not.toBeNull();
+      return result!;
+    };
+    const originals = (id: string) =>
+      b.models.FileRetrievalOperation.collection.find(originalScope(id)).toArray();
+    const lifecycle = (db = b) => createFileRetentionMethods(db);
+    const indexRequest = (id: string) => ({
+      owner: fileOwner,
+      operationId: `index-${id}`,
+      purpose: 'index' as const,
+      fileIds: [id],
+      body: { text: 'controlled body; persisted only as a digest' },
+    });
+    const indexReceipt = (original: FileRetrievalOriginal) => {
+      const payload = {
+        version: 1 as const,
+        operationId: original.operationId,
+        requestSha256: original.bodySha256,
+        backendIdentity: original.policy.backendIdentity,
+        writerEpoch: original.policy.writerEpoch,
+        key: original.sources[0].keys[0],
+        state: 'ready' as const,
+        completedAt: Math.floor(original.admittedAt / 1000),
+      };
+      return { ...payload, receiptSha256: digest(payload) };
+    };
+    const purgeReceipt = (original: FileRetrievalOriginal) => {
+      const payload = {
+        version: 1 as const,
+        purgeOperationId: original.operationId,
+        keys: original.sources[0].keys,
+        backendIdentity: original.policy.backendIdentity,
+        fenceEpoch: original.policy.writerEpoch + 1,
+        state: 'purged' as const,
+        remainingChunks: 0 as const,
+        activeWriters: 0 as const,
+        completedAt: Math.floor(original.admittedAt / 1000),
+      };
+      return { ...payload, receiptSha256: digest(payload) };
+    };
+    async function operations(db: mongoose.Mongoose) {
+      // The owner takes the module type; this is an actual independent Mongoose instance.
+      const api = createFileRetrievalOperationOwner(db as unknown as typeof import('mongoose'), {
+        policySnapshot,
+      });
+      await api.initialize();
+      return api;
+    }
+    async function retrievalReady(id: string) {
+      process.env.UPLOAD_SECURITY_POLICY_SHA256 = securityPolicySha256;
+      first = createUploadManagementRepository(a, { securityPolicySha256, extractionPolicySha256 });
+      await first.initialize();
+      await ready(id);
+      return { writer: await operations(a), reader: await operations(b) };
+    }
+    function gate() {
+      let release!: () => void;
+      const wait = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return { wait, release };
+    }
+    async function bounded<T>(promise: Promise<T>): Promise<T> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error('Mongo lifecycle barrier not reached')),
+              4000,
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    beforeEach(async () => {
+      previousSecurityPolicy = process.env.UPLOAD_SECURITY_POLICY_SHA256;
+      // Existing outer hooks clear File/Upload rows. This collection belongs only to these cases.
+      if (a.models.FileRetrievalOperation) await a.models.FileRetrievalOperation.deleteMany({});
+    });
+    afterEach(() => {
+      if (previousSecurityPolicy === undefined) delete process.env.UPLOAD_SECURITY_POLICY_SHA256;
+      else process.env.UPLOAD_SECURITY_POLICY_SHA256 = previousSecurityPolicy;
+    });
+
+    it('rolls genuine File creation back with acceptance and preserves its unique birth on retry', async () => {
+      const id = 'mongo-birth';
+      await first.reserve(user, request(id), now);
+      const lease = (await first.claim({
+        kind: 'transfer',
+        principal: user,
+        operationId: id,
+        worker,
+        now,
+      }))!;
+      await completeScanner(lease, now);
+      const inserted = jest.spyOn(a.models.File, 'create');
+      const save = jest
+        .spyOn(a.models.UploadOperation, 'replaceOne')
+        .mockRejectedValueOnce(new Error('after actual File insert'));
+      try {
+        await expect(
+          first.accept(user, lease, receipt(lease), approval(lease), { filename: 'note.txt' }, now),
+        ).rejects.toThrow('after actual File insert');
+        expect(inserted).toHaveBeenCalledTimes(1);
+        expect(await b.models.File.countDocuments(scope(id))).toBe(0);
+        const upload = await b.models.UploadOperation.findById(id).lean();
+        expect(upload).not.toHaveProperty('acceptedAt');
+        expect(await second.usage(user, now)).toMatchObject({ usedBytes: 0, reservedBytes: 8 });
+      } finally {
+        save.mockRestore();
+        inserted.mockRestore();
+      }
+      await first.accept(
+        user,
+        lease,
+        receipt(lease),
+        approval(lease),
+        { filename: 'note.txt' },
+        now,
+      );
+      const birth = (await storedFile(id)).retrievalCreation;
+      expect(birth).toEqual({
+        version: 1,
+        owner: fileOwner,
+        fileId: id,
+        acceptedAt: now,
+        state: 'empty',
+      });
+      await second.accept(
+        user,
+        lease,
+        receipt(lease),
+        approval(lease),
+        { filename: 'note.txt' },
+        now + 1,
+      );
+      expect((await storedFile(id)).retrievalCreation).toEqual(birth);
+      expect(await b.models.File.countDocuments(scope(id))).toBe(1);
+      expect(await second.usage(user, now)).toMatchObject({ usedBytes: 8, reservedBytes: 0 });
+      expect(await b.models.File.collection.indexes()).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            name: 'file_identity',
+            key: { tenantId: 1, file_id: 1 },
+            unique: true,
+          }),
+        ]),
+      );
+    });
+
+    it('rolls first admission custody and liability back when the original insert fails', async () => {
+      const id = 'mongo-admission';
+      const { writer, reader } = await retrievalReady(id);
+      const before = (await storedFile(id)).retrievalCreation;
+      const create = jest
+        .spyOn(a.models.FileRetrievalOperation, 'create')
+        .mockRejectedValueOnce(new Error('after actual File admission write'));
+      try {
+        await expect(writer.admit(indexRequest(id))).rejects.toThrow(
+          'after actual File admission write',
+        );
+        expect(create).toHaveBeenCalledTimes(1);
+        expect((await storedFile(id)).retrievalCreation).toEqual(before);
+        expect((await storedFile(id)).managedRetrieval.obligations).toEqual([]);
+        expect(await originals(id)).toHaveLength(0);
+      } finally {
+        create.mockRestore();
+      }
+      const original = await writer.admit(indexRequest(id));
+      expect(await reader.admit(indexRequest(id))).toEqual(original);
+      const current = await storedFile(id);
+      expect(current.retrievalCreation).toEqual({ ...before, state: 'admitted' });
+      expect(current.managedRetrieval.obligations).toEqual([
+        expect.objectContaining({ operationId: original.operationId, state: 'preparing' }),
+      ]);
+      expect(await originals(id)).toHaveLength(1);
+      await createFileMethods(a).updateFile({ file_id: id, retrievalCreation: before });
+      expect((await storedFile(id)).retrievalCreation.state).toBe('admitted');
+    });
+
+    it('rejects first admission when revocation commits after its real snapshot read', async () => {
+      const id = 'mongo-revoke-first';
+      const { writer } = await retrievalReady(id);
+      const reached = gate(),
+        release = gate();
+      const nativeUpdate = a.models.File.updateOne.bind(a.models.File);
+      const touch = jest.spyOn(a.models.File, 'updateOne').mockImplementationOnce((...args) => {
+        reached.release();
+        return release.wait.then(() => nativeUpdate(...args)) as unknown as ReturnType<
+          typeof nativeUpdate
+        >;
+      });
+      const admission = writer.admit(indexRequest(id));
+      const denied = (async () => {
+        await expect(admission).rejects.toMatchObject({
+          code: 'managed_retrieval_source_unavailable',
+        });
+      })();
+      try {
+        await bounded(reached.wait);
+        await lifecycle().revokeFileSources(fileOwner, [id]);
+        release.release();
+        await bounded(denied);
+        expect((await storedFile(id)).retrievalCreation.state).toBe('empty');
+        expect((await storedFile(id)).managedRetrieval.obligations).toEqual([]);
+        expect(await originals(id)).toHaveLength(0);
+      } finally {
+        release.release();
+        touch.mockRestore();
+        await Promise.allSettled([admission, denied]);
+      }
+    });
+
+    it('retains admitted liabilities when revocation waits for the real File write', async () => {
+      const id = 'mongo-admit-first';
+      const { writer } = await retrievalReady(id);
+      const written = gate(),
+        release = gate(),
+        revokeSent = gate();
+      const nativeUpdate = a.models.File.updateOne.bind(a.models.File);
+      const touch = jest.spyOn(a.models.File, 'updateOne').mockImplementationOnce((...args) => {
+        const pending = Promise.resolve(nativeUpdate(...args)).then(async (result) => {
+          written.release();
+          await release.wait;
+          return result;
+        });
+        return pending as unknown as ReturnType<typeof nativeUpdate>;
+      });
+      const client = b.connection.getClient();
+      const onCommand = (event: {
+        commandName: string;
+        command: {
+          update?: string;
+          updates?: Array<{ u?: { $set?: { deletionRequestedAt?: unknown } } }>;
+        };
+      }) => {
+        if (
+          event.commandName === 'update' &&
+          event.command.update === b.models.File.collection.name &&
+          event.command.updates?.some((item) => item.u?.$set?.deletionRequestedAt)
+        )
+          revokeSent.release();
+      };
+      client.on('commandStarted', onCommand);
+      const admission = writer.admit(indexRequest(id));
+      let revoke: Promise<unknown> | undefined;
+      try {
+        await bounded(written.wait);
+        revoke = lifecycle().revokeFileSources(fileOwner, [id]);
+        await bounded(revokeSent.wait);
+        release.release();
+        const original = await bounded(admission);
+        await bounded(revoke);
+        expect((await storedFile(id)).retrievalCreation.state).toBe('admitted');
+        expect((await storedFile(id)).managedRetrieval.obligations).toEqual([
+          expect.objectContaining({ operationId: original.operationId, state: 'preparing' }),
+        ]);
+        expect(await originals(id)).toHaveLength(1);
+        await expect(
+          lifecycle().assertFileSourceDeletionReady(fileOwner, [id]),
+        ).rejects.toBeInstanceOf(FileSourceUnavailableError);
+      } finally {
+        release.release();
+        touch.mockRestore();
+        client.off('commandStarted', onCommand);
+        await Promise.allSettled([admission, ...(revoke ? [revoke] : [])]);
+      }
+    });
+
+    it('commits the exact index receipt and readiness together across abort and replay', async () => {
+      const id = 'mongo-index-ack';
+      const { writer, reader } = await retrievalReady(id);
+      const original = await writer.admit(indexRequest(id));
+      const proof = indexReceipt(original);
+      const record = jest.spyOn(a.models.FileRetrievalOperation, 'updateOne');
+      const touch = jest
+        .spyOn(a.models.File, 'updateOne')
+        .mockRejectedValueOnce(new Error('after actual index receipt write'));
+      try {
+        await expect(
+          writer.acknowledgeIndex(
+            { owner: fileOwner, operationId: original.operationId, receipt: proof },
+            peer,
+          ),
+        ).rejects.toThrow('after actual index receipt write');
+        expect(record).toHaveBeenCalledTimes(1);
+        expect((await originals(id))[0]).not.toHaveProperty('indexReceipt');
+        expect((await storedFile(id)).managedRetrieval.obligations[0].state).toBe('preparing');
+      } finally {
+        touch.mockRestore();
+        record.mockRestore();
+      }
+      await writer.acknowledgeIndex(
+        { owner: fileOwner, operationId: original.operationId, receipt: proof },
+        peer,
+      );
+      await reader.acknowledgeIndex(
+        { owner: fileOwner, operationId: original.operationId, receipt: proof },
+        peer,
+      );
+      expect((await storedFile(id)).managedRetrieval.obligations[0].state).toBe('ready');
+      expect((await originals(id))[0]).toMatchObject({ original, indexReceipt: proof });
+      const { receiptSha256: _old, ...changed } = { ...proof, completedAt: proof.completedAt + 1 };
+      await expect(
+        reader.acknowledgeIndex(
+          {
+            owner: fileOwner,
+            operationId: original.operationId,
+            receipt: { ...changed, receiptSha256: digest(changed) },
+          },
+          peer,
+        ),
+      ).rejects.toThrow();
+      expect((await originals(id))[0].indexReceipt).toEqual(proof);
+    });
+
+    it('replays pending purge exactly and omits terminal work after its original deadline', async () => {
+      const id = 'mongo-purge-retry';
+      const { writer, reader } = await retrievalReady(id);
+      const index = await writer.admit(indexRequest(id));
+      await writer.acknowledgeIndex(
+        { owner: fileOwner, operationId: index.operationId, receipt: indexReceipt(index) },
+        peer,
+      );
+      await lifecycle().revokeFileSources(fileOwner, [id]);
+      const request = { owner: fileOwner, fileId: id };
+      const [purge] = await writer.admitPurge(request);
+      expect(purge).toBeDefined();
+      expect(await reader.admitPurge(request)).toEqual([purge]);
+      expect(await originals(id)).toHaveLength(2);
+      const proof = purgeReceipt(purge);
+      const pending = (await storedFile(id)).managedRetrieval;
+      await expect(
+        reader.acknowledgePurge(
+          { owner: fileOwner, operationId: purge.operationId, receipt: proof },
+          { backendIdentity: 'foreign' },
+        ),
+      ).rejects.toThrow();
+      expect((await storedFile(id)).managedRetrieval).toEqual(pending);
+      await reader.acknowledgePurge(
+        { owner: fileOwner, operationId: purge.operationId, receipt: proof },
+        peer,
+      );
+      await writer.acknowledgePurge(
+        { owner: fileOwner, operationId: purge.operationId, receipt: proof },
+        peer,
+      );
+      const clock = jest.spyOn(Date, 'now').mockReturnValue(purge.workDeadline + 1);
+      try {
+        expect(await reader.admitPurge(request)).toEqual([]);
+      } finally {
+        clock.mockRestore();
+      }
+      const retained = await originals(id);
+      expect(retained).toHaveLength(2);
+      expect(retained.find((item) => item.operationId === purge.operationId)?.original).toEqual(
+        purge,
+      );
+      expect((await storedFile(id)).managedRetrieval.obligations).toEqual([
+        expect.objectContaining({
+          state: 'purged',
+          purgeOperationId: purge.operationId,
+          receiptSha256: proof.receiptSha256,
+        }),
+      ]);
+      await expect(
+        lifecycle().assertFileSourceDeletionReady(fileOwner, [id]),
+      ).resolves.toBeUndefined();
+      expect(await lifecycle().prepareFileSourceDeletion(fileOwner, [id])).toEqual({
+        preparedFileIds: [id],
+      });
+      expect(await lifecycle().finalizeFileSourceDeletion(fileOwner, [id])).toEqual({
+        completedFileIds: [id],
+      });
+      expect((await storedFile(id)).retrievalCreation.state).toBe('admitted');
+    });
+
+    it('settles genuine fresh empty custody without a retrieval owner and preserves unknown legacy custody', async () => {
+      const id = 'mongo-empty';
+      await ready(id);
+      const birth = (await storedFile(id)).retrievalCreation;
+      expect((await storedFile(id)).managedRetrieval).toBeUndefined();
+      expect(await b.models.File.findOne(scope(id)).lean()).not.toHaveProperty('retrievalCreation');
+      await lifecycle().revokeFileSources(fileOwner, [id]);
+      await expect(
+        lifecycle().assertFileSourceDeletionReady(fileOwner, [id]),
+      ).resolves.toBeUndefined();
+      expect(await lifecycle().prepareFileSourceDeletion(fileOwner, [id])).toEqual({
+        preparedFileIds: [id],
+      });
+      expect(await lifecycle().finalizeFileSourceDeletion(fileOwner, [id])).toEqual({
+        completedFileIds: [id],
+      });
+      expect(await lifecycle().finalizeFileSourceDeletion(fileOwner, [id])).toEqual({
+        completedFileIds: [id],
+      });
+      const tombstone = await storedFile(id);
+      expect(tombstone).toMatchObject({ retrievalCreation: birth, uploadOperationId: id });
+      expect(tombstone.deletionCompletedAt).toBeInstanceOf(Date);
+      expect(await second.usage(user, now)).toMatchObject({ usedBytes: 8 });
+      const files = createFileMethods(a);
+      const legacyAt = Date.now();
+      await files.createFile(
+        {
+          ...scope('mongo-legacy'),
+          filename: 'legacy.txt',
+          filepath: '/fixture/legacy',
+          bytes: 1,
+          type: 'text/plain',
+          text: 'x',
+        },
+        true,
+        { retention: { acceptedAt: new Date(legacyAt), expiredAt: new Date(legacyAt + 60_000) } },
+      );
+      await lifecycle().revokeFileSources(fileOwner, ['mongo-legacy']);
+      await expect(
+        lifecycle().assertFileSourceDeletionReady(fileOwner, ['mongo-legacy']),
+      ).rejects.toBeInstanceOf(FileSourceUnavailableError);
+      expect(await lifecycle().finalizeFileSourceDeletion(fileOwner, ['mongo-legacy'])).toEqual({
+        completedFileIds: [],
+      });
+      const legacy = await storedFile('mongo-legacy');
+      expect(legacy.retrievalCreation).toBeUndefined();
+      expect(legacy.text).toBe('x');
+      expect(legacy.deletionCompletedAt).toBeFalsy();
     });
   });
 });

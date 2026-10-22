@@ -5,9 +5,12 @@ import {
   isNativelyReadableText,
   documentParserMimeTypes,
   quoteSourceRefSchema,
+  UPLOAD_DERIVED_MAX_SOURCES,
 } from 'librechat-data-provider';
 import type {
   AppConfig,
+  FileOwnerScope,
+  CheckpointSourceBinding,
   FileRetentionAdmission,
   SourceRetentionContext,
   ResolvedQuoteRetention,
@@ -229,11 +232,10 @@ export function quoteRetentionContext(
   };
 }
 
-/** Remove only dependent fields, retaining unrelated excerpts and their exact source pairing. */
+/** Redact authoritative unavailable IDs; captured File expiry never grants or revokes a new read. */
 export function redactQuoteRetention(
   value: SerializedQuoteRetention,
   revokedFileIds: readonly string[],
-  now: number = Date.now(),
 ): SerializedQuoteRetention {
   const decoded = deserializeQuoteRetention(value);
   const revoked = new Set(revokedFileIds);
@@ -246,12 +248,7 @@ export function redactQuoteRetention(
   const refs: Array<QuoteSourceRef | null> | undefined = value.quoteSourceRefs && [];
   decoded.quotes.forEach((text, index) => {
     const binding = byIndex.get(index);
-    if (
-      binding &&
-      (binding.sourceExpiresAt.getTime() <= now ||
-        binding.sourceFileIds.some((id) => revoked.has(id)))
-    )
-      return;
+    if (binding && binding.sourceFileIds.some((id) => revoked.has(id))) return;
     if (binding) retained.quoteSourceRetention.push({ ...binding, index: retained.quotes.length });
     retained.quotes.push(text);
     refs?.push(value.quoteSourceRefs![index]);
@@ -534,3 +531,170 @@ export const createMinimalRetentionRequest = (
     },
   };
 };
+
+/** Private, authenticated request state shared by overlapping model/steer admissions. */
+export type SourceRetentionRequest = {
+  user: { id: string; tenantId?: string | null };
+  _fileSourceRetention?: SourceRetentionContext;
+  _quoteRetention?: ResolvedQuoteRetention;
+  _quoteRetentionMessageId?: string;
+  _resumableStreamId?: string;
+};
+
+type SourceRetentionSelection = {
+  fileIds: readonly string[];
+  historyMessageIds: readonly string[];
+  checkpointSourceBinding?: CheckpointSourceBinding;
+  historyQuoteSnapshots?: readonly {
+    messageId: string;
+    messageVersion: number | null;
+    quotes: readonly string[];
+  }[];
+};
+export type ResolveSourceRetention = (
+  owner: FileOwnerScope,
+  selection: SourceRetentionSelection,
+) => Promise<SourceRetentionContext | undefined>;
+
+type ModelSourceMessage = (
+  | { messageId: string; id?: string }
+  | { messageId?: null; id: string }
+) & { sourceFileIds?: readonly string[]; quotes?: readonly string[]; __v?: number | null };
+
+type ModelSourceRetentionInput = {
+  request: SourceRetentionRequest;
+  fileIds: readonly string[];
+  sourceMessageIds: readonly string[];
+  storedMessages?: readonly ModelSourceMessage[];
+  getJobCreatedAt: () => number | null | undefined;
+  getCheckpointOptions: () => Pick<SourceRetentionSelection, 'checkpointSourceBinding'> | undefined;
+};
+type ModelSourceRetentionPorts = {
+  resolve: ResolveSourceRetention;
+  bind: (streamId: string, createdAt: number, context: SourceRetentionContext) => Promise<boolean>;
+  revoke: (owner: FileOwnerScope, fileIds: readonly string[]) => Promise<unknown>;
+};
+
+/** Re-resolve the bounded union before effects; an unquoted steer starts immediately. */
+export async function applySteerSourceRetention(
+  req: SourceRetentionRequest,
+  quoteRetention: SerializedQuoteRetention | undefined,
+  resolve: ResolveSourceRetention,
+  apply: () => Promise<void>,
+): Promise<void> {
+  const context =
+    quoteRetention && quoteRetentionContext(deserializeQuoteRetention(quoteRetention));
+  if (!context) return apply();
+  const owner = { userId: req.user.id, tenantId: req.user.tenantId };
+  let current = context;
+  // Each overlap can add only a previously unseen member of the bounded union.
+  for (let attempt = 0; ; attempt++) {
+    const previous = readFileSourceRetention(req._fileSourceRetention);
+    const fileIds = [...new Set([...(previous?.sourceFileIds ?? []), ...current.sourceFileIds])];
+    if (attempt > UPLOAD_DERIVED_MAX_SOURCES || fileIds.length > UPLOAD_DERIVED_MAX_SOURCES)
+      throw new Error('Source union exceeded admission bounds');
+    const resolved = await resolve(owner, { fileIds, historyMessageIds: [] });
+    if (!resolved) throw new Error('Source binding disappeared');
+    const latest = readFileSourceRetention(req._fileSourceRetention);
+    if (latest?.sourceFileIds.some((id) => !resolved.sourceFileIds.includes(id))) {
+      current = resolved;
+      continue;
+    }
+    req._fileSourceRetention = resolved;
+    break;
+  }
+  await apply();
+}
+
+/** Bind the complete exposed union, then revalidate current File authority before provider use. */
+export async function admitModelSourceRetention(
+  input: ModelSourceRetentionInput,
+  ports: ModelSourceRetentionPorts,
+): Promise<void> {
+  const { request: req, fileIds, sourceMessageIds, storedMessages } = input;
+  const owner = { userId: req.user.id, tenantId: req.user.tenantId };
+  const dependentHistory = new Set(
+    (storedMessages ?? [])
+      .filter(
+        (message) => (message.sourceFileIds?.length ?? 0) > 0 || (message.quotes?.length ?? 0) > 0,
+      )
+      .map((message) => message.messageId ?? message.id),
+  );
+  // Model callbacks can overlap; a later resolver must not erase an already exposed source.
+  const mergeContext = async (context: SourceRetentionContext | undefined) => {
+    if (!context) return context;
+    for (let attempt = 0; attempt <= UPLOAD_DERIVED_MAX_SOURCES; attempt++) {
+      const current = readFileSourceRetention(req._fileSourceRetention);
+      const contextIds = context.sourceFileIds;
+      const ids = [...new Set([...(current?.sourceFileIds ?? []), ...contextIds])];
+      if (ids.length > UPLOAD_DERIVED_MAX_SOURCES)
+        throw new Error('Source union exceeded admission bounds');
+      if (ids.every((id) => contextIds.includes(id))) {
+        req._fileSourceRetention = context;
+        return context;
+      }
+      context = await ports.resolve(owner, {
+        fileIds: ids,
+        historyMessageIds: [],
+      });
+      if (!context) throw new Error('Source binding disappeared');
+    }
+    throw new Error('Source union did not settle');
+  };
+  const previous = readFileSourceRetention(req._fileSourceRetention);
+  const selectedIds = new Set(sourceMessageIds);
+  const historyQuoteSnapshots = (storedMessages ?? [])
+    .filter(
+      (message) =>
+        (message.quotes?.length ?? 0) > 0 &&
+        selectedIds.has(message.messageId ?? message.id) &&
+        (message.messageId ?? message.id) !== req._quoteRetentionMessageId,
+    )
+    .map((message) => ({
+      messageId: message.messageId ?? message.id,
+      messageVersion: message.__v ?? null,
+      quotes: [...message.quotes!],
+    }));
+  const selectedQuotes =
+    req._quoteRetention && sourceMessageIds.includes(req._quoteRetentionMessageId!)
+      ? quoteRetentionContext(req._quoteRetention)
+      : undefined;
+  const context = await mergeContext(
+    await ports.resolve(owner, {
+      fileIds: [
+        ...new Set([
+          ...fileIds,
+          ...(previous?.sourceFileIds ?? []),
+          ...(selectedQuotes?.sourceFileIds ?? []),
+        ]),
+      ],
+      historyMessageIds: sourceMessageIds.filter(
+        (id) => dependentHistory.has(id) && id !== req._quoteRetentionMessageId,
+      ),
+      ...input.getCheckpointOptions(),
+      ...(historyQuoteSnapshots.length > 0 && { historyQuoteSnapshots }),
+    }),
+  );
+  if (!context) return;
+  // The merge already kept failed admission source-bound before any further await.
+  const streamId = req._resumableStreamId;
+  if (
+    !streamId ||
+    input.getJobCreatedAt() == null ||
+    !(await ports.bind(streamId, input.getJobCreatedAt()!, context))
+  ) {
+    throw new Error('Source generation admission failed');
+  }
+  try {
+    const revalidated = await ports.resolve(owner, {
+      fileIds: context.sourceFileIds,
+      historyMessageIds: [],
+    });
+    if (!revalidated) throw new Error('Source binding disappeared');
+    await mergeContext(revalidated);
+  } catch (error) {
+    // Compensate through the revoke owner if deletion raced generation binding.
+    await ports.revoke(owner, context.sourceFileIds);
+    throw error;
+  }
+}

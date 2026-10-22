@@ -9,6 +9,7 @@ import {
   ListObjectVersionsCommand,
 } from '@aws-sdk/client-s3';
 import { createManagedS3Storage, managedOriginalKey } from '../managed';
+import { createManagedS3Client } from '../managedClient';
 
 jest.mock('~/files', () => ({ deleteRagFile: jest.fn() }));
 jest.mock('@librechat/data-schemas', () => ({
@@ -409,5 +410,61 @@ describe('managed S3 adapter preserves lifecycle and uncertainty', () => {
     body.destroy(new Error('Synthetic abort'));
     await expect(first).rejects.toThrow();
     expect(closedAtAbort).toBe(true);
+  });
+});
+
+describe('managed client owned construction', () => {
+  const env = {
+    AWS_REGION: 'test-region',
+    AWS_BUCKET_NAME: 'isolated',
+    AWS_ENDPOINT_URL: 'https://storage.invalid',
+    AWS_FORCE_PATH_STYLE: 'true',
+    AWS_ACCESS_KEY_ID: 'test-only-key',
+    AWS_SECRET_ACCESS_KEY: 'test-only-secret',
+  };
+  it('constructs independent actual clients with explicit snapshotted credentials', async () => {
+    const input = { ...env };
+    const first = createManagedS3Client(input);
+    const second = createManagedS3Client(env);
+    input.AWS_ACCESS_KEY_ID = 'changed-after-construction';
+    try {
+      expect(first).toBeInstanceOf(S3Client);
+      expect(second).not.toBe(first);
+      expect(await first.config.credentials()).toMatchObject({
+        accessKeyId: env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: env.AWS_SECRET_ACCESS_KEY,
+      });
+      expect(await first.config.region()).toBe(env.AWS_REGION);
+      expect(await first.config.endpoint!()).toMatchObject({
+        protocol: 'https:',
+        hostname: 'storage.invalid',
+        path: '/',
+      });
+      expect(first.config.forcePathStyle).toBe(true);
+      expect(await first.config.requestChecksumCalculation()).toBe('WHEN_REQUIRED');
+      first.destroy();
+      expect(await second.config.credentials()).toMatchObject({
+        accessKeyId: env.AWS_ACCESS_KEY_ID,
+      });
+    } finally {
+      first.destroy();
+      second.destroy();
+    }
+  });
+  it.each([
+    { AWS_ACCESS_KEY_ID: undefined },
+    { AWS_SECRET_ACCESS_KEY: undefined },
+    { AWS_REGION: '' },
+    { AWS_BUCKET_NAME: '' },
+    { AWS_FORCE_PATH_STYLE: 'false' },
+    { AWS_ENDPOINT_URL: 'http://storage.invalid' },
+    { AWS_ENDPOINT_URL: 'https://user:pass@storage.invalid' },
+    { AWS_ENDPOINT_URL: 'https://storage.invalid/path' },
+    { AWS_ENDPOINT_URL: 'https://storage.invalid/?query=yes' },
+    { AWS_ENDPOINT_URL: 'https://storage.invalid/#fragment' },
+  ])('rejects unavailable managed authority before construction: %j', (override) => {
+    expect(() => createManagedS3Client({ ...env, ...override })).toThrow(
+      'Managed storage configuration unavailable',
+    );
   });
 });

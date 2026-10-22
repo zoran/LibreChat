@@ -4,6 +4,8 @@ const { isAbsolute } = require('node:path');
 const {
   createUploadManagement,
   createManagedSourceResolver,
+  createManagedFileRetrieval,
+  composeManagedFileMaintenance,
   bindManagedContextSources,
   MANAGED_SOURCE_FILE_FIELDS,
   createUploadRuntime,
@@ -17,15 +19,17 @@ const {
   createUnixDocumentPort,
   createManagedS3Storage,
   createUploadMetrics,
-  initializeS3,
+  createManagedS3Client,
   validateEmailCodeBearer,
   validateBrowserBearer,
   guestUploadTransitionEnabled,
   getEmailCodeSettings,
   UploadManagementError,
+  getRemainingShutdownMs,
 } = require('@librechat/api');
 const {
   createUploadManagementRepository,
+  createFileRetrievalOperationOwner,
   runAsSystem,
   logger,
 } = require('@librechat/data-schemas');
@@ -97,34 +101,8 @@ function configureUploadSourceReplay({ manager, models, metrics }) {
   });
 }
 
-/** Cortex uses a purpose-scoped native key, never the SDK's ambient credentials. */
-function managedStorageClient() {
-  let endpoint;
-  try {
-    endpoint = new URL(process.env.AWS_ENDPOINT_URL);
-  } catch {
-    /* checked below */
-  }
-  if (
-    !process.env.AWS_REGION ||
-    !process.env.AWS_BUCKET_NAME ||
-    !process.env.AWS_ACCESS_KEY_ID ||
-    !process.env.AWS_SECRET_ACCESS_KEY ||
-    process.env.AWS_FORCE_PATH_STYLE !== 'true' ||
-    !endpoint ||
-    endpoint.protocol !== 'https:' ||
-    endpoint.username ||
-    endpoint.password ||
-    endpoint.pathname !== '/' ||
-    endpoint.search ||
-    endpoint.hash
-  ) {
-    throw new Error('Managed storage configuration unavailable');
-  }
-  const client = initializeS3();
-  if (!client) throw new Error('Managed original storage unavailable');
-  return client;
-}
+/** Existing Upload composition shares the managed storage construction owner. */
+const managedStorageClient = () => createManagedS3Client(process.env);
 
 /** Revalidate the current durable grant without extending foreground idle lifetime. */
 function uploadPrincipal(repository) {
@@ -208,8 +186,12 @@ async function createUploadComposition({
   security,
   stagingRoot,
   allowedOrigins,
+  trustedFile,
+  retrievalOperations,
+  signal,
   principal = uploadPrincipal(models),
 }) {
+  signal?.throwIfAborted();
   if (
     !worker?.hostId ||
     !worker.instanceId ||
@@ -229,8 +211,12 @@ async function createUploadComposition({
   const management = createUploadManagement({
     repository,
     identity: {
-      authorize: async (owner, scope) =>
-        scope.kind === 'personal' &&
+      authorize: async (owner, request) =>
+        request.resourceType === 'upload' &&
+        ['read', 'upload', 'change', 'remove'].includes(request.action) &&
+        request.owner.scope.kind === 'personal' &&
+        request.owner.ownerUserId === owner.userId &&
+        request.owner.tenantId === owner.tenantId &&
         !!owner.userId &&
         ((owner.authentication === 'verified-email' && owner.tenantId === tenant) ||
           (guestUploadTransitionEnabled() &&
@@ -254,17 +240,14 @@ async function createUploadComposition({
   };
   const workers = createUploadWorkers({
     processing,
+    settlement: { repository, security },
     runAsSystem,
     onError: () => logger.warn('[Uploads] processing unavailable'),
   });
   const cleanup = createManagedUploadCleanup({
     repository,
     storage,
-    documents,
-    security,
-    attempts: workers.attempts,
-    worker,
-    stagingRoot,
+    actor: workers.settlement,
   });
   const live = createUploadLiveHub({
     repository,
@@ -310,6 +293,7 @@ async function createUploadComposition({
     projectAttachments: attachmentProjection(models),
     issueIntake: createUploadTicketIssuer({ repository, identityRepository: models, management }),
   });
+  const extractionPolicySha256 = trustedFile?.extractionPolicySha256;
   const sources = createManagedSourceResolver({
     allowedOrigins,
     principal,
@@ -325,42 +309,70 @@ async function createUploadComposition({
       ).then((files) => files?.[0] ?? null),
     original: (user, id) => runAsSystem(() => repository.cleanupForFile(user, id)),
     policySha256: () => security.policySha256,
+    extractionPolicySha256: () => extractionPolicySha256,
     storage,
   });
-  let started = false;
+  const retrieval = await createManagedFileRetrieval({
+    trustedFile,
+    sources,
+    operations: retrievalOperations,
+    runAsSystem,
+    signal,
+  });
+  let starting;
   return {
     sources,
+    retrieval,
     management,
     repository,
+    fileReads: repository.fileReads,
+    fileReadWorker: Object.freeze({ ...worker }),
     cleanup,
     storage,
     principal,
     router,
-    intakeHandlers,
+    intakeHandlers: { ...intakeHandlers, ...(retrieval ? { lookup: retrieval.lookup } : {}) },
     allowedOrigins: Object.freeze([...allowedOrigins]),
-    maintenance: workers.maintenance,
+    maintenance: composeManagedFileMaintenance(workers.maintenance, retrieval),
     configureSourceReplay(manager) {
       configureUploadSourceReplay({ manager, models, metrics });
     },
     start() {
-      if (started) return;
-      started = true;
-      platform.start?.();
-      controller.start();
-      workers.start();
+      if (!starting)
+        starting = Promise.resolve().then(async () => {
+          signal?.throwIfAborted();
+          await platform.start?.();
+          signal?.throwIfAborted();
+          controller.start();
+          workers.start();
+        });
+      return starting;
     },
     async close(signal) {
       live.close();
-      const [settled] = await Promise.all([workers.close(signal), controller.stop()]);
+      const settled = await Promise.allSettled([
+        workers.close(signal),
+        controller.stop(),
+        retrieval?.close(signal),
+      ]);
       await platform.close?.();
-      if (!settled.complete) throw new Error('Upload shutdown has unresolved work');
+      if (settled.some((result) => result.status === 'rejected') || !settled[0].value?.complete)
+        throw new Error('Upload shutdown has unresolved work');
     },
   };
 }
 
 /** Called once after database/storage initialization. Disabled means no adapter, timer or watch. */
-async function initializeUploads({ registry, identity, recordOriginalPublication }) {
+async function initializeUploads({
+  registry,
+  identity,
+  trustedFile,
+  recordOriginalPublication,
+  signal,
+  onFailure,
+}) {
   if (process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED !== 'true') return undefined;
+  signal?.throwIfAborted();
   if (current) return current;
   if (
     !identity ||
@@ -374,7 +386,9 @@ async function initializeUploads({ registry, identity, recordOriginalPublication
   )
     throw new Error('Upload process identity unavailable');
   const intakeConfig = await managedIntakeControlConfig();
+  signal?.throwIfAborted();
   const security = await managedSecurityClient();
+  signal?.throwIfAborted();
   const client = managedStorageClient();
   const mongoose = require('mongoose');
   const models = require('~/models');
@@ -382,7 +396,9 @@ async function initializeUploads({ registry, identity, recordOriginalPublication
   const worker = { hostId: process.env.POD_NODE_NAME, instanceId: identity.incarnation };
   const stagingRoot = '/var/lib/cortex/uploads/staging';
   await mkdir(stagingRoot, { recursive: true, mode: 0o700 });
+  signal?.throwIfAborted();
   const directory = await lstat(stagingRoot);
+  signal?.throwIfAborted();
   if (
     !directory.isDirectory() ||
     directory.isSymbolicLink() ||
@@ -393,10 +409,12 @@ async function initializeUploads({ registry, identity, recordOriginalPublication
   }
   const repository = createUploadManagementRepository(mongoose, {
     securityPolicySha256: security.policySha256,
+    extractionPolicySha256: trustedFile?.extractionPolicySha256,
     recordOriginalPublication,
   });
   // Initialization never attests an empty store or enables an unreconciled authority.
   await runAsSystem(() => repository.initialize());
+  signal?.throwIfAborted();
   const platform = await createUploadPlatform({ repository, worker, stagingRoot });
   const storage = createManagedS3Storage({
     client,
@@ -425,15 +443,29 @@ async function initializeUploads({ registry, identity, recordOriginalPublication
     security,
     stagingRoot,
     allowedOrigins: [origin],
+    trustedFile,
+    signal,
+    retrievalOperations: (policySnapshot) =>
+      createFileRetrievalOperationOwner(mongoose, { policySnapshot }),
   });
   let intakeControl;
   try {
+    signal?.throwIfAborted();
     intakeControl = await startIntakeControlService({
       ...intakeConfig,
       handlers: composition.intakeHandlers,
     });
   } catch (error) {
-    await composition.close(AbortSignal.timeout(30_000));
+    try {
+      onFailure?.(error);
+    } catch {
+      /* Failure notification cannot skip original cleanup. */
+    }
+    try {
+      await composition.close(AbortSignal.timeout(Math.max(1, getRemainingShutdownMs() ?? 30_000)));
+    } catch {
+      /* Preserve the original startup failure after attempting all composition cleanup. */
+    }
     throw error;
   }
   current = {

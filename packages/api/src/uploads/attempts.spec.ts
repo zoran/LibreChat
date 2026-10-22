@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import { canonicalStorageDeletionReceipt } from 'librechat-data-provider';
 import type { UploadIntakeRecovery, UploadSecurityExecution } from 'librechat-data-provider';
 import type {
   UploadAttemptBinding,
@@ -788,5 +790,116 @@ describe('bound technical recovery in the existing journal', () => {
     });
     expect(callbacks[0]).toHaveBeenCalledTimes(1);
     expect(callbacks[1]).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('unknown PUT owner-receipt journal consumption', () => {
+  const view = (): UploadIntakeRecovery => {
+    const owner = {
+      protocol: 1 as const,
+      requestId: 'cleanup-request',
+      generation: '1',
+      authorityBindingSHA256: 'a'.repeat(64),
+      acceptedObjectSHA256: 'b'.repeat(64),
+      bucket: 'private-bucket',
+      key: 'managed-uploads/user/operation.1__original',
+    };
+    const receipt = {
+      ...owner,
+      state: 'durable_delete_complete' as const,
+      obligationId: 'obligation',
+      aggregateRevision: '2',
+      proofSHA256: 'c'.repeat(64),
+    };
+    return {
+      version: 1,
+      operationId: 'operation',
+      transferGeneration: 1,
+      worker,
+      closed: true,
+      acknowledged: true,
+      storageOutcome: 'unknown',
+      appWriterStopped: true,
+      cleanupReceipt: {
+        binding: owner,
+        receipt,
+        receiptSHA256: createHash('sha256')
+          .update(canonicalStorageDeletionReceipt(receipt))
+          .digest('hex'),
+        consumerCommitId: 'accounting-commit',
+      },
+    };
+  };
+  const local = {
+    writerStopped: false,
+    localWriterStopped: true,
+    localCopiesAbsent: true,
+    storageOutcome: 'unknown' as const,
+    acknowledgementPending: true,
+  };
+  it('consumes exact committed receipt after actual join while retaining unknown storage and weak writer proof', async () => {
+    const journal = createUploadAttemptJournal(worker);
+    const registration = journal.attempts.begin(jest.fn());
+    registration.bind(binding);
+    registration.recover!(async () => view());
+    registration.settle(local);
+    expect(await journal.recoverPending(signal())).toEqual({
+      attempted: 1,
+      settled: 1,
+      pending: 0,
+    });
+    expect(await journal.attempts.stopAndJoin(task, signal())).toMatchObject({
+      storageOutcome: 'unknown',
+      writerStopped: false,
+      localWriterStopped: true,
+      acknowledgementPending: false,
+    });
+    expect(await journal.close()).toEqual({ complete: true });
+  });
+  it.each([
+    'active',
+    'no-local-join',
+    'copies',
+    'security',
+    'hash',
+    'generation',
+    'worker',
+    'commit-replay',
+  ])('keeps %s pending despite a terminal storage receipt', async (change) => {
+    const journal = createUploadAttemptJournal(worker);
+    const registration = journal.attempts.begin(jest.fn());
+    registration.bind(binding);
+    const proof = { ...local };
+    if (change === 'no-local-join') proof.localWriterStopped = false;
+    if (change === 'copies') proof.localCopiesAbsent = false;
+    if (change !== 'active')
+      registration.settle({
+        ...proof,
+        ...(change === 'security' ? { securityPending: true } : {}),
+      });
+    const observed = view();
+    if (change === 'hash') observed.cleanupReceipt!.receiptSHA256 = '0'.repeat(64);
+    if (change === 'generation') observed.transferGeneration = 2;
+    if (change === 'worker') observed.worker = { ...worker, instanceId: 'foreign' };
+    if (change === 'commit-replay') {
+      expect(journal.attempts.acknowledgeOwnerCleanup!(task, observed)).toBe(true);
+      observed.cleanupReceipt!.consumerCommitId = 'other';
+    }
+    expect(journal.attempts.acknowledgeOwnerCleanup!(task, observed)).toBe(false);
+    if (change === 'active') registration.settle(local);
+    expect(await journal.close()).toEqual({ complete: change === 'commit-replay' });
+  });
+  it('cannot consume through generic cleanup fields or caller-owned settlement extras', async () => {
+    const journal = createUploadAttemptJournal(worker);
+    const registration = journal.attempts.begin(jest.fn());
+    registration.bind(binding);
+    registration.settle({ ...local, ...view() });
+    journal.attempts.recordCleanup(task, {
+      ...local,
+      ...view(),
+      writerStopped: true,
+      acknowledgementPending: false,
+    });
+    expect(await journal.close()).toEqual({ complete: false });
   });
 });

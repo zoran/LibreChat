@@ -2,18 +2,22 @@
 import mongoose from 'mongoose';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
-import { uploadDerivedExpiresAt } from 'librechat-data-provider';
+import { uploadReservationFingerprint } from 'librechat-data-provider';
 import type { UploadDerivedOrigin } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
 import type { ManagedUploadAcceptance } from '~/types/file';
-import { createFileWorkspaceMethods } from './fileWorkspace';
 import { createFileRetentionMethods, FileSourceUnavailableError } from './fileRetention';
+import { createUploadManagementRepository } from './uploadManagement';
+import { createHousekeepingStore } from './housekeepingStore';
+import { createFileWorkspaceMethods } from './fileWorkspace';
+import { tenantStorage } from '~/config/tenantContext';
 import { createFileMethods } from './file';
 import { createModels } from '~/models';
-import { tenantStorage } from '~/config/tenantContext';
 
 describe('Workspace File access through the actual retained File authority', () => {
   const db = new mongoose.Mongoose();
@@ -21,6 +25,9 @@ describe('Workspace File access through the actual retained File authority', () 
   let directory: string;
   let lifecycle: ReturnType<typeof createFileRetentionMethods>;
   let workspace: ReturnType<typeof createFileWorkspaceMethods>;
+  let uploads: ReturnType<typeof createUploadManagementRepository>;
+  const principal = () => ({ ...owner, authentication: 'verified-email' as const });
+  const worker = { hostId: 'fixture-host', instanceId: 'fixture-app' };
   const policy = 'c'.repeat(64);
   const now = Date.now();
   const text = 'Synthetic approved Workspace source.\n';
@@ -62,7 +69,6 @@ describe('Workspace File access through the actual retained File authority', () 
       mediaType: 'text/plain',
       transferGeneration: 1,
       acceptedAt: now,
-      expiresAt: uploadDerivedExpiresAt(now, origin),
       ...(origin ? { derivedOrigin: origin } : {}),
       receipt: {
         outcome: 'durable',
@@ -97,37 +103,96 @@ describe('Workspace File access through the actual retained File authority', () 
     };
   }
   async function ready(id: string, origin?: UploadDerivedOrigin) {
-    await transaction(async (session) => {
-      await lifecycle.acceptManagedUpload(acceptance(id, origin), session);
-      await lifecycle.claimManagedUploadProcessing(owner, id, 7, now, session);
-      await lifecycle.publishManagedUpload(
-        owner,
-        id,
-        7,
+    const input = acceptance(id, origin);
+    const key = createHash('sha256').update(id).digest('hex');
+    const request = {
+      operationId: id,
+      idempotencyKey: `${key.slice(0, 8)}-${key.slice(8, 12)}-4${key.slice(13, 16)}-8${key.slice(17, 20)}-${key.slice(20, 32)}`,
+      mediaType: input.mediaType,
+      declaredBytes: input.receipt.bytes,
+      fingerprint: JSON.stringify([{ kind: 'personal' }, input.mediaType, input.receipt.bytes]),
+    };
+    if (origin)
+      await uploads.reserveDerived(
+        principal(),
         {
-          text,
-          structure: {
-            version: 1,
-            source: { sha256, bytes: bytes.length, mediaType: 'text/plain' },
-            extractor: { name: 'synthetic-fixture', version: '1' },
-            pages: [],
-            elements: [
-              {
-                id: 'e1',
-                kind: 'paragraph',
-                start: 0,
-                end: text.length,
-                page: null,
-                parentId: null,
-              },
-            ],
-            quality: { status: 'complete', warnings: [] },
-          },
+          ...request,
+          derived: { binding: origin.binding, directSourceFileIds: origin.directSourceFileIds },
+          fingerprint: uploadReservationFingerprint(
+            { ...request, scope: { kind: 'personal' } },
+            { binding: origin.binding, directSourceFileIds: origin.directSourceFileIds },
+          ),
         },
         now,
-        session,
       );
+    else await uploads.reserve(principal(), request, now);
+    const transfer = (await uploads.claim({
+      kind: 'transfer',
+      principal: principal(),
+      operationId: id,
+      worker,
+      now,
+    }))!;
+    const execution = {
+      version: 2 as const,
+      custody: { kind: 'none' as const },
+      attemptId: `${id}.${transfer.generation}`,
+      instanceId: '11111111-1111-4111-8111-111111111111',
+      executionId: '22222222-2222-4222-8222-222222222222',
+      expiresAt: new Date(now + 60000).toISOString(),
+    };
+    await uploads.bindSecurityExecution(transfer, execution, now);
+    await uploads.settleSecurityExecution(
+      transfer,
+      { execution, writerStopped: true, transientDataRemoved: true },
+      now,
+    );
+    await uploads.accept(
+      principal(),
+      transfer,
+      input.receipt,
+      input.securityApproval!,
+      { filename: input.filename },
+      now,
+    );
+    const gone = (lease: typeof transfer) => ({
+      operationId: id,
+      generation: lease.generation,
+      writerStopped: true,
+      localCopiesAbsent: true,
+      originalAbsent: false,
+      textAndHistoryRemoved: false,
     });
+    await uploads.confirmCleanup(gone(transfer), now);
+    const lease = (await uploads.claim({ kind: 'processing', worker, now }))!;
+    await uploads.bindProcessingExecution(
+      lease,
+      {
+        attemptId: `${id}.${lease.generation}`,
+        instanceId: 'fixture-parser',
+        expiresAt: new Date(now + 60000).toISOString(),
+      },
+      now,
+    );
+    await uploads.publish(
+      lease,
+      {
+        text,
+        writerStopped: true,
+        structure: {
+          version: 1,
+          source: { sha256, bytes: bytes.length, mediaType: 'text/plain' },
+          extractor: { name: 'synthetic-fixture', version: '1' },
+          pages: [],
+          elements: [
+            { id: 'e1', kind: 'paragraph', start: 0, end: text.length, page: null, parentId: null },
+          ],
+          quality: { status: 'complete', warnings: [] },
+        },
+      },
+      now,
+    );
+    await uploads.confirmCleanup(gone(lease), now);
   }
   async function draft(sourceIds = ['source'], id = 'draft') {
     const origin = await transaction((session) =>
@@ -142,6 +207,48 @@ describe('Workspace File access through the actual retained File authority', () 
     return origin;
   }
 
+  let registeredMongo: Array<{
+    pid: number;
+    kind: string;
+    start: string;
+    port?: number;
+    dbPath?: string;
+  }> = [];
+  function registerMongo(status: 'running' | 'settled') {
+    if (!process.env.RETENTION_RUN_SCOPE || !process.env.RETENTION_RUN_KEY) return;
+    if (status === 'running')
+      registeredMongo = mongo.servers.flatMap((server) => {
+        const info = server.instanceInfo;
+        const instance = info?.instance as unknown as {
+          mongodProcess?: { pid?: number };
+          killerProcess?: { pid?: number };
+        };
+        return [
+          ['mongod', instance?.mongodProcess?.pid],
+          ['killer', instance?.killerProcess?.pid],
+        ].flatMap(([kind, pid]) =>
+          typeof pid === 'number'
+            ? [
+                {
+                  kind: String(kind),
+                  pid,
+                  start: readFileSync(`/proc/${pid}/stat`, 'utf8')
+                    .split(')')[1]
+                    .trim()
+                    .split(' ')[19],
+                  port: info?.port,
+                  dbPath: kind === 'mongod' ? info?.dbPath : undefined,
+                },
+              ]
+            : [],
+        );
+      });
+    execFileSync('python3', [
+      `${process.env.RETENTION_RUN_SCOPE}/runner/register-mongo.py`,
+      status,
+      JSON.stringify(registeredMongo),
+    ]);
+  }
   beforeAll(async () => {
     directory = await mkdtemp(join(tmpdir(), 'workspace-file-'));
     mongo = await MongoMemoryReplSet.create({
@@ -154,9 +261,10 @@ describe('Workspace File access through the actual retained File authority', () 
       instanceOpts: [{ dbPath: directory }],
       replSet: { count: 1, storageEngine: 'wiredTiger' },
     });
+    registerMongo('running');
     await db.connect(mongo.getUri('workspace-file'), { serverSelectionTimeoutMS: 5000 });
     createModels(db);
-    await db.models.File.init();
+    await Promise.all([db.models.File.init(), createHousekeepingStore(db).initialize()]);
     lifecycle = createFileRetentionMethods(db, { securityPolicySha256: policy });
     workspace = createFileWorkspaceMethods(db, { securityPolicySha256: policy });
   });
@@ -164,7 +272,27 @@ describe('Workspace File access through the actual retained File authority', () 
     process.env.UPLOAD_SECURITY_POLICY_SHA256 = policy;
     process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = 'true';
     await db.models.File.deleteMany({});
-    if (db.models.UploadCounter) await db.models.UploadCounter.deleteMany({});
+    for (const name of [
+      'User',
+      'UploadCounter',
+      'UploadOperation',
+      'HousekeepingJob',
+      'FileReadReceipt',
+    ])
+      if (db.models[name]) await db.models[name].deleteMany({});
+    await db.models.User.create({
+      _id: owner.userId,
+      tenantId: owner.tenantId,
+      email: 'workspace@example.test',
+      emailVerified: true,
+    });
+    uploads = createUploadManagementRepository(db, {
+      enabled: true,
+      reconciled: true,
+      securityPolicySha256: policy,
+      baseline: { originalBytes: 0, objectBytes: 0, textBytes: 0, recordBytes: 0, bundles: 0 },
+    });
+    await uploads.initialize();
     await db.connection.collection('workspace_commit_fixture').deleteMany({});
   });
   afterEach(() => {
@@ -179,6 +307,7 @@ describe('Workspace File access through the actual retained File authority', () 
     } finally {
       try {
         await mongo?.stop();
+        registerMongo('settled');
       } finally {
         if (directory) await rm(directory, { recursive: true, force: true });
       }

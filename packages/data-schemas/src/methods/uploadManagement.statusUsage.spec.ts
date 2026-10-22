@@ -1,6 +1,7 @@
 /** Real Mongo original publication and Status receipts share the existing upload transaction. */
 import mongoose from 'mongoose';
 import type { UploadPrincipal } from 'librechat-data-provider';
+import type { UploadPublicationPort } from './uploadManagementTypes';
 import { useUploadStructureFixture } from './uploadManagement.structure.fixture';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createStatusUsageMethods } from './statusUsage';
@@ -27,7 +28,10 @@ describe('original-bound managed status publication', () => {
         createCurrent: () => ({}),
       });
       await runtime.initialize();
-      const recordOriginalPublication = jest.fn(runtime.recordOriginalPublication);
+      const recordOriginalPublication = jest.fn<
+        ReturnType<UploadPublicationPort>,
+        Parameters<UploadPublicationPort>
+      >(runtime.recordOriginalPublication);
       fixture.repository = createUploadManagementRepository(db, {
         securityPolicySha256: policy,
         recordOriginalPublication,
@@ -95,11 +99,11 @@ describe('original-bound managed status publication', () => {
       'does not count a %s original outside the trusted scope',
       async (kind) => {
         const { usage } = await bridge();
-        const principal: UploadPrincipal = {
-          userId: new mongoose.Types.ObjectId().toString(),
-          tenantId: kind === 'guest' ? null : 'other-tenant',
-          authentication: kind === 'guest' ? 'guest' : 'verified-email',
-        };
+        const userId = new mongoose.Types.ObjectId().toString();
+        const principal: UploadPrincipal =
+          kind === 'guest'
+            ? { userId, tenantId: null, authentication: 'guest' }
+            : { userId, tenantId: 'other-tenant', authentication: 'verified-email' };
         await db.models.User.create({
           _id: principal.userId,
           tenantId: principal.tenantId,

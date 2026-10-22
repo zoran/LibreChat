@@ -2,18 +2,20 @@
 import mongoose from 'mongoose';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { execFileSync } from 'node:child_process';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import {
   FileContext,
   UPLOAD_RETENTION_MS,
   UPLOAD_DERIVED_MAX_DESCENDANTS,
-  uploadDerivedExpiresAt,
+  uploadReservationFingerprint,
 } from 'librechat-data-provider';
 import type { UploadDerivedIntent, UploadDerivedOrigin } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
-import type { ManagedUploadAcceptance } from './fileRetention';
+import type { ManagedUploadAcceptance } from '~/types/file';
 import {
   createFileRetentionMethods,
   FileSourceCapacityError,
@@ -21,7 +23,9 @@ import {
   resolveFileSources,
   resizeRetainedDerivatives,
 } from './fileRetention';
-import { createUploadStore } from './uploadManagementStore';
+import { createUploadManagementRepository } from './uploadManagement';
+import { createHousekeepingStore } from './housekeepingStore';
+import { currentFileDeadline } from './fileSourceAuthority';
 import { tenantStorage } from '~/config/tenantContext';
 import { createFileMethods } from './file';
 import { createModels } from '~/models';
@@ -31,6 +35,9 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
   let mongo: MongoMemoryReplSet;
   let directory: string;
   let lifecycle: ReturnType<typeof createFileRetentionMethods>;
+  let uploads: ReturnType<typeof createUploadManagementRepository>;
+  const worker = { hostId: 'fixture-host', instanceId: 'fixture-app' };
+  const DAY = 86400_000;
   let files: ReturnType<typeof createFileMethods>;
   const policy = 'c'.repeat(64);
   const now = Date.now();
@@ -55,7 +62,6 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
       mediaType: 'text/plain',
       transferGeneration: 1,
       acceptedAt,
-      expiresAt: uploadDerivedExpiresAt(acceptedAt, origin),
       ...(origin ? { derivedOrigin: origin } : {}),
       receipt: {
         outcome: 'durable',
@@ -118,38 +124,103 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
     });
     return { promise, release };
   }
-  async function ready(input: ManagedUploadAcceptance): Promise<void> {
-    await transaction(async (session) => {
-      await lifecycle.acceptManagedUpload(input, session);
-      await lifecycle.claimManagedUploadProcessing(owner, input.operationId, 7, now, session);
-      await lifecycle.publishManagedUpload(
-        owner,
-        input.operationId,
-        7,
+  async function ready(
+    input: ManagedUploadAcceptance,
+    derived?: UploadDerivedIntent,
+  ): Promise<void> {
+    const id = input.operationId;
+    const now = input.acceptedAt;
+    const principal = input.principal;
+    derived ??= input.derivedOrigin && {
+      binding: input.derivedOrigin.binding,
+      directSourceFileIds: input.derivedOrigin.directSourceFileIds,
+    };
+    const key = createHash('sha256').update(id).digest('hex');
+    const request = {
+      operationId: id,
+      idempotencyKey: `${key.slice(0, 8)}-${key.slice(8, 12)}-4${key.slice(13, 16)}-8${key.slice(17, 20)}-${key.slice(20, 32)}`,
+      mediaType: input.mediaType,
+      declaredBytes: input.receipt.bytes,
+      fingerprint: uploadReservationFingerprint(
         {
-          text,
-          structure: {
-            version: 1,
-            source: { sha256, bytes: bytes.length, mediaType: 'text/plain' },
-            extractor: { name: 'synthetic-fixture', version: '1' },
-            pages: [],
-            elements: [
-              {
-                id: 'e1',
-                kind: 'paragraph',
-                start: 0,
-                end: text.length,
-                page: null,
-                parentId: null,
-              },
-            ],
-            quality: { status: 'complete', warnings: [] },
-          },
+          mediaType: input.mediaType,
+          declaredBytes: input.receipt.bytes,
+          scope: { kind: 'personal' },
         },
-        now,
-        session,
-      );
+        derived,
+      ),
+    };
+    if (derived) await uploads.reserveDerived(principal, { ...request, derived }, now);
+    else await uploads.reserve(principal, request, now);
+    const transfer = (await uploads.claim({
+      kind: 'transfer',
+      principal,
+      operationId: id,
+      worker,
+      now,
+    }))!;
+    expect(transfer.generation).toBe(input.transferGeneration);
+    const execution = {
+      version: 2 as const,
+      custody: { kind: 'none' as const },
+      attemptId: `${id}.${transfer.generation}`,
+      instanceId: '11111111-1111-4111-8111-111111111111',
+      executionId: '22222222-2222-4222-8222-222222222222',
+      expiresAt: new Date(now + 60_000).toISOString(),
+    };
+    await uploads.bindSecurityExecution(transfer, execution, now);
+    await uploads.settleSecurityExecution(
+      transfer,
+      { execution, writerStopped: true, transientDataRemoved: true },
+      now,
+    );
+    await uploads.accept(
+      principal,
+      transfer,
+      input.receipt,
+      input.securityApproval!,
+      { filename: input.filename },
+      now,
+    );
+    const gone = (lease: typeof transfer) => ({
+      operationId: id,
+      generation: lease.generation,
+      writerStopped: true,
+      localCopiesAbsent: true,
+      originalAbsent: false,
+      textAndHistoryRemoved: false,
     });
+    await uploads.confirmCleanup(gone(transfer), now);
+    const lease = (await uploads.claim({ kind: 'processing', worker, now }))!;
+    expect(lease.operationId).toBe(id);
+    await uploads.bindProcessingExecution(
+      lease,
+      {
+        attemptId: `${id}.${lease.generation}`,
+        instanceId: 'fixture-parser',
+        expiresAt: new Date(now + 60_000).toISOString(),
+      },
+      now,
+    );
+    await uploads.publish(
+      lease,
+      {
+        text,
+        writerStopped: true,
+        structure: {
+          version: 1,
+          source: { sha256, bytes: bytes.length, mediaType: 'text/plain' },
+          extractor: { name: 'synthetic-fixture', version: '1' },
+          pages: [],
+          elements: [
+            { id: 'e1', kind: 'paragraph', start: 0, end: text.length, page: null, parentId: null },
+          ],
+          quality: { status: 'complete', warnings: [] },
+        },
+      },
+      now,
+    );
+    await uploads.confirmCleanup(gone(lease), now);
   }
   async function derived(id: string, sources: string[]): Promise<UploadDerivedOrigin> {
     const origin = await capture(sources);
@@ -157,6 +228,48 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
     return origin;
   }
 
+  let registeredMongo: Array<{
+    pid: number;
+    kind: string;
+    start: string;
+    port?: number;
+    dbPath?: string;
+  }> = [];
+  function registerMongo(status: 'running' | 'settled') {
+    if (!process.env.RETENTION_RUN_SCOPE || !process.env.RETENTION_RUN_KEY) return;
+    if (status === 'running')
+      registeredMongo = mongo.servers.flatMap((server) => {
+        const info = server.instanceInfo;
+        const instance = info?.instance as unknown as {
+          mongodProcess?: { pid?: number };
+          killerProcess?: { pid?: number };
+        };
+        return [
+          ['mongod', instance?.mongodProcess?.pid],
+          ['killer', instance?.killerProcess?.pid],
+        ].flatMap(([kind, pid]) =>
+          typeof pid === 'number'
+            ? [
+                {
+                  kind: String(kind),
+                  pid,
+                  start: readFileSync(`/proc/${pid}/stat`, 'utf8')
+                    .split(')')[1]
+                    .trim()
+                    .split(' ')[19],
+                  port: info?.port,
+                  dbPath: kind === 'mongod' ? info?.dbPath : undefined,
+                },
+              ]
+            : [],
+        );
+      });
+    execFileSync('python3', [
+      `${process.env.RETENTION_RUN_SCOPE}/runner/register-mongo.py`,
+      status,
+      JSON.stringify(registeredMongo),
+    ]);
+  }
   beforeAll(async () => {
     directory = await mkdtemp(join(tmpdir(), 'derived-file-'));
     mongo = await MongoMemoryReplSet.create({
@@ -169,9 +282,15 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
       instanceOpts: [{ dbPath: directory }],
       replSet: { count: 1, storageEngine: 'wiredTiger' },
     });
+    registerMongo('running');
     await db.connect(mongo.getUri('derived-file'), { serverSelectionTimeoutMS: 5000 });
     createModels(db);
-    await Promise.all([db.models.File.init(), db.models.Message.init()]);
+    await Promise.all([
+      db.models.File.init(),
+      db.models.Message.init(),
+      db.models.User.init(),
+      createHousekeepingStore(db).initialize(),
+    ]);
     files = createFileMethods(db);
     lifecycle = createFileRetentionMethods(db, { securityPolicySha256: policy });
   });
@@ -179,7 +298,27 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
     process.env.UPLOAD_SECURITY_POLICY_SHA256 = policy;
     process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = 'true';
     await db.models.File.deleteMany({});
-    if (db.models.UploadCounter) await db.models.UploadCounter.deleteMany({});
+    for (const name of [
+      'User',
+      'UploadCounter',
+      'UploadOperation',
+      'HousekeepingJob',
+      'FileReadReceipt',
+    ])
+      if (db.models[name]) await db.models[name].deleteMany({});
+    await db.models.User.create({
+      _id: owner.userId,
+      tenantId: owner.tenantId,
+      email: 'derived@example.test',
+      emailVerified: true,
+    });
+    uploads = createUploadManagementRepository(db, {
+      enabled: true,
+      reconciled: true,
+      securityPolicySha256: policy,
+      baseline: { originalBytes: 0, objectBytes: 0, textBytes: 512, recordBytes: 0, bundles: 0 },
+    });
+    await uploads.initialize();
   });
   afterEach(() => {
     for (const [key, value] of Object.entries(previous)) {
@@ -193,6 +332,7 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
     } finally {
       try {
         await mongo?.stop();
+        registerMongo('settled');
       } finally {
         if (directory) await rm(directory, { recursive: true, force: true });
       }
@@ -200,21 +340,56 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
   });
 
   it('captures actual immutable source identity and inherits its earlier deadline', async () => {
-    const root = acceptance('root', undefined, now - 10_000);
+    const root = acceptance('root');
     await ready(root);
+    // Model a restored pre-tracking source: retain its real Upload receipt and existing shorter deadline.
+    const legacyDeadline = new Date(now + 14 * DAY);
+    await db.models.File.collection.updateOne(
+      { file_id: 'root' },
+      {
+        $set: {
+          expiredAt: legacyDeadline,
+          retentionActivity: {
+            version: 1,
+            baselineDeadlineAt: legacyDeadline,
+            trackedSince: new Date(now),
+            historyConfidence: 'since-tracking',
+            readCount: 0,
+            processingCount: 0,
+            deadlineGeneration: 0,
+          },
+        },
+      },
+    );
+    await db.models.UploadOperation.updateOne(
+      { _id: 'root' },
+      { $set: { expiresAt: legacyDeadline.getTime() } },
+    );
+    await db.models.HousekeepingJob.deleteMany({ 'work.subject.fileId': 'root' });
     const before = await raw('root');
     const origin = await capture(['root']);
     expect(origin).toEqual({
-      version: 1,
+      version: 2,
       binding: intent([]).binding,
       directSourceFileIds: ['root'],
       ancestors: [
-        { subject: root.securityApproval.subject, policySha256: policy, expiresAt: root.expiresAt },
+        {
+          subject: root.securityApproval.subject,
+          policySha256: policy,
+          sourceBindingSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+          expiresAt: before!.expiredAt.getTime(),
+        },
       ],
     });
     expect((await raw('root'))!.retentionRevision).toBeGreaterThan(before!.retentionRevision);
     await ready(acceptance('child', origin));
-    expect((await raw('child'))!.expiredAt).toEqual(new Date(root.expiresAt));
+    expect((await raw('child'))!.expiredAt).toEqual(before!.expiredAt);
+    expect((await raw('child'))!.derivedRetention.ownDeadlineAt).toEqual(
+      new Date(now + UPLOAD_RETENTION_MS),
+    );
+    expect(
+      (await db.models.UploadOperation.findById('child').lean<{ expiresAt: number }>())!.expiresAt,
+    ).toBe(before!.expiredAt.getTime());
     expect((await raw('child'))!.retentionAcceptedAt).toEqual(new Date(now));
     origin.ancestors[0].subject.sha256 = 'a'.repeat(64);
     expect((await raw('child'))!.derivedOrigin.ancestors[0].subject.sha256).toBe(sha256);
@@ -242,6 +417,19 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
       kind === 'owner'
         ? { ...owner, userId: new mongoose.Types.ObjectId().toString() }
         : { ...owner, tenantId: 'tenant-b' };
+    if (kind === 'owner')
+      await db.models.User.create({
+        _id: foreign.userId,
+        tenantId: foreign.tenantId,
+        email: 'foreign@example.test',
+        emailVerified: true,
+      });
+    else
+      // Place the real principal in the requested namespace to exercise the File ownership fence.
+      await db.models.User.collection.updateOne(
+        { _id: new mongoose.Types.ObjectId(owner.userId) },
+        { $set: { tenantId: foreign.tenantId } },
+      );
     await expect(capture(['root'], foreign)).rejects.toBeInstanceOf(FileSourceUnavailableError);
   });
 
@@ -306,15 +494,19 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
     }
   });
 
-  it.each(['parent proof', 'extended deadline'] as const)(
+  it.each(['parent proof', 'File-only extended parent deadline'] as const)(
     'refuses derived acceptance with %s',
     async (invalid) => {
-      const root = acceptance('root', undefined, now - 10_000);
+      const root = acceptance('root');
       await ready(root);
       const origin = await capture(['root']);
       const child = acceptance('child', origin);
       if (invalid === 'parent proof') child.securityApproval = root.securityApproval;
-      else child.expiresAt = now + UPLOAD_RETENTION_MS;
+      else
+        await db.models.File.collection.updateOne(
+          { file_id: 'root' },
+          { $set: { expiredAt: new Date(now + 42 * DAY) } },
+        );
       await expect(
         transaction((session) => lifecycle.acceptManagedUpload(child, session)),
       ).rejects.toBeInstanceOf(FileSourceUnavailableError);
@@ -402,7 +594,7 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
     await expect(
       files.updateFile({ file_id: 'root', expiredAt: new Date(now + 1000) }),
     ).rejects.toBeInstanceOf(FileSourceUnavailableError);
-    expect((await raw('root'))!.expiredAt).toEqual(new Date(now + UPLOAD_RETENTION_MS));
+    expect((await raw('root'))!.expiredAt).toEqual(new Date(now + UPLOAD_RETENTION_MS + 7 * DAY));
     process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = 'false';
     await tenantStorage.run(owner, () =>
       files.createFile(
@@ -444,7 +636,10 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
       proceed.release();
     }
     expect((await revoking).revokedFileIds.sort()).toEqual(['child', 'root']);
-    expect((await raw('child'))!.deletionRequestedAt).toEqual(new Date(now));
+    const revokedAt = (await raw('child'))!.deletionRequestedAt;
+    expect(revokedAt).toBeInstanceOf(Date);
+    expect(revokedAt.getTime()).toBeGreaterThanOrEqual(now);
+    expect(revokedAt.getTime()).toBeLessThanOrEqual(Date.now());
   });
 
   it('revoke-first: acceptance with an already-open old snapshot cannot publish a child', async () => {
@@ -538,21 +733,18 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
   });
 
   it('preserves unfinished child lineage across preparation and unknown Upload completion, without double debit', async () => {
-    await createUploadStore(db, {
-      enabled: true,
-      reconciled: true,
-      baseline: { textBytes: 512 },
-    }).initialize();
     await ready(acceptance('root'));
     const origin = await derived('child', ['root']);
+    const total = async () =>
+      (await db.models.UploadCounter.findById('global').lean<{ value: { textBytes: number } }>())!
+        .value.textBytes;
+    const originalCharge = await total();
+    expect(originalCharge).toBeGreaterThan(512);
     // Synthetic retained-copy liability, charged through the actual shared accounting owner.
     await transaction((session) =>
       resizeRetainedDerivatives(db, owner, [], [{ fileId: 'child', bytes: 2048 }], session),
     );
-    const total = async () =>
-      (await db.models.UploadCounter.findById('global').lean<{ value: { textBytes: number } }>())!
-        .value.textBytes;
-    expect(await total()).toBe(2560);
+    expect(await total()).toBe(originalCharge + 2048);
     await lifecycle.revokeFileSources(owner, ['root']);
     expect(await lifecycle.prepareFileSourceDeletion(owner, ['root'])).toEqual({
       preparedFileIds: [],
@@ -569,7 +761,10 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
     expect(prepared).not.toHaveProperty('text');
     expect(prepared).not.toHaveProperty('securityApproval');
     expect(prepared!.deletionCompletedAt).toBeFalsy();
-    expect(await total()).toBe(512);
+    const derivedDeadline = currentFileDeadline(prepared as never);
+    expect(derivedDeadline.kind).toBe('derived');
+    await expect(capture(['child'])).rejects.toBeInstanceOf(FileSourceUnavailableError);
+    expect(await total()).toBe(originalCharge);
     // Unknown external Uploadfinish acknowledgement: deliberately do not finalize the child.
     const freshSweep = createFileRetentionMethods(db, { securityPolicySha256: policy });
     expect((await freshSweep.revokeFileSources(owner, ['root'])).revokedFileIds.sort()).toEqual([
@@ -582,14 +777,146 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
     expect(await freshSweep.prepareFileSourceDeletion(owner, ['child'])).toEqual({
       preparedFileIds: ['child'],
     });
-    expect(await total()).toBe(512);
+    expect(await total()).toBe(originalCharge);
     expect(await freshSweep.finalizeFileSourceDeletion(owner, ['child'])).toEqual({
       completedFileIds: ['child'],
     });
+    expect(currentFileDeadline((await raw('child')) as never)).toEqual(derivedDeadline);
+    expect(await freshSweep.prepareFileSourceDeletion(owner, ['root'])).toEqual({
+      preparedFileIds: ['root'],
+    });
+    const originalDeadline = currentFileDeadline((await raw('root')) as never);
+    expect(originalDeadline.kind).toBe('original');
+    expect((await freshSweep.revokeFileSources(owner, ['root'])).revokedFileIds).toEqual(['root']);
+    await expect(capture(['root'])).rejects.toBeInstanceOf(FileSourceUnavailableError);
     expect(await freshSweep.finalizeFileSourceDeletion(owner, ['root'])).toEqual({
       completedFileIds: ['root'],
     });
-    expect(await total()).toBe(512);
+    expect(currentFileDeadline((await raw('root')) as never)).toEqual(originalDeadline);
+    expect(await total()).toBe(originalCharge);
+  });
+
+  it('settles expired historical derived custody after the real v2 migration barrier and cleanup re-entry', async () => {
+    await ready(acceptance('root'));
+    const captured = await derived('legacy-child', ['root']);
+    const historical = {
+      ...captured,
+      version: 1,
+      ancestors: captured.ancestors.map(({ sourceBindingSha256: _binding, ...source }) => source),
+    };
+    await transaction((session) =>
+      resizeRetainedDerivatives(db, owner, [], [{ fileId: 'legacy-child', bytes: 2048 }], session),
+    );
+    const expiredAt = new Date(Date.now() - 1);
+    await db.models.File.collection.updateOne(
+      { file_id: 'legacy-child' },
+      { $set: { derivedOrigin: historical, expiredAt }, $unset: { derivedRetention: '' } },
+    );
+    await db.models.UploadOperation.updateOne(
+      { _id: 'legacy-child' },
+      { $set: { derivedOrigin: historical, expiresAt: expiredAt.getTime() } },
+    );
+    const global = (await db.models.UploadCounter.findById('global').lean<{
+      value: {
+        baseline: {
+          originalBytes: number;
+          objectBytes: number;
+          textBytes: number;
+          recordBytes: number;
+          bundles: number;
+        };
+        textBytes: number;
+      };
+    }>())!.value;
+    const page = await uploads.exportSnapshot({ epoch: 'historical-cleanup', limit: 10 });
+    expect(page.version).toBe(2);
+    expect(
+      page.records.find(
+        (row) =>
+          row.kind === 'file-retention' &&
+          (row.subject as { fileId: string }).fileId === 'legacy-child',
+      ),
+    ).toMatchObject({ custody: 'cleanup-only' });
+    const targetDb = new mongoose.Mongoose();
+    try {
+      await targetDb.connect(mongo.getUri('historical-cleanup-target'));
+      createModels(targetDb);
+      await targetDb.models.File.init();
+      const target = createUploadManagementRepository(targetDb, {
+        enabled: false,
+        securityPolicySha256: policy,
+      });
+      await target.initialize();
+      await targetDb.models.File.collection.insertMany(
+        await db.models.File.collection.find({}).toArray(),
+      );
+      await targetDb.models.User.collection.insertMany(
+        await db.models.User.collection.find({}).toArray(),
+      );
+      await target.importSnapshot(page);
+      const file = () => targetDb.models.File.collection.findOne({ file_id: 'legacy-child' });
+      expect((await file())!.derivedRetention.migrationEpoch).toBe('historical-cleanup');
+      const receipt = await uploads.completeExport('historical-cleanup');
+      await target.completeImport({
+        receipt,
+        baseline: global.baseline,
+        lifecycleReconciled: true,
+      });
+      expect((await file())!.derivedOrigin).toEqual(historical);
+      expect((await file())!.derivedRetention.migrationEpoch).toBeUndefined();
+      const deadline = currentFileDeadline((await file()) as never);
+      expect(deadline.deadlineAt).toEqual(expiredAt);
+      const unavailable = async () => {
+        const session = await targetDb.startSession();
+        try {
+          await expect(
+            session.withTransaction(() =>
+              createFileRetentionMethods(targetDb, {
+                securityPolicySha256: policy,
+              }).captureManagedUploadOrigin(
+                owner,
+                { binding: captured.binding, directSourceFileIds: ['legacy-child'] },
+                Date.now(),
+                session,
+              ),
+            ),
+          ).rejects.toBeInstanceOf(FileSourceUnavailableError);
+        } finally {
+          await session.endSession();
+        }
+      };
+      await unavailable();
+      const deletion = createFileRetentionMethods(targetDb, { securityPolicySha256: policy });
+      await deletion.revokeFileSources(owner, ['legacy-child']);
+      expect(await deletion.prepareFileSourceDeletion(owner, ['legacy-child'])).toEqual({
+        preparedFileIds: ['legacy-child'],
+      });
+      expect((await file())!.derivedOrigin).toEqual(historical);
+      expect(currentFileDeadline((await file()) as never)).toEqual(deadline);
+      const total = async () =>
+        (await targetDb.models.UploadCounter.findById('global').lean<{
+          value: { textBytes: number };
+        }>())!.value.textBytes;
+      expect(await total()).toBe(global.textBytes - 2048);
+      const resumed = createFileRetentionMethods(targetDb, { securityPolicySha256: policy });
+      await resumed.revokeFileSources(owner, ['legacy-child']);
+      expect(await resumed.prepareFileSourceDeletion(owner, ['legacy-child'])).toEqual({
+        preparedFileIds: ['legacy-child'],
+      });
+      await unavailable();
+      expect(await resumed.finalizeFileSourceDeletion(owner, ['legacy-child'])).toEqual({
+        completedFileIds: ['legacy-child'],
+      });
+      expect(await resumed.finalizeFileSourceDeletion(owner, ['legacy-child'])).toEqual({
+        completedFileIds: ['legacy-child'],
+      });
+      expect((await file())!.derivedOrigin).toBeUndefined();
+      expect(currentFileDeadline((await file()) as never)).toEqual(deadline);
+      expect(await total()).toBe(global.textBytes - 2048);
+      await unavailable();
+    } finally {
+      await targetDb.disconnect();
+    }
   });
 
   it('keeps a parent and its locator unresolved until every child is finalized', async () => {

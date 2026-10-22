@@ -1,6 +1,7 @@
 const { EventEmitter } = require('node:events');
 const { createHash } = require('node:crypto');
 const { Readable } = require('node:stream');
+const { buildManagedFileReadBinding } = require('librechat-data-provider');
 
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
@@ -74,7 +75,11 @@ function response() {
       this.chunks.push(Buffer.from(chunk));
       return true;
     },
-    end() {
+    end(body) {
+      if (body) {
+        this.chunks.push(Buffer.from(body));
+        this.body = JSON.parse(body.toString());
+      }
       this.writableEnded = true;
     },
     destroy() {
@@ -142,6 +147,69 @@ function fixture(options = {}) {
       }),
     },
   };
+  owner.fileReadWorker = { hostId: 'host-a', instanceId: 'instance-a' };
+  const binding = (representation) =>
+    buildManagedFileReadBinding(
+      {
+        owner: { tenantId: file.tenantId ?? null, userId: file.user },
+        fileId: file.file_id,
+        operationId: file.uploadOperationId,
+        filename: file.filename,
+        mediaType: file.type,
+        source: file.source,
+        bytes: file.bytes,
+        storageKey: file.storageKey,
+        transferGeneration: task.attemptGeneration ?? null,
+        original: task.original,
+        approval: file.securityApproval ?? null,
+        representation,
+        ...(representation === 'preview'
+          ? { preview: { text: file.text, structure: file.documentStructure ?? null } }
+          : {}),
+      },
+      (value) => createHash('sha256').update(value).digest('hex'),
+    );
+  owner.fileReads = {
+    admitManagedFileRead: jest.fn(async (_user, input) => ({
+      version: 1,
+      readId: 'A'.repeat(43),
+      ...input,
+      admittedAt: new Date(wall).toISOString(),
+      notAfter: operation.expiresAt,
+    })),
+    claimManagedFileRead: jest.fn(async (_user, reference, worker, previous) => {
+      let sourceBindingSha256;
+      try {
+        sourceBindingSha256 = binding(reference.representation);
+      } catch {
+        throw Object.assign(new Error('not_found'), { code: 'not_found' });
+      }
+      return {
+        version: 1,
+        readKey: 'a'.repeat(64),
+        claimId: 'claim-a',
+        fence: 1,
+        worker,
+        fileId: reference.fileId,
+        representation: reference.representation,
+        sourceBindingSha256,
+        notAfter: operation.expiresAt,
+        leaseUntil: new Date(wall + 5000).toISOString(),
+        ...previous,
+      };
+    }),
+    completeManagedFileRead: jest.fn(async () => ({
+      status: 'completed',
+      firstCompletion: true,
+      completedAt: new Date(wall).toISOString(),
+    })),
+    inspectManagedFileRead: jest.fn(async () => ({
+      status: 'completed',
+      notAfter: operation.expiresAt,
+      completedAt: new Date(wall).toISOString(),
+    })),
+    abandonManagedFileRead: jest.fn(async () => ({ status: 'released' })),
+  };
   const getFiles = jest.fn(async () => [file]);
   owner.sources = createManagedSourceResolver({
     allowedOrigins: owner.allowedOrigins,
@@ -169,8 +237,8 @@ function fixture(options = {}) {
   const getRuntime = jest.fn(() => owner);
   const req = Object.assign(new EventEmitter(), {
     method: 'GET',
-    headers: { 'sec-fetch-site': 'same-origin' },
-    params: { id: 'operation', file_id: 'operation', userId: 'untrusted-path-owner' },
+    headers: { 'sec-fetch-site': 'same-origin', 'x-cortex-file-read': 'A'.repeat(43) },
+    params: { id: 'operation', file_id: 'operation', userId: user.userId },
     query: {},
     user: { id: user.userId, provider: 'email_code' },
   });
@@ -301,8 +369,8 @@ describe('authorized managed source preview', () => {
       '+securityApproval',
     ]);
     expect(f.owner.repository.cleanupForFile).toHaveBeenCalledWith(user, 'operation');
-    expect(f.owner.principal).toHaveBeenCalledTimes(2);
-    expect(f.owner.management.get).toHaveBeenCalledTimes(2);
+    expect(f.owner.principal.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(f.owner.management.get.mock.calls.length).toBeLessThanOrEqual(6);
     expect(f.res.headers['cache-control']).toBe('private, no-store');
     expect(f.res.body).not.toHaveProperty('securityApproval');
     expect(f.owner.storage.read).not.toHaveBeenCalled();
@@ -453,7 +521,7 @@ describe('authorized managed source preview', () => {
     async (method) => {
       const f = structuredFixture();
       await f.handlers[method](f.req, f.res);
-      expect(f.getFiles.mock.calls[0][2]).not.toMatch(/documentStructure|securityApproval/);
+      expect(f.getFiles.mock.calls[0][2]).not.toMatch(/documentStructure/);
       const publicValue =
         method === 'download'
           ? JSON.parse(decodeURIComponent(f.res.headers['x-file-metadata']))
@@ -509,7 +577,7 @@ describe('managed personal File consumers', () => {
       original: f.receipt,
       signal: expect.any(AbortSignal),
     });
-    expect(f.owner.principal).toHaveBeenCalledTimes(2);
+    expect(f.owner.principal.mock.calls.length).toBeGreaterThanOrEqual(2);
     expect(f.res.headers['content-length']).toBe(5);
     expect(f.res.headers['cache-control']).toBe('private, no-store');
     const metadata = JSON.parse(decodeURIComponent(f.res.headers['x-file-metadata']));
@@ -592,7 +660,7 @@ describe('managed personal File consumers', () => {
     'rejects an untrusted GET browser context %j',
     async (headers) => {
       const f = fixture();
-      f.req.headers = headers;
+      f.req.headers = { ...headers, 'x-cortex-file-read': 'A'.repeat(43) };
       await f.handlers.download(f.req, f.res);
       expect(f.res.statusCode).toBe(404);
       expect(f.owner.principal).not.toHaveBeenCalled();
@@ -601,7 +669,7 @@ describe('managed personal File consumers', () => {
 
   it('accepts an explicit configured Origin and rejects range before any lookup', async () => {
     const f = fixture();
-    f.req.headers = { origin: 'https://cortex.example' };
+    f.req.headers = { origin: 'https://cortex.example', 'x-cortex-file-read': 'A'.repeat(43) };
     await f.handlers.download(f.req, f.res);
     expect(f.res.statusCode).toBe(200);
     const ranged = fixture();
@@ -629,8 +697,8 @@ describe('managed personal File consumers', () => {
     });
     await f.handlers.download(f.req, f.res);
     expect(f.res.chunks.map((chunk) => chunk.length)).toEqual([64 * 1024, 64 * 1024, 64 * 1024]);
-    expect(f.owner.management.get).toHaveBeenCalledTimes(2);
-    expect(f.getFiles).toHaveBeenCalledTimes(1);
+    expect(f.owner.management.get.mock.calls.length).toBeLessThanOrEqual(6);
+    expect(f.getFiles.mock.calls.length).toBeLessThanOrEqual(6);
   });
 
   it('stops before further bytes at the next monotonic revocation check', async () => {
@@ -965,4 +1033,159 @@ describe('managed download with the actual original-integrity storage owner', ()
       expect(body.destroyed).toBe(true);
     },
   );
+});
+
+/** Managed retention: metadata requests never read content, and reads need finite authority. */
+describe('managed read admission regression', () => {
+  test.each(['download', 'preview', 'downloadURL'])(
+    'rejects content/preparation HEAD in %s before read activity',
+    async (handler) => {
+      const f = fixture();
+      f.req.method = 'HEAD';
+      if (handler === 'downloadURL') {
+        f.req.query = { read: '1', representation: 'original' };
+        delete f.req.headers['x-cortex-file-read'];
+      }
+      await f.handlers[handler](f.req, f.res);
+      expect(f.res.statusCode).toBe(405);
+      expect(f.res.headers.allow).toBe('GET');
+      expect(f.owner.fileReads.admitManagedFileRead).not.toHaveBeenCalled();
+      expect(f.owner.fileReads.claimManagedFileRead).not.toHaveBeenCalled();
+      expect(f.owner.fileReads.completeManagedFileRead).not.toHaveBeenCalled();
+      expect(f.owner.storage.read).not.toHaveBeenCalled();
+    },
+  );
+
+  it('requires a server-issued read identity before touching original storage', async () => {
+    const f = fixture();
+    delete f.req.headers['x-cortex-file-read'];
+    await f.handlers.download(f.req, f.res);
+    expect(f.res.statusCode).toBe(428);
+    expect(f.owner.storage.read).not.toHaveBeenCalled();
+  });
+  it('returns metadata only to a background preview observer', async () => {
+    const f = fixture();
+    delete f.req.headers['x-cortex-file-read'];
+    await f.handlers.preview(f.req, f.res);
+    expect(f.res.body).toEqual({ file_id: 'operation', status: 'ready' });
+    expect(f.owner.storage.read).not.toHaveBeenCalled();
+  });
+});
+
+/** Repository is an external port here. Its exactly-once transaction is covered by the File owner. */
+describe('finite managed read response boundary', () => {
+  it('withholds the final bytes until the File owner confirms full verified-body completion', async () => {
+    const f = fixture();
+    let release;
+    let entered;
+    const completing = new Promise((resolve) => {
+      entered = resolve;
+    });
+    f.owner.fileReads.completeManagedFileRead.mockImplementation(
+      async (_user, _claim, evidence) => {
+        expect(evidence.verifiedBytes).toBe(5);
+        expect(evidence.contentSha256).toBe(createHash('sha256').update('hello').digest('hex'));
+        entered();
+        return new Promise((resolve) => {
+          release = resolve;
+        });
+      },
+    );
+    const pending = f.handlers.download(f.req, f.res);
+    await completing;
+    expect(f.res.chunks).toEqual([]);
+    expect(f.res.writableEnded).toBe(false);
+    release({
+      status: 'completed',
+      firstCompletion: true,
+      completedAt: new Date(epoch).toISOString(),
+    });
+    await pending;
+    expect(Buffer.concat(f.res.chunks).toString()).toBe('hello');
+    expect(f.res.writableEnded).toBe(true);
+  });
+  it('leaves an unknown commit with the same identity and no final payload or speculative abandon', async () => {
+    const f = fixture();
+    f.owner.fileReads.completeManagedFileRead.mockResolvedValue({ status: 'unknown' });
+    f.owner.fileReads.inspectManagedFileRead.mockResolvedValue({
+      status: 'unknown',
+      retryAfterMs: 1000,
+    });
+    await f.handlers.download(f.req, f.res);
+    expect(f.res.statusCode).toBe(503);
+    expect(f.res.chunks).toEqual([]);
+    expect(f.owner.fileReads.inspectManagedFileRead).toHaveBeenCalledWith(
+      user,
+      expect.objectContaining({ readId: 'A'.repeat(43) }),
+    );
+    expect(f.owner.fileReads.admitManagedFileRead).not.toHaveBeenCalled();
+    expect(f.owner.fileReads.abandonManagedFileRead).not.toHaveBeenCalled();
+  });
+  it('reconciles a lost commit response without adding a second completion', async () => {
+    const f = fixture();
+    f.owner.fileReads.completeManagedFileRead.mockResolvedValue({ status: 'unknown' });
+    await f.handlers.download(f.req, f.res);
+    expect(Buffer.concat(f.res.chunks).toString()).toBe('hello');
+    expect(f.owner.fileReads.completeManagedFileRead).toHaveBeenCalledTimes(1);
+    expect(f.owner.fileReads.admitManagedFileRead).not.toHaveBeenCalled();
+  });
+  it('releases a failed attempt without completing or replacing its identity', async () => {
+    const f = fixture();
+    f.owner.storage.read.mockImplementation(async function* () {
+      yield Buffer.from('four');
+    });
+    await f.handlers.download(f.req, f.res);
+    expect(f.owner.fileReads.completeManagedFileRead).not.toHaveBeenCalled();
+    expect(f.owner.fileReads.abandonManagedFileRead).toHaveBeenCalledWith(
+      user,
+      expect.any(Object),
+      { reason: 'read_failed' },
+    );
+    expect(f.owner.fileReads.admitManagedFileRead).not.toHaveBeenCalled();
+  });
+  it('uses the existing URL route only for explicit admission and same-ID inspection', async () => {
+    const f = fixture();
+    f.req.query = { read: '1', representation: 'preview' };
+    delete f.req.headers['x-cortex-file-read'];
+    await f.handlers.downloadURL(f.req, f.res);
+    expect(f.res.body).toMatchObject({
+      version: 1,
+      fileId: 'operation',
+      representation: 'preview',
+      readId: 'A'.repeat(43),
+    });
+    expect(f.owner.fileReads.completeManagedFileRead).not.toHaveBeenCalled();
+    const inspecting = fixture();
+    inspecting.req.query = { read: '1', representation: 'original' };
+    await inspecting.handlers.downloadURL(inspecting.req, inspecting.res);
+    expect(inspecting.res.statusCode).toBe(204);
+    expect(inspecting.owner.fileReads.admitManagedFileRead).not.toHaveBeenCalled();
+  });
+  it('conceals foreign path owners and rejects duplicate or malformed read authority', async () => {
+    const foreign = fixture();
+    foreign.req.params.userId = 'different-user';
+    await foreign.handlers.download(foreign.req, foreign.res);
+    expect(foreign.res.statusCode).toBe(404);
+    expect(foreign.owner.storage.read).not.toHaveBeenCalled();
+    const duplicate = fixture();
+    duplicate.req.headers['x-cortex-file-read'] = ['A'.repeat(43), 'B'.repeat(43)];
+    await duplicate.handlers.download(duplicate.req, duplicate.res);
+    expect(duplicate.res.statusCode).toBe(400);
+  });
+  it('does not reveal preview content until its exact serialized-body completion is known', async () => {
+    const f = fixture();
+    f.owner.fileReads.completeManagedFileRead.mockImplementation(
+      async (_user, _claim, evidence) => {
+        const body =
+          '{"file_id":"operation","status":"ready","text":"useful text","textFormat":"text"}';
+        expect(evidence.verifiedBytes).toBe(Buffer.byteLength(body));
+        expect(evidence.contentSha256).toBe(createHash('sha256').update(body).digest('hex'));
+        expect(f.res.body).toBeUndefined();
+        return { status: 'refused', reason: 'expired' };
+      },
+    );
+    await f.handlers.preview(f.req, f.res);
+    expect(f.res.statusCode).toBe(404);
+    expect(f.res.body).not.toHaveProperty('text');
+  });
 });

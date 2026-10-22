@@ -1,9 +1,15 @@
 import mongoose from 'mongoose';
 import { v4 as uuid } from 'uuid';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import type { UploadLease, UploadPrincipal } from 'librechat-data-provider';
+import type {
+  MessageSourceCleanupCursor,
+  MessageSourceCleanupResult,
+} from './messageSourceCleanup';
 import type { CounterRow } from './uploadManagementStore';
 import { createUploadStore, RESOURCE_MAX } from './uploadManagementStore';
 import { createMessageMethods, CLIENT_MESSAGE_SELECT } from './message';
+import { createUploadManagementRepository } from './uploadManagement';
 import { tenantStorage, runAsSystem } from '~/config/tenantContext';
 import { createFileRetentionMethods } from './fileRetention';
 import { createFileMethods } from './file';
@@ -22,7 +28,10 @@ const methods = createMessageMethods(mongoose);
 const tenant = <T>(id: string, fn: () => T) => tenantStorage.run({ tenantId: id }, fn);
 
 beforeAll(async () => {
-  server = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
+  server = await MongoMemoryReplSet.create({
+    replSet: { count: 1 },
+    instanceOpts: [{ args: ['--setParameter', 'enableTestCommands=1'] }],
+  });
   models = createModels(mongoose);
   Object.assign(mongoose.models, models);
   await mongoose.connect(server.getUri());
@@ -37,6 +46,7 @@ afterEach(async () => {
   await runAsSystem(() => mongoose.models.Message.deleteMany({}));
   await runAsSystem(() => mongoose.models.File.deleteMany({}));
   if (mongoose.models.UploadCounter) await mongoose.models.UploadCounter.deleteMany({});
+  if (mongoose.models.UploadOperation) await mongoose.models.UploadOperation.deleteMany({});
 });
 
 describe('managed document derivative storage', () => {
@@ -66,6 +76,169 @@ describe('managed document derivative storage', () => {
     });
     return { sourceFileIds: [fileId], sourceExpiresAt: new Date(Date.now() + 60_000) };
   }
+  let previousCleanupPolicy: string | undefined;
+  beforeEach(() => {
+    previousCleanupPolicy = process.env.UPLOAD_SECURITY_POLICY_SHA256;
+  });
+  afterEach(() => {
+    if (previousCleanupPolicy === undefined) delete process.env.UPLOAD_SECURITY_POLICY_SHA256;
+    else process.env.UPLOAD_SECURITY_POLICY_SHA256 = previousCleanupPolicy;
+  });
+  async function managedSource(policy = 'c'.repeat(64)) {
+    process.env.UPLOAD_SECURITY_POLICY_SHA256 = policy;
+    const sourceId = uuid();
+    await mongoose.models.User.updateOne(
+      { _id: userId },
+      {
+        $setOnInsert: {
+          name: 'Synthetic Message cleanup owner',
+          email: `${userId}@example.invalid`,
+          provider: 'local',
+          emailVerified: true,
+        },
+      },
+      { upsert: true },
+    );
+    const uploads = createUploadManagementRepository(mongoose, {
+      enabled: true,
+      reconciled: true,
+      securityPolicySha256: policy,
+    });
+    await uploads.initialize();
+    const principal: UploadPrincipal = {
+      tenantId: owner.tenantId,
+      userId,
+      authentication: 'verified-email',
+    };
+    const at = Date.now();
+    const worker = { hostId: 'fixture-host', instanceId: 'fixture-instance' };
+    const reservation = await uploads.reserve(
+      principal,
+      {
+        operationId: sourceId,
+        idempotencyKey: uuid(),
+        mediaType: 'text/plain',
+        declaredBytes: 6,
+        fingerprint: JSON.stringify([{ kind: 'personal' }, 'text/plain', 6]),
+      },
+      at,
+    );
+    const transfer = await uploads.claim({
+      kind: 'transfer',
+      principal,
+      operationId: reservation.id,
+      worker,
+      now: at,
+    });
+    if (!transfer) throw new Error('Managed fixture transfer was not admitted');
+    const execution = {
+      version: 2 as const,
+      custody: { kind: 'none' as const },
+      attemptId: `${sourceId}.${transfer.generation}`,
+      instanceId: uuid(),
+      executionId: uuid(),
+      expiresAt: new Date(at + 60000).toISOString(),
+    };
+    await uploads.bindSecurityExecution(transfer, execution, at);
+    await uploads.settleSecurityExecution(
+      transfer,
+      { execution, writerStopped: true, transientDataRemoved: true },
+      at,
+    );
+    await uploads.accept(
+      principal,
+      transfer,
+      {
+        outcome: 'durable',
+        bytes: 6,
+        source: 's3',
+        filepath: `/api/files/download/${sourceId}`,
+        storageKey: `t/${owner.tenantId}/managed-uploads/${userId}/${sourceId}.${transfer.generation}__original`,
+        integrity: {
+          version: 1,
+          algorithm: 'sha256',
+          sha256: 'a'.repeat(64),
+          chunkBytes: 262144,
+          chunkSha256: ['b'.repeat(64)],
+        },
+      },
+      {
+        version: 1,
+        decision: 'approved',
+        policySha256: policy,
+        subject: {
+          userId,
+          tenantId: owner.tenantId,
+          operationId: sourceId,
+          transferGeneration: transfer.generation,
+          mediaType: 'text/plain',
+          bytes: 6,
+          sha256: 'a'.repeat(64),
+        },
+        scannerVersion: 'fixture-v1',
+        checkedAt: new Date(at).toISOString(),
+        coverage: { complete: true, pages: 1, parts: 1 },
+      },
+      { filename: 'A.txt' },
+      at,
+    );
+    const settleLocalCopies = (lease: UploadLease) =>
+      uploads.confirmCleanup(
+        {
+          operationId: lease.operationId,
+          generation: lease.generation,
+          writerStopped: true,
+          localCopiesAbsent: true,
+          originalAbsent: false,
+          textAndHistoryRemoved: false,
+        },
+        at,
+      );
+    await settleLocalCopies(transfer);
+    const processing = await uploads.claim({ kind: 'processing', worker, now: at });
+    if (!processing || processing.operationId !== sourceId)
+      throw new Error('Managed fixture processing was not admitted');
+    await uploads.bindProcessingExecution(
+      processing,
+      {
+        attemptId: `${sourceId}.${processing.generation}`,
+        instanceId: 'fixture-parser',
+        expiresAt: new Date(at + 60000).toISOString(),
+      },
+      at,
+    );
+    await uploads.publish(
+      processing,
+      {
+        text: 'secret',
+        writerStopped: true,
+        structure: {
+          version: 1,
+          source: { sha256: 'a'.repeat(64), bytes: 6, mediaType: 'text/plain' },
+          extractor: { name: 'fixture', version: '1' },
+          pages: [],
+          elements: [{ id: 'e1', kind: 'paragraph', start: 0, end: 6, page: null, parentId: null }],
+          quality: { status: 'complete', warnings: [] },
+        },
+      },
+      at,
+    );
+    await settleLocalCopies(processing);
+    return (await methods.resolveFileRetentionContext(owner, {
+      fileIds: [sourceId],
+      historyMessageIds: [],
+    }))!;
+  }
+
+  async function derivativeTotal() {
+    const counter = await mongoose.models.UploadCounter.findById('global')
+      .lean<CounterRow>()
+      .orFail();
+    if (!('textBytes' in counter.value)) throw new Error('Expected the global text counter');
+    // UploadOperation owns its extracted document bytes; this is the retained Message ledger.
+    return counter.value.baseline.textBytes;
+  }
+
   async function total() {
     const counter = await mongoose.models.UploadCounter.findById('global')
       .lean<CounterRow>()
@@ -438,18 +611,18 @@ describe('managed document derivative storage', () => {
   it('keeps deleted-history liabilities until the existing File cleanup completes', async () =>
     run(async () => {
       await initialize();
-      const context = await source();
+      const context = await managedSource();
       const message = row();
       await methods.saveMessage(owner, message, { sourceRetention: context });
-      const charged = await total();
+      const charged = await derivativeTotal();
       await methods.deleteMessages({ user: userId, messageId: message.messageId });
-      expect(await total()).toBe(charged);
+      expect(await derivativeTotal()).toBe(charged);
       await files.revokeFileSources(owner, context.sourceFileIds);
       await methods.redactFileSourceContent(owner, context.sourceFileIds);
       await files.finalizeFileSourceDeletion(owner, context.sourceFileIds);
-      expect(await total()).toBe(0);
+      expect(await derivativeTotal()).toBe(0);
       await files.finalizeFileSourceDeletion(owner, context.sourceFileIds);
-      expect(await total()).toBe(0);
+      expect(await derivativeTotal()).toBe(0);
     }));
   it('does not infer a zero charge from an unreconciled retained row', async () =>
     run(async () => {
@@ -493,31 +666,31 @@ describe('managed document derivative storage', () => {
   it('charges native history copies and preserves source deletion on their new identities', async () =>
     run(async () => {
       await initialize();
-      const context = await source();
+      const context = await managedSource();
       const original = row();
       await methods.saveMessage(owner, original, { sourceRetention: context });
       const saved = await methods.getMessage({ user: userId, messageId: original.messageId });
       const copyId = uuid();
-      const before = await total();
+      const before = await derivativeTotal();
       await methods.bulkSaveMessages([{ ...saved, _id: undefined, messageId: copyId }], true, {
         privateTextTokens: new Map(),
         nativeSources: new Map([
           [copyId, { messageId: original.messageId, messageVersion: saved!.__v ?? null }],
         ]),
       });
-      expect(await total()).toBeGreaterThan(before);
+      expect(await derivativeTotal()).toBeGreaterThan(before);
       const copy = await methods.getMessage({ user: userId, messageId: copyId });
       expect(copy?.sourceFileIds).toEqual(context.sourceFileIds);
       await files.revokeFileSources(owner, context.sourceFileIds);
       await methods.redactFileSourceContent(owner, context.sourceFileIds);
       expect((await methods.getMessage({ user: userId, messageId: copyId }))?.text).toBe('');
-      expect(await total()).toBe(0);
+      expect(await derivativeTotal()).toBe(0);
     }));
   it('charges quote components separately and leaves unrelated quotes after one source is removed', async () =>
     run(async () => {
       await initialize();
-      const first = await source();
-      const second = await source();
+      const first = await managedSource();
+      const second = await managedSource();
       const firstAnswer = row();
       const secondAnswer = row();
       await methods.saveMessage(owner, firstAnswer, { sourceRetention: first });
@@ -528,18 +701,18 @@ describe('managed document derivative storage', () => {
       ]);
       const question = { ...row(), isCreatedByUser: true, quotes: quoteRetention.quotes };
       await methods.saveMessage(owner, question, { quoteRetention });
-      const beforeEdit = await total();
+      const beforeEdit = await derivativeTotal();
       await methods.updateMessageText(userId, {
         messageId: question.messageId,
         text: 'ordinary words '.repeat(500),
       });
-      expect(await total()).toBe(beforeEdit);
+      expect(await derivativeTotal()).toBe(beforeEdit);
       await files.revokeFileSources(owner, first.sourceFileIds);
       await methods.redactFileSourceContent(owner, first.sourceFileIds);
       const saved = await methods.getMessage({ user: userId, messageId: question.messageId });
       expect(saved?.quotes).toEqual(['second quotation']);
-      expect(await total()).toBeGreaterThan(0);
-      expect(await total()).toBeLessThan(beforeEdit);
+      expect(await derivativeTotal()).toBeGreaterThan(0);
+      expect(await derivativeTotal()).toBeLessThan(beforeEdit);
       const raw = await models.Message.findOne({ messageId: question.messageId })
         .select('+retainedTextAllocations')
         .lean()
@@ -548,6 +721,494 @@ describe('managed document derivative storage', () => {
         second.sourceFileIds,
       );
     }));
+
+  describe('bounded Message source cleanup', () => {
+    const options = (
+      cursor: MessageSourceCleanupCursor | null = null,
+      limit = 1,
+      signal = new AbortController().signal,
+    ) => ({
+      deadlineAt: Date.now() + 10_000,
+      signal,
+      cursor,
+      limit,
+    });
+    const deferred = () => {
+      let resolve!: () => void;
+      const promise = new Promise<void>((done) => {
+        resolve = done;
+      });
+      return { promise, resolve: () => resolve() };
+    };
+    async function fixture(count = 1) {
+      await initialize();
+      const context = await managedSource();
+      const messages = Array.from({ length: count }, () => row());
+      for (const message of messages)
+        await methods.saveMessage(owner, message, { sourceRetention: context });
+      await files.revokeFileSources(owner, context.sourceFileIds);
+      return { context, messages };
+    }
+
+    it('pages actual body, quote and attachment effects and proves final absence', async () =>
+      run(async () => {
+        await initialize();
+        const context = await managedSource();
+        const messages = [row(), row(), row()];
+        for (const message of messages)
+          await methods.saveMessage(owner, message, { sourceRetention: context });
+        const quoteRetention = await methods.resolveQuoteRetention(owner, [
+          { text: 'owned quotation', sourceRef: { messageId: messages[0].messageId } },
+        ]);
+        await methods.saveMessage(
+          owner,
+          { ...row(), isCreatedByUser: true, quotes: quoteRetention.quotes },
+          { quoteRetention },
+        );
+        const reference = await models.Message.create({
+          ...row(),
+          user: userId,
+          files: [{ file_id: context.sourceFileIds[0] }],
+        });
+        await files.revokeFileSources(owner, context.sourceFileIds);
+        const bulk = jest.spyOn(models.Message, 'updateMany');
+        let cursor: MessageSourceCleanupCursor | null = null;
+        let redacted = 0,
+          detached = 0,
+          complete = false;
+        for (let attempt = 0; attempt < 12; attempt++) {
+          const result: MessageSourceCleanupResult = await methods.redactFileSourceContent(
+            owner,
+            context.sourceFileIds,
+            options(cursor),
+          );
+          expect(result.redactedMessages + result.detachedMessages).toBeLessThanOrEqual(1);
+          if (attempt === 0) expect(result.complete).toBe(false);
+          redacted += result.redactedMessages;
+          detached += result.detachedMessages;
+          if (result.complete) {
+            complete = true;
+            expect(result.cursor).toBeNull();
+            break;
+          }
+          cursor = result.cursor;
+        }
+        expect(complete).toBe(true);
+        expect({ redacted, detached }).toEqual({ redacted: 4, detached: 1 });
+        expect((await models.Message.findById(reference._id).lean())?.files).toEqual([]);
+        expect(await derivativeTotal()).toBe(0);
+        expect(bulk).not.toHaveBeenCalled();
+        await expect(
+          methods.redactFileSourceContent(owner, context.sourceFileIds),
+        ).resolves.toEqual({ redactedMessages: 0, detachedMessages: 0 });
+      }));
+
+    it('does not infer completion from a cursor beyond pending rows and revisits their phase', async () =>
+      run(async () => {
+        const { context } = await fixture(2);
+        const first = await methods.redactFileSourceContent(
+          owner,
+          context.sourceFileIds,
+          options(),
+        );
+        expect(first.complete).toBe(false);
+        const skipped = await methods.redactFileSourceContent(
+          owner,
+          context.sourceFileIds,
+          options({ ...first.cursor!, after: 'f'.repeat(24) }),
+        );
+        expect(skipped).toMatchObject({
+          complete: false,
+          redactedMessages: 0,
+          cursor: { phase: 'detach', after: null },
+        });
+        const reset = await methods.redactFileSourceContent(
+          owner,
+          context.sourceFileIds,
+          options(skipped.cursor),
+        );
+        expect(reset).toMatchObject({ complete: false, cursor: { phase: 'redact', after: null } });
+        await expect(
+          methods.redactFileSourceContent(owner, context.sourceFileIds, options(reset.cursor)),
+        ).resolves.toMatchObject({ complete: true, redactedMessages: 1 });
+        expect(await derivativeTotal()).toBe(0);
+      }));
+
+    it('observes a pending historical row inserted behind its cursor before the final proof', async () =>
+      run(async () => {
+        const { context } = await fixture();
+        const find = models.Message.findOne.bind(models.Message);
+        let inserted = false;
+        jest.spyOn(models.Message, 'findOne').mockImplementation((...args) => {
+          const query = find(...args);
+          if (query.getFilter().$or?.length === 4) {
+            const execute = query.exec.bind(query);
+            jest.spyOn(query, 'exec').mockImplementation(async () => {
+              if (!inserted) {
+                inserted = true;
+                await models.Message.create({
+                  ...row(),
+                  _id: new mongoose.Types.ObjectId('000000000000000000000001'),
+                  user: userId,
+                  ...context,
+                });
+              }
+              return execute();
+            });
+          }
+          return query;
+        });
+        const result = await methods.redactFileSourceContent(
+          owner,
+          context.sourceFileIds,
+          options(),
+        );
+        expect(inserted).toBe(true);
+        expect(result.complete).toBe(false);
+        await expect(
+          methods.redactFileSourceContent(owner, context.sourceFileIds),
+        ).resolves.toEqual({ redactedMessages: 1, detachedMessages: 0 });
+        expect(await derivativeTotal()).toBe(0);
+      }));
+
+    it('retries the existing version CAS and preserves an independent concurrent quote', async () =>
+      run(async () => {
+        const { context, messages } = await fixture();
+        const initial = await models.Message.findOne({ messageId: messages[0].messageId })
+          .lean()
+          .orFail();
+        const replace = models.Message.collection.replaceOne.bind(models.Message.collection);
+        jest
+          .spyOn(models.Message.collection, 'replaceOne')
+          .mockImplementationOnce(async (...args) => {
+            await models.Message.updateOne(
+              { messageId: messages[0].messageId },
+              { $set: { quotes: ['independent quote'] }, $inc: { __v: 1 } },
+            );
+            return replace(...args);
+          });
+        await expect(
+          methods.redactFileSourceContent(owner, context.sourceFileIds, options()),
+        ).resolves.toMatchObject({ complete: true, redactedMessages: 1 });
+        const stored = await models.Message.findOne({ messageId: messages[0].messageId }).lean();
+        expect(stored?.quotes).toEqual(['independent quote']);
+        expect(stored?.text).toBe('');
+        expect(stored?.__v).toBe((initial.__v ?? 0) + 2);
+        expect(await derivativeTotal()).toBe(0);
+      }));
+
+    it('rejects an unrevoked source before Message effects', async () =>
+      run(async () => {
+        await initialize();
+        const context = await managedSource();
+        const message = row();
+        await methods.saveMessage(owner, message, { sourceRetention: context });
+        await expect(
+          methods.redactFileSourceContent(owner, context.sourceFileIds, options()),
+        ).rejects.toMatchObject({ name: 'FileSourceUnavailableError' });
+        expect((await models.Message.findOne({ messageId: message.messageId }).lean())?.text).toBe(
+          message.text,
+        );
+      }));
+
+    it.each([0, 101, 1.5, Number.NaN])(
+      'rejects invalid page size %s before a query',
+      async (limit) =>
+        run(async () => {
+          const find = jest.spyOn(models.File, 'find');
+          await expect(
+            methods.redactFileSourceContent(owner, [], options(null, limit)),
+          ).rejects.toBeInstanceOf(TypeError);
+          expect(find).not.toHaveBeenCalled();
+        }),
+    );
+
+    it('rejects foreign scope and malformed cursors before a query', async () =>
+      run(async () => {
+        const { context } = await fixture(2);
+        const first = await methods.redactFileSourceContent(
+          owner,
+          context.sourceFileIds,
+          options(),
+        );
+        const find = jest.spyOn(models.File, 'find');
+        await expect(
+          methods.redactFileSourceContent(
+            { ...owner, userId: new mongoose.Types.ObjectId().toString() },
+            context.sourceFileIds,
+            options(first.cursor),
+          ),
+        ).rejects.toBeInstanceOf(TypeError);
+        await expect(
+          methods.redactFileSourceContent(owner, [uuid()], options(first.cursor)),
+        ).rejects.toBeInstanceOf(TypeError);
+        await expect(
+          methods.redactFileSourceContent(
+            owner,
+            context.sourceFileIds,
+            options({ ...first.cursor!, after: 'invalid' }),
+          ),
+        ).rejects.toBeInstanceOf(TypeError);
+        expect(find).not.toHaveBeenCalled();
+      }));
+
+    it('rejects a pre-aborted signal and expired deadline before a query', async () =>
+      run(async () => {
+        const signal = new AbortController();
+        signal.abort();
+        const find = jest.spyOn(models.File, 'find');
+        await expect(
+          methods.redactFileSourceContent(owner, [], options(null, 1, signal.signal)),
+        ).rejects.toMatchObject({ name: 'AbortError' });
+        await expect(
+          methods.redactFileSourceContent(owner, [], { ...options(), deadlineAt: Date.now() - 1 }),
+        ).rejects.toMatchObject({ name: 'TimeoutError' });
+        expect(find).not.toHaveBeenCalled();
+      }));
+
+    it.each(['abort', 'deadline'] as const)(
+      'joins its original stalled query after %s instead of reporting success',
+      async (kind) =>
+        run(async () => {
+          const { context, messages } = await fixture();
+          const controller = new AbortController(),
+            entered = deferred(),
+            release = deferred();
+          const find = models.File.find.bind(models.File);
+          jest.spyOn(models.File, 'find').mockImplementationOnce((...args) => {
+            const query = find(...args),
+              execute = query.exec.bind(query);
+            jest.spyOn(query, 'exec').mockImplementation(async () => {
+              expect(query.getOptions().timeoutMS).toBeGreaterThan(0);
+              expect(query.getOptions().timeoutMS).toBeLessThanOrEqual(10_000);
+              expect(query.getOptions().signal).toBe(controller.signal);
+              entered.resolve();
+              await release.promise;
+              return execute();
+            });
+            return query;
+          });
+          let settled = false;
+          const result = methods.redactFileSourceContent(
+            owner,
+            context.sourceFileIds,
+            options(null, 1, controller.signal),
+          );
+          const observed = result
+            .then(
+              (value) => ({ value }),
+              (error: unknown) => ({ error }),
+            )
+            .finally(() => {
+              settled = true;
+            });
+          await entered.promise;
+          try {
+            if (kind === 'abort') controller.abort();
+            else jest.spyOn(Date, 'now').mockReturnValue(Date.now() + 20_000);
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            expect(settled).toBe(false);
+          } finally {
+            release.resolve();
+          }
+          expect(await observed).toHaveProperty('error');
+          jest.restoreAllMocks();
+          expect(
+            (await models.Message.findOne({ messageId: messages[0].messageId }).lean())?.text,
+          ).toBe(messages[0].text);
+          expect(await derivativeTotal()).toBeGreaterThan(0);
+        }),
+    );
+
+    it('rolls back actual redaction and accounting when aborted inside the transaction', async () =>
+      run(async () => {
+        const { context, messages } = await fixture();
+        const before = await derivativeTotal(),
+          controller = new AbortController();
+        const replace = models.Message.collection.replaceOne.bind(models.Message.collection);
+        jest
+          .spyOn(models.Message.collection, 'replaceOne')
+          .mockImplementationOnce(async (...args) => {
+            const result = await replace(...args);
+            controller.abort();
+            return result;
+          });
+        await expect(
+          methods.redactFileSourceContent(
+            owner,
+            context.sourceFileIds,
+            options(null, 1, controller.signal),
+          ),
+        ).rejects.toMatchObject({ name: 'AbortError' });
+        expect(
+          (await models.Message.findOne({ messageId: messages[0].messageId }).lean())?.text,
+        ).toBe(messages[0].text);
+        expect(await derivativeTotal()).toBe(before);
+      }));
+
+    it.each(['abort', 'unknown acknowledgement'] as const)(
+      'retains partial committed progress after %s and safely retries the prior cursor',
+      async (kind) =>
+        run(async () => {
+          const { context } = await fixture(2);
+          const controller = new AbortController(),
+            start = mongoose.startSession.bind(mongoose);
+          const sessionSpy = jest
+            .spyOn(mongoose, 'startSession')
+            .mockImplementationOnce(async (...args) => {
+              const session = await start(...args),
+                commit = session.commitTransaction.bind(session);
+              jest
+                .spyOn(session, 'commitTransaction')
+                .mockImplementationOnce(async (...commitArgs) => {
+                  await commit(...commitArgs);
+                  if (kind === 'abort') controller.abort();
+                  else throw new Error('Unknown commit acknowledgement');
+                });
+              return session;
+            });
+          await expect(
+            methods.redactFileSourceContent(
+              owner,
+              context.sourceFileIds,
+              options(null, 2, controller.signal),
+            ),
+          ).rejects.toBeInstanceOf(Error);
+          sessionSpy.mockRestore();
+          expect(
+            await models.Message.countDocuments({
+              sourceFileIds: { $in: context.sourceFileIds },
+              sourceContentRemovedAt: { $ne: null },
+            }),
+          ).toBe(1);
+          await expect(
+            methods.redactFileSourceContent(owner, context.sourceFileIds, options(null, 2)),
+          ).resolves.toMatchObject({ complete: true, redactedMessages: 1 });
+          expect(await derivativeTotal()).toBe(0);
+        }),
+    );
+
+    it('bounds an actual stalled Mongo command with its native remaining deadline', async () =>
+      run(async () => {
+        const { context, messages } = await fixture();
+        const admin = mongoose.connection.db!.admin();
+        await admin.command({
+          configureFailPoint: 'failCommand',
+          mode: { times: 1 },
+          data: {
+            failCommands: ['find'],
+            blockConnection: true,
+            blockTimeMS: 750,
+          },
+        });
+        const started = Date.now();
+        try {
+          await expect(
+            methods.redactFileSourceContent(owner, context.sourceFileIds, {
+              ...options(),
+              deadlineAt: started + 100,
+            }),
+          ).rejects.toBeInstanceOf(Error);
+          expect(Date.now() - started).toBeLessThan(1000);
+        } finally {
+          await admin.command({ configureFailPoint: 'failCommand', mode: 'off' });
+        }
+        expect(
+          (await models.Message.findOne({ messageId: messages[0].messageId }).lean())?.text,
+        ).toBe(messages[0].text);
+        expect(await derivativeTotal()).toBeGreaterThan(0);
+      }));
+
+    it('does not enlarge the original page budget when the wall clock moves backward', async () =>
+      run(async () => {
+        const { context } = await fixture();
+        const find = models.File.find.bind(models.File);
+        const messageFind = models.Message.find.bind(models.Message);
+        let originalRemaining = 0;
+        jest.spyOn(models.File, 'find').mockImplementationOnce((...args) => {
+          const query = find(...args),
+            execute = query.exec.bind(query);
+          jest.spyOn(query, 'exec').mockImplementation(async () => {
+            originalRemaining = query.getOptions().timeoutMS;
+            const found = await execute();
+            jest.spyOn(Date, 'now').mockReturnValue(Date.now() - 60_000);
+            return found;
+          });
+          return query;
+        });
+        jest.spyOn(models.Message, 'find').mockImplementationOnce((...args) => {
+          const query = messageFind(...args),
+            execute = query.exec.bind(query);
+          jest.spyOn(query, 'exec').mockImplementation(async () => {
+            expect(query.getOptions().timeoutMS).toBeLessThanOrEqual(originalRemaining);
+            expect(query.getOptions().timeoutMS).toBeGreaterThan(0);
+            return execute();
+          });
+          return query;
+        });
+        try {
+          await expect(
+            methods.redactFileSourceContent(owner, context.sourceFileIds, {
+              ...options(),
+              deadlineAt: Date.now() + 1000,
+            }),
+          ).resolves.toMatchObject({ complete: true });
+        } finally {
+          jest.restoreAllMocks();
+        }
+        expect(await derivativeTotal()).toBe(0);
+      }));
+
+    it('keeps the compatibility drain within its original finite overall deadline', async () =>
+      run(async () => {
+        const { context } = await fixture(2);
+        const start = Date.now(),
+          find = models.Message.findOne.bind(models.Message);
+        jest.spyOn(models.Message, 'findOne').mockImplementation((...args) => {
+          const query = find(...args);
+          if (query.getFilter().$or?.length === 4) {
+            const execute = query.exec.bind(query);
+            jest.spyOn(query, 'exec').mockImplementation(async () => {
+              const result = await execute();
+              jest.spyOn(Date, 'now').mockReturnValue(start + 60_001);
+              return result;
+            });
+          }
+          return query;
+        });
+        try {
+          await expect(
+            methods.redactFileSourceContent(owner, context.sourceFileIds),
+          ).rejects.toMatchObject({ name: 'TimeoutError' });
+        } finally {
+          jest.restoreAllMocks();
+        }
+        expect(await derivativeTotal()).toBe(0);
+      }));
+
+    it('does not convert a failed final proof into completion after a committed page', async () =>
+      run(async () => {
+        const { context } = await fixture();
+        const find = models.Message.findOne.bind(models.Message);
+        const proof = jest.spyOn(models.Message, 'findOne').mockImplementation((...args) => {
+          const query = find(...args);
+          if (query.getFilter().$or?.length === 4)
+            jest.spyOn(query, 'exec').mockImplementationOnce(async () => {
+              expect(query.getOptions().readConcern).toEqual({ level: 'majority' });
+              throw new Error('Final query unavailable');
+            });
+          return query;
+        });
+        await expect(
+          methods.redactFileSourceContent(owner, context.sourceFileIds, options()),
+        ).rejects.toThrow('Final query unavailable');
+        proof.mockRestore();
+        await expect(
+          methods.redactFileSourceContent(owner, context.sourceFileIds, options()),
+        ).resolves.toMatchObject({ complete: true, redactedMessages: 0 });
+        expect(await derivativeTotal()).toBe(0);
+      }));
+  });
   it('serializes concurrent source writes from two independent Mongo clients at the cap', async () =>
     run(async () => {
       await initialize();

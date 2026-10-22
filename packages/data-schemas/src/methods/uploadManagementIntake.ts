@@ -1,3 +1,4 @@
+import { uploadOriginalKey as key } from './uploadManagementState';
 /** Private Intake capability and App-promotion fences on the existing transactional upload row. */
 import {
   readUploadIntakeGrant,
@@ -30,10 +31,18 @@ import type {
 import type { ClientSession } from 'mongoose';
 import type { StoredUpload, UploadStore, GlobalState } from './uploadManagementStore';
 import {
+  hasUploadPromotionClosure,
+  hasUploadActorClosure,
+  hasUploadStorageCompletion,
+  validateUploadCleanupCustody,
+} from './uploadCleanupReceipts';
+import {
   hasCompleteUploadSecurityExecution,
   recordUploadSecuritySettlement,
 } from './uploadManagement.security';
 import { principalFilter, assertLease, uploadDigest, reject } from './uploadManagementStore';
+
+export { uploadOriginalKey } from './uploadManagementState';
 
 export type UploadIntakeReference = {
   grant: UploadIntakeGrant;
@@ -41,6 +50,12 @@ export type UploadIntakeReference = {
   generation?: number;
 };
 export type UploadIntakeMethods = {
+  /** Internal actor observation; exact original owner only, never an accepted File cleanup port. */
+  readActorCleanupRecovery(input: {
+    operationId: string;
+    attemptGeneration: number;
+    worker: UploadWorker;
+  }): Promise<UploadIntakeRecovery | null>;
   sealIntakeRecovery(
     binding: UploadIntakeRecoveryBinding,
     now: number,
@@ -66,6 +81,15 @@ export type UploadIntakeMethods = {
     now: number,
   ): Promise<UploadPromotionRecord>;
   settlePromotion(input: UploadPromotionSettlement, now: number): Promise<UploadPromotionRecord>;
+  recordPromotionLocalCleanup(
+    input: {
+      operationId: string;
+      transferGeneration: number;
+      promotionId: string;
+      worker: UploadWorker;
+    },
+    now: number,
+  ): Promise<boolean>;
   getPromotion(
     principal: UploadPrincipal,
     id: string,
@@ -78,8 +102,6 @@ const sameWorker = (a: UploadWorker | undefined, b: UploadWorker | undefined): b
   !!a && !!b && a.hostId === b.hostId && a.instanceId === b.instanceId;
 const same = (a: unknown, b: unknown): boolean =>
   uploadDigest(a ?? null) === uploadDigest(b ?? null);
-const key = (row: StoredUpload): string =>
-  `${row.tenantId === null ? '' : `t/${row.tenantId}/`}managed-uploads/${row.userId}/${row._id}.${row.attemptGeneration}__original`;
 
 function grantOf(row: StoredUpload): UploadIntakeGrant | null {
   const grant = readUploadIntakeGrant(row.intake?.grant);
@@ -152,7 +174,7 @@ export function readStoredUploadPromotion(row: StoredUpload): UploadPromotionRec
   return record;
 }
 export function hasStoppedUploadPromotion(row: StoredUpload): boolean {
-  return readStoredUploadPromotion(row)?.writerStopped !== false;
+  return readStoredUploadPromotion(row)?.writerStopped !== false || hasUploadPromotionClosure(row);
 }
 export function requireUploadPromotionAcceptance(
   row: StoredUpload,
@@ -204,7 +226,7 @@ export function validateUploadMigrationIntake(row: StoredUpload): void {
         reject('migration_conflict');
     }
     const promotion = readStoredUploadPromotion(row);
-    if (promotion && !promotion.writerStopped) reject('migration_conflict');
+    if (promotion && !hasStoppedUploadPromotion(row)) reject('migration_conflict');
     if (promotion && !hasCompleteUploadSecurityExecution(row)) reject('migration_conflict');
     if (row.acceptedAt != null && (row.intake || promotion))
       requireUploadPromotionAcceptance(row, row.original, row.securityApproval!, {
@@ -216,7 +238,24 @@ export function validateUploadMigrationIntake(row: StoredUpload): void {
 }
 
 /** Only a permanently fenced reference can prove that no future App writer will start. */
-function recoveryView(row: StoredUpload): UploadIntakeRecovery {
+function recoveryView(row: StoredUpload, actor?: UploadWorker): UploadIntakeRecovery {
+  const c = row.cleanupCustody;
+  const completed =
+    row.acceptedAt == null &&
+    !row.fileId &&
+    ['failed', 'cancelled', 'deleted', 'expired'].includes(row.state) &&
+    !!c?.consumerCommitId &&
+    hasUploadStorageCompletion(row) &&
+    hasUploadActorClosure(row);
+  if (completed) validateUploadCleanupCustody(row);
+  const cleanupReceipt = completed
+    ? {
+        binding: c!.binding!,
+        receipt: c!.receipt!,
+        receiptSHA256: c!.receiptSHA256!,
+        consumerCommitId: c!.consumerCommitId!,
+      }
+    : undefined;
   const promotion = readStoredUploadPromotion(row);
   const storageOutcome =
     promotion?.state === 'writing' ? 'unknown' : (promotion?.receipt?.outcome ?? 'not_started');
@@ -224,11 +263,12 @@ function recoveryView(row: StoredUpload): UploadIntakeRecovery {
     version: 1,
     operationId: row._id,
     transferGeneration: row.intake!.generation,
-    worker: row.intake!.worker,
+    worker: actor ?? row.intake!.worker,
     closed: true,
-    acknowledged: row.intake!.cleanupAcknowledged === true,
+    acknowledged: completed || row.intake!.cleanupAcknowledged === true,
     storageOutcome,
-    appWriterStopped: storageOutcome !== 'unknown',
+    appWriterStopped: storageOutcome !== 'unknown' || completed,
+    ...(cleanupReceipt ? { cleanupReceipt } : {}),
     ...(promotion
       ? { promotion: { promotionId: promotion.promotionId, worker: promotion.worker } }
       : {}),
@@ -303,6 +343,29 @@ export function createUploadIntakeMethods(
     return row;
   }
   return {
+    async readActorCleanupRecovery(input) {
+      const row = await store.Operation.findById(input.operationId).lean<StoredUpload>();
+      if (
+        !row?.intake ||
+        row.acceptedAt != null ||
+        row.fileId ||
+        row.attemptGeneration !== input.attemptGeneration ||
+        row.intake.generation !== input.attemptGeneration ||
+        !row.cleanupCustody?.consumerCommitId
+      )
+        return null;
+      const promotion = readStoredUploadPromotion(row);
+      if (
+        !sameWorker(row.intake.worker, input.worker) &&
+        !(
+          promotion?.lease.generation === input.attemptGeneration &&
+          sameWorker(promotion.worker, input.worker)
+        )
+      )
+        return null;
+      const view = recoveryView(row, input.worker);
+      return view.cleanupReceipt && view.acknowledged ? view : null;
+    },
     async sealIntakeRecovery(value, _now) {
       const binding = readUploadIntakeRecoveryBinding(value);
       if (!binding) reject('invalid_request');
@@ -340,6 +403,26 @@ export function createUploadIntakeMethods(
         const row = await recoveryRow(binding, session);
         const result = check(row);
         if (result.acknowledged) return result;
+        // Persist the actual Intake join even when the original PUT remains unknown.
+        // Never attach an old transfer's local proof to a later processing writer.
+        if (
+          (row.workerGeneration ?? row.generation) === binding.transferGeneration &&
+          sameWorker(row.worker, binding.worker)
+        ) {
+          const previousActor = row.actorSettlement;
+          const exactPrevious =
+            previousActor?.generation === binding.transferGeneration &&
+            sameWorker(previousActor.worker, binding.worker);
+          row.actorSettlement = {
+            generation: binding.transferGeneration,
+            worker: { ...binding.worker },
+            writerStopped: exactPrevious && previousActor!.writerStopped === true,
+            localWriterStopped: true,
+            localCopiesAbsent:
+              (exactPrevious && previousActor!.localCopiesAbsent === true) ||
+              local.localCopiesAbsent,
+          };
+        }
         if (
           result.appWriterStopped &&
           (!row.securityExecution || hasCompleteUploadSecurityExecution(row))
@@ -473,6 +556,46 @@ export function createUploadIntakeMethods(
         await store.save(row, session);
         return readUploadPromotionRecord(row.promotion)!;
       });
+    },
+    async recordPromotionLocalCleanup(input, _now) {
+      const proof = structuredClone(input);
+      const session = await store.mongoose.startSession();
+      try {
+        return (
+          (await session.withTransaction(
+            async () => {
+              const row = await store.Operation.findById(proof.operationId)
+                .session(session)
+                .lean<StoredUpload>();
+              if (!row || !['failed', 'cancelled', 'deleted', 'expired'].includes(row.state))
+                reject('not_ready');
+              const promotion = readStoredUploadPromotion(row);
+              if (
+                !promotion ||
+                promotion.promotionId !== proof.promotionId ||
+                promotion.lease.generation !== proof.transferGeneration ||
+                !sameWorker(promotion.worker, proof.worker)
+              )
+                reject('lease_lost');
+              row.cleanupCustody ??= { version: 1 };
+              row.cleanupCustody.promotionLocal = {
+                promotionId: proof.promotionId,
+                generation: proof.transferGeneration,
+                worker: proof.worker,
+              };
+              await store.save(row, session);
+              return true;
+            },
+            {
+              readConcern: { level: 'snapshot' },
+              writeConcern: { w: 'majority', wtimeout: 2000 },
+              maxCommitTimeMS: 2000,
+            },
+          )) === true
+        );
+      } finally {
+        await session.endSession();
+      }
     },
     async settlePromotion(value, _now) {
       const input = readUploadPromotionSettlement(value);

@@ -97,6 +97,11 @@ import {
   assertSourceObjectSize,
   sourceChunkBytes,
 } from './internal/sourceBudget';
+import {
+  canonicalSourceIds,
+  sourceCleanupTerminal,
+  SOURCE_CLEANUP_CONCURRENCY,
+} from './sourceCleanup';
 import { isRecoveredSteerPayload, RecoveredSteerPayloadMismatchError } from './SteerRecovery';
 import { sourceRetentionAvailable, isStopConfirmed } from './interfaces/IJobStore';
 import { SourceReplayLifecycle } from './internal/sourceReplayLifecycle';
@@ -782,6 +787,9 @@ export interface TerminalJobClaim {
  *   when the real client connects, which would prevent readyPromise from resolving.
  */
 interface RuntimeJobState {
+  /** Assigned only by actual local create/provider admission, never by a facade read. */
+  sourceActorProviderExecutionId?: string;
+  sourceActorTerminalFinish?: Promise<void>;
   sourceRetention?: GenerationSourceRetention;
   sourceEventBytes?: number;
   sourceEventEntries?: number;
@@ -1182,7 +1190,9 @@ class GenerationJobManagerClass {
         this.tokenUsageWriteQueues.size +
         this.runStepWriteQueues.size +
         this.subscriberCleanupPromises.size +
-        this.fencedRuntimeRetirements.size,
+        this.fencedRuntimeRetirements.size +
+        this.sourceCleanupFlights.size +
+        (this.sourceCleanupScan ? 1 : 0),
       activeStreams,
     });
   }
@@ -1280,6 +1290,200 @@ class GenerationJobManagerClass {
   /** Whether to cleanup event transport immediately on job completion */
   private _cleanupOnComplete = true;
   private sourceReplay?: SourceReplayLifecycle;
+  private readonly sourceCleanupFlights = new Set<Promise<void>>();
+  private readonly sourceCleanupActors = new Map<
+    RuntimeJobState,
+    {
+      streamId: string;
+      providerExecutionId: string;
+      round: number;
+      flight?: Promise<void>;
+    }
+  >();
+
+  private sourceCleanupRound = 0;
+  private sourceCleanupIterator?: IterableIterator<[string, RuntimeJobState]>;
+  private sourceCleanupScan?: Promise<void>;
+
+  private requestSourceActorCleanup(streamId: string, runtime: RuntimeJobState): void {
+    if (this.shuttingDown || !runtime.sourceActorProviderExecutionId) return;
+    if (!this.sourceCleanupActors.has(runtime)) {
+      if (this.sourceCleanupActors.size >= SOURCE_REPLAY_LIMITS.epochs) return;
+      this.sourceCleanupActors.set(runtime, {
+        streamId,
+        providerExecutionId: runtime.sourceActorProviderExecutionId,
+        round: -1,
+      });
+    }
+    this.pumpSourceActorCleanup();
+  }
+
+  private pumpSourceActorCleanup(): void {
+    if (this.shuttingDown) return;
+    for (const [runtime, actor] of this.sourceCleanupActors) {
+      if (this.sourceCleanupFlights.size >= SOURCE_CLEANUP_CONCURRENCY) break;
+      if (actor.flight || actor.round === this.sourceCleanupRound) continue;
+      actor.round = this.sourceCleanupRound;
+      const flight = this.settleSourceActor(runtime, actor)
+        .catch((error) => {
+          logger.warn('[GenerationJobManager] Source actor cleanup remains unresolved', { error });
+        })
+        .finally(() => {
+          this.sourceCleanupFlights.delete(flight);
+          actor.flight = undefined;
+          // A slow attempt may span a round change. Give already-waiting actors
+          // their turn before retrying this unresolved actor in the new round.
+          if (this.sourceCleanupActors.get(runtime) === actor) {
+            this.sourceCleanupActors.delete(runtime);
+            this.sourceCleanupActors.set(runtime, actor);
+          }
+          this.pumpSourceActorCleanup();
+        });
+      actor.flight = flight;
+      this.sourceCleanupFlights.add(flight);
+    }
+  }
+
+  private async settleSourceActor(
+    runtime: RuntimeJobState,
+    actor: {
+      streamId: string;
+      providerExecutionId: string;
+    },
+  ): Promise<void> {
+    const { streamId, providerExecutionId } = actor;
+    const read = () =>
+      (this.jobStore.getSourceReplayJob ?? this.jobStore.getJob).call(this.jobStore, streamId);
+    const stillExact = () =>
+      runtime.sourceActorProviderExecutionId === providerExecutionId &&
+      (!this.runtimeState.has(streamId) || this.runtimeState.get(streamId) === runtime);
+    let job = await read();
+    if (
+      !stillExact() ||
+      job?.createdAt !== runtime.createdAt ||
+      job.providerExecutionId !== providerExecutionId
+    ) {
+      this.sourceCleanupActors.delete(runtime);
+      return;
+    }
+    if (!job.sourceRetention || job.sourceRetentionRevokedAt == null) {
+      this.sourceCleanupActors.delete(runtime);
+      return;
+    }
+    runtime.sourceRetentionRevokedAt = job.sourceRetentionRevokedAt;
+    runtime.abortController.abort();
+    this.releaseAbortSubscription(runtime);
+    // Retain actual handles before the existing terminal finalizer removes its maps.
+    const writes = [
+      this.replayEventWriteQueues.get(streamId),
+      this.tokenUsageWriteQueues.get(streamId),
+      this.runStepWriteQueues.get(streamId),
+      runtime.createdEventPublication,
+      runtime.subscriberStateWrite,
+      ...runtime.earlyEventSequencePromises,
+      ...[...runtime.inFlightSnapshotEmissions.values()].map((entry) => entry.snapshotReady),
+    ];
+    const result = await this.abortJob(streamId, {
+      expectedCreatedAt: runtime.createdAt,
+      expectedProviderExecutionId: providerExecutionId,
+      awaitProviderDrain: true,
+    });
+    if (!isStopConfirmed(result) || !stillExact()) return;
+    // A concurrent terminal winner may not yet have entered its actual finalizer.
+    if (!runtime.sourceActorTerminalFinish) return;
+    await runtime.sourceActorTerminalFinish;
+    const settled = await Promise.allSettled(writes);
+    if (!stillExact() || settled.some((result) => result.status === 'rejected')) return;
+    job = await read();
+    if (
+      !stillExact() ||
+      job?.createdAt !== runtime.createdAt ||
+      job.providerExecutionId !== providerExecutionId ||
+      !job.sourceRetention ||
+      job.sourceRetentionRevokedAt == null ||
+      !sourceCleanupTerminal(job)
+    )
+      return;
+    this.clearSourceReplayLocalState(streamId, runtime.createdAt, runtime);
+    runtime.inFlightSnapshotEmissions.clear();
+    runtime.earlyEventSequencePromises.length = 0;
+    runtime.earlyReplayHandlers.clear();
+    runtime.resumeCaptureHandlers.clear();
+    runtime.localErrorHandlers.clear();
+    runtime.sourceCleanupHandlers?.clear();
+    const recorded = await this.jobStore.recordSourceActorSettlement?.({
+      schema: 1,
+      streamId,
+      createdAt: runtime.createdAt,
+      providerExecutionId,
+      sourceRetentionRevokedAt: job.sourceRetentionRevokedAt,
+      sourceFileIds: canonicalSourceIds(job.sourceRetention.sourceFileIds),
+      localCopiesAbsent: true,
+    });
+    if (recorded) this.sourceCleanupActors.delete(runtime);
+  }
+
+  /** Existing owner timer supplies missed-wakeup recovery; no worker manager or second timer. */
+  private inspectSourceActorRevocations(): Promise<void> {
+    if (this.shuttingDown) return Promise.resolve();
+    if (this.sourceCleanupScan) return this.sourceCleanupScan;
+    const scan = (async () => {
+      this.sourceCleanupRound++;
+      this.sourceCleanupIterator ??= this.runtimeState.entries();
+      for (let inspected = 0; inspected < 16; inspected++) {
+        const next = this.sourceCleanupIterator.next();
+        if (next.done) {
+          this.sourceCleanupIterator = undefined;
+          break;
+        }
+        const [streamId, runtime] = next.value;
+        if (!runtime.sourceActorProviderExecutionId) continue;
+        const job = await (this.jobStore.getSourceReplayJob ?? this.jobStore.getJob).call(
+          this.jobStore,
+          streamId,
+        );
+        if (this.shuttingDown) return;
+        if (
+          this.runtimeState.get(streamId) !== runtime ||
+          job?.createdAt !== runtime.createdAt ||
+          job.providerExecutionId !== runtime.sourceActorProviderExecutionId ||
+          job.sourceRetentionRevokedAt == null
+        )
+          continue;
+        // Cancel every observed owner before waiting for a free terminal/drain slot.
+        runtime.sourceRetentionRevokedAt = job.sourceRetentionRevokedAt;
+        runtime.abortController.abort();
+        this.requestSourceActorCleanup(streamId, runtime);
+      }
+      this.pumpSourceActorCleanup();
+    })().finally(() => {
+      this.sourceCleanupScan = undefined;
+    });
+    this.sourceCleanupScan = scan;
+    return scan;
+  }
+
+  private async drainSourceActorCleanup(deadline: number): Promise<void> {
+    const pending = [
+      ...this.sourceCleanupFlights,
+      ...(this.sourceCleanupScan ? [this.sourceCleanupScan] : []),
+    ];
+    if (!pending.length) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        Promise.allSettled(pending),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+    // Keep adapter custody for registered effects; the host owns force-exit/native unknown proof.
+    if (this.sourceCleanupFlights.size || this.sourceCleanupScan)
+      throw new Error('generation_source_cleanup_shutdown_pending');
+  }
 
   /** Composition supplies File's existing private ledger port after configuring the stores. */
   configureSourceReplay(config: SourceReplayConfiguration): void {
@@ -1315,17 +1519,22 @@ class GenerationJobManagerClass {
     );
   }
 
-  private clearSourceReplayLocalState(streamId: string, epoch: number): void {
-    const runtime = this.runtimeState.get(streamId);
+  private clearSourceReplayLocalState(
+    streamId: string,
+    epoch: number,
+    captured?: RuntimeJobState,
+  ): void {
+    const runtime = captured ?? this.runtimeState.get(streamId);
     if (runtime?.createdAt !== epoch) return;
     runtime.sourceRetentionRevokedAt ??= Date.now();
     runtime.earlyEventBuffer.length = 0;
     runtime.earlyEventBufferBytes = 0;
     runtime.finalEvent = undefined;
     runtime.errorEvent = undefined;
-    runtime.inFlightSnapshotEmissions.clear();
+    // Keep outstanding writer handles until their actual settlement, including after a purge hint.
     for (const cleanup of [...(runtime.sourceCleanupHandlers ?? [])]) cleanup();
-    this.runStepBuffers?.delete(streamId);
+    if (!this.runtimeState.has(streamId) || this.runtimeState.get(streamId) === runtime)
+      this.runStepBuffers?.delete(streamId);
     this.jobStore.clearContentState(streamId, epoch);
   }
 
@@ -1402,6 +1611,10 @@ class GenerationJobManagerClass {
     isRedis?: boolean;
     cleanupOnComplete?: boolean;
   }): void {
+    if (this.sourceCleanupFlights.size || this.sourceCleanupScan)
+      throw new Error('generation_source_cleanup_reconfiguration_pending');
+    this.sourceCleanupActors.clear();
+    this.sourceCleanupIterator = undefined;
     assertJobStoreV2(services.jobStore);
     this.cancelFencedRuntimeRetirements();
     const previousStore = this.storeLabel;
@@ -1829,6 +2042,7 @@ class GenerationJobManagerClass {
         currentRuntime.abortController.abort();
         this.releaseAbortSubscription(currentRuntime);
       }
+      this.requestSourceActorCleanup(streamId, currentRuntime);
       return ownsProvider;
     });
 
@@ -3567,6 +3781,7 @@ class GenerationJobManagerClass {
     const resolveReady = (): void => undefined;
 
     const runtime: RuntimeJobState = {
+      sourceActorProviderExecutionId: jobData.providerExecutionId,
       sourceRetention: jobData.sourceRetention,
       sourceRetentionRevokedAt: jobData.sourceRetentionRevokedAt,
       createdAt: jobData.createdAt,
@@ -5058,6 +5273,8 @@ class GenerationJobManagerClass {
 
     const finishing = this.finishTerminalJobInternal(claim);
     this.terminalFinishPromises.set(claim, finishing);
+    const actor = this.terminalClaimRuntimes.get(claim);
+    if (actor) actor.sourceActorTerminalFinish = finishing;
     return finishing;
   }
 
@@ -5372,6 +5589,8 @@ class GenerationJobManagerClass {
        * same-stream replacement between authorization and the manager read
        * could be stopped by a stale request intended for its predecessor. */
       expectedCreatedAt?: number;
+      /** Optional exact execution fence for a captured source-cleanup target. */
+      expectedProviderExecutionId?: string;
       /** Destructive user cleanup must wait until the provider owner has
        * completed every trailing persistence task, not merely received Stop. */
       awaitProviderDrain?: boolean;
@@ -5450,6 +5669,20 @@ class GenerationJobManagerClass {
       jobData = unlockedJob;
     }
 
+    if (
+      options?.expectedProviderExecutionId != null &&
+      jobData.providerExecutionId !== options.expectedProviderExecutionId
+    )
+      return {
+        text: '',
+        content: [],
+        jobData,
+        success: false,
+        failureReason: 'generation_replaced',
+        finalEvent: null,
+        collectedUsage: [],
+      };
+
     const abortableStatus = jobData.status;
     if (abortableStatus !== 'running' && abortableStatus !== 'requires_action') {
       if (options?.awaitProviderDrain) {
@@ -5518,6 +5751,7 @@ class GenerationJobManagerClass {
         from: transitionFrom,
         to: 'aborted',
         expectCreatedAt: jobData.createdAt,
+        expectProviderExecutionId: options?.expectedProviderExecutionId,
         ...(expectedActionId != null && { expectActionId: expectedActionId }),
         patch: {
           completedAt: terminalPersistenceStartedAt,
@@ -5561,6 +5795,19 @@ class GenerationJobManagerClass {
     }
     if (drainedSteers == null) {
       const currentJob = await this.jobStore.getJob(streamId);
+      if (
+        options?.expectedProviderExecutionId != null &&
+        currentJob?.providerExecutionId !== options.expectedProviderExecutionId
+      )
+        return {
+          text: '',
+          content: [],
+          jobData: currentJob,
+          success: false,
+          failureReason: 'generation_replaced',
+          finalEvent: null,
+          collectedUsage: [],
+        };
       this.reconcileInactiveGeneration(streamId, jobData.createdAt, currentJob, runtime);
       const jobStillActive =
         currentJob?.createdAt === jobData.createdAt &&
@@ -9168,6 +9415,7 @@ class GenerationJobManagerClass {
       )
     )
       return false;
+    runtime!.sourceActorProviderExecutionId = providerExecutionId;
     this.openProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
     try {
       const started = await this.jobStore.beginProviderExecution(
@@ -10310,6 +10558,7 @@ class GenerationJobManagerClass {
   }
 
   private async cleanup(): Promise<void> {
+    await this.inspectSourceActorRevocations();
     await this.sourceReplay?.sweep();
     // A crashed pause writer must never become resumable merely because its
     // lease elapsed. Give a locally-observed runtime the first chance to fail
@@ -10694,7 +10943,10 @@ class GenerationJobManagerClass {
 
     await this.drainSubscriberCleanups();
     await this.awaitGenerationSettlements(Math.max(0, settlementDeadline - Date.now()));
+    await this.drainSourceActorCleanup(settlementDeadline);
     await this.finalizeOwnedJobsForShutdown();
+    this.sourceCleanupActors.clear();
+    this.sourceCleanupIterator = undefined;
     this.jobStore.setStaleGenerationHandler?.(undefined);
     await this.jobStore.destroy();
     this.eventTransport.destroy();
