@@ -1,15 +1,15 @@
 import { useState } from 'react';
 import { RecoilRoot } from 'recoil';
 import userEvent from '@testing-library/user-event';
+import { FileSources, QueryKeys } from 'librechat-data-provider';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { FileSources, QueryKeys } from 'librechat-data-provider';
 import type { TChatProjectFile, FileLibraryItem, TFileUpload } from 'librechat-data-provider';
 import type * as ClientModule from '@librechat/client';
 import type * as ReactModule from 'react';
 import type { ReactNode } from 'react';
-import ProjectResources from './ProjectResources';
 import { useDeleteFilesMutation } from '~/data-provider/Files/mutations';
+import ProjectResources from './ProjectResources';
 
 const mockUploadMutateAsync = jest.fn();
 const mockCanUseFileSearch = jest.fn(() => true);
@@ -305,7 +305,7 @@ describe('ProjectResources', () => {
     expect(await screen.findByRole('dialog', { name: filename })).toBeInTheDocument();
     expect(screen.getByText('Approved source source-two')).toBeInTheDocument();
     expect(screen.queryByText('Approved source source-one')).not.toBeInTheDocument();
-    expect(mockPreview).toHaveBeenCalledWith('source-two', { enabled: true }, undefined);
+    expect(mockPreview).toHaveBeenCalledWith('source-two', { enabled: true }, undefined, 'content');
     expect(mockAddMutateAsync).not.toHaveBeenCalled();
     expect(mockRemoveMutateAsync).not.toHaveBeenCalled();
     await user.keyboard('{Escape}');

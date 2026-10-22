@@ -75,7 +75,12 @@ describe('FileSourceButton', () => {
     expect(await screen.findByRole('dialog', { name: file.filename })).toBeInTheDocument();
     expect(screen.getByText('Approved native text')).toBeInTheDocument();
     expect(screen.getByText('PLAIN · 2.0 KB')).toBeInTheDocument();
-    expect(mockPreview).toHaveBeenLastCalledWith(file.file_id, { enabled: true }, undefined);
+    expect(mockPreview).toHaveBeenLastCalledWith(
+      file.file_id,
+      { enabled: true },
+      undefined,
+      'content',
+    );
     expect(mockBlob).toHaveBeenLastCalledWith('owner', file.file_id, undefined);
     expect(document.body.innerHTML).not.toContain(file.filepath);
     await user.keyboard('{Escape}');

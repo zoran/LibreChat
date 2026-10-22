@@ -10,6 +10,7 @@ import {
   CLIENT_MESSAGE_SELECT,
 } from './message';
 import { createUploadStore, RESOURCE_MAX } from './uploadManagementStore';
+import { initialFileRetentionActivity } from './fileActivityTransition';
 import { tenantStorage, runAsSystem } from '~/config/tenantContext';
 import { createFileRetentionMethods } from './fileRetention';
 import { createModels } from '../models';
@@ -41,6 +42,7 @@ async function stored(messageId: string) {
 }
 async function source() {
   const file_id = uuid();
+  const acceptedAt = new Date();
   const expiredAt = new Date(Date.now() + 60_000);
   await mongoose.models.File.create({
     user: owner.userId,
@@ -51,8 +53,9 @@ async function source() {
     bytes: 11,
     text: 'source text',
     retainedDerivativeBytes: 0,
-    retentionAcceptedAt: new Date(),
+    retentionAcceptedAt: acceptedAt,
     expiredAt,
+    retentionActivity: initialFileRetentionActivity(expiredAt, acceptedAt, 'complete'),
   });
   return { sourceFileIds: [file_id], sourceExpiresAt: expiredAt };
 }
@@ -70,11 +73,20 @@ afterAll(async () => {
 });
 beforeEach(async () => {
   jest.clearAllMocks();
+  await run(() =>
+    mongoose.models.User.create({
+      _id: owner.userId,
+      tenantId: owner.tenantId,
+      email: 'artifact-version@example.test',
+      emailVerified: true,
+    }),
+  );
   await createUploadStore(mongoose, { enabled: true, reconciled: true }).initialize();
 });
 afterEach(async () => {
   await runAsSystem(() => mongoose.models.Message.deleteMany({}));
   await runAsSystem(() => mongoose.models.File.deleteMany({}));
+  await runAsSystem(() => mongoose.models.User.deleteMany({}));
   await mongoose.models.UploadCounter.deleteMany({});
 });
 
