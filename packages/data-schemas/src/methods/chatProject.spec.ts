@@ -11,6 +11,8 @@ import {
   updateChatProjectLastConversationForUser,
   type ChatProjectMethods,
 } from './chatProject';
+import { initialFileRetentionActivity } from './fileActivityTransition';
+import { createHousekeepingStore } from './housekeepingStore';
 import { tenantStorage } from '~/config/tenantContext';
 import { createFileMethods } from './file';
 import { createModels } from '~/models';
@@ -582,28 +584,40 @@ describe('persistent Project context', () => {
     const policy = 'a'.repeat(64);
     let previousPolicy: string | undefined;
     let previousManagedOnly: string | undefined;
+    let housekeeping: ReturnType<typeof createHousekeepingStore>;
 
+    beforeAll(async () => {
+      housekeeping = createHousekeepingStore(mongoose);
+      await housekeeping.initialize();
+      modelsToCleanup.push(housekeeping.model.modelName);
+    });
     beforeEach(() => {
       previousPolicy = process.env.UPLOAD_SECURITY_POLICY_SHA256;
       previousManagedOnly = process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED;
       process.env.UPLOAD_SECURITY_POLICY_SHA256 = policy;
       delete process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED;
     });
-    afterEach(() => {
+    afterEach(async () => {
       if (previousPolicy === undefined) delete process.env.UPLOAD_SECURITY_POLICY_SHA256;
       else process.env.UPLOAD_SECURITY_POLICY_SHA256 = previousPolicy;
       if (previousManagedOnly === undefined) delete process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED;
       else process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED = previousManagedOnly;
+      await housekeeping.model.deleteMany({});
     });
 
     async function createManagedReference(fileId: string) {
       const tenantId = tenantStorage.getStore()?.tenantId ?? null;
+      const now = Date.now();
+      const acceptedAt = new Date(now - 1_000);
+      const expiredAt = new Date(now + 86_400_000);
       return createReference(fileId, {
         tenantId,
         uploadOperationId: fileId,
-        retentionAcceptedAt: new Date(Date.now() - 1_000),
-        expiredAt: new Date(Date.now() + 86_400_000),
-        expiresAt: new Date(Date.now() + 3_600_000),
+        retentionAcceptedAt: acceptedAt,
+        expiredAt,
+        retentionActivity: initialFileRetentionActivity(expiredAt, acceptedAt, 'complete'),
+        retentionRevision: 0,
+        expiresAt: new Date(now + 3_600_000),
         temp_file_id: `temporary-${fileId}`,
         source: 's3',
         storageKey: `${tenantId ? `t/${tenantId}/` : ''}managed-uploads/${owner}/${fileId}.1__original`,
@@ -613,7 +627,7 @@ describe('persistent Project context', () => {
           decision: 'approved',
           policySha256: policy,
           scannerVersion: 'fixture/1',
-          checkedAt: new Date(Date.now() - 1_000).toISOString(),
+          checkedAt: acceptedAt.toISOString(),
           coverage: { complete: true, pages: 1, parts: 1 },
           subject: {
             tenantId,
@@ -628,13 +642,65 @@ describe('persistent Project context', () => {
       });
     }
 
+    function expiredFixtureFields(file: IMongoFile) {
+      const expiredAt = new Date(file.retentionAcceptedAt!.getTime() + 1);
+      return {
+        expiredAt,
+        retentionActivity: initialFileRetentionActivity(
+          expiredAt,
+          file.retentionAcceptedAt!,
+          'complete',
+        ),
+      };
+    }
+
+    async function expectCommittedRevocation(original: IMongoFile) {
+      const revoked = await File.findById(original._id)
+        .select('+retentionActivity +retentionRevocationId')
+        .lean<IMongoFile>()
+        .orFail();
+      expect(revoked).toMatchObject({
+        deletionRequestedAt: expect.any(Date),
+        retentionRevocationId: expect.any(String),
+        retentionRevision: original.retentionRevision! + 1,
+        expiredAt: original.expiredAt,
+      });
+      expect(revoked.retentionActivity).toEqual(original.retentionActivity);
+      const jobs = await housekeeping.model
+        .find({
+          handler: 'file.cleanup',
+          'work.subject.tenantId': original.tenantId ?? null,
+          'work.subject.ownerUserId': String(original.user),
+          'work.subject.fileId': original.file_id,
+          generation: original.retentionActivity!.deadlineGeneration,
+        })
+        .lean();
+      expect(jobs).toHaveLength(1);
+      expect(jobs[0]).toMatchObject({
+        work: {
+          handler: 'file.cleanup',
+          subject: {
+            tenantId: original.tenantId ?? null,
+            ownerUserId: String(original.user),
+            fileId: original.file_id,
+          },
+          deadlineGeneration: original.retentionActivity!.deadlineGeneration,
+          revocationId: revoked.retentionRevocationId,
+        },
+        dueAt: revoked.deletionRequestedAt,
+        state: 'queued',
+        execution: { phase: 'awaiting_deadline' },
+      });
+      return revoked;
+    }
+
     // Regression: collection admission must use the same current File eligibility as its reader.
     it.each([
       ['pending', { status: 'pending' }],
       ['rejected', { 'securityApproval.decision': 'rejected' }],
       ['missing-approval', { securityApproval: null }],
       ['obsolete-policy', { 'securityApproval.policySha256': 'c'.repeat(64) }],
-      ['expired', { expiredAt: new Date(0) }],
+      ['expired', {}],
       ['deleting', { deletionRequestedAt: new Date() }],
       ['deleted', { deletionCompletedAt: new Date() }],
       ['derived-draft', { derivedOrigin: { version: 1, purpose: 'draft' } }],
@@ -642,7 +708,10 @@ describe('persistent Project context', () => {
       const project = await methods.createChatProject(owner, { name: 'Eligibility' });
       const fileId = `blocked-${name}`;
       const original = await createManagedReference(fileId);
-      await File.collection.updateOne({ _id: original._id }, { $set: fields });
+      await File.collection.updateOne(
+        { _id: original._id },
+        { $set: name === 'expired' ? expiredFixtureFields(original) : fields },
+      );
       await expect(
         methods.addChatProjectFile(owner, project._id!.toString(), fileId),
       ).rejects.toThrow('Project file unavailable');
@@ -711,6 +780,10 @@ describe('persistent Project context', () => {
     it('checks eligibility again before releasing a hold after native revocation', async () => {
       const project = await methods.createChatProject(owner, { name: 'Revoked before release' });
       const file = await createManagedReference('revoked-before-release');
+      const beforeRevocation = await File.findById(file._id)
+        .select('+retentionActivity +retentionRevocationId')
+        .lean<IMongoFile>()
+        .orFail();
       const updateOne = File.updateOne.bind(File);
       const spy = jest.spyOn(File, 'updateOne').mockImplementationOnce(((
         ...args: Parameters<typeof File.updateOne>
@@ -729,6 +802,7 @@ describe('persistent Project context', () => {
         file_ids: [],
         contextRevision: project.contextRevision,
       });
+      await expectCommittedRevocation(beforeRevocation);
       expect(await File.findById(file._id).lean()).toMatchObject({
         expiresAt: file.expiresAt,
         temp_file_id: file.temp_file_id,
@@ -776,6 +850,10 @@ describe('persistent Project context', () => {
         const project = await methods.createChatProject(owner, { name: 'Revoked while attaching' });
         const file = await createManagedReference('revoked-during-attach');
         if (replay) await methods.addChatProjectFile(owner, project._id!.toString(), file.file_id);
+        const beforeAttach = await File.findById(file._id)
+          .select('+retentionActivity +retentionRevocationId')
+          .lean<IMongoFile>()
+          .orFail();
         const attach = ChatProject.findOneAndUpdate.bind(ChatProject);
         const spy = jest.spyOn(ChatProject, 'findOneAndUpdate').mockImplementationOnce(((
           ...args: Parameters<typeof ChatProject.findOneAndUpdate>
@@ -789,7 +867,7 @@ describe('persistent Project context', () => {
                 file.file_id,
               ]);
             } else if (transition === 'expire') {
-              await File.updateOne({ _id: file._id }, { $set: { expiredAt: new Date(0) } });
+              await File.updateOne({ _id: file._id }, { $set: expiredFixtureFields(file) });
             } else {
               process.env.UPLOAD_SECURITY_POLICY_SHA256 = 'd'.repeat(64);
             }
@@ -809,7 +887,9 @@ describe('persistent Project context', () => {
         );
         expect(await File.findById(file._id).lean()).not.toBeNull();
         if (transition === 'revoke') {
-          expect((await File.findById(file._id).lean())?.deletionRequestedAt).toBeInstanceOf(Date);
+          const revoked = await expectCommittedRevocation(beforeAttach);
+          expect(revoked.expiresAt).toEqual(beforeAttach.expiresAt);
+          expect(revoked.temp_file_id).toEqual(beforeAttach.temp_file_id);
         }
       },
     );

@@ -5,6 +5,7 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import type { SourceCoverage } from 'librechat-data-provider';
 import type { IMessage } from '~/types';
 import { createUploadStore, RESOURCE_MAX } from './uploadManagementStore';
+import { initialFileRetentionActivity } from './fileActivityTransition';
 import { tenantStorage, runAsSystem } from '~/config/tenantContext';
 import { createFileRetentionMethods } from './fileRetention';
 import { createMessageMethods } from './message';
@@ -60,6 +61,8 @@ const total = async () => {
 };
 async function source() {
   const fileId = uuid();
+  const acceptedAt = new Date(Date.now() - 60_000);
+  const deadlineAt = new Date(Date.now() + 60_000);
   await mongoose.models.File.create({
     user: owner.userId,
     file_id: fileId,
@@ -69,10 +72,18 @@ async function source() {
     bytes: 11,
     text: 'source text',
     retainedDerivativeBytes: 0,
-    retentionAcceptedAt: new Date(),
-    expiredAt: new Date(Date.now() + 60_000),
+    retentionAcceptedAt: acceptedAt,
+    expiredAt: deadlineAt,
+    retentionActivity: initialFileRetentionActivity(deadlineAt, acceptedAt, 'complete'),
   });
-  return { sourceFileIds: [fileId], sourceExpiresAt: new Date(Date.now() + 60_000) };
+  return { sourceFileIds: [fileId], sourceExpiresAt: deadlineAt };
+}
+async function expireSource(fileId: string) {
+  const expiredAt = new Date(Date.now() - 1);
+  await mongoose.models.File.updateOne(
+    { file_id: fileId },
+    { $set: { expiredAt, 'retentionActivity.baselineDeadlineAt': expiredAt } },
+  );
 }
 
 beforeAll(async () => {
@@ -87,11 +98,20 @@ afterAll(async () => {
   await server?.stop();
 });
 beforeEach(async () => {
+  await run(() =>
+    mongoose.models.User.create({
+      _id: owner.userId,
+      tenantId: owner.tenantId,
+      email: 'source-coverage@example.test',
+      emailVerified: true,
+    }),
+  );
   await createUploadStore(mongoose, { enabled: true, reconciled: true }).initialize();
 });
 afterEach(async () => {
   await runAsSystem(() => mongoose.models.Message.deleteMany({}));
   await runAsSystem(() => mongoose.models.File.deleteMany({}));
+  await runAsSystem(() => mongoose.models.User.deleteMany({}));
   await mongoose.models.UploadCounter.deleteMany({});
 });
 
@@ -148,6 +168,43 @@ describe('server-owned source coverage', () => {
         sourceCoverage: proof,
       });
       expect(await total()).toBe(charged);
+    }));
+
+  it('rejects coverage that expires after trusted intake before transaction admission', async () =>
+    run(async () => {
+      const context = await source();
+      context.sourceExpiresAt = new Date(Date.now() + 1_000);
+      const message = row();
+      const originalStartSession = mongoose.startSession.bind(mongoose);
+      const admission = jest
+        .spyOn(mongoose, 'startSession')
+        .mockImplementationOnce(async (...args) => {
+          const session = await originalStartSession(...args);
+          await new Promise((resolve) =>
+            setTimeout(resolve, Math.max(0, context.sourceExpiresAt.getTime() - Date.now() + 5)),
+          );
+          return session;
+        });
+      const principalWrite = jest.spyOn(mongoose.models.User, 'updateOne');
+      try {
+        await expect(
+          methods.saveMessage(owner, message, {
+            sourceRetention: context,
+            sourceCoverage: coverage(context.sourceFileIds[0]),
+          }),
+        ).rejects.toThrow('Document source unavailable');
+        expect(admission).toHaveBeenCalledTimes(1);
+        expect(principalWrite).not.toHaveBeenCalled();
+        const current = await mongoose.models.File.findOne({
+          file_id: context.sourceFileIds[0],
+        }).orFail();
+        expect(current.expiredAt.getTime()).toBeGreaterThan(Date.now());
+        expect(await raw(message.messageId)).toBeNull();
+        expect(await total()).toBe(0);
+      } finally {
+        admission.mockRestore();
+        principalWrite.mockRestore();
+      }
     }));
 
   it.each([
@@ -207,7 +264,16 @@ describe('server-owned source coverage', () => {
       }),
   );
 
-  it.each(['foreign-owner', 'foreign-tenant', 'revoked', 'expired', 'budget'] as const)(
+  it.each([
+    'foreign-owner',
+    'foreign-tenant',
+    'revoked',
+    'expired',
+    'budget',
+    'missing-principal',
+    'disabled-principal',
+    'deleting-principal',
+  ] as const)(
     'retains real transactional %s admission instead of trusting receipt IDs',
     async (reason) =>
       run(async () => {
@@ -215,26 +281,39 @@ describe('server-owned source coverage', () => {
           ? tenantStorage.run({ tenantId: 'another-tenant' }, source)
           : source());
         const proof = coverage(context.sourceFileIds[0]);
+        if (reason === 'missing-principal')
+          await mongoose.models.User.deleteOne({ _id: owner.userId });
+        if (reason === 'disabled-principal' || reason === 'deleting-principal')
+          await mongoose.models.User.updateOne(
+            { _id: owner.userId },
+            {
+              $set:
+                reason === 'disabled-principal'
+                  ? { authDisabled: true }
+                  : { agentTriggerDeletionStartedAt: new Date() },
+            },
+          );
         if (reason === 'foreign-owner')
           await mongoose.models.File.updateOne(
             { file_id: context.sourceFileIds[0] },
             { $set: { user: new mongoose.Types.ObjectId() } },
           );
         if (reason === 'revoked') await files.revokeFileSources(owner, context.sourceFileIds);
-        if (reason === 'expired')
-          await mongoose.models.File.updateOne(
-            { file_id: context.sourceFileIds[0] },
-            { $set: { expiredAt: new Date(0) } },
-          );
+        if (reason === 'expired') await expireSource(context.sourceFileIds[0]);
         if (reason === 'budget')
           await mongoose.models.UploadCounter.updateOne(
             { _id: 'global' },
             { $set: { 'value.textBytes': RESOURCE_MAX.textBytes } },
           );
         const message = row();
-        await expect(
-          methods.saveMessage(owner, message, { sourceRetention: context, sourceCoverage: proof }),
-        ).rejects.toThrow();
+        const write = methods.saveMessage(owner, message, {
+          sourceRetention: context,
+          sourceCoverage: proof,
+        });
+        if (reason.endsWith('-principal')) {
+          await expect(write).rejects.toMatchObject({ code: 'principal_unavailable' });
+          expect(await total()).toBe(0);
+        } else await expect(write).rejects.toThrow();
         expect(await raw(message.messageId)).toBeNull();
       }),
   );
@@ -304,10 +383,7 @@ describe('server-owned source coverage', () => {
         });
         expect(await total()).toBeGreaterThan(0);
         if (reason === 'expire') {
-          await mongoose.models.File.updateOne(
-            { file_id: context.sourceFileIds[0] },
-            { $set: { expiredAt: new Date(0) } },
-          );
+          await expireSource(context.sourceFileIds[0]);
           expect(
             (await methods.getMessage({ user: owner.userId, messageId: message.messageId }))
               ?.metadata,

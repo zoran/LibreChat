@@ -1567,6 +1567,15 @@ export function createMessageMethods(
       await session.withTransaction(
         async () => {
           commitState.write = undefined;
+          if (
+            options.sourceCoverage &&
+            !(
+              options.sourceRetention?.sourceExpiresAt instanceof Date &&
+              Number.isFinite(options.sourceRetention.sourceExpiresAt.getTime()) &&
+              options.sourceRetention.sourceExpiresAt.getTime() > Date.now()
+            )
+          )
+            throw new FileSourceUnavailableError();
           const current = await Message.findOne({ ...identity, ...fileSourceScope(owner) })
             .session(session)
             .select(privateMessagePaths())
@@ -2359,6 +2368,7 @@ export function createMessageMethods(
           metadata.insertOnly === true ||
           !(retention?.sourceExpiresAt instanceof Date) ||
           !Number.isFinite(retention.sourceExpiresAt.getTime()) ||
+          retention.sourceExpiresAt.getTime() <= Date.now() ||
           !Array.isArray(retention.sourceFileIds) ||
           !retention.sourceFileIds.length ||
           sourceCoverage.entries.some((entry) => !retention.sourceFileIds.includes(entry.file_id))
