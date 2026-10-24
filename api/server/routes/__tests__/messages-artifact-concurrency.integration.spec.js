@@ -32,6 +32,7 @@ jest.mock('~/server/middleware', () => {
 });
 
 const db = require('~/models');
+Object.assign(mongoose.models, createModels(mongoose));
 const methods = createMethods(mongoose);
 Object.assign(db, methods);
 const router = require('../messages');
@@ -82,7 +83,6 @@ describe('artifact HTTP compare-and-set against real native Mongo methods', () =
   const app = application();
   beforeAll(async () => {
     mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
-    Object.assign(mongoose.models, createModels(mongoose));
     await mongoose.connect(mongo.getUri());
     await mongoose.models.Message.createIndexes();
     await mongoose.models.File.init();
@@ -189,19 +189,23 @@ describe('artifact HTTP compare-and-set against real native Mongo methods', () =
   it('cannot restore artifact content after the actual source-retention owner revokes its source', async () => {
     const { row, sourceFileIds } = await run(async () => {
       const fileId = uuid();
-      const sourceExpiresAt = new Date(Date.now() + 60000);
-      await mongoose.models.File.create({
-        user: owner.userId,
-        file_id: fileId,
-        filename: 'source.txt',
-        filepath: '/fixture/source',
-        type: 'text/plain',
-        bytes: 11,
-        text: 'source text',
-        retainedDerivativeBytes: 0,
-        retentionAcceptedAt: new Date(),
-        expiredAt: sourceExpiresAt,
-      });
+      const acceptedAt = new Date();
+      const sourceExpiresAt = new Date(acceptedAt.getTime() + 60000);
+      await methods.createFile(
+        {
+          user: owner.userId,
+          tenantId: owner.tenantId,
+          file_id: fileId,
+          filename: 'source.txt',
+          filepath: '/fixture/source',
+          type: 'text/plain',
+          bytes: 11,
+          text: 'source text',
+          retainedDerivativeBytes: 0,
+        },
+        undefined,
+        { retention: { acceptedAt, expiredAt: sourceExpiresAt } },
+      );
       const sourceRetention = { sourceFileIds: [fileId], sourceExpiresAt };
       const saved = await seed({ sourceRetention });
       await methods.revokeFileSources(owner, [fileId]);

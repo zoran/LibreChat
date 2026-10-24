@@ -81,6 +81,8 @@ jest.mock('~/server/middleware', () => ({
  */
 describe('message writes that bypass conversation retention', () => {
   let app;
+  let retentionDb;
+  let retentionDbTarget;
   const { configMiddleware } = require('~/server/middleware');
   const db = require('~/models');
   const { getMessage, saveMessage } = db;
@@ -96,7 +98,17 @@ describe('message writes that bypass conversation retention', () => {
   const interfaceConfig = { retentionMode: RetentionMode.EPHEMERAL, temporaryChatRetention: 1 };
 
   beforeAll(() => {
-    const messagesRouter = require('../messages');
+    const { historyMaintenance } = require('~/server/services/HistoryMaintenance');
+    const wrapMethods = jest.spyOn(historyMaintenance, 'methods');
+    let messagesRouter;
+    try {
+      messagesRouter = require('../messages');
+      const call = wrapMethods.mock.calls.findIndex(([target]) => target === db);
+      retentionDbTarget = wrapMethods.mock.calls[call][0];
+      retentionDb = wrapMethods.mock.results[call].value;
+    } finally {
+      wrapMethods.mockRestore();
+    }
 
     app = express();
     app.use(express.json());
@@ -132,6 +144,8 @@ describe('message writes that bypass conversation retention', () => {
     });
 
     it('re-stamps the parent conversation of the edited message', async () => {
+      expect(retentionDbTarget).toBe(db);
+      expect(retentionDb).not.toBe(db);
       const response = await request(app)
         .post(`/api/messages/artifact/${messageId}`)
         .send({ index: 0, original: 'original artifact', updated: 'updated artifact' });
@@ -142,7 +156,7 @@ describe('message writes that bypass conversation retention', () => {
         expect.objectContaining({ messageId, conversationId, user: userId }),
         { context: 'POST /api/messages/artifact/:messageId', expectedVersion: null },
       );
-      expect(applyForcedRetention).toHaveBeenCalledWith(db, {
+      expect(applyForcedRetention).toHaveBeenCalledWith(retentionDb, {
         ctx: expect.objectContaining({ userId, interfaceConfig }),
         conversationId,
       });
@@ -178,7 +192,7 @@ describe('message writes that bypass conversation retention', () => {
         .send({ feedback: { rating: 'thumbsDown', tag: 'inaccurate' } });
 
       expect(response.status).toBe(200);
-      expect(applyForcedRetention).toHaveBeenCalledWith(db, {
+      expect(applyForcedRetention).toHaveBeenCalledWith(retentionDb, {
         ctx: expect.objectContaining({ userId, interfaceConfig }),
         conversationId,
         messageId,
@@ -199,7 +213,7 @@ describe('message writes that bypass conversation retention', () => {
 
       expect(response.status).toBe(200);
       expect(applyForcedRetention).toHaveBeenCalledWith(
-        db,
+        retentionDb,
         expect.objectContaining({ conversationId: 'conversation-2', messageId }),
       );
     });
@@ -227,7 +241,7 @@ describe('message writes that bypass conversation retention', () => {
       const response = await request(app).post('/api/messages/branch').send({ messageId, agentId });
 
       expect(response.status).toBe(201);
-      expect(applyForcedRetention).toHaveBeenCalledWith(db, {
+      expect(applyForcedRetention).toHaveBeenCalledWith(retentionDb, {
         ctx: expect.objectContaining({ userId, interfaceConfig }),
         conversationId,
       });
