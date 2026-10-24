@@ -3,6 +3,7 @@ const { spawn } = require('child_process');
 const { constants } = require('os');
 const net = require('net');
 const path = require('path');
+const { prepareMaintenanceStartup, releaseMaintenanceStartup } = require('./maintenance-startup');
 require('dotenv').config();
 
 const DEFAULT_MONGO_URI = 'mongodb://127.0.0.1:27017/LibreChat-e2e';
@@ -243,8 +244,12 @@ async function startServer() {
     if (startupInterrupted) {
       return;
     }
+    const maintenanceStartup = await prepareMaintenanceStartup();
+    if (startupInterrupted) {
+      return;
+    }
     applicationChild = spawn(process.execPath, [__filename, APPLICATION_CHILD_ARG], {
-      env: process.env,
+      env: { ...process.env, ...maintenanceStartup.env },
       stdio: 'inherit',
     });
     applicationClosed = new Promise((resolve) => {
@@ -256,6 +261,7 @@ async function startServer() {
         resolve({ code, signal, error: spawnError });
       });
     });
+    await releaseMaintenanceStartup(maintenanceStartup, applicationChild);
     const result = await applicationClosed;
     if (result.error) {
       throw result.error;
