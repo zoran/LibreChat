@@ -6,6 +6,7 @@ import { UPLOAD_ERROR_CODES, UPLOAD_MAX_FILE_BYTES } from 'librechat-data-provid
 import type { UploadWorker, UploadOriginalIntegrity } from 'librechat-data-provider';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import type { ApplicationWorkPort } from '../../app/maintenance';
 import type { RetrievalLookupHandler } from './retrieval-lookup';
 import { readRetrievalLookup, encodeRetrievalLookup } from './retrieval-lookup';
 import { UploadManagementError, isUploadManagementError } from '../errors';
@@ -314,7 +315,11 @@ export async function startIntakeControlService(options: {
   host?: string;
   port?: number;
   deadlineMs?: number;
-}): Promise<{ address: AddressInfo; close(signal?: AbortSignal): Promise<{ complete: boolean }> }> {
+}): Promise<{
+  address: AddressInfo;
+  maintenance: ApplicationWorkPort;
+  close(signal?: AbortSignal): Promise<{ complete: boolean }>;
+}> {
   const config = fields(options, [
     'tls',
     'peers',
@@ -386,6 +391,29 @@ export async function startIntakeControlService(options: {
   if (!Number.isSafeInteger(milliseconds) || milliseconds < 1 || milliseconds > 120_000) fail();
   const active = new Set<{ controller: AbortController; done: Promise<void> }>();
   let stopped = false;
+  let pausedBy: string | null = null;
+  let listenerClosing = false;
+  const maintenance: ApplicationWorkPort = {
+    pauseAdmissions(requestId) {
+      if (!requestId || stopped || (pausedBy !== null && pausedBy !== requestId)) return false;
+      pausedBy = requestId;
+      return true;
+    },
+    resumeAdmissions(requestId) {
+      if (stopped || pausedBy !== requestId) return false;
+      pausedBy = null;
+      return true;
+    },
+    async getMaintenanceCensus(requestId) {
+      return {
+        admissionClosed: requestId !== null && pausedBy === requestId,
+        queuedContinuations: 0,
+        // handle() includes original repository calls and promotion.close() after disconnect.
+        pendingWrites: active.size + Number(listenerClosing),
+        complete: true,
+      };
+    },
+  };
   async function handle(
     message: IncomingMessage,
     response: ServerResponse,
@@ -469,11 +497,8 @@ export async function startIntakeControlService(options: {
       const context = { operationId: match[2], capability, worker: { ...worker } };
       if (match[1] === 'control') {
         if (expectContinue || message.method !== 'POST') fail();
-        const result = await handlers.control(
-          context,
-          await readJson(message, deadline.signal),
-          deadline.signal,
-        );
+        const command = await readJson(message, deadline.signal);
+        const result = await handlers.control(context, command, deadline.signal);
         deadline.signal.throwIfAborted();
         respond(response, 200, result ?? null);
       } else {
@@ -514,6 +539,13 @@ export async function startIntakeControlService(options: {
   }
   function dispatch(message: IncomingMessage, response: ServerResponse, expectContinue: boolean) {
     message.pause();
+    // Native A drains remote Intake before taking this local File hold. Until then the
+    // channel stays open for recovery. Once paused, every new request is refused before
+    // body reading or any owner call; requests already admitted retain their originals.
+    if (stopped || pausedBy !== null) {
+      failure(response, new UploadManagementError('unavailable'));
+      return;
+    }
     // Body reading consumes this original budget; the File callback cannot start a fresh clock.
     const deadlineAt = Date.now() + milliseconds;
     const deadline = clock(undefined, milliseconds);
@@ -552,10 +584,17 @@ export async function startIntakeControlService(options: {
   let closed: Promise<void> | undefined;
   return {
     address,
+    maintenance,
     async close(signal = AbortSignal.timeout(10_000)): Promise<{ complete: boolean }> {
       if (!stopped) {
         stopped = true;
-        closed = new Promise((resolve) => server.close(() => resolve()));
+        listenerClosing = true;
+        closed = new Promise((resolve) =>
+          server.close(() => {
+            listenerClosing = false;
+            resolve();
+          }),
+        );
       }
       for (const item of active) item.controller.abort();
       server.closeAllConnections();

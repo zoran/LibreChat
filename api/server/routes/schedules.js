@@ -54,18 +54,10 @@ const handlers = createSchedulesHandlers({
     return (files ?? []).map((file) => file.file_id);
   },
   markFilesUsed: async (fileIds, userId) => {
-    // BOUNDED renewable hold (extendFilesTTL), not a permanent `$unset` of the upload
-    // TTL: permanence made a schedule deleted before its first run, an edit that
-    // replaced file_ids, or a failed creation leak the upload forever, since nothing
-    // ever restored an expiry. The first fire that actually SENDS the file clears its
-    // TTL through the ordinary consumption path; until then the hold is renewed at
-    // create/edit and each fire preflight, and lapses when the schedule stops touching
-    // it. Files already made permanent by a real send are skipped by construction.
-    // Idempotent, and never touches the usage counter (a retention is not a consumption).
-    // Then VERIFY every requested file still exists: one can be deleted between the
-    // ownership check and here, and a silent success would persist a schedule whose
-    // attachments the first fire drops. Existence is the check — not the hold's
-    // modified-count, which reads 0 for an already-permanent or already-held file.
+    // Validate the current File owner without renewing or erasing historical expiry.
+    // Permanent and retained files return zero; temporary legacy files are refused.
+    // Verify existence separately because files can disappear after ownership validation.
+    // The returned count is not evidence that every requested attachment still exists.
     const unique = [...new Set(fileIds)];
     await methods.extendFilesTTL(unique, SCHEDULE_FILE_HOLD, { user: userId });
     const files = await methods.getFiles({ file_id: { $in: unique }, user: userId }, null, {

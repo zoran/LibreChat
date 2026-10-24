@@ -72,28 +72,10 @@ function createHousekeepingService(configuration) {
     let acquisitionOriginal;
     let transferred = false;
     let closing;
-    let modelsStarted = false;
-    const modelOriginals = new Map();
 
     const failStartup = () => {
       void api.requestGracefulShutdown('startup_failure').catch(() => undefined);
     };
-    function retainModelOriginals() {
-      if (!modelsStarted) return;
-      // mongoose.model() already starts init(); init() returns that same memoized original.
-      // Include models created by owner factories even if their construction later throws.
-      for (const model of Object.values(mongoose.models)) {
-        if (modelOriginals.has(model)) continue;
-        let original;
-        try {
-          original = model.init();
-        } catch (error) {
-          original = Promise.reject(error);
-        }
-        modelOriginals.set(model, original);
-        void original.catch(failStartup);
-      }
-    }
 
     // The application's original work settles before this callback. During partial acquisition,
     // pre-drain joins acquisitionOriginal instead. Neither close path ever waits for app.start().
@@ -134,21 +116,19 @@ function createHousekeepingService(configuration) {
         instrumentMongooseQueryMetrics: api.instrumentMongooseQueryMetrics,
         optionalEnabled: api.optionalEnabled,
         logger: schemas.logger,
+        onFailure: failStartup,
       });
       await connector.connect();
       signal.throwIfAborted();
       let jobs;
       let uploads;
       let targets;
-      modelsStarted = true;
-      try {
+      connector.modelBootstrap.construct(() => {
         schemas.createModels(mongoose);
         jobs = schemas.createHousekeepingStore(mongoose);
         uploads = schemas.createUploadManagementRepository(mongoose, uploadPolicy);
         targets = schemas.createFileCleanupProgressMethods(mongoose, jobs);
-      } finally {
-        retainModelOriginals();
-      }
+      });
       for (const resource of [jobs, uploads, targets]) {
         signal.throwIfAborted();
         await schemas.runAsSystem(() => resource.initialize());
@@ -162,11 +142,9 @@ function createHousekeepingService(configuration) {
       retrieval = await api.createManagedFilePurge({
         trustedFile,
         operations: (policySnapshot) => {
-          try {
-            return schemas.createFileRetrievalOperationOwner(mongoose, { policySnapshot });
-          } finally {
-            retainModelOriginals();
-          }
+          return connector.modelBootstrap.construct(() =>
+            schemas.createFileRetrievalOperationOwner(mongoose, { policySnapshot }),
+          );
         },
         runAsSystem: schemas.runAsSystem,
         signal,
@@ -236,16 +214,15 @@ function createHousekeepingService(configuration) {
         // A failed owner cannot delay the one process deadline behind another model's init.
         failStartup();
       }
-      retainModelOriginals();
-      const results = await Promise.allSettled(modelOriginals.values());
-      if (failed) throw failed.error;
-      const errors = results.filter((result) => result.status === 'rejected');
-      if (errors.length) {
-        throw new AggregateError(
-          errors.map((result) => result.reason),
-          'Housekeeping model initialization failed',
-        );
+      // The shared connector retains the same memoized originals, including partial acquisition.
+      let modelFailure;
+      try {
+        await connector?.modelBootstrap.join();
+      } catch (error) {
+        modelFailure = { error };
       }
+      if (failed) throw failed.error;
+      if (modelFailure) throw modelFailure.error;
       return dependencies;
     })();
     const opening = acquisitionOriginal.then((dependencies) => {

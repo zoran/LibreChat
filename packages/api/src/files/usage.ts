@@ -64,13 +64,13 @@ export interface FilesUsageResult {
 }
 
 export interface FilesUsageDeps {
-  /** Owner-scoped TTL hold (`db.extendFilesTTL`-shaped). */
+  /** Owner-scoped File validation; zero for permanent files, refusal for legacy expiry. */
   extendFilesTTL: (
     fileIds: string[],
     hold: FilesUsageHold,
     owner: { user: string; tenantId?: string | null },
   ) => Promise<number>;
-  /** Configured approval window, so the hold outlasts a paused run. */
+  /** Configured approval window supplied to the existing validation contract. */
   approvalTtlMs?: number;
 }
 

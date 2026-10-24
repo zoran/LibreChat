@@ -509,6 +509,13 @@ export type FileCoverageInvalidateReason =
   | 'owner_conflict';
 /** Closed discriminated input; JSON parsers reject extra keys, accessors and non-own data. */
 export type FileCoverageAction =
+  | Readonly<{
+      action: 'prepare-ttl';
+      run: FileCoverageRun;
+      collectionUuid: string;
+      indexName: string;
+      indexSha256: string;
+    }>
   | Readonly<{ action: 'begin'; run: FileCoverageRun }>
   | Readonly<{ action: 'advance'; run: FileCoverageRun; expectedCheckpoint: number }>
   | Readonly<{ action: 'verify-seal'; run: FileCoverageRun; expectedCheckpoint: number }>
@@ -570,7 +577,30 @@ export type FileCoverageFailureCode =
   | 'capacity'
   | 'unavailable'
   | 'unknown_commit';
+/** Current actual catalog observation; it is not a DDL or exclusion receipt. */
+export type FileCoverageCatalog = Readonly<{
+  collectionUuid: string;
+  fileTtlIndexes: readonly Readonly<{ name: string; indexSha256: string }>[];
+}>;
 export type FileCoverageResult =
+  | Readonly<{
+      outcome: 'prepared'; // Current raw expiry absence only; not a DDL/settlement/coverage receipt.
+      storeId: string;
+      generation: number;
+      runSha256: string;
+      collectionUuid: string;
+      indexName: string;
+      indexSha256: string;
+      snapshot: Readonly<{ seconds: number; increment: number }>;
+      population: Pick<
+        FileInventoryCounts,
+        | 'totalFiles'
+        | 'expiresAtAbsentOrNull'
+        | 'expiresAtScalarDate'
+        | 'expiresAtArray'
+        | 'expiresAtOther'
+      >;
+    }>
   | Readonly<{
       outcome: 'progress';
       generation: number;
@@ -586,6 +616,7 @@ export type FileCoverageResult =
       generation: number | null;
       phase: 'absent' | 'invalid' | 'preparing' | 'sealed';
       receipt: FileCoverageReceipt | null;
+      catalog: FileCoverageCatalog;
     }>
   | Readonly<{ outcome: 'refused' | 'unknown'; code: FileCoverageFailureCode }>;
 

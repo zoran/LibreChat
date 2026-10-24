@@ -41,6 +41,8 @@ export type ManagedFileRouteRequest = Parameters<ManagedSourceResolver['authoriz
 export type ManagedFileRouteRuntime = {
   sources: ManagedSourceResolver;
   management: { list(principal: UploadPrincipal): Promise<Operation[]> };
+  /** The Upload/File owner retains the whole operation, including writable GET continuations. */
+  runFileOperation<T>(work: () => Promise<T>): Promise<T>;
   fileReads?: FileReads;
   fileReadWorker?: Readonly<UploadWorker>;
 };
@@ -219,9 +221,9 @@ export function createManagedFileHandlers(
     req.once('aborted', abort);
     res.once('close', disconnect);
     const within = async <T>(work: Promise<T>): Promise<T> => {
-      check();
       let onAbort: (() => void) | undefined;
       try {
+        check();
         return await Promise.race([
           work,
           new Promise<never>((_, reject) => {
@@ -232,6 +234,9 @@ export function createManagedFileHandlers(
         ]);
       } finally {
         if (onAbort) controller.signal.removeEventListener('abort', onAbort);
+        // Response cancellation cannot settle the original Mongo transaction or endSession.
+        // Keep the enclosing File operation held until that original has actually returned.
+        await work.catch(() => undefined);
       }
     };
     return {
@@ -288,16 +293,27 @@ export function createManagedFileHandlers(
       if (!owner) throw unavailable();
       if (!owner.fileReads || !owner.fileReadWorker) throw unavailable('unavailable');
       user = await scope.within(readPrincipal(req, owner));
-      claim = await scope.within(
-        owner.fileReads.claimManagedFileRead(user, reference, owner.fileReadWorker),
+      claim = await scope.within<ReadClaim>(
+        owner.fileReads
+          .claimManagedFileRead(user, reference, owner.fileReadWorker)
+          .then((value) => {
+            // A claim arriving after HTTP abort still belongs to this attempt's finally cleanup.
+            claim = value;
+            return value;
+          }),
       );
       scope.narrow(claim.notAfter);
       const renew = async () => {
         scope.check();
         if (access) await scope.within(revalidate(req, access!));
         else await scope.within(principal(req, owner, user));
-        claim = await scope.within(
-          owner!.fileReads!.claimManagedFileRead(user!, reference, owner!.fileReadWorker!, claim),
+        claim = await scope.within<ReadClaim>(
+          owner!
+            .fileReads!.claimManagedFileRead(user!, reference, owner!.fileReadWorker!, claim)
+            .then((value) => {
+              claim = value;
+              return value;
+            }),
         );
         scope.check();
       };
@@ -564,11 +580,27 @@ export function createManagedFileHandlers(
     }
   }
 
+  function owned<T>(
+    handler: (req: ManagedFileRouteRequest, res: Response) => Promise<T>,
+  ): (req: ManagedFileRouteRequest, res: Response) => Promise<T | void> {
+    return async (req, res) => {
+      try {
+        const owner = getRuntime();
+        // Disabled bootstrap retains its existing empty/read-unavailable behavior.
+        if (!owner) return await handler(req, res);
+        if (typeof owner.runFileOperation !== 'function') throw unavailable('unavailable');
+        return await owner.runFileOperation(() => handler(req, res));
+      } catch (error) {
+        sendFailure(res, error);
+      }
+    };
+  }
+
   return {
-    download,
-    downloadURL,
-    preview,
-    list,
+    download: owned(download),
+    downloadURL: owned(downloadURL),
+    preview: owned(preview),
+    list: owned(list),
     authorize: (req: ManagedFileRouteRequest) => principal(req, getRuntime()),
     failure: sendFailure,
   };

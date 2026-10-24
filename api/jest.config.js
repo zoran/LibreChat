@@ -28,6 +28,7 @@ module.exports = {
   testTimeout: 30000, // 30 seconds timeout for all tests
   setupFiles: ['./test/jestSetup.js', './test/__mocks__/logger.js'],
   moduleNameMapper: {
+    '^~/config/winston$': '<rootDir>/../packages/data-schemas/src/config/winston.ts',
     '~/(.*)': '<rootDir>/$1',
     '~/data/auth.json': '<rootDir>/__mocks__/auth.mock.json',
     '^openid-client/passport$': '<rootDir>/test/__mocks__/openid-client-passport.js',
@@ -39,7 +40,7 @@ module.exports = {
       {
         presets: [
           ['@babel/preset-env', { targets: { node: 'current' } }],
-          '@babel/preset-typescript',
+          ['@babel/preset-typescript', { allowDeclareFields: true }],
         ],
       },
     ],

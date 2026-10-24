@@ -66,6 +66,7 @@ async function main(): Promise<void> {
       env: process.env,
       identity,
       workOwners: { intake: service.maintenance },
+      fileDomainOwners: ['intake'],
       startupReady: () => !closing,
     });
     await maintenance.listen();

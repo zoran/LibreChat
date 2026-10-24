@@ -144,6 +144,7 @@ describe('File library HTTP and native Mongo composition', () => {
         reopenGenerationAdmission: () => true,
       },
       workOwners: { fileLibrary: libraryOwner },
+      fileDomainOwners: ['fileLibrary'],
       unqualifiedOwners: ['Other application writers are outside this fixture'],
     });
     const handlers = createFileLibraryHandlers({

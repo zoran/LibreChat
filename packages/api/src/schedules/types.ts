@@ -157,14 +157,9 @@ export function hasAbortInFlight(run: { abortRequestedAt?: Date }, now: number):
 }
 
 /**
- * Renewable upload hold for schedule attachments (extendFilesTTL-shaped), replacing
- * the earlier permanent TTL removal, which leaked the upload forever when the schedule
- * was deleted before its first run, its file_ids were replaced, or creation failed.
- * Touched at create/edit and at every fire preflight; the FIRST fire that actually
- * sends the file clears its TTL permanently through the ordinary consumption path, so
- * the hold only has to bridge upload -> first consumption. `renewMs` covers the longest
- * cadence gap (weekly) twice over; `maxLifetimeMs` bounds a schedule that never manages
- * to consume (auto-disable stops its renewals long before this ceiling).
+ * Existing bounds passed to owner-scoped schedule attachment validation.
+ * The current File owner leaves permanent/retained files unchanged and refuses
+ * historical temporary expiry; these values do not authorize renewal or erasure.
  */
 export const SCHEDULE_FILE_HOLD: { renewMs: number; maxLifetimeMs: number } = {
   renewMs: 14 * 24 * 60 * 60 * 1000,

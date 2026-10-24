@@ -54,6 +54,7 @@ jest.mock('./files', () => {
   const { createManagedFileHandlers, isCortexFileMode } = require('./managed');
   const managed = createManagedFileHandlers({
     getRuntime: () => ({
+      runFileOperation: (work) => work(),
       sources: {
         authorize: async () => ({
           tenantId: 'tenant-a',

@@ -5,6 +5,8 @@ import type {
   AgentApiKeyListItem,
   IAgentApiKey,
 } from '~/types';
+import type { AuthPersistenceObserver } from './authPersistence';
+import { observeAuthPersistence } from './authPersistence';
 import { hashToken, getRandomValues } from '~/crypto';
 import logger from '~/config/winston';
 
@@ -12,7 +14,10 @@ const API_KEY_PREFIX = 'sk-';
 const API_KEY_LENGTH = 32;
 
 export function createAgentApiKeyMethods(mongoose: typeof import('mongoose')): {
-  createAgentApiKey: (data: AgentApiKeyCreateData) => Promise<AgentApiKeyCreateResult>;
+  createAgentApiKey: (
+    data: AgentApiKeyCreateData,
+    observer?: AuthPersistenceObserver,
+  ) => Promise<AgentApiKeyCreateResult>;
   validateAgentApiKey: (
     apiKey: string,
   ) => Promise<{ userId: Types.ObjectId; keyId: Types.ObjectId } | null>;
@@ -20,6 +25,7 @@ export function createAgentApiKeyMethods(mongoose: typeof import('mongoose')): {
   deleteAgentApiKey: (
     keyId: string | Types.ObjectId,
     userId: string | Types.ObjectId,
+    observer?: AuthPersistenceObserver,
   ) => Promise<boolean>;
   deleteAllAgentApiKeys: (userId: string | Types.ObjectId) => Promise<number>;
   getAgentApiKeyById: (
@@ -35,18 +41,23 @@ export function createAgentApiKeyMethods(mongoose: typeof import('mongoose')): {
     return { key, keyHash, keyPrefix };
   }
 
-  async function createAgentApiKey(data: AgentApiKeyCreateData): Promise<AgentApiKeyCreateResult> {
+  async function createAgentApiKey(
+    data: AgentApiKeyCreateData,
+    observer?: AuthPersistenceObserver,
+  ): Promise<AgentApiKeyCreateResult> {
     try {
       const AgentApiKey = mongoose.models.AgentApiKey;
       const { key, keyHash, keyPrefix } = await generateApiKey();
 
-      const apiKeyDoc = await AgentApiKey.create({
-        userId: data.userId,
-        name: data.name,
-        keyHash,
-        keyPrefix,
-        expiresAt: data.expiresAt || undefined,
-      });
+      const apiKeyDoc = await observeAuthPersistence(observer, async () =>
+        AgentApiKey.create({
+          userId: data.userId,
+          name: data.name,
+          keyHash,
+          keyPrefix,
+          expiresAt: data.expiresAt || undefined,
+        }),
+      );
 
       return {
         id: apiKeyDoc._id.toString(),
@@ -119,10 +130,13 @@ export function createAgentApiKeyMethods(mongoose: typeof import('mongoose')): {
   async function deleteAgentApiKey(
     keyId: string | Types.ObjectId,
     userId: string | Types.ObjectId,
+    observer?: AuthPersistenceObserver,
   ): Promise<boolean> {
     try {
       const AgentApiKey = mongoose.models.AgentApiKey;
-      const result = await AgentApiKey.deleteOne({ _id: keyId, userId });
+      const result = await observeAuthPersistence(observer, async () =>
+        AgentApiKey.deleteOne({ _id: keyId, userId }),
+      );
       return result.deletedCount > 0;
     } catch (error) {
       logger.error('[deleteAgentApiKey] Error deleting API key:', error);

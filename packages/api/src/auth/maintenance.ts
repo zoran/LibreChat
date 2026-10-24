@@ -4,36 +4,55 @@ import type { AuthContinuationObserver } from '@librechat/data-schemas';
 import type { RequestHandler, Response } from 'express';
 import type { ApplicationWorkPort } from '~/app';
 
+interface AuthCallbackOptions<T> {
+  write?: boolean;
+  complete?: (this: unknown, error?: unknown, value?: T, ...rest: unknown[]) => unknown;
+}
+
 export interface AuthOperation extends AuthContinuationObserver {
   /** Register before invocation, including work whose rejection its consumer will sanitize. */
   track<T>(action: () => Promise<T> | T): Promise<T>;
   /** Callback APIs must complete through their actual callback; abort/timeout is not settlement. */
-  callback<T>(start: (done: (error?: unknown, value?: T) => void) => void): Promise<T>;
+  callback<T>(
+    start: (done: (error?: unknown, value?: T, ...rest: unknown[]) => unknown) => unknown,
+    options?: AuthCallbackOptions<T>,
+  ): Promise<T>;
 }
 export interface AuthMaintenance extends ApplicationWorkPort {
   admissionMiddleware: RequestHandler;
   current(): AuthOperation | undefined;
+  /** Capture live original admissions once; membership cannot expand or outlive settlement. */
+  snapshotAdmissions(): (operation: AuthOperation) => boolean;
   forRequest(req: object): AuthOperation | undefined;
   run<T>(req: object | undefined, action: (operation: AuthOperation) => Promise<T> | T): Promise<T>;
   own(handler: RequestHandler): RequestHandler;
   markUncertain(): void;
+  stopAdmissions(): void;
+  drain(): Promise<void>;
 }
 
 export function createAuthMaintenance(): AuthMaintenance {
   const context = new AsyncLocalStorage<AuthOperation>();
   const requests = new WeakMap<object, AuthOperation>();
   const live = new Set<AuthOperation>();
+  const drained = new Set<() => void>();
   let pause: string | null = null;
+  let stopped = false;
   let revision = 0;
   let writes = 0;
   let uncertain = false;
 
   function create() {
-    if (pause !== null) throw Object.assign(new Error('APP_QUIESCING'), { status: 503 });
+    if (stopped || pause !== null) throw Object.assign(new Error('APP_QUIESCING'), { status: 503 });
     let pending = 0;
     let rootComplete = false;
     const finish = () => {
-      if (rootComplete && pending === 0) live.delete(operation);
+      if (!rootComplete || pending !== 0) return;
+      live.delete(operation);
+      if (live.size === 0) {
+        drained.forEach((resolve) => resolve());
+        drained.clear();
+      }
     };
     const operation: AuthOperation = {
       markUncertain() {
@@ -65,22 +84,86 @@ export function createAuthMaintenance(): AuthMaintenance {
           }
         });
       },
-      callback<T>(start: (done: (error?: unknown, value?: T) => void) => void): Promise<T> {
-        return operation.write(
+      callback<T>(
+        start: (done: (error?: unknown, value?: T, ...rest: unknown[]) => unknown) => unknown,
+        options: AuthCallbackOptions<T> = {},
+      ): Promise<T> {
+        const retain = options.write === false ? operation.track : operation.write;
+        return retain(
           () =>
             new Promise<T>((resolve, reject) => {
+              const restore = AsyncLocalStorage.snapshot();
               let called = false;
-              const done = (error?: unknown, value?: unknown) => {
-                if (called) return;
-                called = true;
-                if (error) reject(error);
+              let returned = false;
+              let originalDone = false;
+              let deliveryDone = false;
+              let value: T | undefined;
+              let failed = false;
+              let failure: unknown;
+              const fail = (error: unknown) => {
+                if (options.write !== false) uncertain = true;
+                if (!failed) {
+                  failed = true;
+                  failure = error;
+                }
+              };
+              const settle = () => {
+                if (!returned || !originalDone || !deliveryDone) return;
+                if (failed) reject(failure);
                 else resolve(value as T);
               };
+              const done = function (this: unknown, ...args: [unknown?, T?, ...unknown[]]) {
+                if (called) return;
+                called = true;
+                if (args[0]) fail(args[0]);
+                value = args[1];
+                let delivered;
+                try {
+                  delivered = restore(() =>
+                    context.run(operation, () => options.complete?.apply(this, args)),
+                  );
+                } catch (error) {
+                  uncertain = true;
+                  fail(error);
+                  deliveryDone = true;
+                  settle();
+                  return;
+                }
+                void Promise.resolve(delivered).then(
+                  () => {
+                    deliveryDone = true;
+                    settle();
+                  },
+                  (error) => {
+                    uncertain = true;
+                    fail(error);
+                    deliveryDone = true;
+                    settle();
+                  },
+                );
+                return delivered;
+              };
+              Object.defineProperty(done, 'length', { value: options.complete?.length ?? 2 });
+              let original;
               try {
-                start(done);
+                original = start(done);
               } catch (error) {
+                fail(error);
                 done(error);
               }
+              returned = true;
+              void Promise.resolve(original).then(
+                () => {
+                  originalDone = true;
+                  settle();
+                },
+                (error) => {
+                  fail(error);
+                  // A rejected return cannot retire an original callback that has not arrived.
+                  originalDone = true;
+                  settle();
+                },
+              );
             }),
         );
       },
@@ -97,8 +180,12 @@ export function createAuthMaintenance(): AuthMaintenance {
 
   const admissionMiddleware: RequestHandler = (req, res, next) => {
     const existing = requests.get(req);
-    if (existing) return context.run(existing, next);
-    if (pause !== null) {
+    if (existing) {
+      if (live.has(existing)) return context.run(existing, next);
+      uncertain = true;
+      return next(new Error('Authentication continuation used after settlement'));
+    }
+    if (stopped || pause !== null) {
       res.setHeader('Retry-After', '1');
       res.status(503).json({ code: 'APP_QUIESCING' });
       return;
@@ -123,6 +210,10 @@ export function createAuthMaintenance(): AuthMaintenance {
   const owner: AuthMaintenance = {
     admissionMiddleware,
     current: () => context.getStore(),
+    snapshotAdmissions() {
+      const admitted = new WeakSet(live);
+      return (operation) => live.has(operation) && admitted.has(operation);
+    },
     forRequest: (req) => requests.get(req),
     async run(req, action) {
       const existing = (req && requests.get(req)) ?? context.getStore();
@@ -157,7 +248,7 @@ export function createAuthMaintenance(): AuthMaintenance {
       return true;
     },
     resumeAdmissions(id) {
-      if (pause !== id || uncertain) return false;
+      if (stopped || pause !== id || uncertain) return false;
       pause = null;
       revision++;
       return true;
@@ -167,11 +258,22 @@ export function createAuthMaintenance(): AuthMaintenance {
       const matches = id === pause;
       await Promise.resolve();
       return {
-        admissionClosed: pause !== null,
+        admissionClosed: stopped || pause !== null,
         queuedContinuations: live.size,
         pendingWrites: writes,
         complete: matches && id === pause && sampled === revision && !uncertain,
       };
+    },
+    stopAdmissions() {
+      if (!stopped) {
+        stopped = true;
+        revision++;
+      }
+    },
+    async drain() {
+      owner.stopAdmissions();
+      if (live.size !== 0) await new Promise<void>((resolve) => drained.add(resolve));
+      if (uncertain) throw new Error('AUTH_SETTLEMENT_UNCONFIRMED');
     },
   };
   return owner;

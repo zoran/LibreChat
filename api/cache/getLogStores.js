@@ -3,6 +3,7 @@ const { Time, CacheKeys, ViolationTypes } = require('librechat-data-provider');
 const {
   logFile,
   keyvMongo,
+  ownMongoCache,
   cacheConfig,
   sessionCache,
   standardCache,
@@ -36,11 +37,14 @@ const namespaces = {
   [ViolationTypes.VERIFY_EMAIL_LIMIT]: violationCache(ViolationTypes.VERIFY_EMAIL_LIMIT),
   [ViolationTypes.RESET_PASSWORD_LIMIT]: violationCache(ViolationTypes.RESET_PASSWORD_LIMIT),
   [ViolationTypes.ILLEGAL_MODEL_REQUEST]: violationCache(ViolationTypes.ILLEGAL_MODEL_REQUEST),
-  [ViolationTypes.BAN]: new Keyv({
-    store: keyvMongo,
-    namespace: CacheKeys.BANS,
-    ttl: cacheConfig.BAN_DURATION,
-  }),
+  [ViolationTypes.BAN]: ownMongoCache(
+    new Keyv({
+      store: keyvMongo,
+      namespace: CacheKeys.BANS,
+      ttl: cacheConfig.BAN_DURATION,
+    }),
+    'auth',
+  ),
 
   [CacheKeys.OPENID_SESSION]: sessionCache(CacheKeys.OPENID_SESSION),
   [CacheKeys.SAML_SESSION]: sessionCache(CacheKeys.SAML_SESSION),
@@ -53,7 +57,10 @@ const namespaces = {
   [CacheKeys.CONFIG_STORE]: standardCache(CacheKeys.CONFIG_STORE),
   [CacheKeys.TOOL_CACHE]: standardCache(CacheKeys.TOOL_CACHE),
   [CacheKeys.PENDING_REQ]: standardCache(CacheKeys.PENDING_REQ),
-  [CacheKeys.ENCODED_DOMAINS]: new Keyv({ store: keyvMongo, namespace: CacheKeys.ENCODED_DOMAINS }),
+  [CacheKeys.ENCODED_DOMAINS]: ownMongoCache(
+    new Keyv({ store: keyvMongo, namespace: CacheKeys.ENCODED_DOMAINS }),
+    'domains',
+  ),
   [CacheKeys.ABORT_KEYS]: standardCache(CacheKeys.ABORT_KEYS, Time.TEN_MINUTES),
   [CacheKeys.TOKEN_CONFIG]: standardCache(CacheKeys.TOKEN_CONFIG, Time.THIRTY_MINUTES),
   [CacheKeys.GEN_TITLE]: standardCache(CacheKeys.GEN_TITLE, Time.TWO_MINUTES),

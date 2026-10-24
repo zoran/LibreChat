@@ -158,7 +158,7 @@ export interface SchedulesServiceDeps {
       width?: number;
       source: string;
     }> | null>;
-    /** Owner-scoped bounded TTL hold (`db.extendFilesTTL`-shaped). */
+    /** Owner-scoped File validation; zero for permanent files, refusal for legacy expiry. */
     extendFilesTTL: (
       fileIds: string[],
       hold: { renewMs: number; maxLifetimeMs: number },
@@ -809,10 +809,9 @@ export function createSchedulesService(
     projectAccess: async (projectId, user) =>
       (await deps.getChatProject(user.id, projectId)) == null ? 'missing' : 'ok',
     resolveFiles: async (fileIds, user) => {
-      // Renew the bounded upload hold at every fire preflight, BEST-EFFORT: the hold
-      // only has to bridge upload -> first consumption (a real send clears the TTL
-      // permanently), and a failed renewal must not fail the fire — at worst the hold
-      // lapses later and resolveFiles drops the reaped file (droppedFileIds records it).
+      // Validate attachments against the current File owner before resolving them.
+      // Permanent files need no expiry write. Historical temporary expiry is refused;
+      // retain the existing uncertainty path when validation fails.
       await methods
         .extendFilesTTL(fileIds, SCHEDULE_FILE_HOLD, { user: user.id, tenantId: user.tenantId })
         .catch((err) => {

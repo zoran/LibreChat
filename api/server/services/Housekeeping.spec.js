@@ -316,7 +316,10 @@ describe('standalone Housekeeping service custody', () => {
       const original = deferred();
       const failure = new Error('owner initialization failed');
       schemas.createModels.mockImplementation(() => {
-        mongoose.models.Background = { init: jest.fn(() => original.promise) };
+        mongoose.models.Background = {
+          $init: original.promise,
+          init: jest.fn(() => original.promise),
+        };
       });
       targets.initialize.mockRejectedValue(failure);
       let completed = false;
@@ -342,7 +345,10 @@ describe('standalone Housekeeping service custody', () => {
   it('waits for original background initialization before transferring resources to the application', async () => {
     const original = deferred();
     schemas.createModels.mockImplementation(() => {
-      mongoose.models.Background = { init: jest.fn(() => original.promise) };
+      mongoose.models.Background = {
+        $init: original.promise,
+        init: jest.fn(() => original.promise),
+      };
     });
     const pending = service().start();
     await flush();
@@ -351,6 +357,55 @@ describe('standalone Housekeeping service custody', () => {
     await pending;
     expect(application.start).toHaveBeenCalledTimes(1);
     await shutdown.requestGracefulShutdown('startup_failure');
+  });
+
+  it('captures a partial model factory and joins the original before failed acquisition can close', async () => {
+    const original = deferred();
+    const failure = new Error('partial schema factory');
+    schemas.createModels.mockImplementation(() => {
+      mongoose.models.Partial = { $init: original.promise, init: jest.fn(() => original.promise) };
+      throw failure;
+    });
+    const observed = service()
+      .start()
+      .catch((error) => error);
+    try {
+      await flush();
+      expect(shutdown.isShutdownInProgress()).toBe(true);
+      expect(mongoose.connection.close).not.toHaveBeenCalled();
+      expect(generationFactory).not.toHaveBeenCalled();
+    } finally {
+      original.resolve();
+    }
+    expect(await observed).toBe(failure);
+    await shutdown.requestGracefulShutdown('startup_failure');
+    expect(mongoose.connection.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains a model created by the later Retrieval factory before transferring custody', async () => {
+    const original = deferred();
+    schemas.createFileRetrievalOperationOwner.mockImplementation(() => {
+      mongoose.models.Retrieval = {
+        $init: original.promise,
+        init: jest.fn(() => original.promise),
+      };
+      return {};
+    });
+    api.createManagedFilePurge.mockImplementation(async ({ operations }) => {
+      operations({});
+      return retrieval;
+    });
+    const starting = service().start();
+    try {
+      await flush();
+      expect(api.createHousekeepingApplication).not.toHaveBeenCalled();
+      expect(mongoose.models.Retrieval.init).toHaveBeenCalledTimes(1);
+    } finally {
+      original.resolve();
+    }
+    await starting;
+    await shutdown.requestGracefulShutdown('startup_failure');
+    expect(mongoose.connection.close).toHaveBeenCalledTimes(1);
   });
 
   it('owns a Redis handle returned after cancellation and closes it without starting S3', async () => {

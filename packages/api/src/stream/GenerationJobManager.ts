@@ -157,13 +157,21 @@ const REAPED_JOB_ERROR = 'Generation timed out';
 const MAX_OUTSTANDING_COALESCED_RECEIPTS = 256;
 const PROVIDER_DRAIN_POLL_MS = 50;
 
-/**
- * The settlement budget is the opt-in. Graceful shutdown owns the real deadline and passes what
- * is actually left, so open provider executions get the full remaining window to record their
- * drains. A bare `destroy()` — test teardown, a direct reset — supplies nothing and must not
- * block on executions that were begun and never drained.
- */
+/** Graceful shutdown supplies its remaining deadline. A bare destroy has no waiting budget;
+ * neither path may discharge an original operation merely because that budget expired. */
 const SHUTDOWN_SETTLEMENT_FALLBACK_MS = 0;
+/** The current-job CAS and exact original-effect settlement are separate acknowledgements. */
+interface ProviderDrainOutcome {
+  marked: boolean;
+  confirmed: boolean;
+}
+interface ProviderExecutionTracker {
+  promise: Promise<void>;
+  settle: () => void;
+  drain?: Promise<ProviderDrainOutcome>;
+  settlement?: Promise<boolean>;
+  uncertain?: boolean;
+}
 type ToolExecutionStatus = 'success' | 'error' | 'cancelled';
 type ToolCallWithExecutionStatus = Agents.AgentToolCall & {
   executionStatus?: ToolExecutionStatus;
@@ -1012,6 +1020,9 @@ class GenerationJobManagerClass {
 
   /** Rejects new jobs once graceful shutdown has started. */
   private shuttingDown = false;
+  private shutdownSettlement?: Promise<void>;
+  private shutdownSettlementDeadline?: number;
+  private shutdownSettlementComplete = false;
   private readonly durableAdmission = new GenerationAdmissionCoordinator();
 
   configureGenerationAdmission(config: GenerationAdmissionConfiguration): void {
@@ -1212,52 +1223,55 @@ class GenerationJobManagerClass {
     segment: string,
     writes: readonly Promise<unknown>[] = [],
   ): Promise<boolean> {
-    const results = await Promise.allSettled(writes);
-    if (results.some((result) => result.status === 'rejected')) return false;
-    if (!(await this.durableAdmission.writesSettled(streamId, epoch, segment))) return false;
-    if (
-      this.durableAdmission.required &&
-      (await this.durableAdmission.cancel(streamId, epoch, segment))
-    ) {
-      return this.markProviderExecutionDrained(streamId, epoch, segment);
-    }
+    // Own the first observation before joining supplied or coordinator writes. A duplicate
+    // must not overtake original trailing work by arriving with a smaller write list.
+    return this.retainProviderSettlement(streamId, epoch, segment, async () => {
+      const results = await Promise.allSettled(writes);
+      if (results.some((result) => result.status === 'rejected')) return false;
+      if (!(await this.durableAdmission.writesSettled(streamId, epoch, segment))) return false;
+      if (this.durableAdmission.canCancelInitialization(streamId, epoch, segment)) {
+        if (!(await this.durableAdmission.cancel(streamId, epoch, segment))) return false;
+        return (await this.recordOriginalProviderDrain(streamId, epoch, segment)).confirmed;
+      }
 
-    const job = await this.jobStore.getJob(streamId);
-    let outcome: GenerationAdmissionTerminal['outcome'] | undefined;
-    switch (job?.status) {
-      case 'complete':
-      case 'requires_action':
-        // A pause completes this execution segment; the job still awaits its successor.
-        outcome = 'completed';
-        break;
-      case 'error':
-        outcome = 'failed';
-        break;
-      case 'aborted':
-        outcome = 'cancelled';
-        break;
-    }
-    if (
-      this.durableAdmission.required &&
-      (!job ||
-        job.createdAt !== epoch ||
-        job.providerExecutionId !== segment ||
-        outcome == null ||
-        job.terminalPersistencePending ||
-        job.terminalHostActionPending)
-    )
-      return false;
-    await this.flushCoalescedStreamBuffers(streamId);
-    const drained = await this.markProviderExecutionDrained(streamId, epoch, segment);
-    if (!drained || !this.durableAdmission.required) return drained;
-    if (outcome == null) return false;
-    return this.durableAdmission.settle(
-      streamId,
-      epoch,
-      segment,
-      outcome,
-      JSON.stringify({ streamId, epoch, segment, status: job?.status, persistence: 'settled' }),
-    );
+      const job = await this.jobStore.getJob(streamId);
+      let outcome: GenerationAdmissionTerminal['outcome'] | undefined;
+      switch (job?.status) {
+        case 'complete':
+        case 'requires_action':
+          outcome = 'completed';
+          break;
+        case 'error':
+          outcome = 'failed';
+          break;
+        case 'aborted':
+          outcome = 'cancelled';
+          break;
+      }
+      if (
+        this.durableAdmission.required &&
+        (!job ||
+          job.createdAt !== epoch ||
+          job.providerExecutionId !== segment ||
+          outcome == null ||
+          job.terminalPersistencePending ||
+          job.terminalHostActionPending)
+      )
+        return undefined;
+      // Only the readiness refusal above has no dispatched settlement effect and may be
+      // rechecked. Every original effect below retains its positive or unknown result.
+      await this.flushCoalescedStreamBuffers(streamId);
+      const drained = await this.recordOriginalProviderDrain(streamId, epoch, segment);
+      if (!drained.confirmed || !this.durableAdmission.required) return drained.confirmed;
+      if (outcome == null) return false;
+      return this.durableAdmission.settle(
+        streamId,
+        epoch,
+        segment,
+        outcome,
+        JSON.stringify({ streamId, epoch, segment, status: job?.status, persistence: 'settled' }),
+      );
+    });
   }
 
   cancelGenerationInitialization(
@@ -1269,16 +1283,13 @@ class GenerationJobManagerClass {
   }
 
   /**
-   * Provider executions this process has begun and not yet drained, awaited during shutdown so
-   * each can record its own drain once its trailing writes settle. Opened in
-   * `beginProviderExecution` and closed in `markProviderExecutionDrained` — the two chokepoints
-   * every entry point (interactive, resume, remote API) already passes through — so no caller
-   * has to remember to register, and a new entry point cannot silently opt out.
+   * Existing provider originals, opened at dispatch and retained through their exact drain.
+   * A standalone acknowledged drain closes its provider tracker independently of unresolved
+   * durable admission. Once full settlement owns the entry, it also retains the first trailing
+   * writes and native terminal acknowledgement; a direct drain cannot overtake that owner.
+   * Rejected or unacknowledged original effects remain held, including after observer deadlines.
    */
-  private readonly openProviderExecutions = new Map<
-    string,
-    { promise: Promise<void>; settle: () => void }
-  >();
+  private readonly openProviderExecutions = new Map<string, ProviderExecutionTracker>();
 
   /** Whether we're using Redis stores */
   private _isRedis = false;
@@ -1611,6 +1622,19 @@ class GenerationJobManagerClass {
     isRedis?: boolean;
     cleanupOnComplete?: boolean;
   }): void {
+    const custody = this.durableAdmission.getLocalCustody();
+    if (
+      this.openProviderExecutions.size ||
+      this.ownedJobs.size ||
+      this.subscriberCleanupPromises.size ||
+      this.replayEventWriteQueues.size ||
+      this.tokenUsageWriteQueues.size ||
+      this.runStepWriteQueues.size ||
+      custody.pending ||
+      custody.unresolved ||
+      (this.shutdownSettlement && !this.shutdownSettlementComplete)
+    )
+      throw new Error('generation_reconfiguration_pending');
     if (this.sourceCleanupFlights.size || this.sourceCleanupScan)
       throw new Error('generation_source_cleanup_reconfiguration_pending');
     this.sourceCleanupActors.clear();
@@ -1659,9 +1683,9 @@ class GenerationJobManagerClass {
     }
 
     this.ownedJobs.clear();
-    /** The trackers belong to the services being replaced; a stale one would make a later
-     *  graceful destroy() wait its whole budget on an execution that can never drain. */
-    this.releaseOpenProviderExecutions();
+    this.shutdownSettlement = undefined;
+    this.shutdownSettlementDeadline = undefined;
+    this.shutdownSettlementComplete = false;
     setGenerationJobsInFlight(previousStore, 0);
 
     this.jobStore.setStaleGenerationHandler?.(undefined);
@@ -1685,6 +1709,8 @@ class GenerationJobManagerClass {
       typeof services.eventTransport.flushPendingChunks === 'function' &&
       typeof services.jobStore.flushPendingAppends === 'function';
     this._cleanupOnComplete = services.cleanupOnComplete ?? true;
+    // All original custody guards passed. Reopen only our shutdown hold, never maintenance.
+    this.durableAdmission.reopen('shutdown');
     this.shuttingDown = false;
     this.syncRunningJobMetrics();
 
@@ -9241,44 +9267,125 @@ class GenerationJobManagerClass {
    * The opaque segment id prevents a paused controller from acknowledging a
    * later HITL resume that reuses the same generation epoch. */
 
-  /**
-   * Wait for tracked generations to settle, bounded so shutdown still finishes inside a
-   * container stop grace period. Anything still outstanding is left alone: asserting a drain
-   * it has not reached is the unsafe direction, so we log and let the deployment's
-   * hard-kill handling own that case.
-   */
-  private async awaitGenerationSettlements(budget: number): Promise<void> {
-    const deadline = Date.now() + budget;
-    /** Re-snapshot until the set drains. A settlement can be registered while an earlier
-     *  one is being awaited — the controller registers its detached chain just before its
-     *  initialization settlement resolves — and a one-time snapshot would return between
-     *  the two, tearing down the store and transport under a still-running provider. */
-    while (this.openProviderExecutions.size > 0) {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        break;
+  /** Join the original pre-drain work without surrendering resources on a deadline. */
+  async awaitGenerationSettlements(budget: number): Promise<void> {
+    if (this.shutdownSettlementComplete) return;
+    if (!this.shutdownSettlement) {
+      this.shutdownSettlementDeadline =
+        Date.now() + Math.max(0, Number.isFinite(budget) ? budget : 0);
+      this.prepareForShutdown();
+      // Install custody before any finalizer can synchronously reenter this owner. Finalization
+      // is dispatched once here, while dependencies live; post-drain destroy only observes it.
+      this.shutdownSettlement = Promise.resolve().then(async () => {
+        const deadline = this.shutdownSettlementDeadline!;
+        const originals = await Promise.allSettled([
+          this.finalizeOwnedJobsForShutdown(),
+          this.drainSubscriberCleanups(),
+          this.waitForProviderExecutions(),
+          this.drainSourceActorCleanup(deadline),
+        ]);
+        const failure = originals.find((result) => result.status === 'rejected');
+        if (failure?.status === 'rejected') throw failure.reason;
+        // Original finalizers may have registered disconnect/source work while those first
+        // snapshots were draining. Keep the same deadline and existing owners for the join.
+        await this.drainSubscriberCleanups();
+        await this.drainSourceActorCleanup(deadline);
+        await this.waitForProviderExecutions();
+        this.shutdownSettlementComplete = true;
+      });
+      void this.shutdownSettlement.catch(() => undefined);
+    }
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        this.shutdownSettlement,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error('generation_shutdown_pending')),
+            Math.max(0, this.shutdownSettlementDeadline! - Date.now()),
+          );
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** The caller bounds observation; the retained join follows the same original operations
+   * after that cutoff so a later positive acknowledgement remains observable without replay. */
+  private async waitForProviderExecutions(): Promise<void> {
+    for (;;) {
+      const custody = this.durableAdmission.getLocalCustody();
+      if ([...this.openProviderExecutions.values()].some((entry) => entry.uncertain))
+        throw new Error('generation_shutdown_unconfirmed');
+      if (!this.openProviderExecutions.size && !custody.pending) {
+        if (custody.unresolved) throw new Error('generation_shutdown_unconfirmed');
+        return;
       }
       const pending = [...this.openProviderExecutions.values()].map((entry) => entry.promise);
       let timer: NodeJS.Timeout | undefined;
       try {
-        await Promise.race([
-          Promise.allSettled(pending),
-          new Promise<void>((resolve) => {
-            timer = setTimeout(resolve, remaining);
-          }),
-        ]);
+        const tick = new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, PROVIDER_DRAIN_POLL_MS);
+        });
+        await (pending.length ? Promise.race([Promise.all(pending), tick]) : tick);
       } finally {
-        if (timer) {
-          clearTimeout(timer);
-        }
+        if (timer) clearTimeout(timer);
       }
     }
-    const unsettled = this.openProviderExecutions.size;
-    if (unsettled > 0) {
-      logger.warn(
-        `[GenerationJobManager] ${unsettled} provider execution(s) did not drain within ${budget}ms of shutdown; their drains are unrecorded`,
-      );
+  }
+
+  private retainProviderSettlement(
+    streamId: string,
+    epoch: number,
+    segment: string,
+    run: () => Promise<boolean | undefined>,
+  ): Promise<boolean> {
+    const entry = this.openProviderExecution(streamId, epoch, segment);
+    if (!entry.settlement) {
+      entry.settlement = Promise.resolve().then(async () => {
+        if (entry.uncertain) return false;
+        try {
+          const settled = await run();
+          if (settled === undefined) {
+            // All supplied originals settled; readiness alone refused before any drain effect.
+            entry.settlement = undefined;
+            return false;
+          }
+          if (settled) this.closeProviderExecution(streamId, epoch, segment);
+          else entry.uncertain = true;
+          return settled;
+        } catch (error) {
+          entry.uncertain = true;
+          throw error;
+        }
+      });
+      void entry.settlement.catch(() => undefined);
     }
+    return entry.settlement;
+  }
+
+  private recordOriginalProviderDrain(
+    streamId: string,
+    epoch: number,
+    segment: string,
+  ): Promise<ProviderDrainOutcome> {
+    const entry = this.openProviderExecution(streamId, epoch, segment);
+    if (!entry.drain) {
+      entry.drain = Promise.resolve().then(async () => {
+        if (entry.uncertain) return { marked: false, confirmed: false };
+        try {
+          const recorded = await this.recordProviderExecutionDrain(streamId, epoch, segment);
+          if (!recorded.confirmed) entry.uncertain = true;
+          return recorded;
+        } catch (error) {
+          entry.uncertain = true;
+          throw error;
+        }
+      });
+      void entry.drain.catch(() => undefined);
+    }
+    return entry.drain;
   }
 
   async markProviderExecutionDrained(
@@ -9286,27 +9393,37 @@ class GenerationJobManagerClass {
     expectedCreatedAt: number,
     providerExecutionId: string,
   ): Promise<boolean> {
-    try {
-      return await this.recordProviderExecutionDrain(
-        streamId,
-        expectedCreatedAt,
-        providerExecutionId,
-      );
-    } finally {
-      /** Settles the shutdown wait whether or not the record succeeded: a drain that failed
-       *  to write has nothing further to wait for, and holding shutdown open on it would only
-       *  push the process into the force-exit with the same unrecorded marker. */
-      this.closeProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
+    const entry = this.openProviderExecutions.get(
+      this.providerExecutionKey(streamId, expectedCreatedAt, providerExecutionId),
+    );
+    if (entry?.settlement) {
+      const settled = await entry.settlement;
+      return settled && entry.drain !== undefined && (await entry.drain).marked;
     }
+    if (providerExecutionId.length === 0 || providerExecutionId.length > 128) return false;
+    const recorded = await this.recordOriginalProviderDrain(
+      streamId,
+      expectedCreatedAt,
+      providerExecutionId,
+    );
+    // Full settlement may have taken custody while the original drain was pending.
+    // Its first trailing writes and durable terminal acknowledgement still own completion.
+    const settlement = this.openProviderExecutions.get(
+      this.providerExecutionKey(streamId, expectedCreatedAt, providerExecutionId),
+    )?.settlement;
+    if (settlement) return (await settlement) && recorded.marked;
+    if (recorded.confirmed)
+      this.closeProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
+    return recorded.marked;
   }
 
   private async recordProviderExecutionDrain(
     streamId: string,
     expectedCreatedAt: number,
     providerExecutionId: string,
-  ): Promise<boolean> {
+  ): Promise<ProviderDrainOutcome> {
     if (providerExecutionId.length === 0 || providerExecutionId.length > 128) {
-      return false;
+      return { marked: false, confirmed: false };
     }
 
     const observedJob = await this.jobStore.getJob(streamId);
@@ -9320,16 +9437,42 @@ class GenerationJobManagerClass {
       await this.persistAgentEventRunStepEvidence(streamId, observedJob);
     }
 
-    const [marked, recorded] = await Promise.all([
-      this.jobStore.markProviderExecutionDrained?.(
-        streamId,
-        expectedCreatedAt,
-        providerExecutionId,
-      ) ?? Promise.resolve(false),
-      this.eventTransport.recordProviderDrain?.(streamId, expectedCreatedAt, providerExecutionId) ??
-        Promise.resolve(false),
+    const [markResult, recordResult] = await Promise.allSettled([
+      Promise.resolve().then(
+        () =>
+          this.jobStore.markProviderExecutionDrained?.(
+            streamId,
+            expectedCreatedAt,
+            providerExecutionId,
+          ) ?? false,
+      ),
+      Promise.resolve().then(
+        () =>
+          this.eventTransport.recordProviderDrain?.(
+            streamId,
+            expectedCreatedAt,
+            providerExecutionId,
+          ) ?? false,
+      ),
     ]);
+    // One rejection cannot discharge its still-pending sibling original operation.
+    if (markResult.status === 'rejected') throw markResult.reason;
+    if (recordResult.status === 'rejected') throw recordResult.reason;
+    const marked = markResult.value;
+    const recorded = recordResult.value;
+    if (!recorded || typeof this.jobStore.markProviderExecutionDrained !== 'function')
+      return { marked: false, confirmed: false };
     const job = await this.jobStore.getJob(streamId);
+    if (!marked) {
+      // Both original writes have settled. The real store returns false for a stale
+      // exact identity; confirm that identity after their join, never from a pre-read.
+      // The transport's positive exact-segment proof survives replacement separately.
+      return {
+        marked: false,
+        confirmed:
+          job?.createdAt !== expectedCreatedAt || job.providerExecutionId !== providerExecutionId,
+      };
+    }
     if (
       marked &&
       job?.createdAt === expectedCreatedAt &&
@@ -9359,7 +9502,7 @@ class GenerationJobManagerClass {
     }
     if (marked && job?.sourceReplayIntent)
       await this.sourceReplay?.settleCurrent(streamId, expectedCreatedAt);
-    return marked;
+    return { marked: true, confirmed: true };
   }
 
   /** Starts the initial provider owner only if account deletion, abort, or a
@@ -9425,7 +9568,9 @@ class GenerationJobManagerClass {
       );
       if (!started) {
         // Only an acknowledged no-mutation result discharges this start attempt.
-        this.closeProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
+        const entry = this.openProviderExecutions.get(key);
+        if (!entry?.drain && !entry?.settlement)
+          this.closeProviderExecution(streamId, expectedCreatedAt, providerExecutionId);
         return false;
       }
       // From here on the existing exact-segment drain owns the open obligation, even on false.
@@ -9472,16 +9617,17 @@ class GenerationJobManagerClass {
     streamId: string,
     createdAt: number,
     providerExecutionId: string,
-  ): void {
+  ): ProviderExecutionTracker {
     const key = this.providerExecutionKey(streamId, createdAt, providerExecutionId);
-    if (this.openProviderExecutions.has(key)) {
-      return;
-    }
+    const existing = this.openProviderExecutions.get(key);
+    if (existing) return existing;
     let settle: () => void = () => undefined;
     const promise = new Promise<void>((resolve) => {
       settle = resolve;
     });
-    this.openProviderExecutions.set(key, { promise, settle });
+    const entry = { promise, settle };
+    this.openProviderExecutions.set(key, entry);
+    return entry;
   }
 
   private closeProviderExecution(
@@ -9498,22 +9644,13 @@ class GenerationJobManagerClass {
     entry.settle();
   }
 
-  /**
-   * Release the tracker for an execution whose owner will never record its drain — a run
-   * that settled its provider work but failed terminalization and deliberately publishes no
-   * marker. Nothing is written: shutdown simply stops waiting on it, and the absent marker
-   * keeps telling a successor the truth.
-   */
+  /** Failed terminalization is settled local work, but unconfirmed durable custody. */
   abandonProviderExecution(streamId: string, createdAt: number, providerExecutionId: string): void {
-    this.closeProviderExecution(streamId, createdAt, providerExecutionId);
-  }
-
-  /** Settle and drop every open tracker; used wherever the services they belong to go away. */
-  private releaseOpenProviderExecutions(): void {
-    for (const entry of this.openProviderExecutions.values()) {
-      entry.settle();
-    }
-    this.openProviderExecutions.clear();
+    const entry = this.openProviderExecutions.get(
+      this.providerExecutionKey(streamId, createdAt, providerExecutionId),
+    );
+    if (entry) entry.uncertain = true;
+    this.durableAdmission.holdProviderExecution(streamId, createdAt, providerExecutionId);
   }
 
   private async waitForProviderExecutionDrain(
@@ -10885,24 +11022,33 @@ class GenerationJobManagerClass {
       }
     }
     this.syncRunningJobMetrics();
+    const failure = results.find((result) => result.status === 'rejected');
+    if (failure?.status === 'rejected') throw failure.reason;
   }
 
   /**
    * Stop accepting jobs and close only this process's attached SSE responses.
    *
-   * This runs before HTTP drain. Durable finalization waits until post-drain, when only jobs
-   * still owned by this process are atomically moved to a terminal state.
+   * This runs before HTTP drain. The existing settlement barrier retains original owned-job
+   * finalization and provider continuations while their stores and transports remain alive.
    */
   prepareForShutdown(): void {
     if (this.shuttingDown) {
       return;
     }
     this.shuttingDown = true;
+    this.durableAdmission.close('shutdown');
     this.cancelFencedRuntimeRetirements();
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
 
     for (const runtime of this.runtimeState.values()) {
       runtime.startupTelemetry?.end('aborted');
       runtime.startupTelemetry = undefined;
+      this.stopSubscriberLease(runtime);
+      runtime.abortController.abort();
     }
 
     const streamIds = new Set([
@@ -10922,38 +11068,15 @@ class GenerationJobManagerClass {
     const settlementBudgetMs = Number.isFinite(options.settlementBudgetMs)
       ? Math.max(0, options.settlementBudgetMs as number)
       : SHUTDOWN_SETTLEMENT_FALLBACK_MS;
-    /** Anchored here, not after subscriber cleanup: that cleanup is unbounded, and the caller's
-     *  budget was measured against the force-exit timer that keeps running through it. */
-    const settlementDeadline = Date.now() + settlementBudgetMs;
-    this.shuttingDown = true;
-    this.cancelFencedRuntimeRetirements();
-
-    if (this.cleanupInterval) {
-      clearInterval(this.cleanupInterval);
-      this.cleanupInterval = null;
-    }
-
-    for (const runtime of this.runtimeState.values()) {
-      runtime.startupTelemetry?.end('aborted');
-      runtime.startupTelemetry = undefined;
-      this.stopSubscriberLease(runtime);
-      this.releaseAbortSubscription(runtime, true);
-      runtime.abortController.abort();
-    }
-
-    await this.drainSubscriberCleanups();
-    await this.awaitGenerationSettlements(Math.max(0, settlementDeadline - Date.now()));
-    await this.drainSourceActorCleanup(settlementDeadline);
-    await this.finalizeOwnedJobsForShutdown();
+    await this.awaitGenerationSettlements(settlementBudgetMs);
+    // The retained pre-drain result includes all owned-job finalization. Never dispatch a
+    // fresh finalizer after shared dependency teardown has been allowed to begin.
+    for (const runtime of this.runtimeState.values()) this.releaseAbortSubscription(runtime, true);
     this.sourceCleanupActors.clear();
     this.sourceCleanupIterator = undefined;
     this.jobStore.setStaleGenerationHandler?.(undefined);
     await this.jobStore.destroy();
     this.eventTransport.destroy();
-    /** Whatever the bounded wait left behind must not outlive this store: a later
-     *  `configure()`/`initialize()` in the same process would otherwise wait a full budget
-     *  on executions that can never drain. */
-    this.releaseOpenProviderExecutions();
     this.runtimeState.clear();
     this.ownedJobs.clear();
     this.syncRunningJobMetrics();

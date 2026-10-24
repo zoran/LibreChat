@@ -1,7 +1,8 @@
 import { randomUUID } from 'crypto';
 import { logger } from '@librechat/data-schemas';
 import type { MCPRecoveryGenerationScope } from './catalog/recovery';
-import { registerShutdownTask } from '~/app/shutdown';
+import type { ApplicationWorkPort } from '../app/maintenance';
+import { registerShutdownTask } from '../app/shutdown';
 
 const DEFAULT_RETRY_INTERVAL_MS = 30_000;
 const DEFAULT_RETRY_BATCH_SIZE = 100;
@@ -51,6 +52,8 @@ export interface MCPAuthorizationFenceRetryWorkerPolicy {
 }
 
 export interface MCPAuthorizationFenceRetryService {
+  /** Original custody outlives bounded replay observation and deduplication. */
+  maintenance: ApplicationWorkPort;
   clear(scope: MCPRecoveryGenerationScope, version: string): Promise<void>;
   drain(): Promise<void>;
   persist(scope: MCPRecoveryGenerationScope): Promise<string>;
@@ -74,12 +77,44 @@ export function createMCPAuthorizationFenceRetryService(
     | undefined;
   let retryBatchSize = DEFAULT_RETRY_BATCH_SIZE;
   let attemptTimeoutMs = DEFAULT_ATTEMPT_TIMEOUT_MS;
+  let retryIntervalMs = DEFAULT_RETRY_INTERVAL_MS;
+  let requestId: string | null = null;
+  let revision = 0;
+  let stopped = false;
+  let uncertain = false;
+  const originals = new Set<Promise<unknown>>();
+
+  const clearTimer = () => {
+    if (retryTimer != null) clearInterval(retryTimer);
+    retryTimer = undefined;
+  };
+  const admissionClosed = () => stopped || uncertain || requestId !== null;
+  const markUncertain = () => {
+    if (!uncertain) revision += 1;
+    uncertain = true;
+    clearTimer();
+  };
+  const own = <T>(operation: () => Promise<T>): Promise<T> => {
+    // Register custody and both outcome observers before any producer can dispatch.
+    const original = Promise.resolve().then(operation);
+    originals.add(original);
+    void original.then(
+      () => originals.delete(original),
+      () => {
+        markUncertain();
+        originals.delete(original);
+      },
+    );
+    return original;
+  };
+  const closed = () => Promise.reject(new Error('MCP_AUTHORIZATION_RETRY_ADMISSION_CLOSED'));
 
   const attemptKey = (retry: MCPAuthorizationFenceRetryRecord): string =>
     JSON.stringify([retry.tenantId ?? '', retry.userId, retry.serverName, retry.version]);
 
   const getOrStartAttempt = (
     retry: MCPAuthorizationFenceRetryRecord,
+    invalidate: (scope: MCPRecoveryGenerationScope) => Promise<unknown>,
   ): Promise<RetryAttemptResult> => {
     const key = attemptKey(retry);
     const activeAttempt = activeAttempts.get(key);
@@ -87,61 +122,70 @@ export function createMCPAuthorizationFenceRetryService(
       return activeAttempt;
     }
 
-    const attempt = deps
-      .runInRetryScope(retry, async () => {
-        await invalidateRecoveryGeneration?.({
-          userId: retry.userId,
-          serverName: retry.serverName,
-        });
-      })
-      .then(async () => {
+    const scope = { userId: retry.userId, serverName: retry.serverName };
+    const attempt = own(() =>
+      deps.runInRetryScope(retry, async () => {
+        await invalidate({ ...scope });
         await deps.storage.deleteVersion({
-          scope: { userId: retry.userId, serverName: retry.serverName },
+          scope,
           tenantId: retry.tenantId,
           version: retry.version,
         });
-        return { succeeded: true } as const;
-      })
-      .catch((error: unknown) => ({ succeeded: false, error }) as const)
-      .finally(() => {
-        if (activeAttempts.get(key) === attempt) {
-          activeAttempts.delete(key);
-        }
-      });
+      }),
+    ).then<RetryAttemptResult, RetryAttemptResult>(
+      () => ({ succeeded: true }),
+      (error: unknown) => ({ succeeded: false, error }),
+    );
     activeAttempts.set(key, attempt);
+    void attempt.then(() => {
+      if (activeAttempts.get(key) === attempt) activeAttempts.delete(key);
+    });
     return attempt;
   };
 
-  const persist = async (scope: MCPRecoveryGenerationScope): Promise<string> => {
+  const persist = (scope: MCPRecoveryGenerationScope): Promise<string> => {
+    if (admissionClosed()) return closed();
     const version = randomUUID();
-    await deps.storage.upsert({
-      scope,
+    const input = {
+      scope: { ...scope },
       tenantId: deps.getTenantId() ?? null,
       version,
       now: new Date(),
+    };
+    return own(async () => {
+      await deps.storage.upsert(input);
+      return version;
     });
-    return version;
   };
 
-  const clear = async (scope: MCPRecoveryGenerationScope, version: string): Promise<void> => {
-    await deps.storage.deleteVersion({
-      scope,
+  const clear = (scope: MCPRecoveryGenerationScope, version: string): Promise<void> => {
+    if (admissionClosed()) return closed();
+    const input = {
+      scope: { ...scope },
       tenantId: deps.getTenantId() ?? null,
       version,
-    });
+    };
+    return own(() => deps.storage.deleteVersion(input));
   };
 
-  const drain = async (): Promise<void> => {
-    if (drainPromise != null || invalidateRecoveryGeneration == null) {
-      return drainPromise;
-    }
-    drainPromise = (async () => {
-      const retries = await deps.storage.list(retryBatchSize);
+  const drain = (): Promise<void> => {
+    if (drainPromise != null) return drainPromise;
+    if (admissionClosed()) return closed();
+    if (invalidateRecoveryGeneration == null) return Promise.resolve();
+    // A paused/reconfigured worker cannot replace an already admitted batch's dependencies.
+    const invalidate = invalidateRecoveryGeneration;
+    const batchSize = retryBatchSize;
+    const timeoutMs = attemptTimeoutMs;
+    const batch = own(async () => {
+      const retries = (await deps.storage.list(batchSize)).map((retry) => ({
+        ...retry,
+        updatedAt: new Date(retry.updatedAt),
+      }));
       for (const retry of retries) {
         let timeoutId: ReturnType<typeof setTimeout> | undefined;
         let timedOut = false;
         const key = attemptKey(retry);
-        const attempt = getOrStartAttempt(retry);
+        const attempt = getOrStartAttempt(retry, invalidate);
         try {
           const result = await Promise.race([
             attempt,
@@ -149,7 +193,7 @@ export function createMCPAuthorizationFenceRetryService(
               timeoutId = setTimeout(() => {
                 timedOut = true;
                 reject(new Error('MCP authorization generation replay timed out'));
-              }, attemptTimeoutMs);
+              }, timeoutMs);
             }),
           ]);
           if (!result.succeeded) {
@@ -170,16 +214,18 @@ export function createMCPAuthorizationFenceRetryService(
             let deferTimeoutId: ReturnType<typeof setTimeout> | undefined;
             try {
               await Promise.race([
-                deps.storage.deferVersion({
-                  scope: { userId: retry.userId, serverName: retry.serverName },
-                  tenantId: retry.tenantId,
-                  version: retry.version,
-                  updatedAt: new Date(Math.max(Date.now(), retry.updatedAt.getTime() + 1)),
-                }),
+                own(() =>
+                  deps.storage.deferVersion({
+                    scope: { userId: retry.userId, serverName: retry.serverName },
+                    tenantId: retry.tenantId,
+                    version: retry.version,
+                    updatedAt: new Date(Math.max(Date.now(), retry.updatedAt.getTime() + 1)),
+                  }),
+                ),
                 new Promise<never>((_, reject) => {
                   deferTimeoutId = setTimeout(
                     () => reject(new Error('MCP authorization retry deferral timed out')),
-                    attemptTimeoutMs,
+                    timeoutMs,
                   );
                 }),
               ]);
@@ -200,24 +246,37 @@ export function createMCPAuthorizationFenceRetryService(
           }
         }
       }
-    })().finally(() => {
-      drainPromise = undefined;
     });
-    return drainPromise;
+    drainPromise = batch;
+    const finished = () => {
+      if (drainPromise === batch) drainPromise = undefined;
+    };
+    void batch.then(finished, finished);
+    return batch;
   };
 
   const scheduleDrain = (): void => {
+    if (admissionClosed()) return;
     void drain().catch((error) =>
       logger.warn('[MCP authorization] Could not read durable generation retries', error),
     );
   };
 
+  const stopAdmissions = (): void => {
+    if (!stopped) revision += 1;
+    stopped = true;
+    clearTimer();
+  };
   const stop = async (): Promise<void> => {
-    if (retryTimer != null) {
-      clearInterval(retryTimer);
-      retryTimer = undefined;
-    }
-    await drainPromise?.catch(() => undefined);
+    stopAdmissions();
+    // Admitted batches can still produce descendants while shutdown waits.
+    while (originals.size > 0) await Promise.allSettled([...originals]);
+    if (uncertain) throw new Error('MCP_AUTHORIZATION_RETRY_SETTLEMENT_UNCONFIRMED');
+  };
+  const armTimer = (): void => {
+    if (admissionClosed() || retryTimer != null || invalidateRecoveryGeneration == null) return;
+    retryTimer = setInterval(scheduleDrain, retryIntervalMs);
+    retryTimer.unref?.();
   };
 
   const start = (
@@ -227,14 +286,46 @@ export function createMCPAuthorizationFenceRetryService(
     invalidateRecoveryGeneration = invalidator;
     retryBatchSize = policy.batchSize ?? DEFAULT_RETRY_BATCH_SIZE;
     attemptTimeoutMs = policy.attemptTimeoutMs ?? DEFAULT_ATTEMPT_TIMEOUT_MS;
-    if (retryTimer != null) {
-      return;
-    }
-    retryTimer = setInterval(scheduleDrain, policy.intervalMs ?? DEFAULT_RETRY_INTERVAL_MS);
-    retryTimer.unref?.();
-    (deps.registerShutdown ?? registerShutdownTask)('MCP authorization fence retry worker', stop);
+    retryIntervalMs = policy.intervalMs ?? DEFAULT_RETRY_INTERVAL_MS;
+    clearTimer();
+    armTimer();
     scheduleDrain();
   };
 
-  return { clear, drain, persist, start, stop };
+  const maintenance: ApplicationWorkPort = {
+    pauseAdmissions(id) {
+      if (!id || (requestId !== null && requestId !== id)) return false;
+      if (requestId === null) {
+        requestId = id;
+        revision += 1;
+        clearTimer();
+      }
+      return true;
+    },
+    resumeAdmissions(id) {
+      if (stopped || uncertain || requestId !== id) return false;
+      requestId = null;
+      revision += 1;
+      armTimer();
+      return true;
+    },
+    async getMaintenanceCensus(id) {
+      const sampledRevision = revision;
+      const matching = id === requestId;
+      await Promise.resolve();
+      return {
+        admissionClosed: admissionClosed(),
+        queuedContinuations: originals.size,
+        pendingWrites: originals.size,
+        complete: matching && sampledRevision === revision && !uncertain,
+      };
+    },
+  };
+  const register = deps.registerShutdown ?? registerShutdownTask;
+  register('MCP authorization fence retry admissions', stopAdmissions, {
+    phase: 'pre-drain',
+    priority: 110,
+  });
+  register('MCP authorization fence retry worker', stop, { phase: 'pre-drain', priority: 90 });
+  return { clear, drain, persist, start, stop, maintenance };
 }

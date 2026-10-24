@@ -10,6 +10,7 @@ export default {
   coverageReporters: ['text', 'cobertura'],
   testResultsProcessor: 'jest-junit',
   moduleNameMapper: {
+    '^@librechat/data-schemas$': '<rootDir>/src/index.ts',
     '^@src/(.*)$': '<rootDir>/src/$1',
     '^~/(.*)$': '<rootDir>/src/$1',
   },

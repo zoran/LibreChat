@@ -1,3 +1,4 @@
+const { historyMaintenance } = require('~/server/services/HistoryMaintenance');
 const { createHistoryImportStorage } = require('~/server/utils/import/historyStorage');
 const multer = require('multer');
 const express = require('express');
@@ -64,7 +65,7 @@ const {
   pendingBackgroundToolCompletions,
 } = require('~/server/services/Endpoints/agents/backgroundCompletion');
 const getLogStores = require('~/cache/getLogStores');
-const db = require('~/models');
+const db = historyMaintenance.methods(require('~/models'));
 
 const assistantClients = {
   [EModelEndpoint.azureAssistants]: require('~/server/services/Endpoints/azureAssistants'),
@@ -175,104 +176,120 @@ const conversationPullRequestHandler = createConversationPullRequestHandler({
   env: process.env,
 });
 router.use(requireJwtAuth);
+router.use(historyMaintenance.admissionMiddleware);
 
 const isValidProjectFilter = (projectId) =>
   !projectId || projectId === 'unassigned' || /^[a-f\d]{24}$/i.test(projectId);
 
-router.get('/', async (req, res) => {
-  const limit = normalizeLimit(req.query.limit);
-  const cursor = req.query.cursor;
-  const isArchived = isEnabled(req.query.isArchived);
-  const pinned = isEnabled(req.query.pinned);
-  const search =
-    typeof req.query.search === 'string' ? req.query.search.trim() || undefined : undefined;
-  const sortBy = normalizeSortField(req.query.sortBy, {
-    fields: CONVERSATION_SORT_FIELDS,
-    fallback: 'updatedAt',
-  });
-  const sortDirection = normalizeSortDirection(req.query.sortDirection);
-  const projectId = Array.isArray(req.query.projectId)
-    ? req.query.projectId[0]
-    : req.query.projectId;
+router.get(
+  '/',
+  historyMaintenance.own(async (req, res) => {
+    const limit = normalizeLimit(req.query.limit);
+    const cursor = req.query.cursor;
+    const isArchived = isEnabled(req.query.isArchived);
+    const pinned = isEnabled(req.query.pinned);
+    const search =
+      typeof req.query.search === 'string' ? req.query.search.trim() || undefined : undefined;
+    const sortBy = normalizeSortField(req.query.sortBy, {
+      fields: CONVERSATION_SORT_FIELDS,
+      fallback: 'updatedAt',
+    });
+    const sortDirection = normalizeSortDirection(req.query.sortDirection);
+    const projectId = Array.isArray(req.query.projectId)
+      ? req.query.projectId[0]
+      : req.query.projectId;
 
-  if (!isValidProjectFilter(projectId)) {
-    return res.status(400).json({ error: 'projectId must be a valid project id or unassigned' });
-  }
-
-  let tags;
-  if (req.query.tags) {
-    tags = Array.isArray(req.query.tags) ? req.query.tags : [req.query.tags];
-  }
-
-  try {
-    const { filters, error: filterError } = await resolveConversationListFilters(
-      req.query,
-      getAppConfig,
-    );
-    if (filterError) {
-      return res.status(400).json({ error: filterError });
+    if (!isValidProjectFilter(projectId)) {
+      return res.status(400).json({ error: 'projectId must be a valid project id or unassigned' });
     }
 
-    const result = await db.getConvosByCursor(req.user.id, {
-      cursor,
-      limit,
-      isArchived,
-      pinned,
-      tags,
-      search,
-      sortBy,
-      sortDirection,
-      projectId,
-      ...filters,
-    });
-    res.status(200).json(result);
-  } catch (error) {
-    logger.error('Error fetching conversations', error);
-    res.status(500).json({ error: 'Error fetching conversations' });
-  }
-});
+    let tags;
+    if (req.query.tags) {
+      tags = Array.isArray(req.query.tags) ? req.query.tags : [req.query.tags];
+    }
+
+    try {
+      const { filters, error: filterError } = await resolveConversationListFilters(
+        req.query,
+        getAppConfig,
+      );
+      if (filterError) {
+        return res.status(400).json({ error: filterError });
+      }
+
+      const result = await db.getConvosByCursor(req.user.id, {
+        cursor,
+        limit,
+        isArchived,
+        pinned,
+        tags,
+        search,
+        sortBy,
+        sortDirection,
+        projectId,
+        ...filters,
+      });
+      res.status(200).json(result);
+    } catch (error) {
+      logger.error('Error fetching conversations', error);
+      res.status(500).json({ error: 'Error fetching conversations' });
+    }
+  }),
+);
 
 router.get(
   '/:parentConversationId/subagents/:threadId/tasks/:taskId/activity',
-  subagentActivityStreamHandler,
+  historyMaintenance.own(subagentActivityStreamHandler),
 );
 router.post(
   '/:parentConversationId/subagents/:threadId/control',
-  configMiddleware,
-  ...subagentControlLimiters,
-  validateSubagentControlRequest,
-  filterSubagentControlMessage,
-  moderateSubagentControlMessage,
-  subagentControlHandler,
+  historyMaintenance.own(configMiddleware),
+  ...historyMaintenance.own(subagentControlLimiters),
+  historyMaintenance.own(validateSubagentControlRequest),
+  historyMaintenance.own(filterSubagentControlMessage),
+  historyMaintenance.own(moderateSubagentControlMessage),
+  historyMaintenance.own(subagentControlHandler),
 );
-router.get('/:parentConversationId/subagents', parentSubagentIndexHandler);
-router.get('/:conversationId/pull-request', conversationPullRequestHandler);
-router.get('/:conversationId/background-tasks', backgroundTaskPolicy, backgroundTaskIndexHandler);
+router.get('/:parentConversationId/subagents', historyMaintenance.own(parentSubagentIndexHandler));
+router.get('/:conversationId/pull-request', historyMaintenance.own(conversationPullRequestHandler));
+router.get(
+  '/:conversationId/background-tasks',
+  historyMaintenance.own(backgroundTaskPolicy),
+  historyMaintenance.own(backgroundTaskIndexHandler),
+);
 router.post(
   '/:conversationId/background-tasks/cancel',
-  backgroundTaskPolicy,
-  backgroundTaskCancelHandler,
+  historyMaintenance.own(backgroundTaskPolicy),
+  historyMaintenance.own(backgroundTaskCancelHandler),
 );
-router.get('/:parentConversationId/subagents/:threadId', subagentThreadViewHandler);
+router.get(
+  '/:parentConversationId/subagents/:threadId',
+  historyMaintenance.own(subagentThreadViewHandler),
+);
 
-router.get('/:conversationId', async (req, res) => {
-  const { conversationId } = req.params;
-  const convo = await db.getConvo(req.user.id, conversationId);
+router.get(
+  '/:conversationId',
+  historyMaintenance.own(async (req, res) => {
+    const { conversationId } = req.params;
+    const convo = await db.getConvo(req.user.id, conversationId);
 
-  if (convo && convo.subagentThread == null) {
-    res.status(200).json(convo);
-  } else {
-    res.status(404).end();
-  }
-});
+    if (convo && convo.subagentThread == null) {
+      res.status(200).json(convo);
+    } else {
+      res.status(404).end();
+    }
+  }),
+);
 
 router.get(
   '/gen_title/:conversationId',
-  createGeneratedTitleHandler({
-    getConvoTitleState: db.getConvoTitleState,
-    getCache: () => getLogStores(CacheKeys.GEN_TITLE),
-    logger,
-  }),
+  historyMaintenance.own(
+    createGeneratedTitleHandler({
+      getConvoTitleState: db.getConvoTitleState,
+      getCache: () => getLogStores(CacheKeys.GEN_TITLE),
+      logger,
+    }),
+  ),
 );
 
 /** Settle every sibling cleanup before propagating a failure. */
@@ -461,169 +478,177 @@ async function deleteOwnerConversationPersistence(userId, filter, tenantId, chec
   return { ...result, conversationIds: targets };
 }
 
-router.delete('/', configMiddleware, async (req, res) => {
-  let filter = {};
-  const { conversationId, source, thread_id, endpoint } = req.body?.arg ?? {};
+router.delete(
+  '/',
+  historyMaintenance.own(configMiddleware),
+  historyMaintenance.own(async (req, res) => {
+    let filter = {};
+    const { conversationId, source, thread_id, endpoint } = req.body?.arg ?? {};
 
-  if (conversationId != null && typeof conversationId !== 'string') {
-    return res.status(400).json({ error: 'Invalid conversationId' });
-  }
-
-  // Prevent deletion of all conversations
-  if (!conversationId && !source && !thread_id && !endpoint) {
-    return res.status(400).json({
-      error: 'no parameters provided',
-    });
-  }
-
-  if (conversationId) {
-    filter = { conversationId };
-  } else if (source === 'button') {
-    return res.status(200).send('No conversationId provided');
-  }
-
-  if (
-    typeof endpoint !== 'undefined' &&
-    Object.prototype.propertyIsEnumerable.call(assistantClients, endpoint)
-  ) {
-    /** @type {{ openai: OpenAI }} */
-    const { openai } = await assistantClients[endpoint].initializeClient({ req, res });
-    try {
-      const response = await openai.beta.threads.delete(thread_id);
-      logger.debug('Deleted OpenAI thread:', response);
-    } catch (error) {
-      logger.error('Error deleting OpenAI thread:', error);
+    if (conversationId != null && typeof conversationId !== 'string') {
+      return res.status(400).json({ error: 'Invalid conversationId' });
     }
-  }
 
-  try {
-    const tenantId =
-      typeof req.user.tenantId === 'string' && req.user.tenantId !== ''
-        ? req.user.tenantId
-        : undefined;
-    const checkpointer = req.config?.endpoints?.[EModelEndpoint.agents]?.checkpointer;
-    let cancellationPlan;
-    let checkpointDeletion;
-    let dbResponse;
-    if (filter.conversationId) {
-      checkpointDeletion = await openCheckpointDeletion(
-        req.user.id,
-        tenantId,
-        filter.conversationId,
-        checkpointer,
-      );
-      await checkpointDeletion.remember([filter.conversationId]);
-      cancellationPlan = await subagentThreadTaskStore.planCancellationForConversations(
-        req.user.id,
-        checkpointDeletion.conversationIds(),
-        tenantId,
-      );
-      await subagentThreadTaskStore.cancelPlan(cancellationPlan);
-      dbResponse = await db.deleteConvos(req.user.id, filter, {
-        allowEmpty: true,
-        beforeDelete: async (conversationIds) => {
-          await checkpointDeletion.remember(conversationIds);
-          await confirmAgentGenerationsDrained(req.user.id, conversationIds, [], tenantId);
-          await checkpointDeletion.remember(conversationIds);
-        },
+    // Prevent deletion of all conversations
+    if (!conversationId && !source && !thread_id && !endpoint) {
+      return res.status(400).json({
+        error: 'no parameters provided',
       });
-    } else {
-      /** An empty filter deletes every conversation this owner has, so it runs behind
-       * the same admission fence as `DELETE /all` rather than a bare drain. */
+    }
+
+    if (conversationId) {
+      filter = { conversationId };
+    } else if (source === 'button') {
+      return res.status(200).send('No conversationId provided');
+    }
+
+    if (
+      typeof endpoint !== 'undefined' &&
+      Object.prototype.propertyIsEnumerable.call(assistantClients, endpoint)
+    ) {
+      /** @type {{ openai: OpenAI }} */
+      const { openai } = await assistantClients[endpoint].initializeClient({ req, res });
+      try {
+        const response = await openai.beta.threads.delete(thread_id);
+        logger.debug('Deleted OpenAI thread:', response);
+      } catch (error) {
+        logger.error('Error deleting OpenAI thread:', error);
+      }
+    }
+
+    try {
+      const tenantId =
+        typeof req.user.tenantId === 'string' && req.user.tenantId !== ''
+          ? req.user.tenantId
+          : undefined;
+      const checkpointer = req.config?.endpoints?.[EModelEndpoint.agents]?.checkpointer;
+      let cancellationPlan;
+      let checkpointDeletion;
+      let dbResponse;
+      if (filter.conversationId) {
+        checkpointDeletion = await openCheckpointDeletion(
+          req.user.id,
+          tenantId,
+          filter.conversationId,
+          checkpointer,
+        );
+        await checkpointDeletion.remember([filter.conversationId]);
+        cancellationPlan = await subagentThreadTaskStore.planCancellationForConversations(
+          req.user.id,
+          checkpointDeletion.conversationIds(),
+          tenantId,
+        );
+        await subagentThreadTaskStore.cancelPlan(cancellationPlan);
+        dbResponse = await db.deleteConvos(req.user.id, filter, {
+          allowEmpty: true,
+          beforeDelete: async (conversationIds) => {
+            await checkpointDeletion.remember(conversationIds);
+            await confirmAgentGenerationsDrained(req.user.id, conversationIds, [], tenantId);
+            await checkpointDeletion.remember(conversationIds);
+          },
+        });
+      } else {
+        /** An empty filter deletes every conversation this owner has, so it runs behind
+         * the same admission fence as `DELETE /all` rather than a bare drain. */
+        const fencedDeletion = await withAgentOwnerDeletionFence(
+          req.user.id,
+          tenantId,
+          () => deleteOwnerConversationPersistence(req.user.id, filter, tenantId, checkpointer),
+          () => deleteOwnerConversationPersistence(req.user.id, filter, tenantId, checkpointer),
+        );
+        return res.status(201).json(fencedDeletion.result);
+      }
+      let deletedConversationIds = [
+        ...new Set([
+          ...(dbResponse.conversationIds ?? (filter.conversationId ? [filter.conversationId] : [])),
+          ...(checkpointDeletion?.conversationIds() ?? []),
+        ]),
+      ];
+      /** Root deletion closes new child admission. Replay the plan to catch a task
+       * admitted after the first pass but before that fence, extended with the cascade
+       * this deletion reported. */
+      if (cancellationPlan != null && deletedConversationIds.length > 0) {
+        /** Confirm late children stopped before payload cleanup. A failed retry leaves
+         * durable deletion intent available even though conversation deletion committed. */
+        await retryPostDeleteCancellation(cancellationPlan, deletedConversationIds);
+        await drainDeletedAgentGenerations(
+          req.user.id,
+          deletedConversationIds,
+          cancellationPlan.leases
+            .filter(
+              (lease) =>
+                deletedConversationIds.includes(lease.parentConversationId) ||
+                deletedConversationIds.includes(lease.conversationId),
+            )
+            .map((lease) => lease.taskId),
+          tenantId,
+          checkpointDeletion,
+        );
+      } else if (deletedConversationIds.length > 0) {
+        /** Owner-wide deletion drains lease-backed tasks before the cascade, but a
+         * requires_action event actor has intentionally released its lease. Its durable
+         * generation is still addressable by the deleted conversation id and must be
+         * terminalized before its checkpoint is pruned. */
+        await drainDeletedAgentGenerations(
+          req.user.id,
+          deletedConversationIds,
+          [],
+          tenantId,
+          checkpointDeletion,
+        );
+      }
+      deletedConversationIds = [
+        ...new Set([...deletedConversationIds, ...(checkpointDeletion?.conversationIds() ?? [])]),
+      ];
+      if (checkpointDeletion != null) {
+        await checkpointDeletion.cleanup();
+      }
+      if (filter.conversationId) {
+        await settleCleanupChildren(
+          deletedConversationIds.map((id) => db.deleteToolCalls(req.user.id, id)),
+        );
+        await settleCleanupChildren(
+          deletedConversationIds.map((id) => deleteConvoSharedLinksWithCleanup(req.user.id, id)),
+        );
+      }
+      await checkpointDeletion?.acknowledge();
+      res.status(201).json(dbResponse);
+    } catch (error) {
+      logger.error('Error clearing conversations', error);
+      res.status(500).send('Error clearing conversations');
+    }
+  }),
+);
+
+router.delete(
+  '/all',
+  historyMaintenance.own(configMiddleware),
+  historyMaintenance.own(async (req, res) => {
+    try {
+      const tenantId =
+        typeof req.user.tenantId === 'string' && req.user.tenantId !== ''
+          ? req.user.tenantId
+          : undefined;
+      const checkpointer = req.config?.endpoints?.[EModelEndpoint.agents]?.checkpointer;
+      /** Fences new child admission for this owner, drains the live ones, and deletes
+       * inside that fence: a child admitted on another replica mid-deletion would
+       * otherwise keep running against conversations that no longer exist. */
       const fencedDeletion = await withAgentOwnerDeletionFence(
         req.user.id,
         tenantId,
-        () => deleteOwnerConversationPersistence(req.user.id, filter, tenantId, checkpointer),
-        () => deleteOwnerConversationPersistence(req.user.id, filter, tenantId, checkpointer),
+        () => deleteOwnerConversationPersistence(req.user.id, {}, tenantId, checkpointer),
+        () => deleteOwnerConversationPersistence(req.user.id, {}, tenantId, checkpointer),
       );
-      return res.status(201).json(fencedDeletion.result);
+      const dbResponse = fencedDeletion.result;
+      await db.deleteToolCalls(req.user.id);
+      await deleteAllSharedLinksWithCleanup(req.user.id);
+      res.status(201).json(dbResponse);
+    } catch (error) {
+      logger.error('Error clearing conversations', error);
+      res.status(500).send('Error clearing conversations');
     }
-    let deletedConversationIds = [
-      ...new Set([
-        ...(dbResponse.conversationIds ?? (filter.conversationId ? [filter.conversationId] : [])),
-        ...(checkpointDeletion?.conversationIds() ?? []),
-      ]),
-    ];
-    /** Root deletion closes new child admission. Replay the plan to catch a task
-     * admitted after the first pass but before that fence, extended with the cascade
-     * this deletion reported. */
-    if (cancellationPlan != null && deletedConversationIds.length > 0) {
-      /** Confirm late children stopped before payload cleanup. A failed retry leaves
-       * durable deletion intent available even though conversation deletion committed. */
-      await retryPostDeleteCancellation(cancellationPlan, deletedConversationIds);
-      await drainDeletedAgentGenerations(
-        req.user.id,
-        deletedConversationIds,
-        cancellationPlan.leases
-          .filter(
-            (lease) =>
-              deletedConversationIds.includes(lease.parentConversationId) ||
-              deletedConversationIds.includes(lease.conversationId),
-          )
-          .map((lease) => lease.taskId),
-        tenantId,
-        checkpointDeletion,
-      );
-    } else if (deletedConversationIds.length > 0) {
-      /** Owner-wide deletion drains lease-backed tasks before the cascade, but a
-       * requires_action event actor has intentionally released its lease. Its durable
-       * generation is still addressable by the deleted conversation id and must be
-       * terminalized before its checkpoint is pruned. */
-      await drainDeletedAgentGenerations(
-        req.user.id,
-        deletedConversationIds,
-        [],
-        tenantId,
-        checkpointDeletion,
-      );
-    }
-    deletedConversationIds = [
-      ...new Set([...deletedConversationIds, ...(checkpointDeletion?.conversationIds() ?? [])]),
-    ];
-    if (checkpointDeletion != null) {
-      await checkpointDeletion.cleanup();
-    }
-    if (filter.conversationId) {
-      await settleCleanupChildren(
-        deletedConversationIds.map((id) => db.deleteToolCalls(req.user.id, id)),
-      );
-      await settleCleanupChildren(
-        deletedConversationIds.map((id) => deleteConvoSharedLinksWithCleanup(req.user.id, id)),
-      );
-    }
-    await checkpointDeletion?.acknowledge();
-    res.status(201).json(dbResponse);
-  } catch (error) {
-    logger.error('Error clearing conversations', error);
-    res.status(500).send('Error clearing conversations');
-  }
-});
-
-router.delete('/all', configMiddleware, async (req, res) => {
-  try {
-    const tenantId =
-      typeof req.user.tenantId === 'string' && req.user.tenantId !== ''
-        ? req.user.tenantId
-        : undefined;
-    const checkpointer = req.config?.endpoints?.[EModelEndpoint.agents]?.checkpointer;
-    /** Fences new child admission for this owner, drains the live ones, and deletes
-     * inside that fence: a child admitted on another replica mid-deletion would
-     * otherwise keep running against conversations that no longer exist. */
-    const fencedDeletion = await withAgentOwnerDeletionFence(
-      req.user.id,
-      tenantId,
-      () => deleteOwnerConversationPersistence(req.user.id, {}, tenantId, checkpointer),
-      () => deleteOwnerConversationPersistence(req.user.id, {}, tenantId, checkpointer),
-    );
-    const dbResponse = fencedDeletion.result;
-    await db.deleteToolCalls(req.user.id);
-    await deleteAllSharedLinksWithCleanup(req.user.id);
-    res.status(201).json(dbResponse);
-  } catch (error) {
-    logger.error('Error clearing conversations', error);
-    res.status(500).send('Error clearing conversations');
-  }
-});
+  }),
+);
 
 /**
  * Archives or unarchives a conversation.
@@ -632,109 +657,119 @@ router.delete('/all', configMiddleware, async (req, res) => {
  * @param {boolean} req.body.arg.isArchived - Whether to archive (true) or unarchive (false).
  * @returns {object} 200 - The updated conversation object.
  */
-router.post('/archive', validateConvoAccess, async (req, res) => {
-  const { conversationId, isArchived } = req.body?.arg ?? {};
+router.post(
+  '/archive',
+  historyMaintenance.own(validateConvoAccess),
+  historyMaintenance.own(async (req, res) => {
+    const { conversationId, isArchived } = req.body?.arg ?? {};
 
-  if (!conversationId) {
-    return res.status(400).json({ error: 'conversationId is required' });
-  }
-
-  if (typeof isArchived !== 'boolean') {
-    return res.status(400).json({ error: 'isArchived must be a boolean' });
-  }
-
-  try {
-    const dbResponse = await db.saveConvo(
-      {
-        userId: req?.user?.id,
-        isTemporary: req?.resolvedConversation?.isTemporary,
-        expiredAt: req?.resolvedConversation?.expiredAt,
-        interfaceConfig: req?.config?.interfaceConfig,
-      },
-      { conversationId, isArchived },
-      {
-        context: `POST /api/convos/archive ${conversationId}`,
-        /** Filing a chat away is not activity: `updatedAt` stays the chat's own last
-         * activity so unarchiving restores it to its real place in the date groups.
-         * When it was archived is recorded separately, on `archivedAt`. */
-        preserveUpdatedAt: true,
-        /** Without timestamps, an upsert would insert a conversation that has none. */
-        noUpsert: true,
-        /** Metadata-only writes must preserve concurrent message appends. */
-        appendMessageIds: [],
-      },
-    );
-
-    if (!dbResponse) {
-      return res.status(404).json({ error: 'Conversation not found' });
+    if (!conversationId) {
+      return res.status(400).json({ error: 'conversationId is required' });
     }
 
-    res.status(200).json(dbResponse);
-  } catch (error) {
-    logger.error('Error archiving conversation', error);
-    res.status(500).send('Error archiving conversation');
-  }
-});
+    if (typeof isArchived !== 'boolean') {
+      return res.status(400).json({ error: 'isArchived must be a boolean' });
+    }
+
+    try {
+      const dbResponse = await db.saveConvo(
+        {
+          userId: req?.user?.id,
+          isTemporary: req?.resolvedConversation?.isTemporary,
+          expiredAt: req?.resolvedConversation?.expiredAt,
+          interfaceConfig: req?.config?.interfaceConfig,
+        },
+        { conversationId, isArchived },
+        {
+          context: `POST /api/convos/archive ${conversationId}`,
+          /** Filing a chat away is not activity: `updatedAt` stays the chat's own last
+           * activity so unarchiving restores it to its real place in the date groups.
+           * When it was archived is recorded separately, on `archivedAt`. */
+          preserveUpdatedAt: true,
+          /** Without timestamps, an upsert would insert a conversation that has none. */
+          noUpsert: true,
+          /** Metadata-only writes must preserve concurrent message appends. */
+          appendMessageIds: [],
+        },
+      );
+
+      if (!dbResponse) {
+        return res.status(404).json({ error: 'Conversation not found' });
+      }
+
+      res.status(200).json(dbResponse);
+    } catch (error) {
+      logger.error('Error archiving conversation', error);
+      res.status(500).send('Error archiving conversation');
+    }
+  }),
+);
 
 /**
  * Archives every conversation currently visible to the user.
  * @route POST /archive/all
  * @returns {object} 200 - The number of conversations archived.
  */
-router.post('/archive/all', archiveAllHandler);
+router.post('/archive/all', historyMaintenance.own(archiveAllHandler));
 
-router.post('/pin', validateConvoAccess, async (req, res) => {
-  const { conversationId, pinned } = req.body?.arg ?? {};
+router.post(
+  '/pin',
+  historyMaintenance.own(validateConvoAccess),
+  historyMaintenance.own(async (req, res) => {
+    const { conversationId, pinned } = req.body?.arg ?? {};
 
-  if (!conversationId) {
-    return res.status(400).json({ error: 'conversationId is required' });
-  }
-
-  if (pinned === undefined) {
-    return res.status(400).json({ error: 'pinned is required' });
-  }
-
-  if (typeof pinned !== 'boolean') {
-    return res.status(400).json({ error: 'pinned must be a boolean' });
-  }
-
-  try {
-    const dbResponse = await db.setConvoPinned(req.user.id, conversationId, pinned);
-
-    if (!dbResponse) {
-      return res.status(404).json({ error: 'Conversation not found' });
+    if (!conversationId) {
+      return res.status(400).json({ error: 'conversationId is required' });
     }
 
-    res.status(200).json(dbResponse);
-  } catch (error) {
-    logger.error('Error pinning conversation', error);
-    res.status(500).send('Error pinning conversation');
-  }
-});
+    if (pinned === undefined) {
+      return res.status(400).json({ error: 'pinned is required' });
+    }
+
+    if (typeof pinned !== 'boolean') {
+      return res.status(400).json({ error: 'pinned must be a boolean' });
+    }
+
+    try {
+      const dbResponse = await db.setConvoPinned(req.user.id, conversationId, pinned);
+
+      if (!dbResponse) {
+        return res.status(404).json({ error: 'Conversation not found' });
+      }
+
+      res.status(200).json(dbResponse);
+    } catch (error) {
+      logger.error('Error pinning conversation', error);
+      res.status(500).send('Error pinning conversation');
+    }
+  }),
+);
 
 router.post(
   '/seen',
-  validateConvoAccess,
-  createMarkConvoSeenHandler({ markConvoSeen: db.markConvoSeen }),
+  historyMaintenance.own(validateConvoAccess),
+  historyMaintenance.own(createMarkConvoSeenHandler({ markConvoSeen: db.markConvoSeen })),
 );
 
 router.post(
   '/unread',
-  validateConvoAccess,
-  createMarkConvoUnreadHandler({ markConvoUnread: db.markConvoUnread }),
+  historyMaintenance.own(validateConvoAccess),
+  historyMaintenance.own(createMarkConvoUnreadHandler({ markConvoUnread: db.markConvoUnread })),
 );
 
 router.post(
   '/update',
-  validateConvoAccess,
-  configMiddleware,
-  createRenameConversationHandler({
-    saveConvo: db.saveConvo,
-    getConvo: db.getConvo,
-    getActiveRunIds:
-      GenerationJobManager.getCleanupBlockingJobIdsForConversations.bind(GenerationJobManager),
-    logger,
-  }),
+  historyMaintenance.own(validateConvoAccess),
+  historyMaintenance.own(configMiddleware),
+  historyMaintenance.own(
+    createRenameConversationHandler({
+      saveConvo: db.saveConvo,
+      getConvo: db.getConvo,
+      getActiveRunIds:
+        GenerationJobManager.getCleanupBlockingJobIdsForConversations.bind(GenerationJobManager),
+      logger,
+    }),
+  ),
 );
 
 const { importIpLimiter, importUserLimiter } = createImportLimiters();
@@ -749,15 +784,19 @@ const upload = multer({
 const uploadSingle = upload.single('file');
 
 function handleUpload(req, res, next) {
-  uploadSingle(req, res, (err) => {
-    if (err && err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(413).json({ message: 'File exceeds the maximum allowed size' });
-    }
-    if (err) {
-      return next(err);
-    }
-    next();
-  });
+  return historyMaintenance.callback(
+    req,
+    (done) => uploadSingle(req, res, done),
+    (err) => {
+      if (err && err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(413).json({ message: 'File exceeds the maximum allowed size' });
+      }
+      if (err) {
+        return next(err);
+      }
+      next();
+    },
+  );
 }
 
 /**
@@ -768,17 +807,22 @@ function handleUpload(req, res, next) {
  */
 router.post(
   '/import',
-  requireManagedIntake,
-  importIpLimiter,
-  importUserLimiter,
-  configMiddleware,
-  handleUpload,
-  restoreTenantContextFromReq,
-  async (req, res) => {
+  historyMaintenance.own(requireManagedIntake),
+  historyMaintenance.own(importIpLimiter),
+  historyMaintenance.own(importUserLimiter),
+  historyMaintenance.own(configMiddleware),
+  historyMaintenance.own(handleUpload),
+  historyMaintenance.own((req, res, next) =>
+    restoreTenantContextFromReq(req, res, next, {
+      onUploadCleanupFailure: historyMaintenance.markUncertain,
+    }),
+  ),
+  historyMaintenance.own(async (req, res) => {
     try {
       /* TODO: optimize to return imported conversations and add manually */
       await importConversations({
         filepath: req.file?.path,
+        onCleanupFailure: historyMaintenance.markUncertain,
         requestUserId: req.user.id,
         userRole: req.user.role,
         interfaceConfig: req.config?.interfaceConfig,
@@ -798,7 +842,7 @@ router.post(
       logger.error('Error processing file', error);
       res.status(500).send('Error processing file');
     }
-  },
+  }),
 );
 
 /**
@@ -809,45 +853,51 @@ router.post(
  * @param {express.Response<TForkConvoResponse>} res - Express response object.
  * @returns {Promise<void>} - The response after forking the conversation.
  */
-router.post('/fork', forkIpLimiter, forkUserLimiter, configMiddleware, async (req, res) => {
-  try {
-    /** @type {TForkConvoRequest} */
-    const { conversationId, messageId, option, splitAtTarget, latestMessageId } = req.body;
-    const result = await forkConversation({
-      requestUserId: req.user.id,
-      originalConvoId: conversationId,
-      targetMessageId: messageId,
-      latestMessageId,
-      records: true,
-      splitAtTarget,
-      option,
-      interfaceConfig: req.config?.interfaceConfig,
-      filters: req.config?.filters,
-      ...(req.config?.messageFilter?.pii == null
-        ? {}
-        : { legacyPii: req.config.messageFilter.pii }),
-    });
+router.post(
+  '/fork',
+  historyMaintenance.own(forkIpLimiter),
+  historyMaintenance.own(forkUserLimiter),
+  historyMaintenance.own(configMiddleware),
+  historyMaintenance.own(async (req, res) => {
+    try {
+      /** @type {TForkConvoRequest} */
+      const { conversationId, messageId, option, splitAtTarget, latestMessageId } = req.body;
+      const result = await forkConversation({
+        requestUserId: req.user.id,
+        originalConvoId: conversationId,
+        targetMessageId: messageId,
+        latestMessageId,
+        records: true,
+        splitAtTarget,
+        option,
+        interfaceConfig: req.config?.interfaceConfig,
+        filters: req.config?.filters,
+        ...(req.config?.messageFilter?.pii == null
+          ? {}
+          : { legacyPii: req.config.messageFilter.pii }),
+      });
 
-    res.json(withToolCallPreviews(req, result));
-  } catch (error) {
-    if (isContentFilterError(error)) {
-      return res.status(error.statusCode).json(error.body);
+      res.json(withToolCallPreviews(req, result));
+    } catch (error) {
+      if (isContentFilterError(error)) {
+        return res.status(error.statusCode).json(error.body);
+      }
+      if (isConversationImportError(error)) {
+        return res.status(error.statusCode).json(error.body);
+      }
+      logger.error('Error forking conversation:', error);
+      res.status(500).send('Error forking conversation');
     }
-    if (isConversationImportError(error)) {
-      return res.status(error.statusCode).json(error.body);
-    }
-    logger.error('Error forking conversation:', error);
-    res.status(500).send('Error forking conversation');
-  }
-});
+  }),
+);
 
 router.post(
   '/duplicate',
-  forkIpLimiter,
-  forkUserLimiter,
-  configMiddleware,
-  filterConversationTitle,
-  async (req, res) => {
+  historyMaintenance.own(forkIpLimiter),
+  historyMaintenance.own(forkUserLimiter),
+  historyMaintenance.own(configMiddleware),
+  historyMaintenance.own(filterConversationTitle),
+  historyMaintenance.own(async (req, res) => {
     const { conversationId, title } = req.body;
 
     try {
@@ -872,7 +922,7 @@ router.post(
       logger.error('Error duplicating conversation:', error);
       res.status(500).send('Error duplicating conversation');
     }
-  },
+  }),
 );
 
 module.exports = router;

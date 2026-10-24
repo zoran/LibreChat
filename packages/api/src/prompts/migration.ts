@@ -1,8 +1,9 @@
 import { logger } from '@librechat/data-schemas';
 import { AccessRoleIds, ResourceType, PrincipalType } from 'librechat-data-provider';
-import { ensureRequiredCollectionsExist } from '../db/utils';
 import type { AccessRoleMethods, IPromptGroupDocument } from '@librechat/data-schemas';
 import type { Model, Mongoose } from 'mongoose';
+import type { MigrationCheckObserver } from '../db/utils';
+import { ensureRequiredCollectionsExist } from '../db/utils';
 
 const GLOBAL_PROJECT_NAME = 'instance';
 
@@ -14,6 +15,8 @@ export interface PromptMigrationCheckParams {
   mongoose: Mongoose;
   methods: PromptMigrationCheckDbMethods;
   PromptGroupModel: Model<IPromptGroupDocument>;
+  /** The actual startup owner observes originals before best-effort result normalization. */
+  observer?: MigrationCheckObserver;
 }
 
 interface PromptGroupMigrationData {
@@ -36,19 +39,20 @@ export interface PromptMigrationCheckResult {
 
 /**
  * Check if prompt groups need to be migrated to the new permission system
- * This performs a dry-run check similar to the migration script
+ * Collection preparation precedes the permission census; startup retains its original effects.
  */
 export async function checkPromptPermissionsMigration({
   methods,
   mongoose,
   PromptGroupModel,
+  observer,
 }: PromptMigrationCheckParams): Promise<PromptMigrationCheckResult> {
   logger.debug('Checking if prompt permissions migration is needed');
 
   try {
     const db = mongoose.connection.db;
     if (db) {
-      await ensureRequiredCollectionsExist(db);
+      await ensureRequiredCollectionsExist(db, observer);
     }
 
     const ownerRole = await methods.findRoleByIdentifier(AccessRoleIds.PROMPTGROUP_OWNER);
@@ -136,6 +140,7 @@ export async function checkPromptPermissionsMigration({
 
     return result;
   } catch (error) {
+    observer?.markUncertain(error);
     logger.error('Failed to check prompt permissions migration', error);
     return {
       totalToMigrate: 0,

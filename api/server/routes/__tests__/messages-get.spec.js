@@ -52,7 +52,8 @@ jest.mock('@librechat/api', () => {
 
   return {
     prepareToolCallPreviews: jest.fn(() => (messages) => Promise.resolve(messages)),
-    createToolCallPartHandler: jest.fn(() => (_req, res) => res.status(404).end()),
+    createToolCallPartHandler: jest.requireActual('../../../../packages/api/src/messages/parts')
+      .createToolCallPartHandler,
     rejectToolCallPreviewWrites: (_req, _res, next) => next(),
     withMessageToolCallPreviews: (_req, message) => message,
     /** The real helper, without loading the rest of the package this suite mocks around. */
@@ -194,6 +195,7 @@ jest.mock('~/server/middleware', () => {
     canReadActiveJobConversation,
     sendValidationResponse,
     prepareMessageRequestValidation,
+    createMessageRequestValidation: jest.fn(),
     configMiddleware: (req, res, next) => {
       req.config = {
         filters: {
@@ -1228,5 +1230,102 @@ describe('message route conversation ownership filters', () => {
       quotes: ['api-key:'],
     });
     expect(updateMessage).not.toHaveBeenCalled();
+  });
+
+  describe('history original custody in process', () => {
+    const { EventEmitter } = require('events');
+    const { historyMaintenance: owner } = require('~/server/services/HistoryMaintenance');
+    const tick = () => new Promise((resolve) => setImmediate(resolve));
+    function invoke(url, query = {}) {
+      const req = Object.assign(new EventEmitter(), {
+        method: 'GET',
+        url,
+        query,
+        headers: {},
+        user: { id: authenticatedUserId },
+      });
+      const res = Object.assign(new EventEmitter(), {
+        status(code) {
+          this.statusCode = code;
+          return this;
+        },
+        set() {
+          return this;
+        },
+        json(body) {
+          this.body = body;
+          return this.end();
+        },
+        end() {
+          this.writableEnded = true;
+          this.emit('finish');
+          return this;
+        },
+      });
+      require('../messages').handle(req, res, (error) => {
+        if (error) throw error;
+      });
+      return { req, res };
+    }
+    it.each(['ownership 404', 'validation 404', 'tool part 404', 'ownership failure'])(
+      'retains the original sibling read beyond %s and response closure',
+      async (failure) => {
+        let complete;
+        const original = new Promise((resolve) => {
+          complete = resolve;
+        });
+        if (failure === 'ownership failure')
+          getConvoOwnership.mockRejectedValueOnce(new Error('ownership failed'));
+        else if (failure === 'ownership 404') getConvoOwnership.mockResolvedValueOnce(null);
+        if (failure.startsWith('ownership')) getMessagesByCursor.mockReturnValueOnce(original);
+        else getMessages.mockReturnValueOnce(original);
+        if (failure === 'validation 404') {
+          prepareMessageRequestValidation.mockImplementationOnce((req, _res, next) => {
+            req.messageRequestValidation = {
+              shouldFetchMessages: true,
+              promise: Promise.resolve({ ok: false, status: 404, body: { error: 'missing' } }),
+            };
+            next();
+          });
+        }
+        if (failure === 'tool part 404') {
+          require('~/server/middleware').createMessageRequestValidation.mockReturnValueOnce({
+            shouldFetchMessages: true,
+            promise: Promise.resolve({ ok: false, status: 404, body: { error: 'missing' } }),
+          });
+        }
+        const { req, res } =
+          failure === 'tool part 404'
+            ? invoke('/convo-1/message-1/parts/0', { toolCallId: 'call-1' })
+            : invoke(
+                failure.startsWith('ownership') ? '/' : '/convo-1',
+                failure.startsWith('ownership') ? { conversationId: 'convo-1' } : {},
+              );
+        try {
+          await tick();
+          expect(res.statusCode).toBe(failure === 'ownership failure' ? 500 : 404);
+          req.emit('aborted');
+          res.emit('close');
+          expect(owner.pauseAdmissions('history-read')).toBe(true);
+          expect(await owner.getMaintenanceCensus('history-read')).toMatchObject({
+            admissionClosed: true,
+            queuedContinuations: 0,
+            pendingWrites: 1,
+            complete: true,
+          });
+          const blocked = invoke('/');
+          expect(blocked.res.statusCode).toBe(503);
+          expect(blocked.res.body).toEqual({ error: 'APP_QUIESCING' });
+        } finally {
+          complete({ messages: [] });
+          await tick();
+        }
+        expect(await owner.getMaintenanceCensus('history-read')).toMatchObject({
+          pendingWrites: 0,
+        });
+        expect(owner.resumeAdmissions('foreign')).toBe(false);
+        expect(owner.resumeAdmissions('history-read')).toBe(true);
+      },
+    );
   });
 });

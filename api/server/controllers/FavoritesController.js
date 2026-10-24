@@ -1,4 +1,5 @@
 const { updateUser, getUserById } = require('~/models');
+const { authUserUpdate } = require('~/server/services/LegacyAuthMaintenance');
 
 const MAX_FAVORITES = 50;
 const MAX_STRING_LENGTH = 256;
@@ -86,7 +87,7 @@ const updateFavoritesController = async (req, res) => {
       }
     }
 
-    const user = await updateUser(userId, { favorites });
+    const user = await authUserUpdate(updateUser, userId, { favorites });
 
     if (!user) {
       return res.status(404).json({ message: 'User not found' });
@@ -112,7 +113,7 @@ const getFavoritesController = async (req, res) => {
 
     if (!Array.isArray(favorites)) {
       favorites = [];
-      await updateUser(userId, { favorites: [] });
+      await authUserUpdate(updateUser, userId, { favorites: [] });
     }
 
     return res.status(200).json(favorites);

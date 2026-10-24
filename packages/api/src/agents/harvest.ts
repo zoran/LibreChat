@@ -98,12 +98,12 @@ export interface CodeHarvestDeps {
     preparedBuffer?: Buffer;
     downloadFallback?: boolean;
   }) => Promise<ProcessedCodeOutput | null>;
-  /** Host file service: runs the deferred office-preview extraction. */
+  /** Host file service: joins original preview and fallback persistence. */
   runPreviewFinalize: (params: {
     finalize?: () => Promise<unknown>;
     fileId: string;
     previewRevision?: number;
-  }) => void;
+  }) => Promise<unknown>;
   /** Waits for the dispatch epoch, including terminal persistence. Read outages
    * remain retryable; replacement ends the wait without following a successor. */
   waitForGenerationSettled?: (
@@ -396,7 +396,7 @@ export function createBackgroundCodeResultHandler(deps: CodeHarvestDeps): CodeHa
           attachments.push(anchoredFile);
           /** No live stream at completion time; the client's preview polling
            *  (or the poll turn's re-emit) surfaces the finalized preview. */
-          runPreviewFinalize({
+          await runPreviewFinalize({
             finalize: result.finalize,
             fileId: result.file.file_id,
             previewRevision: result.previewRevision,

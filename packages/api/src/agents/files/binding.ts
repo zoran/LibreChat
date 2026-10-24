@@ -82,7 +82,7 @@ export function createChatRunFileBindings({
     finalize?: PublishedCodeOutputResult['finalize'];
     fileId?: string;
     previewRevision?: string;
-  }) => void;
+  }) => Promise<unknown>;
   encoder: Omit<RunFileMessageEncoderDeps, 'req' | 'getStrategyFunctions'>;
   getStrategyFunctions: (source: string) => StrategyFunctions;
   artifactPromises: Array<Promise<TFile | null>>;

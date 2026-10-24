@@ -61,7 +61,6 @@ describe('native checkpoint recovery coordinator', () => {
       methods,
       ownerInstanceId: owner,
       processBootId: 'new-boot',
-      externalCensus: async () => ({ queuedContinuations: 0, pendingWrites: 0, complete: true }),
     });
     return value;
   }

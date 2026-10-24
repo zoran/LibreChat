@@ -633,13 +633,53 @@ describe('accepted File to Upload accounting owner join', () => {
   });
   it('reserves Upload ACK headroom on every fence before any further File effect', async () => {
     await bound();
+    const source = { ...(await row())!, filename: '' };
+    // Independent maximum legal ACK specimen: full BSON, including both numeric encodings.
+    const future = {
+      ...source,
+      revision: Number.MAX_SAFE_INTEGER,
+      generation: Number.MAX_SAFE_INTEGER,
+      originalRemoved: true,
+      textRemoved: true,
+      cleanupCustody: {
+        version: 1,
+        acceptedFileAck: {
+          reference: 'a'.repeat(128),
+          operationId: source._id,
+          cleanupGeneration: Number.MAX_SAFE_INTEGER,
+          attemptGeneration: source.attemptGeneration!,
+          revocationId: 'a'.repeat(128),
+          receiptSHA256: 'a'.repeat(64),
+        },
+        ...(source.promotion
+          ? {
+              promotionLocal: {
+                promotionId: source.promotion.promotionId,
+                generation: source.attemptGeneration!,
+                worker: source.promotion.worker,
+              },
+            }
+          : {}),
+      },
+    };
+    const room = UPLOAD_RECORD_BYTES - mongoose.mongo.BSON.calculateObjectSize(future);
+    expect(room).toBeGreaterThan(20000);
+    source.filename = 'x'.repeat(room + 1);
+    expect(mongoose.mongo.BSON.calculateObjectSize(source)).toBeLessThan(UPLOAD_RECORD_BYTES);
     await db.connection
       .db!.collection<StoredUpload>(db.models.UploadOperation.collection.name)
-      .updateOne({ _id: 'original' }, { $set: { filename: 'x'.repeat(20000) } });
+      .updateOne({ _id: 'original' }, { $set: { filename: source.filename } });
     await expect(tx((s) => owner.fenceAcceptedFileCleanup({ claim }, s))).rejects.toMatchObject({
       code: 'capacity_exceeded',
     });
     expect((await row())!.cleanupCustody?.acceptedFileAck).toBeUndefined();
+    await db.models.UploadOperation.updateOne(
+      { _id: 'original' },
+      { $set: { filename: 'x'.repeat(room) } },
+    );
+    await expect(tx((s) => owner.fenceAcceptedFileCleanup({ claim }, s))).resolves.toMatchObject({
+      state: 'bound',
+    });
   });
   it('the actual migration exporter preserves the ACK and verifies its File custody', async () => {
     await terminal();

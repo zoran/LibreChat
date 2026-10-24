@@ -59,12 +59,13 @@ const mockHasOfficeHtmlPath = jest.fn(() => false);
 /* Stands in for the real chunk parser so a transport test can decide what
  * one `/exec` response means without reaching into `packages/api`. */
 const mockParseSandboxImageChunk = jest.fn((response) => response);
-/* Pass-through `withTimeout`: tests don't drive timeouts here (those live
- * in promise.spec.ts and the finalizePreview unit tests below). */
-const passthroughWithTimeout = async (promise) => promise;
+/* Keep the real extractor original separate from the observer timeout so
+ * the preview lifecycle cases below can hold one after the other expires. */
+const mockWithTimeout = jest.fn(async (promise) => promise);
 jest.mock('@librechat/api', () => {
   return {
     processCodeOutput: jest.requireActual('@librechat/api').processCodeOutput,
+    fileDeletionWorkOwner: jest.requireActual('@librechat/api').fileDeletionWorkOwner,
     createSandboxTextReader: jest.requireActual('@librechat/api').createSandboxTextReader,
     prepareCodeOutputBufferForInspection:
       jest.requireActual('@librechat/api').prepareCodeOutputBufferForInspection,
@@ -145,7 +146,7 @@ jest.mock('@librechat/api', () => {
       'X-CodeAPI-Expected-Profile': executionProfile,
       ...(bridgeWorkerId ? { 'X-LibreChat-Code-Worker-ID': bridgeWorkerId } : {}),
     }),
-    withTimeout: (...args) => passthroughWithTimeout(...args),
+    withTimeout: (...args) => mockWithTimeout(...args),
     hasOfficeHtmlPath: (...args) => mockHasOfficeHtmlPath(...args),
     /**
      * Arrow-function indirection (vs. a direct `jest.fn()` reference) so
@@ -298,6 +299,11 @@ describe('Code Process', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    Object.assign(
+      require('@librechat/api').fileDeletionWorkOwner,
+      jest.requireActual('@librechat/api').createFileDeletionWorkOwner(),
+    );
+    mockWithTimeout.mockImplementation(async (promise) => promise);
     fileSizeLimitConfig.value = 20 * 1024 * 1024;
     // Default mock: atomic claim returns a new file record (no existing file)
     mockClaimCodeFile.mockResolvedValue({
@@ -312,6 +318,14 @@ describe('Code Process', () => {
       saveBuffer: jest.fn().mockResolvedValue('/uploads/mock-file-path.txt'),
     });
     determineFileType.mockResolvedValue({ mime: 'text/plain' });
+  });
+
+  afterEach(async () => {
+    // Preview now starts inside File custody even when a metadata-only test
+    // does not call finalize. Settle that original before replacing its fixtures.
+    await require('@librechat/api')
+      .fileDeletionWorkOwner.drain()
+      .catch(() => undefined);
   });
 
   describe('code output inspection preflight', () => {
@@ -770,6 +784,7 @@ describe('Code Process', () => {
           imageBuffer,
           'high',
           'mock-uuid-1234.png',
+          expect.objectContaining({ effect: expect.any(Function) }),
         );
         expect(result.type).toBe('image/webp');
         expect(result.context).toBe(FileContext.execute_code);
@@ -818,6 +833,7 @@ describe('Code Process', () => {
           imageBuffer,
           'high',
           'existing-img-id.png',
+          expect.objectContaining({ effect: expect.any(Function) }),
         );
         expect(result.file_id).toBe('existing-img-id');
         expect(result.usage).toBe(2);
@@ -1026,6 +1042,7 @@ describe('Code Process', () => {
           'Makefile',
           expect.any(String),
           expect.any(String),
+          expect.objectContaining({ effect: expect.any(Function) }),
         );
       });
 
@@ -1067,6 +1084,7 @@ describe('Code Process', () => {
           'note.txt',
           'text/plain',
           'utf8-text',
+          expect.objectContaining({ effect: expect.any(Function) }),
         );
         expect(result.text).toBe('hello world\n');
         expect(mockCommitCodeFile).toHaveBeenCalledWith(
@@ -1714,10 +1732,10 @@ describe('Code Process', () => {
        *   the initial emit (await): persist `text: null, status: 'pending'`,
        *     return `{ file, finalize }` so the caller can ship the
        *     attachment to the client immediately;
-       *   the deferred render (background): finalize() invokes the extractor and
+       *   the retained render: finalize() joins the original extractor and
        *     transitions the record to 'ready' (with text/textFormat) or
-       *     'failed' (with previewError). The agent's final response
-       *     never blocks on the deferred render.
+       *     'failed' (with previewError). Pending metadata is immediately
+       *     available; final File/Generation settlement joins the render.
        *
        * The `hasOfficeHtmlPath` mock is the gate. Other tests keep it
        * at `false` (legacy single-phase path); we flip it on here. */
@@ -1732,12 +1750,27 @@ describe('Code Process', () => {
         mockHasOfficeHtmlPath.mockReturnValue(false);
       });
 
-      it('persists the initial emit with status:pending and text:null, deferring extraction', async () => {
+      it('emits pending metadata while the same File original retains extraction and the DB write', async () => {
         mockAxios.mockResolvedValue({ data: Buffer.alloc(100) });
         determineFileType.mockResolvedValue({
           mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         });
 
+        let finishExtraction;
+        let finishWrite;
+        mockExtractCodeArtifactText.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finishExtraction = resolve;
+            }),
+        );
+        updateFile.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finishWrite = resolve;
+            }),
+        );
+        const owner = require('@librechat/api').fileDeletionWorkOwner;
         const result = await processCodeOutput({ ...baseParams, name: 'data.xlsx' });
 
         expect(result.file).toMatchObject({
@@ -1748,13 +1781,35 @@ describe('Code Process', () => {
           textFormat: null,
         });
         expect(typeof result.finalize).toBe('function');
-        // Extractor MUST NOT have been called yet — that's deferred preview work.
-        expect(mockExtractCodeArtifactText).not.toHaveBeenCalled();
+        expect(mockExtractCodeArtifactText).toHaveBeenCalledTimes(1);
         // Persisted record with the pending status.
         expect(mockCommitCodeFile).toHaveBeenCalledWith(
           expect.objectContaining({ status: 'pending', text: null, textFormat: null }),
           undefined,
         );
+        expect(result.finalize()).toBe(result.finalize());
+        expect(owner.maintenance.pauseAdmissions('preview-hold')).toBe(true);
+        let settled = false;
+        const joined = result.finalize().then(() => {
+          settled = true;
+        });
+        const drained = owner.drain();
+        expect(await owner.maintenance.getMaintenanceCensus('preview-hold')).toMatchObject({
+          admissionClosed: true,
+          pendingWrites: 1,
+          complete: true,
+        });
+        finishExtraction('<table/>');
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(settled).toBe(false);
+        expect(finishWrite).toEqual(expect.any(Function));
+        finishWrite({ file_id: result.file.file_id, status: 'ready' });
+        await joined;
+        await expect(drained).resolves.toBeUndefined();
+        expect(await owner.maintenance.getMaintenanceCensus('preview-hold')).toMatchObject({
+          pendingWrites: 0,
+          complete: true,
+        });
       });
 
       it('finalize() runs the extractor, transitions to ready with text+textFormat on success', async () => {
@@ -1810,33 +1865,78 @@ describe('Code Process', () => {
         );
       });
 
-      it('finalize() transitions to failed with previewError:timeout when the outer timeout rejects', async () => {
-        /* The passthrough `withTimeout` mock at the file scope returns
-         * its inner promise unchanged, so the only way the catch branch
-         * fires here is if the extractor itself throws. The real
-         * production path: `extractCodeArtifactText` swallows its own
-         * errors and returns null, so any throw reaching `finalizePreview`
-         * came from the outer `withTimeout` rejection. Simulate it by
-         * having the extractor throw with the same shape. */
+      it('retains the original extractor after timeout without marking known preview failure unknown', async () => {
         mockAxios.mockResolvedValue({ data: Buffer.alloc(100) });
         determineFileType.mockResolvedValue({
           mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
         });
-        mockExtractCodeArtifactText.mockImplementationOnce(async () => {
-          throw new Error('Preview extraction exceeded 60000ms');
-        });
-
+        let finishExtraction;
+        mockExtractCodeArtifactText.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finishExtraction = resolve;
+            }),
+        );
+        mockWithTimeout.mockImplementationOnce(() =>
+          Promise.reject(new Error('Preview extraction exceeded 60000ms')),
+        );
+        const owner = require('@librechat/api').fileDeletionWorkOwner;
         const { finalize } = await processCodeOutput({ ...baseParams, name: 'data.xlsx' });
-        await finalize();
-
+        let joined = false;
+        const completion = finalize().then(() => {
+          joined = true;
+        });
+        await new Promise((resolve) => setImmediate(resolve));
         expect(updateFile).toHaveBeenCalledWith(
-          expect.objectContaining({
-            file_id: 'mock-uuid-1234',
-            status: 'failed',
-            previewError: 'timeout',
-          }),
+          expect.objectContaining({ status: 'failed', previewError: 'timeout' }),
           { previewRevision: 'mock-uuid-1234' },
         );
+        expect(joined).toBe(false);
+        expect(await owner.maintenance.getMaintenanceCensus(null)).toMatchObject({
+          pendingWrites: 1,
+          complete: true,
+        });
+        const drained = owner.drain();
+        finishExtraction('<table>late result</table>');
+        await completion;
+        await expect(drained).resolves.toBeUndefined();
+        expect(updateFile).toHaveBeenCalledTimes(1);
+      });
+
+      it('retains the fallback write after a known helper failure across admission closure', async () => {
+        mockAxios.mockResolvedValue({ data: Buffer.alloc(100) });
+        mockExtractCodeArtifactText.mockResolvedValueOnce('<table/>');
+        mockGetExtractedTextFormat.mockImplementationOnce(() => {
+          throw new Error('unexpected format helper failure');
+        });
+        let finishFallback;
+        updateFile.mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              finishFallback = resolve;
+            }),
+        );
+        const owner = require('@librechat/api').fileDeletionWorkOwner;
+        const { finalize } = await processCodeOutput({ ...baseParams, name: 'data.xlsx' });
+        let joined = false;
+        const completion = finalize().then(() => {
+          joined = true;
+        });
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(updateFile).toHaveBeenCalledWith(
+          { file_id: 'mock-uuid-1234', status: 'failed', previewError: 'unexpected' },
+          { previewRevision: 'mock-uuid-1234' },
+        );
+        owner.maintenance.pauseAdmissions('fallback-hold');
+        const drained = owner.drain();
+        expect(joined).toBe(false);
+        expect(await owner.maintenance.getMaintenanceCensus('fallback-hold')).toMatchObject({
+          pendingWrites: 1,
+          complete: true,
+        });
+        finishFallback({ file_id: 'mock-uuid-1234', status: 'failed' });
+        await completion;
+        await expect(drained).resolves.toBeUndefined();
       });
 
       it('survives a failing updateFile in finalize() without throwing', async () => {
@@ -1853,39 +1953,113 @@ describe('Code Process', () => {
         expect(logger.error).toHaveBeenCalledWith(
           expect.stringContaining('failed to persist preview result'),
         );
+        const owner = require('@librechat/api').fileDeletionWorkOwner;
+        expect(await owner.maintenance.getMaintenanceCensus(null)).toMatchObject({
+          pendingWrites: 0,
+          complete: false,
+        });
+        await expect(owner.drain()).rejects.toThrow('FILE_DELETION_SETTLEMENT_UNCONFIRMED');
       });
     });
 
     describe('legacy single-phase flow (non-office files)', () => {
-      /* Lock in that non-office files (txt/json/pdf/binary) keep the
-       * inline extract+create flow with NO finalize key — the caller
-       * gets a fully-resolved record, no background work to run. */
-      it('returns no finalize key for plain text', async () => {
+      /* Non-office files return metadata before File originals settle.
+       * finalize joins the actual originals and returns null when no preview changes. */
+      it.each(['storage', 'database'])(
+        'keeps %s failure unknown after download fallback',
+        async (failure) => {
+          mockAxios.mockResolvedValue({ data: Buffer.alloc(100) });
+          if (failure === 'storage') {
+            getStrategyFunctions.mockReturnValue({
+              saveBuffer: jest.fn().mockRejectedValue(new Error('storage reply lost')),
+            });
+          } else {
+            mockCommitCodeFile.mockRejectedValueOnce(new Error('database reply lost'));
+          }
+          const result = await processCodeOutput(baseParams);
+          expect(result.file.filepath).toContain('/api/files/code/download/');
+          await expect(result.finalize()).resolves.toBeNull();
+          const owner = require('@librechat/api').fileDeletionWorkOwner;
+          expect(await owner.maintenance.getMaintenanceCensus(null)).toMatchObject({
+            pendingWrites: 0,
+            complete: false,
+          });
+          await expect(owner.drain()).rejects.toThrow('FILE_DELETION_SETTLEMENT_UNCONFIRMED');
+        },
+      );
+
+      it('releases non-office metadata while retaining a parser original after its observer returns null', async () => {
+        mockHasOfficeHtmlPath.mockReturnValue(false);
+        mockAxios.mockResolvedValue({ data: Buffer.from('pdf') });
+        determineFileType.mockResolvedValue({ mime: 'application/pdf' });
+        const owner = require('@librechat/api').fileDeletionWorkOwner;
+        let finishParser;
+        const parser = new Promise((resolve) => {
+          finishParser = resolve;
+        });
+        mockExtractCodeArtifactText.mockImplementationOnce(
+          async (_buffer, _name, _mime, _category, work) => {
+            // Real extract.spec covers the inner timeout. This boundary models its
+            // early null observer with the original still retained in this scope.
+            void owner.run(() => parser, work);
+            return null;
+          },
+        );
+        let result;
+        const metadata = processCodeOutput({ ...baseParams, name: 'report.pdf' }).then((value) => {
+          result = value;
+          return value;
+        });
+        try {
+          await new Promise((resolve) => setImmediate(resolve));
+          expect(result?.file).toMatchObject({ filename: 'report.pdf', text: null });
+          expect(owner.maintenance.pauseAdmissions('document-hold')).toBe(true);
+          let joined = false;
+          const completion = result.finalize().then(() => {
+            joined = true;
+          });
+          await new Promise((resolve) => setImmediate(resolve));
+          expect(joined).toBe(false);
+          await expect(
+            owner.maintenance.getMaintenanceCensus('document-hold'),
+          ).resolves.toMatchObject({ admissionClosed: true, pendingWrites: 1, complete: true });
+          finishParser(null);
+          await completion;
+          expect(joined).toBe(true);
+          expect(mockUpdateFile).not.toHaveBeenCalled();
+        } finally {
+          finishParser(null);
+          await metadata;
+        }
+      });
+
+      it('joins plain-text File completion without emitting a preview update', async () => {
+        mockHasOfficeHtmlPath.mockReturnValue(false);
         mockAxios.mockResolvedValue({ data: Buffer.alloc(100) });
         const result = await processCodeOutput({ ...baseParams, name: 'note.txt' });
-        expect(result.finalize).toBeUndefined();
+        await expect(result.finalize()).resolves.toBeNull();
         expect(result.file).toMatchObject({ filename: 'note.txt' });
       });
 
-      it('returns no finalize key for the size-limit fallback', async () => {
+      it('joins File completion without a preview update for the size-limit fallback', async () => {
         mockAxios.mockResolvedValue({ data: Buffer.alloc(100 * 1024 * 1024) });
         const result = await processCodeOutput(baseParams);
-        expect(result.finalize).toBeUndefined();
+        await expect(result.finalize()).resolves.toBeNull();
         expect(result.file.filepath).toContain('/api/files/code/download/');
       });
 
-      it('returns no finalize key for the saveBuffer-unavailable fallback', async () => {
+      it('joins File completion without a preview update for the saveBuffer-unavailable fallback', async () => {
         getStrategyFunctions.mockReturnValueOnce({});
         mockAxios.mockResolvedValue({ data: Buffer.alloc(100) });
         const result = await processCodeOutput(baseParams);
-        expect(result.finalize).toBeUndefined();
+        await expect(result.finalize()).resolves.toBeNull();
         expect(result.file.filepath).toContain('/api/files/code/download/');
       });
 
-      it('returns no finalize key for the axios-error fallback', async () => {
+      it('joins File completion without a preview update for the axios-error fallback', async () => {
         mockAxios.mockRejectedValue(new Error('network'));
         const result = await processCodeOutput(baseParams);
-        expect(result.finalize).toBeUndefined();
+        await expect(result.finalize()).resolves.toBeNull();
         expect(result.file.filepath).toContain('/api/files/code/download/');
       });
     });
@@ -1909,7 +2083,7 @@ describe('Code Process', () => {
       updateFile.mockResolvedValue({});
     });
 
-    it('is a no-op when finalize is undefined (non-office files)', () => {
+    it('is a no-op when finalize is undefined', () => {
       expect(() =>
         runPreviewFinalize({ finalize: undefined, fileId: 'fid-1', onResolved: jest.fn() }),
       ).not.toThrow();
@@ -1985,7 +2159,7 @@ describe('Code Process', () => {
       expect(updateFile).not.toHaveBeenCalled();
     });
 
-    it('skips onResolved gracefully when caller omits it (e.g., tools.js direct endpoint)', async () => {
+    it('skips onResolved gracefully when File starts its original without an emitter', async () => {
       const finalize = jest.fn().mockResolvedValue({ file_id: 'fid-1', status: 'ready' });
       // No onResolved — non-streaming caller.
       expect(() => runPreviewFinalize({ finalize, fileId: 'fid-1' })).not.toThrow();

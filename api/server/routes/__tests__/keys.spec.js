@@ -1,5 +1,14 @@
 const express = require('express');
 const request = require('supertest');
+const { once } = require('node:events');
+
+// Payload/status policy assertions remain separate from the real-owner causal fixture.
+const mockAuthPersistence = { write: (action) => action() };
+jest.mock('~/server/services/LegacyAuthMaintenance', () => ({
+  ownAuthHandler: (handler) => handler,
+  authTrack: (action) => action(),
+  authPersistence: mockAuthPersistence,
+}));
 
 jest.mock('~/models', () => ({
   updateUserKey: jest.fn(),
@@ -15,6 +24,7 @@ jest.mock('~/server/middleware', () => ({
 
 describe('Keys Routes', () => {
   let app;
+  let server;
   const { updateUserKey, deleteUserKey, getUserKeyExpiry } = require('~/models');
 
   beforeAll(() => {
@@ -31,50 +41,65 @@ describe('Keys Routes', () => {
     app.use('/api/keys', keysRouter);
   });
 
-  beforeEach(() => {
+  beforeEach(async () => {
     jest.clearAllMocks();
+    server = app.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+  });
+
+  afterEach(async () => {
+    if (!server?.listening) return;
+    const closed = once(server, 'close');
+    server.close();
+    await closed;
   });
 
   describe('PUT /', () => {
     it('should update a user key with the authenticated user ID', async () => {
       updateUserKey.mockResolvedValue({});
 
-      const response = await request(app)
+      const response = await request(server)
         .put('/api/keys')
         .send({ name: 'openAI', value: 'sk-test-key-123', expiresAt: '2026-12-31' });
 
       expect(response.status).toBe(201);
-      expect(updateUserKey).toHaveBeenCalledWith({
-        userId: 'test-user-123',
-        name: 'openAI',
-        value: 'sk-test-key-123',
-        expiresAt: '2026-12-31',
-      });
+      expect(updateUserKey).toHaveBeenCalledWith(
+        {
+          userId: 'test-user-123',
+          name: 'openAI',
+          value: 'sk-test-key-123',
+          expiresAt: '2026-12-31',
+        },
+        mockAuthPersistence,
+      );
       expect(updateUserKey).toHaveBeenCalledTimes(1);
     });
 
     it('should not allow userId override via request body (IDOR prevention)', async () => {
       updateUserKey.mockResolvedValue({});
 
-      const response = await request(app).put('/api/keys').send({
+      const response = await request(server).put('/api/keys').send({
         userId: 'attacker-injected-id',
         name: 'openAI',
         value: 'sk-attacker-key',
       });
 
       expect(response.status).toBe(201);
-      expect(updateUserKey).toHaveBeenCalledWith({
-        userId: 'test-user-123',
-        name: 'openAI',
-        value: 'sk-attacker-key',
-        expiresAt: undefined,
-      });
+      expect(updateUserKey).toHaveBeenCalledWith(
+        {
+          userId: 'test-user-123',
+          name: 'openAI',
+          value: 'sk-attacker-key',
+          expiresAt: undefined,
+        },
+        mockAuthPersistence,
+      );
     });
 
     it('should ignore extraneous fields from request body', async () => {
       updateUserKey.mockResolvedValue({});
 
-      const response = await request(app).put('/api/keys').send({
+      const response = await request(server).put('/api/keys').send({
         name: 'openAI',
         value: 'sk-test-key',
         expiresAt: '2026-12-31',
@@ -84,32 +109,38 @@ describe('Keys Routes', () => {
       });
 
       expect(response.status).toBe(201);
-      expect(updateUserKey).toHaveBeenCalledWith({
-        userId: 'test-user-123',
-        name: 'openAI',
-        value: 'sk-test-key',
-        expiresAt: '2026-12-31',
-      });
+      expect(updateUserKey).toHaveBeenCalledWith(
+        {
+          userId: 'test-user-123',
+          name: 'openAI',
+          value: 'sk-test-key',
+          expiresAt: '2026-12-31',
+        },
+        mockAuthPersistence,
+      );
     });
 
     it('should handle missing optional fields', async () => {
       updateUserKey.mockResolvedValue({});
 
-      const response = await request(app)
+      const response = await request(server)
         .put('/api/keys')
         .send({ name: 'anthropic', value: 'sk-ant-key' });
 
       expect(response.status).toBe(201);
-      expect(updateUserKey).toHaveBeenCalledWith({
-        userId: 'test-user-123',
-        name: 'anthropic',
-        value: 'sk-ant-key',
-        expiresAt: undefined,
-      });
+      expect(updateUserKey).toHaveBeenCalledWith(
+        {
+          userId: 'test-user-123',
+          name: 'anthropic',
+          value: 'sk-ant-key',
+          expiresAt: undefined,
+        },
+        mockAuthPersistence,
+      );
     });
 
     it('should return 400 when request body is null', async () => {
-      const response = await request(app)
+      const response = await request(server)
         .put('/api/keys')
         .set('Content-Type', 'application/json')
         .send('null');
@@ -123,13 +154,16 @@ describe('Keys Routes', () => {
     it('should delete a user key by name', async () => {
       deleteUserKey.mockResolvedValue({});
 
-      const response = await request(app).delete('/api/keys/openAI');
+      const response = await request(server).delete('/api/keys/openAI');
 
       expect(response.status).toBe(204);
-      expect(deleteUserKey).toHaveBeenCalledWith({
-        userId: 'test-user-123',
-        name: 'openAI',
-      });
+      expect(deleteUserKey).toHaveBeenCalledWith(
+        {
+          userId: 'test-user-123',
+          name: 'openAI',
+        },
+        mockAuthPersistence,
+      );
       expect(deleteUserKey).toHaveBeenCalledTimes(1);
     });
   });
@@ -138,17 +172,20 @@ describe('Keys Routes', () => {
     it('should delete all keys when all=true', async () => {
       deleteUserKey.mockResolvedValue({});
 
-      const response = await request(app).delete('/api/keys?all=true');
+      const response = await request(server).delete('/api/keys?all=true');
 
       expect(response.status).toBe(204);
-      expect(deleteUserKey).toHaveBeenCalledWith({
-        userId: 'test-user-123',
-        all: true,
-      });
+      expect(deleteUserKey).toHaveBeenCalledWith(
+        {
+          userId: 'test-user-123',
+          all: true,
+        },
+        mockAuthPersistence,
+      );
     });
 
     it('should return 400 when all query param is not true', async () => {
-      const response = await request(app).delete('/api/keys');
+      const response = await request(server).delete('/api/keys');
 
       expect(response.status).toBe(400);
       expect(response.body).toEqual({ error: 'Specify either all=true to delete.' });
@@ -161,7 +198,7 @@ describe('Keys Routes', () => {
       const mockExpiry = { expiresAt: '2026-12-31' };
       getUserKeyExpiry.mockResolvedValue(mockExpiry);
 
-      const response = await request(app).get('/api/keys?name=openAI');
+      const response = await request(server).get('/api/keys?name=openAI');
 
       expect(response.status).toBe(200);
       expect(response.body).toEqual(mockExpiry);

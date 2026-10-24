@@ -1634,54 +1634,61 @@ async function saveBase64Image(
   url,
   { req, file_id: _file_id, filename: _filename, endpoint, context, resolution },
 ) {
-  const retentionExpiryPromise = getRetentionExpiry(req);
-  const appConfig = req.config;
-  const effectiveResolution = resolution ?? appConfig.fileConfig?.imageGeneration ?? 'high';
-  const file_id = _file_id ?? v4();
-  let filename = `${file_id}-${_filename}`;
-  const { buffer: inputBuffer, type: declaredType } = base64ToBuffer(url);
+  return fileDeletionWorkOwner.run(async (work) => {
+    const retentionExpiryPromise = fileDeletionWorkOwner.run(() => getRetentionExpiry(req), work);
+    const appConfig = req.config;
+    const effectiveResolution = resolution ?? appConfig.fileConfig?.imageGeneration ?? 'high';
+    const file_id = _file_id ?? v4();
+    let filename = `${file_id}-${_filename}`;
+    const { buffer: inputBuffer, type: declaredType } = base64ToBuffer(url);
 
-  const image = await resizeImageBuffer(inputBuffer, effectiveResolution, endpoint);
-  /** Sharp re-encodes what it resizes, so the bytes being saved are not necessarily in the
-   * format the data URL declared — an SVG arrives here and is rasterized to PNG. The record has
-   * to describe the bytes, because `file.type` is handed to providers verbatim as `media_type`
-   * (Anthropic), `inlineData.mimeType` (Google), and the `data:` prefix (OpenAI). */
-  const type = image.type ?? declaredType;
-  if (!path.extname(_filename)) {
-    const extension = mime.getExtension(type);
-    if (extension) {
-      filename += `.${extension}`;
-    } else {
-      throw new Error(`Could not determine file extension from MIME type: ${type}`);
+    const image = await resizeImageBuffer(inputBuffer, effectiveResolution, endpoint);
+    /** Sharp re-encodes what it resizes, so the bytes being saved are not necessarily in the
+     * format the data URL declared — an SVG arrives here and is rasterized to PNG. The record has
+     * to describe the bytes, because `file.type` is handed to providers verbatim as `media_type`
+     * (Anthropic), `inlineData.mimeType` (Google), and the `data:` prefix (OpenAI). */
+    const type = image.type ?? declaredType;
+    if (!path.extname(_filename)) {
+      const extension = mime.getExtension(type);
+      if (extension) {
+        filename += `.${extension}`;
+      } else {
+        throw new Error(`Could not determine file extension from MIME type: ${type}`);
+      }
     }
-  }
-  const source = getFileStrategy(appConfig, { isImage: true });
-  const { saveBuffer } = getStrategyFunctions(source);
-  const filepath = await saveBuffer({
-    userId: req.user.id,
-    fileName: filename,
-    buffer: image.buffer,
-    tenantId: req.user.tenantId,
+    const source = getFileStrategy(appConfig, { isImage: true });
+    const { saveBuffer } = getStrategyFunctions(source);
+    const filepath = await work.effect(() =>
+      saveBuffer({
+        userId: req.user.id,
+        fileName: filename,
+        buffer: image.buffer,
+        tenantId: req.user.tenantId,
+      }),
+    );
+    const storageMetadata = getStorageMetadata({ filepath, source });
+    const retentionExpiry = await retentionExpiryPromise;
+    return await work.effect(() =>
+      db.createFile(
+        {
+          type,
+          source,
+          context,
+          file_id,
+          filepath,
+          ...storageMetadata,
+          filename,
+          user: req.user.id,
+          bytes: image.bytes,
+          width: image.width,
+          ...retentionExpiry,
+          height: image.height,
+          tenantId: req.user.tenantId,
+        },
+        true,
+      ),
+    );
   });
-  const storageMetadata = getStorageMetadata({ filepath, source });
-  return await db.createFile(
-    {
-      type,
-      source,
-      context,
-      file_id,
-      filepath,
-      ...storageMetadata,
-      filename,
-      user: req.user.id,
-      bytes: image.bytes,
-      width: image.width,
-      ...(await retentionExpiryPromise),
-      height: image.height,
-      tenantId: req.user.tenantId,
-    },
-    true,
-  );
 }
 
 /**

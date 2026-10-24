@@ -112,6 +112,54 @@ describe('callTool generated-content protection', () => {
     });
   });
 
+  it('returns pending metadata while the direct tool preview remains in the File hold', async () => {
+    const { createFileDeletionWorkOwner } = jest.requireActual('@librechat/api');
+    const { runPreviewFinalize } = require('~/server/services/Files/Code/process');
+    const owner = createFileDeletionWorkOwner();
+    let finishPreview;
+    const preview = new Promise((resolve) => {
+      finishPreview = resolve;
+    });
+    // The File service owns the original before exposing its early metadata.
+    const original = owner.run((work) => work.effect(() => preview));
+    const finalize = jest.fn(() => original);
+    const file = { file_id: 'pending-file', filename: 'output.csv', status: 'pending' };
+    mockProcessCodeOutput.mockResolvedValueOnce({ file, finalize });
+    runPreviewFinalize.mockImplementation(({ finalize: join }) => join());
+    mockInvoke.mockResolvedValueOnce({
+      content: 'safe output',
+      artifact: { session_id: 'sandbox', files: [{ id: 'file-1', name: 'output.csv' }] },
+    });
+    const res = createResponse();
+    const completion = callTool(createRequest(undefined), res);
+    try {
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(res.json).toHaveBeenCalledWith({ result: 'safe output', attachments: [file] });
+      expect(mockCreateToolCall).toHaveBeenCalledTimes(1);
+      expect(finalize).not.toHaveBeenCalled();
+      expect(owner.maintenance.pauseAdmissions('direct-preview')).toBe(true);
+      await expect(owner.maintenance.getMaintenanceCensus('direct-preview')).resolves.toMatchObject(
+        { admissionClosed: true, pendingWrites: 1, complete: true },
+      );
+      let drained = false;
+      const drain = owner.drain().then(() => {
+        drained = true;
+      });
+      expect(drained).toBe(false);
+      finishPreview(null);
+      await original;
+      await drain;
+      expect(drained).toBe(true);
+    } finally {
+      finishPreview(null);
+      await original;
+      await completion;
+      await owner.drain();
+      runPreviewFinalize.mockReset();
+    }
+  });
+
   it('starts retention before tool invocation using the authenticated message conversation', async () => {
     const { getRetentionExpiry } = require('~/server/services/Files/retention');
     const { getMessage } = require('~/models');

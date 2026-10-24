@@ -42,7 +42,13 @@ function observedOwner(): ApplicationWorkPort & {
   };
 }
 function options(owner = observedOwner()) {
-  return { env, identity, workOwners: { owner }, startupReady: () => true };
+  return {
+    env,
+    identity,
+    workOwners: { owner },
+    fileDomainOwners: ['owner'],
+    startupReady: () => true,
+  };
 }
 async function http(
   app: AppMaintenance,
@@ -87,6 +93,7 @@ describe('generation-free native workload maintenance', () => {
       env,
       identity,
       workOwners: { attempts: journal.maintenance },
+      fileDomainOwners: ['attempts'],
       startupReady: () => true,
     });
     try {
@@ -103,13 +110,22 @@ describe('generation-free native workload maintenance', () => {
           queuedContinuations: 0,
           pendingWrites: 1,
         },
+        fileDomain: { known: true, census: { admissionClosed: false, pendingWrites: 1 } },
       });
       expect(app.operation('begin', request(app))).toBe(200);
       expect(() => journal.attempts.begin(() => {})).toThrow();
       expect(await app.ready()).toBe(false);
-      expect(await app.status()).toMatchObject({ known: true, phase: 'quiescing' });
+      expect(await app.status()).toMatchObject({
+        known: true,
+        phase: 'quiescing',
+        fileDomain: { known: true, census: { admissionClosed: true, pendingWrites: 1 } },
+      });
       registration.settle(stopped);
-      expect(await app.status()).toMatchObject({ known: true, phase: 'drained' });
+      expect(await app.status()).toMatchObject({
+        known: true,
+        phase: 'drained',
+        fileDomain: { known: true, census: { admissionClosed: true, pendingWrites: 0 } },
+      });
       expect(app.operation('cancel', request(app, 1))).toBe(200);
       expect(app.operation('cancel', request(app, 1))).toBe(200);
       expect(app.operation('begin', request(app))).toBe(409);
@@ -129,9 +145,14 @@ describe('generation-free native workload maintenance', () => {
     const app = createWorkloadMaintenance({
       ...options(),
       workOwners: { attempts: journal.maintenance },
+      fileDomainOwners: ['attempts'],
     });
     expect(await app.ready()).toBe(true);
-    expect(await app.status()).toMatchObject({ known: false, census: null });
+    expect(await app.status()).toMatchObject({
+      known: false,
+      census: null,
+      fileDomain: { known: false, census: null },
+    });
     expect(app.operation('begin', request(app))).toBe(200);
     expect(await app.status()).toMatchObject({ known: false, phase: 'quiescing' });
     expect(app.operation('cancel', request(app, 1))).toBe(503);
@@ -182,7 +203,11 @@ describe('generation-free native workload maintenance', () => {
       throw new Error('owner unavailable');
     };
     const paused = jest.spyOn(b, 'pauseAdmissions');
-    const app = createWorkloadMaintenance({ ...options(), workOwners: { a, b } });
+    const app = createWorkloadMaintenance({
+      ...options(),
+      workOwners: { a, b },
+      fileDomainOwners: ['a', 'b'],
+    });
     expect(app.operation('begin', request(app))).toBe(503);
     expect(paused).toHaveBeenCalledWith('rotation');
     expect(await app.status()).toMatchObject({ known: false, phase: 'quiescing' });
@@ -206,13 +231,22 @@ describe('generation-free native workload maintenance', () => {
     await Promise.resolve();
     expect(app.operation('cancel', request(app, 1))).toBe(200);
     finish({ admissionClosed: true, queuedContinuations: 0, pendingWrites: 0, complete: true });
-    expect(await pending).toMatchObject({ known: false, phase: 'running', census: null });
+    expect(await pending).toMatchObject({
+      known: false,
+      phase: 'running',
+      census: null,
+      fileDomain: { known: false, census: null },
+    });
     jest.useFakeTimers();
     try {
       owner.getMaintenanceCensus.mockImplementationOnce(() => new Promise(() => {}));
       const status = app.status();
       await jest.advanceTimersByTimeAsync(2100);
-      expect(await status).toMatchObject({ known: false, census: null });
+      expect(await status).toMatchObject({
+        known: false,
+        census: null,
+        fileDomain: { known: false, census: null },
+      });
       expect(await app.ready()).toBe(true);
     } finally {
       jest.useRealTimers();

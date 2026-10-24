@@ -11,6 +11,7 @@ const {
 const { ResourceType, PermissionBits } = require('librechat-data-provider');
 const { findAccessibleResources } = require('~/server/services/PermissionService');
 const { updateUser, getUserById } = require('~/models');
+const { authUserUpdate } = require('~/server/services/LegacyAuthMaintenance');
 
 /** Builds the injected deps for `pruneOrphanSkillStates` from live models. */
 function buildPruneDeps(user) {
@@ -81,7 +82,7 @@ const updateSkillStatesController = async (req, res) => {
       });
     }
 
-    const user = await updateUser(req.user.id, { skillStates: pruned });
+    const user = await authUserUpdate(updateUser, req.user.id, { skillStates: pruned });
 
     if (!user) {
       return res.status(404).json({ message: 'User not found' });

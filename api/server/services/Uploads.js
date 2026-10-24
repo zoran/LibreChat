@@ -37,6 +37,33 @@ const {
 const { createUploadTicketIssuer, managedIntakeControlConfig } = require('./UploadIntake');
 
 let current;
+let admissionsClosedBy;
+let initialization = 'unstarted';
+/** The actual composition inherits closure before acquiring its first dispatching service. */
+const uploadMaintenance = Object.freeze({
+  pauseAdmissions(requestId) {
+    if (!requestId || (admissionsClosedBy && admissionsClosedBy !== requestId)) return false;
+    admissionsClosedBy = requestId;
+    return current ? current.maintenance.pauseAdmissions(requestId) : true;
+  },
+  resumeAdmissions(requestId) {
+    if (admissionsClosedBy !== requestId || !['ready', 'disabled'].includes(initialization))
+      return false;
+    if (current && !current.maintenance.resumeAdmissions(requestId)) return false;
+    admissionsClosedBy = undefined;
+    return true;
+  },
+  async getMaintenanceCensus(requestId) {
+    if (current) return current.maintenance.getMaintenanceCensus(requestId);
+    return {
+      admissionClosed: !!admissionsClosedBy && admissionsClosedBy === requestId,
+      queuedContinuations: 0,
+      pendingWrites: initialization === 'initializing' ? 1 : 0,
+      // Only the actual disabled acquisition branch knows that no runtime was constructed.
+      complete: initialization === 'disabled',
+    };
+  },
+});
 const getUploadRuntime = () => current;
 /** The server composition, never request metadata, selects managed source access. */
 const getManagedContextSources = (req) =>
@@ -203,6 +230,20 @@ async function createUploadComposition({
     typeof security.cancel !== 'function'
   )
     throw new Error('Invalid upload composition');
+  let pausedBy;
+  let closed = false;
+  const fileOperations = new Set();
+  function runFileOperation(work) {
+    if (closed || pausedBy) return Promise.reject(new UploadManagementError('admission_paused'));
+    // Register before dispatch, and release on the original's settlement, never HTTP close.
+    const original = Promise.resolve().then(work);
+    fileOperations.add(original);
+    void original.then(
+      () => fileOperations.delete(original),
+      () => fileOperations.delete(original),
+    );
+    return original;
+  }
   const metrics = createUploadMetrics(registry, [worker.hostId], {
     slot: worker.hostId,
     snapshot: () => security.dispatchObservation?.() ?? null,
@@ -287,6 +328,7 @@ async function createUploadComposition({
   const authority = { principal, allowedOrigins };
   const router = createUploadHttpRouter({
     ...authority,
+    runFileOperation,
     management,
     live,
     status: controller.status,
@@ -319,12 +361,35 @@ async function createUploadComposition({
     runAsSystem,
     signal,
   });
+  const workMaintenance = composeManagedFileMaintenance(workers.maintenance, retrieval);
+  const maintenance = {
+    pauseAdmissions(requestId) {
+      if (!requestId || (pausedBy && pausedBy !== requestId)) return false;
+      pausedBy = requestId;
+      return workMaintenance.pauseAdmissions(requestId);
+    },
+    resumeAdmissions(requestId) {
+      if (closed || pausedBy !== requestId || !workMaintenance.resumeAdmissions(requestId))
+        return false;
+      pausedBy = undefined;
+      return true;
+    },
+    async getMaintenanceCensus(requestId) {
+      const census = await workMaintenance.getMaintenanceCensus(requestId);
+      return {
+        ...census,
+        admissionClosed: !!pausedBy && pausedBy === requestId && census.admissionClosed,
+        pendingWrites: census.pendingWrites + fileOperations.size,
+      };
+    },
+  };
   let starting;
   return {
     sources,
     retrieval,
     management,
     repository,
+    runFileOperation,
     fileReads: repository.fileReads,
     fileReadWorker: Object.freeze({ ...worker }),
     cleanup,
@@ -333,7 +398,7 @@ async function createUploadComposition({
     router,
     intakeHandlers: { ...intakeHandlers, ...(retrieval ? { lookup: retrieval.lookup } : {}) },
     allowedOrigins: Object.freeze([...allowedOrigins]),
-    maintenance: composeManagedFileMaintenance(workers.maintenance, retrieval),
+    maintenance,
     configureSourceReplay(manager) {
       configureUploadSourceReplay({ manager, models, metrics });
     },
@@ -348,12 +413,26 @@ async function createUploadComposition({
         });
       return starting;
     },
-    async close(signal) {
+    async close(signal = AbortSignal.timeout(Math.max(1, getRemainingShutdownMs() ?? 30_000))) {
+      closed = true;
       live.close();
+      let abort;
       const settled = await Promise.allSettled([
         workers.close(signal),
         controller.stop(),
         retrieval?.close(signal),
+        (async () => {
+          try {
+            const interrupted = new Promise((_, reject) => {
+              abort = () => reject(new Error('Upload original drain interrupted'));
+              signal.addEventListener('abort', abort, { once: true });
+            });
+            signal.throwIfAborted();
+            await Promise.race([Promise.allSettled([...fileOperations]), interrupted]);
+          } finally {
+            if (abort) signal.removeEventListener('abort', abort);
+          }
+        })(),
       ]);
       await platform.close?.();
       if (settled.some((result) => result.status === 'rejected') || !settled[0].value?.complete)
@@ -371,9 +450,13 @@ async function initializeUploads({
   signal,
   onFailure,
 }) {
-  if (process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED !== 'true') return undefined;
+  if (process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED !== 'true') {
+    initialization = 'disabled';
+    return undefined;
+  }
   signal?.throwIfAborted();
   if (current) return current;
+  initialization = 'initializing';
   if (
     !identity ||
     !/^[a-f0-9]{40}$/.test(identity.source) ||
@@ -448,38 +531,141 @@ async function initializeUploads({
     retrievalOperations: (policySnapshot) =>
       createFileRetrievalOperationOwner(mongoose, { policySnapshot }),
   });
-  let intakeControl;
   try {
     signal?.throwIfAborted();
-    intakeControl = await startIntakeControlService({
-      ...intakeConfig,
-      handlers: composition.intakeHandlers,
-    });
+    if (admissionsClosedBy && !composition.maintenance.pauseAdmissions(admissionsClosedBy))
+      throw new Error('Upload startup admission closure unconfirmed');
   } catch (error) {
+    initialization = 'failed';
     try {
       onFailure?.(error);
     } catch {
-      /* Failure notification cannot skip original cleanup. */
+      /* Notify before original cleanup without skipping it. */
     }
     try {
       await composition.close(AbortSignal.timeout(Math.max(1, getRemainingShutdownMs() ?? 30_000)));
     } catch {
-      /* Preserve the original startup failure after attempting all composition cleanup. */
+      /* Preserve the first startup failure after the original cleanup settles. */
     }
     throw error;
   }
-  current = {
-    ...composition,
-    async close(signal) {
-      const result = await intakeControl.close(signal);
-      await composition.close(signal);
-      if (!result.complete) throw new Error('Upload intake shutdown has unresolved work');
+  let intakeControl;
+  let starting;
+  let closing;
+  let startingPending = false;
+  let closingPending = false;
+  let intakePausedBy = admissionsClosedBy;
+  const maintenance = {
+    pauseAdmissions(requestId) {
+      if (!requestId || (intakePausedBy && intakePausedBy !== requestId)) return false;
+      intakePausedBy = requestId;
+      const compositionClosed = composition.maintenance.pauseAdmissions(requestId);
+      const intakeClosed = intakeControl?.maintenance.pauseAdmissions(requestId) ?? true;
+      return compositionClosed && intakeClosed;
+    },
+    resumeAdmissions(requestId) {
+      if (closing || intakePausedBy !== requestId) return false;
+      if (intakeControl && !intakeControl.maintenance.resumeAdmissions(requestId)) return false;
+      if (!composition.maintenance.resumeAdmissions(requestId)) {
+        intakeControl?.maintenance.pauseAdmissions(requestId);
+        return false;
+      }
+      intakePausedBy = undefined;
+      return true;
+    },
+    async getMaintenanceCensus(requestId) {
+      const [compositionCensus, intakeCensus] = await Promise.all([
+        composition.maintenance.getMaintenanceCensus(requestId),
+        intakeControl?.maintenance.getMaintenanceCensus(requestId),
+      ]);
+      return {
+        admissionClosed:
+          compositionCensus.admissionClosed &&
+          !!intakePausedBy &&
+          intakePausedBy === requestId &&
+          (intakeCensus?.admissionClosed ?? true),
+        queuedContinuations:
+          compositionCensus.queuedContinuations + (intakeCensus?.queuedContinuations ?? 0),
+        pendingWrites:
+          compositionCensus.pendingWrites +
+          (intakeCensus?.pendingWrites ?? 0) +
+          Number(startingPending) +
+          Number(closingPending),
+        complete: compositionCensus.complete && (intakeCensus?.complete ?? true),
+      };
     },
   };
+  current = {
+    ...composition,
+    maintenance,
+    start() {
+      if (intakePausedBy || closing)
+        return Promise.reject(new Error('Upload startup admission is closed'));
+      if (starting) return starting;
+      startingPending = true;
+      // Retain this original before native listener or runtime dispatch starts.
+      starting = Promise.resolve()
+        .then(async () => {
+          signal?.throwIfAborted();
+          try {
+            intakeControl = await startIntakeControlService({
+              ...intakeConfig,
+              handlers: composition.intakeHandlers,
+            });
+            if (intakePausedBy && !intakeControl.maintenance.pauseAdmissions(intakePausedBy))
+              throw new Error('Upload intake admission closure unconfirmed');
+            signal?.throwIfAborted();
+            if (closing) throw new Error('Upload shutdown precedes runtime dispatch');
+            await composition.start();
+          } catch (error) {
+            try {
+              onFailure?.(error);
+            } catch {
+              /* Original failure still owns cleanup. */
+            }
+            throw error;
+          }
+        })
+        .finally(() => {
+          startingPending = false;
+        });
+      return starting;
+    },
+    close(signal) {
+      if (closing) return closing;
+      const paused = maintenance.pauseAdmissions(intakePausedBy ?? 'shutdown');
+      closingPending = true;
+      // A late listener remains this owner's original: stop dispatch, join it, then close it.
+      closing = Promise.resolve()
+        .then(async () => {
+          await starting?.catch(() => undefined);
+          let intakeResult;
+          const failures = [];
+          try {
+            intakeResult = await intakeControl?.close(signal);
+          } catch (error) {
+            failures.push(error);
+          }
+          try {
+            await composition.close(signal);
+          } catch (error) {
+            failures.push(error);
+          }
+          if (!paused || (intakeResult && !intakeResult.complete) || failures.length)
+            throw new Error('Upload shutdown has unresolved original work');
+        })
+        .finally(() => {
+          closingPending = false;
+        });
+      return closing;
+    },
+  };
+  initialization = 'ready';
   return current;
 }
 
 module.exports = {
+  uploadMaintenance,
   getUploadRuntime,
   getManagedContextSources,
   initializeUploads,

@@ -6,6 +6,9 @@ import {
   UPLOAD_REPLAY_MS,
   UPLOAD_RECORD_BYTES,
   canonicalStorageDeletionReceipt,
+  isStorageDeletionBinding,
+  isStorageDeletionResult,
+  isStorageDeletionConsumptionResult,
 } from 'librechat-data-provider';
 import type {
   StorageDeletionBinding,
@@ -499,17 +502,103 @@ describe('Upload Housekeeping composed Mongo transactions', () => {
     const authority = await attempted();
     const binding = await bound(authority);
     const source = (await currentRow())!;
+    // Independent protocol-maximal custody, sized as one BSON document rather than summed parts.
+    const token = 'a'.repeat(128);
+    const digest = 'a'.repeat(64);
+    const request = {
+      protocol: 1 as const,
+      requestId: token,
+      generation: String(source.attemptGeneration),
+      authorityBindingSHA256: digest,
+      acceptedObjectSHA256: digest,
+    };
+    const maximalBinding = {
+      ...request,
+      bucket: '\u0800'.repeat(255),
+      key: binding.key,
+    };
+    const receipt = {
+      ...maximalBinding,
+      state: 'durable_delete_complete' as const,
+      obligationId: token,
+      aggregateRevision: '9223372036854775807',
+      proofSHA256: digest,
+    };
+    const consumed = {
+      state: 'recorded' as const,
+      obligationId: token,
+      receiptSHA256: digest,
+      consumerCommitId: token,
+    };
+    expect(isStorageDeletionBinding(maximalBinding)).toBe(true);
+    expect(isStorageDeletionResult(receipt, maximalBinding, token)).toBe(true);
+    expect(isStorageDeletionConsumptionResult(consumed, consumed)).toBe(true);
+    const future = {
+      ...source,
+      filename: '',
+      revision: Number.MAX_SAFE_INTEGER,
+      generation: Number.MAX_SAFE_INTEGER,
+      originalRemoved: true,
+      textRemoved: true,
+      cleanupCustody: {
+        version: 1 as const,
+        request,
+        cleanupGeneration: Number.MAX_SAFE_INTEGER,
+        binding: maximalBinding,
+        obligationId: token,
+        receipt,
+        receiptSHA256: digest,
+        consumerCommitId: token,
+        consumed,
+        retiredAt: Number.MAX_SAFE_INTEGER,
+      },
+    };
+    const size = mongoose.mongo.BSON.calculateObjectSize;
+    const room = UPLOAD_RECORD_BYTES - size(future);
+    expect(room).toBeGreaterThan(18000);
+    expect(size({ ...future, filename: 'x'.repeat(room) })).toBe(UPLOAD_RECORD_BYTES);
     expect(() =>
-      assertUploadCleanupCapacity(
-        { ...source, filename: 'x'.repeat(18000) },
-        mongoose.mongo.BSON.calculateObjectSize,
-      ),
-    ).toThrow();
+      assertUploadCleanupCapacity({ ...source, filename: 'x'.repeat(room) }, size),
+    ).not.toThrow();
+    expect(() =>
+      assertUploadCleanupCapacity({ ...source, filename: 'x'.repeat(room + 1) }, size),
+    ).toThrow('capacity_exceeded');
     const forged = structuredClone(source);
     forged.cleanupCustody!.consumerCommitId = 'invented';
     expect(() => validateUploadCleanupCustody(forged)).toThrow();
     expect(binding.key).toContain('.1__original');
   });
+  it('checks the post-increment BSON row and rolls back an int32-boundary overflow without custody', async () => {
+    await reserve('operation');
+    const source = { ...(await currentRow())!, revision: 2147483647, filename: '' };
+    delete source.cleanupCustody;
+    const size = mongoose.mongo.BSON.calculateObjectSize;
+    source.filename = 'x'.repeat(UPLOAD_RECORD_BYTES - 3 - size(source));
+    expect(size(source)).toBe(UPLOAD_RECORD_BYTES - 3);
+    expect(size({ ...source, revision: source.revision + 1 })).toBe(UPLOAD_RECORD_BYTES + 1);
+    await db.connection
+      .db!.collection<StoredUpload>(db.models.UploadOperation.collection.name)
+      .replaceOne({ _id: source._id }, source);
+    const before = await currentRow();
+    const counter = await db.models.UploadCounter.findById('global').lean();
+    const projected = await jobs.model.find({}).lean();
+    const store = createUploadStore(db, {});
+    await expect(
+      store.transaction(async (session, global) => {
+        global.turn++;
+        await store.save(structuredClone(source), session);
+      }),
+    ).rejects.toMatchObject({ code: 'capacity_exceeded' });
+    expect(await currentRow()).toEqual(before);
+    expect(await db.models.UploadCounter.findById('global').lean()).toEqual(counter);
+    expect(await jobs.model.find({}).lean()).toEqual(projected);
+    source.filename = source.filename.slice(1);
+    await store.transaction(async (session) => store.save(source, session));
+    const persisted = (await currentRow())!;
+    expect(persisted.revision).toBe(2147483648);
+    expect(size(persisted)).toBe(UPLOAD_RECORD_BYTES);
+  });
+
   it('projects reserve/save changes atomically and retains the original execution on refresh', async () => {
     await reserve('operation');
     const before = await db.models.UploadOperation.findById('operation').lean<StoredUpload>();

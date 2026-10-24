@@ -1,13 +1,13 @@
 import { Types } from 'mongoose';
+import { permissionBitSupersets, tenantStorage } from '@librechat/data-schemas';
 import {
   ResourceType,
   PrincipalType,
   PermissionBits,
   AccessRoleIds,
 } from 'librechat-data-provider';
-import { permissionBitSupersets, tenantStorage } from '@librechat/data-schemas';
-import { enrichRemoteAgentPrincipals } from './permissions';
 import type { EnricherDependencies, Principal } from './permissions';
+import { backfillRemoteAgentPermissions, enrichRemoteAgentPrincipals } from './permissions';
 
 /**
  * Tests for `enrichRemoteAgentPrincipals`.
@@ -223,5 +223,58 @@ describe('enrichRemoteAgentPrincipals', () => {
       expect(result.principals[0].id).toBe(ownerUserId.toString());
       expect(result.principals[1].id).toBe(stranger.id);
     });
+  });
+});
+
+describe('backfill original completion', () => {
+  function makeDeps(): EnricherDependencies {
+    return {
+      aggregateAclEntries: jest.fn(),
+      findRoleByIdentifier: jest.fn(),
+      bulkWriteAclEntries: jest.fn(),
+      logger: { error: jest.fn() },
+    };
+  }
+
+  test('the empty branch returns completion without dispatching a lookup', async () => {
+    const deps = makeDeps();
+    await expect(
+      backfillRemoteAgentPermissions(deps, new Types.ObjectId(), []),
+    ).resolves.toBeUndefined();
+    expect(deps.findRoleByIdentifier).not.toHaveBeenCalled();
+    expect(deps.bulkWriteAclEntries).not.toHaveBeenCalled();
+  });
+
+  test('a missing role completes without a bulk write', async () => {
+    const deps = makeDeps();
+    jest.mocked(deps.findRoleByIdentifier).mockResolvedValue(null);
+    await expect(
+      backfillRemoteAgentPermissions(deps, new Types.ObjectId(), [new Types.ObjectId()]),
+    ).resolves.toBeUndefined();
+    expect(deps.bulkWriteAclEntries).not.toHaveBeenCalled();
+    expect(deps.logger.error).toHaveBeenCalledWith(expect.stringContaining('role not found'));
+  });
+
+  test('the complete returned original includes the bulk rejection and its existing error log', async () => {
+    const deps = makeDeps();
+    const error = new Error('unknown write');
+    jest
+      .mocked(deps.findRoleByIdentifier)
+      .mockResolvedValue({ _id: new Types.ObjectId(), permBits: PermissionBits.VIEW });
+    jest.mocked(deps.bulkWriteAclEntries).mockRejectedValue(error);
+    const markUncertain = jest.fn();
+    const observer = {
+      track: async <T>(start: () => Promise<T> | T) => start(),
+      write: async <T>(start: () => Promise<T>) => start(),
+      markUncertain,
+    };
+    await expect(
+      backfillRemoteAgentPermissions(deps, new Types.ObjectId(), [new Types.ObjectId()], observer),
+    ).resolves.toBeUndefined();
+    expect(markUncertain).toHaveBeenCalledTimes(1);
+    expect(deps.logger.error).toHaveBeenCalledWith(
+      '[backfillRemoteAgentPermissions] Failed to backfill:',
+      error,
+    );
   });
 });

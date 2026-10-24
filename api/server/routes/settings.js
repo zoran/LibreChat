@@ -1,4 +1,11 @@
 const express = require('express');
+const {
+  ownAuthHandler,
+  authTrack,
+  authCache,
+  authUserUpdate,
+  authPersistence,
+} = require('~/server/services/LegacyAuthMaintenance');
 const { CacheKeys } = require('librechat-data-provider');
 const {
   createToolFavoritesHandlers,
@@ -27,30 +34,36 @@ const router = express.Router();
 
 const toolFavorites = createToolFavoritesHandlers({
   getToolFavorites,
-  addToolFavorite,
-  removeToolFavorite,
+  // Retain preflight reads without treating an expected capacity refusal as a failed write.
+  addToolFavorite: (params) => authTrack(() => addToolFavorite(params, authPersistence)),
+  removeToolFavorite: (params) => authTrack(() => removeToolFavorite(params, authPersistence)),
 });
 
 const authUserDocCacheStore = getLogStores(CacheKeys.AUTH_USER_DOC);
+const ownedAuthUserDocCacheStore = authUserDocCacheStore && authCache(authUserDocCacheStore);
 const pinnedOrder = createPinnedOrderHandlers({
   getUserById,
-  updateUser,
+  updateUser: (...args) => authUserUpdate(updateUser, ...args),
   invalidateCachedAuthUserDoc: (userId) =>
-    invalidateCachedAuthUserDoc(authUserDocCacheStore, { userId }),
+    authTrack(() => invalidateCachedAuthUserDoc(ownedAuthUserDocCacheStore, { userId })),
 });
 
-router.get('/favorites/tools', requireJwtAuth, toolFavorites.listToolFavorites);
-router.put('/favorites/tools/:itemType/:itemId', requireJwtAuth, toolFavorites.addToolFavorite);
+router.get('/favorites/tools', requireJwtAuth, ownAuthHandler(toolFavorites.listToolFavorites));
+router.put(
+  '/favorites/tools/:itemType/:itemId',
+  requireJwtAuth,
+  ownAuthHandler(toolFavorites.addToolFavorite),
+);
 router.delete(
   '/favorites/tools/:itemType/:itemId',
   requireJwtAuth,
-  toolFavorites.removeToolFavorite,
+  ownAuthHandler(toolFavorites.removeToolFavorite),
 );
-router.get('/favorites', requireJwtAuth, getFavoritesController);
-router.post('/favorites', requireJwtAuth, updateFavoritesController);
-router.get('/pinned-order', requireJwtAuth, pinnedOrder.getPinnedOrder);
-router.post('/pinned-order', requireJwtAuth, pinnedOrder.updatePinnedOrder);
-router.get('/skills/active', requireJwtAuth, getSkillStatesController);
-router.post('/skills/active', requireJwtAuth, updateSkillStatesController);
+router.get('/favorites', requireJwtAuth, ownAuthHandler(getFavoritesController));
+router.post('/favorites', requireJwtAuth, ownAuthHandler(updateFavoritesController));
+router.get('/pinned-order', requireJwtAuth, ownAuthHandler(pinnedOrder.getPinnedOrder));
+router.post('/pinned-order', requireJwtAuth, ownAuthHandler(pinnedOrder.updatePinnedOrder));
+router.get('/skills/active', requireJwtAuth, ownAuthHandler(getSkillStatesController));
+router.post('/skills/active', requireJwtAuth, ownAuthHandler(updateSkillStatesController));
 
 module.exports = router;

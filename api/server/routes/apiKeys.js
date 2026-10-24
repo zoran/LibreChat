@@ -9,28 +9,58 @@ const {
   getRoleByName,
 } = require('~/models');
 const { requireJwtAuth } = require('~/server/middleware');
+const {
+  ownAuthHandler,
+  authTrack,
+  authCache,
+  authPersistence,
+} = require('~/server/services/LegacyAuthMaintenance');
 
 const router = express.Router();
 
 const handlers = createApiKeyHandlers({
-  createAgentApiKey,
+  createAgentApiKey: (data) => authTrack(() => createAgentApiKey(data, authPersistence)),
   listAgentApiKeys,
-  deleteAgentApiKey,
+  deleteAgentApiKey: (id, userId) =>
+    authTrack(() => deleteAgentApiKey(id, userId, authPersistence)),
   getAgentApiKeyById,
 });
 
 const checkRemoteAgentsUse = generateCheckAccess({
   permissionType: PermissionTypes.REMOTE_AGENTS,
   permissions: [Permissions.USE],
-  getRoleByName,
+  getRoleByName: (name, fields) =>
+    authTrack(() =>
+      getRoleByName(name, fields, { persistence: authPersistence, observeCache: authCache }),
+    ),
 });
 
-router.post('/', requireJwtAuth, checkRemoteAgentsUse, handlers.createApiKey);
+router.post(
+  '/',
+  requireJwtAuth,
+  ownAuthHandler(checkRemoteAgentsUse),
+  ownAuthHandler(handlers.createApiKey),
+);
 
-router.get('/', requireJwtAuth, checkRemoteAgentsUse, handlers.listApiKeys);
+router.get(
+  '/',
+  requireJwtAuth,
+  ownAuthHandler(checkRemoteAgentsUse),
+  ownAuthHandler(handlers.listApiKeys),
+);
 
-router.get('/:id', requireJwtAuth, checkRemoteAgentsUse, handlers.getApiKey);
+router.get(
+  '/:id',
+  requireJwtAuth,
+  ownAuthHandler(checkRemoteAgentsUse),
+  ownAuthHandler(handlers.getApiKey),
+);
 
-router.delete('/:id', requireJwtAuth, checkRemoteAgentsUse, handlers.deleteApiKey);
+router.delete(
+  '/:id',
+  requireJwtAuth,
+  ownAuthHandler(checkRemoteAgentsUse),
+  ownAuthHandler(handlers.deleteApiKey),
+);
 
 module.exports = router;

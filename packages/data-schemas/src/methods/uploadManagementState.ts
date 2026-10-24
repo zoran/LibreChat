@@ -130,16 +130,92 @@ export function storedUploadPrincipal(
 export const uploadOriginalKey = (row: StoredUpload): string =>
   `${row.tenantId === null ? '' : `t/${row.tenantId}/`}managed-uploads/${row.userId}/${row._id}.${row.attemptGeneration}__original`;
 
-/** Reserve bounded receipt room on admission and preserve it through every owner replacement. */
+/** Maximum reachable custody extension; stable identity is measured, never replaced by a locator cap. */
+function cleanupCapacityEnvelope(row: StoredUpload): UploadCleanupCustody {
+  const token = 'a'.repeat(128);
+  const digest = 'a'.repeat(64);
+  const generation = row.attemptGeneration ?? Number.MAX_SAFE_INTEGER;
+  const promotionLocal = row.promotion
+    ? {
+        promotionId: row.promotion.promotionId,
+        generation,
+        worker: row.promotion.worker,
+      }
+    : undefined;
+  // Accepted File owns physical deletion. Upload retains only its bounded acknowledgement.
+  if (row.acceptedAt != null || row.fileId != null)
+    return {
+      version: 1,
+      acceptedFileAck: {
+        reference: token,
+        operationId: row._id,
+        cleanupGeneration: Number.MAX_SAFE_INTEGER,
+        attemptGeneration: generation,
+        revocationId: token,
+        receiptSHA256: digest,
+      },
+      ...(promotionLocal ? { promotionLocal } : {}),
+    };
+  const request: StorageDeletionRequest = {
+    protocol: 1,
+    requestId: token,
+    generation: String(generation),
+    authorityBindingSHA256: digest,
+    acceptedObjectSHA256: digest,
+  };
+  const binding: StorageDeletionBinding = {
+    ...request,
+    // The protocol bounds UTF-16 length. Three UTF-8 bytes per code unit is its maximum.
+    bucket: '\u0800'.repeat(255),
+    key: uploadOriginalKey({ ...row, attemptGeneration: generation }),
+  };
+  return {
+    version: 1,
+    request,
+    cleanupGeneration: Number.MAX_SAFE_INTEGER,
+    binding,
+    obligationId: token,
+    receipt: {
+      ...binding,
+      state: 'durable_delete_complete',
+      obligationId: token,
+      aggregateRevision: '9223372036854775807',
+      proofSHA256: digest,
+    },
+    receiptSHA256: digest,
+    consumerCommitId: token,
+    consumed: {
+      state: 'recorded',
+      obligationId: token,
+      receiptSHA256: digest,
+      consumerCommitId: token,
+    },
+    retiredAt: Number.MAX_SAFE_INTEGER,
+    ...(promotionLocal ? { promotionLocal } : {}),
+  };
+}
+
+/** Keep actual bytes and the reachable durable-custody extension inside the existing record charge. */
 export function assertUploadCleanupCapacity(
   row: StoredUpload,
   size: (value: object) => number,
 ): void {
+  if (size(row) > UPLOAD_RECORD_BYTES) reject('capacity_exceeded');
   if (!row.cleanupCustody) return;
-  const { cleanupCustody, ...base } = row;
+  const custody = cleanupCapacityEnvelope(row);
+  // Future receipt writes can cross BSON's int32 boundary. Removal flags accompany final ACKs.
+  const future = {
+    ...row,
+    revision: Number.MAX_SAFE_INTEGER,
+    generation: Number.MAX_SAFE_INTEGER,
+    originalRemoved: true,
+    textRemoved: true,
+    cleanupCustody: custody,
+  };
   if (
-    size(base) + UPLOAD_CLEANUP_HEADROOM > UPLOAD_RECORD_BYTES ||
-    size(cleanupCustody) > UPLOAD_CLEANUP_HEADROOM
+    size(row.cleanupCustody) > UPLOAD_CLEANUP_HEADROOM ||
+    size(custody) > UPLOAD_CLEANUP_HEADROOM ||
+    size(future) > UPLOAD_RECORD_BYTES
   )
     reject('capacity_exceeded');
 }

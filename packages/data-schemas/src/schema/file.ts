@@ -202,11 +202,9 @@ const file: Schema<IMongoFile> = new Schema(
       enum: ['provider', 'text', 'none'],
     },
     expiresAt: {
-      /* Short-lived upload TTL managed by MongoDB. This is separate from
-       * retention-scoped `expiredAt`, which is swept by application code
-       * after storage cleanup succeeds. */
+      /* Preserve historical temporary expiry for refusal and reconciliation.
+       * Successor births do not use it; model initialization must not recreate TTL. */
       type: Date,
-      expires: 3600, // 1 hour in seconds
     },
     tenantId: {
       type: String,

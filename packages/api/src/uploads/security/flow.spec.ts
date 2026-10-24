@@ -513,7 +513,8 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         derivedOrigin: captured!.derivedOrigin,
         securitySettlement: { writerStopped: true, transientDataRemoved: true },
         stagingHeld: false,
-        cleanupPending: false,
+        // Scanner/local cleanup does not consume the durable storage cleanup receipt.
+        cleanupPending: decision === 'marked',
       });
       if (decision === 'marked') {
         expect(received.response.statusCode).toBe(422);
@@ -743,7 +744,8 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
           transientDataRemoved: true,
         },
         stagingHeld: false,
-        cleanupPending: false,
+        // Rejected attempts remain owned by durable housekeeping after local cleanup.
+        cleanupPending: rejection !== undefined,
       });
       expect(await readdir(stagingRoot)).toEqual([]);
       await expect(

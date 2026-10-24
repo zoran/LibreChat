@@ -1,4 +1,6 @@
 import { ErrorTypes } from 'librechat-data-provider';
+import type { AuthPersistenceObserver } from './authPersistence';
+import { observeAuthPersistence } from './authPersistence';
 // Note: checkUserKeyExpiry moved to @librechat/api (utils/key.ts) as it's a pure validation utility
 import { encrypt, decrypt } from '~/crypto';
 import logger from '~/config/winston';
@@ -6,13 +8,19 @@ import logger from '~/config/winston';
 /** Factory function that takes mongoose instance and returns the key methods */
 export function createKeyMethods(mongoose: typeof import('mongoose')): {
   getUserKey: (params: { userId: string; name: string }) => Promise<string>;
-  updateUserKey: (params: {
-    userId: string;
-    name: string;
-    value: string;
-    expiresAt?: Date | null;
-  }) => Promise<unknown>;
-  deleteUserKey: (params: { userId: string; name?: string; all?: boolean }) => Promise<unknown>;
+  updateUserKey: (
+    params: {
+      userId: string;
+      name: string;
+      value: string;
+      expiresAt?: Date | null;
+    },
+    observer?: AuthPersistenceObserver,
+  ) => Promise<unknown>;
+  deleteUserKey: (
+    params: { userId: string; name?: string; all?: boolean },
+    observer?: AuthPersistenceObserver,
+  ) => Promise<unknown>;
   getUserKeyValues: (params: { userId: string; name: string }) => Promise<Record<string, string>>;
   getUserKeyExpiry: (params: {
     userId: string;
@@ -110,12 +118,15 @@ export function createKeyMethods(mongoose: typeof import('mongoose')): {
    * @description This function either updates an existing user key or inserts a new one into the database,
    *              after encrypting the provided value. It sets the provided expiry date for the key (or unsets for no expiry).
    */
-  async function updateUserKey(params: {
-    userId: string;
-    name: string;
-    value: string;
-    expiresAt?: Date | null;
-  }): Promise<unknown> {
+  async function updateUserKey(
+    params: {
+      userId: string;
+      name: string;
+      value: string;
+      expiresAt?: Date | null;
+    },
+    observer?: AuthPersistenceObserver,
+  ): Promise<unknown> {
     const { userId, name, value, expiresAt = null } = params;
     const Key = mongoose.models.Key;
     const encryptedValue = await encrypt(value);
@@ -132,10 +143,12 @@ export function createKeyMethods(mongoose: typeof import('mongoose')): {
     } else {
       updateQuery.$unset = { expiresAt: '' };
     }
-    return await Key.findOneAndUpdate({ userId, name }, updateQuery, {
-      upsert: true,
-      new: true,
-    }).lean();
+    return observeAuthPersistence(observer, async () =>
+      Key.findOneAndUpdate({ userId, name }, updateQuery, {
+        upsert: true,
+        new: true,
+      }).lean(),
+    );
   }
 
   /**
@@ -149,17 +162,22 @@ export function createKeyMethods(mongoose: typeof import('mongoose')): {
    *              If a name is provided and all is false, it deletes only the key with that name.
    *              If all is true, it ignores the name and deletes all keys for the user.
    */
-  async function deleteUserKey(params: {
-    userId: string;
-    name?: string;
-    all?: boolean;
-  }): Promise<unknown> {
+  async function deleteUserKey(
+    params: {
+      userId: string;
+      name?: string;
+      all?: boolean;
+    },
+    observer?: AuthPersistenceObserver,
+  ): Promise<unknown> {
     const { userId, name, all = false } = params;
     const Key = mongoose.models.Key;
     if (all) {
-      return await Key.deleteMany({ userId });
+      return observeAuthPersistence(observer, async () => Key.deleteMany({ userId }));
     }
-    return await Key.findOneAndDelete({ userId, name }).lean();
+    return observeAuthPersistence(observer, async () =>
+      Key.findOneAndDelete({ userId, name }).lean(),
+    );
   }
 
   return {

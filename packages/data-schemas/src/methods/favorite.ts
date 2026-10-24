@@ -1,4 +1,6 @@
+import type { AuthPersistenceObserver } from './authPersistence';
 import type * as t from '~/types';
+import { observeAuthPersistence } from './authPersistence';
 
 export const MAX_TOOL_FAVORITES = 100;
 
@@ -21,8 +23,14 @@ function capError(): Error {
 
 export function createToolFavoriteMethods(mongoose: typeof import('mongoose')): {
   getToolFavorites: (userId: string) => Promise<t.IToolFavoriteLean[]>;
-  addToolFavorite: (params: t.ToolFavoriteParams) => Promise<t.AddToolFavoriteResult>;
-  removeToolFavorite: (params: t.ToolFavoriteParams) => Promise<t.RemoveToolFavoriteResult>;
+  addToolFavorite: (
+    params: t.ToolFavoriteParams,
+    observer?: AuthPersistenceObserver,
+  ) => Promise<t.AddToolFavoriteResult>;
+  removeToolFavorite: (
+    params: t.ToolFavoriteParams,
+    observer?: AuthPersistenceObserver,
+  ) => Promise<t.RemoveToolFavoriteResult>;
 } {
   async function getToolFavorites(userId: string): Promise<t.IToolFavoriteLean[]> {
     const ToolFavorite = mongoose.models.ToolFavorite;
@@ -38,11 +46,10 @@ export function createToolFavoriteMethods(mongoose: typeof import('mongoose')): 
    * treated as success. The cap check is read-then-write and may transiently
    * overshoot by one or two under concurrency — acceptable for a soft UX cap.
    */
-  async function addToolFavorite({
-    userId,
-    itemType,
-    itemId,
-  }: t.ToolFavoriteParams): Promise<t.AddToolFavoriteResult> {
+  async function addToolFavorite(
+    { userId, itemType, itemId }: t.ToolFavoriteParams,
+    observer?: AuthPersistenceObserver,
+  ): Promise<t.AddToolFavoriteResult> {
     const ToolFavorite = mongoose.models.ToolFavorite;
     const filter = { user: userId, itemType, itemId };
 
@@ -56,27 +63,32 @@ export function createToolFavoriteMethods(mongoose: typeof import('mongoose')): 
       throw capError();
     }
 
-    try {
-      await ToolFavorite.updateOne(
-        filter,
-        { $setOnInsert: filter },
-        { upsert: true, runValidators: true },
-      );
-    } catch (error) {
-      if (!isDuplicateKeyError(error)) {
-        throw error;
+    // Admission belongs to the caller; only actual persistence is a write.
+    await observeAuthPersistence(observer, async () => {
+      try {
+        await ToolFavorite.updateOne(
+          filter,
+          { $setOnInsert: filter },
+          { upsert: true, runValidators: true },
+        );
+      } catch (error) {
+        // An acknowledged duplicate is the existing idempotent success, not uncertainty.
+        if (!isDuplicateKeyError(error)) {
+          throw error;
+        }
       }
-    }
+    });
     return { ok: true, added: true };
   }
 
-  async function removeToolFavorite({
-    userId,
-    itemType,
-    itemId,
-  }: t.ToolFavoriteParams): Promise<t.RemoveToolFavoriteResult> {
+  async function removeToolFavorite(
+    { userId, itemType, itemId }: t.ToolFavoriteParams,
+    observer?: AuthPersistenceObserver,
+  ): Promise<t.RemoveToolFavoriteResult> {
     const ToolFavorite = mongoose.models.ToolFavorite;
-    const result = await ToolFavorite.deleteOne({ user: userId, itemType, itemId });
+    const result = await observeAuthPersistence(observer, async () =>
+      ToolFavorite.deleteOne({ user: userId, itemType, itemId }),
+    );
     return { ok: true, removed: result.deletedCount > 0 };
   }
 

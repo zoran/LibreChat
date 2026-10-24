@@ -8,67 +8,175 @@ const path = require('node:path');
 const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../index.js'), 'utf8');
 const runtimeSource = fs.readFileSync(path.join(__dirname, '../services/start/runtime.js'), 'utf8');
+const maintenanceSource = fs.readFileSync(
+  path.join(__dirname, '../services/start/maintenance.js'),
+  'utf8',
+);
+const noop = () => undefined;
+const facade = () => ({
+  pauseAdmissions: jest.fn(),
+  resumeAdmissions: jest.fn(),
+  getMaintenanceCensus: jest.fn(),
+  stopAdmissions: jest.fn(),
+  drain: jest.fn(),
+});
+function maintenanceInputs(overrides = {}) {
+  return {
+    browserMaintenance: facade(),
+    scheduleMaintenance: facade(),
+    agentTriggerMaintenance: facade(),
+    agentQueuedTurnMaintenance: facade(),
+    skillSyncMaintenance: facade(),
+    fileLibraryMaintenance: facade(),
+    uploadMaintenance: facade(),
+    databaseBootstrap: facade(),
+    legacyAuthMaintenance: facade(),
+    historyMaintenance: facade(),
+    permissionMaintenance: facade(),
+    mcpAuthorizationFenceRetryMaintenance: facade(),
+    mcpCatalogMaintenance: facade(),
+    mongoCacheMaintenance: { ...facade(), maintenance: facade() },
+    startupMigrationMaintenance: { ...facade(), maintenance: facade() },
+    startupReady: () => true,
+    startupSignal: new AbortController().signal,
+    shutdownTeardownReserveMs: 10_000,
+    agentEventMethods: {},
+    recordExpiredScheduleApproval: noop,
+    resumeAgentEventDetachedAction: noop,
+    ...overrides,
+  };
+}
+function loadMaintenance(overrides = {}) {
+  const api = {
+    cacheConfig: { SHARED_STATE: {} },
+    fileDeletionWorkOwner: { ...facade(), maintenance: facade() },
+    codeEnvironmentLifecycleMaintenance: facade(),
+    createAppMaintenance: jest.fn(() => ({ identity: {} })),
+    initializeMaintenanceGeneration: jest.fn(),
+    createStreamServices: () => ({}),
+    isEnabled: () => false,
+    createAgentEventTerminalHandler: jest.fn(),
+    registerShutdownTask: jest.fn(),
+    GenerationJobManager: {
+      configure: noop,
+      configureGenerationAdmission: noop,
+      setApprovalExpiredHandler: noop,
+      setTerminalHostActionHandler: noop,
+      initialize: noop,
+    },
+    ...overrides,
+  };
+  const module = { exports: {} };
+  vm.runInNewContext(maintenanceSource, {
+    module,
+    process: { env: {} },
+    require: (id) => {
+      if (id !== '@librechat/api') throw new Error(`Unexpected maintenance dependency: ${id}`);
+      return api;
+    },
+  });
+  return { ...module.exports, api };
+}
+function loadRuntime(initializeUploads, appConfig = {}) {
+  const api = new Proxy({}, { get: (target, key) => (target[key] ??= jest.fn()) });
+  const modules = {
+    axios: {},
+    '@librechat/data-schemas': { runAsSystem: (run) => run() },
+    '@librechat/api': api,
+    '~/db': { modelBootstrap: { capture: noop } },
+    '~/models': { seedDatabase: jest.fn(), sweepOrphanedPreviews: jest.fn() },
+    '../Skills/sync': { initializeGitHubSkillSync: jest.fn() },
+    '../Uploads': { initializeUploads },
+    '../Files/LibraryMaintenance': require('../services/Files/LibraryMaintenance'),
+    '../Endpoints/agents/subagentThreadStore': { configureSubagentTaskRouting: jest.fn() },
+    '../Config': { getAppConfig: jest.fn().mockResolvedValue(appConfig) },
+    '../status/usage': {},
+  };
+  const module = { exports: {} };
+  vm.runInNewContext(runtimeSource, {
+    module,
+    process: { env: {} },
+    AbortSignal,
+    require(id) {
+      if (!(id in modules)) throw new Error(`Unexpected startup dependency: ${id}`);
+      return modules[id];
+    },
+  });
+  return { ...module.exports, api, modules };
+}
+
 test('gives uploads the same process identity as native application maintenance', async () => {
   const identity = Object.freeze({ incarnation: 'native-process' });
   const initializeUploads = jest.fn();
-  const statement = runtimeSource.match(/const uploads = await initializeUploads\([^;]+;/)?.[0];
   const recordOriginalPublication = jest.fn();
+  const signal = new AbortController().signal;
+  const onFailure = jest.fn();
   expect(source).toContain('identity: maintenance.identity,');
-  expect(statement).toBeDefined();
-  await vm.runInNewContext(`(async () => {${statement}})()`, {
+  expect(source).toContain('onFailure: failStartup,');
+  await loadRuntime(initializeUploads).initializeApplicationRuntime({
     registry: 'registry',
     identity,
     recordOriginalPublication,
-    initializeUploads,
+    signal,
+    onFailure,
   });
   expect(initializeUploads).toHaveBeenCalledWith({
     registry: 'registry',
     identity,
     recordOriginalPublication,
+    signal,
+    trustedFile: undefined,
+    onFailure,
   });
 });
 
-test('wires all actual work facades, late browser load, and the same external census', async () => {
-  const facade = () => ({
-    pauseAdmissions: jest.fn(),
-    resumeAdmissions: jest.fn(),
-    getMaintenanceCensus: jest.fn(),
-  });
-  const browser = facade();
-  const uploads = facade();
-  const context = {
-    process: { env: {} },
-    cacheConfig: { SHARED_STATE: {} },
-    serverReady: true,
-    startupSignal: { throwIfAborted: jest.fn() },
-    scheduleMaintenance: facade(),
-    agentTriggerMaintenance: facade(),
-    agentQueuedTurnMaintenance: facade(),
-    skillSyncMaintenance: facade(),
-    fileDeletionWorkOwner: { maintenance: facade() },
-    fileLibraryMaintenance: facade(),
-    getUploadRuntime: jest.fn(() => ({ maintenance: uploads })),
-    legacyAuthMaintenance: facade(),
-    createAppMaintenance: jest.fn(() => ({ externalCensus: jest.fn(), identity: {} })),
-  };
-  const start = source.indexOf('let browserMaintenance;');
-  vm.runInNewContext(
-    source.slice(start, source.indexOf('const rejectChatStartsUntilReady', start)),
-    context,
-  );
-  const deps = context.createAppMaintenance.mock.calls[0][0];
-  expect(() => deps.workOwners.browser.pauseAdmissions('early')).toThrow();
-  // Assign in the original lexical context, matching the real delayed route-load point.
-  context.routes = { auth: { browserMaintenance: browser } };
-  vm.runInNewContext(
-    source.match(/browserMaintenance = routes.auth.browserMaintenance;/)[0],
-    context,
-  );
+test('binds the declared File owners and configures Generation without an App census callback', async () => {
+  const input = maintenanceInputs();
+  const { api, createWebMaintenance, registerWebMaintenanceShutdown } = loadMaintenance();
+  registerWebMaintenanceShutdown(input);
+  const result = createWebMaintenance(input);
+  expect(api.createAppMaintenance).toHaveBeenCalledTimes(1);
+  const deps = api.createAppMaintenance.mock.calls[0][0];
   for (const method of ['pauseAdmissions', 'resumeAdmissions', 'getMaintenanceCensus']) {
     deps.workOwners.browser[method]('op');
-    expect(browser[method]).toHaveBeenCalledWith('op');
+    expect(input.browserMaintenance[method]).toHaveBeenCalledWith('op');
   }
-  expect(Object.keys(deps.workOwners)).toEqual([
+  expect(deps.workOwners).toMatchObject({
+    schedules: input.scheduleMaintenance,
+    triggers: input.agentTriggerMaintenance,
+    queuedTurns: input.agentQueuedTurnMaintenance,
+    skillSync: input.skillSyncMaintenance,
+    fileDeletion: api.fileDeletionWorkOwner.maintenance,
+    fileLibrary: input.fileLibraryMaintenance,
+    uploads: input.uploadMaintenance,
+    databaseBootstrap: input.databaseBootstrap,
+    auth: input.legacyAuthMaintenance,
+    history: input.historyMaintenance,
+    codeLifecycle: api.codeEnvironmentLifecycleMaintenance,
+    permissions: input.permissionMaintenance,
+    mcpAuthorizationRetry: input.mcpAuthorizationFenceRetryMaintenance,
+    mongoCache: input.mongoCacheMaintenance.maintenance,
+    startupCollections: input.startupMigrationMaintenance.maintenance,
+    mcpCatalog: input.mcpCatalogMaintenance,
+  });
+  for (const [key, owner] of Object.entries({
+    uploads: input.uploadMaintenance,
+    auth: input.legacyAuthMaintenance,
+    history: input.historyMaintenance,
+    codeLifecycle: api.codeEnvironmentLifecycleMaintenance,
+    permissions: input.permissionMaintenance,
+    mcpAuthorizationRetry: input.mcpAuthorizationFenceRetryMaintenance,
+    mongoCache: input.mongoCacheMaintenance.maintenance,
+    startupCollections: input.startupMigrationMaintenance.maintenance,
+    mcpCatalog: input.mcpCatalogMaintenance,
+  }))
+    expect(deps.workOwners[key]).toBe(owner);
+  expect(deps.unqualifiedOwners).toHaveLength(3);
+  await result.configureGenerationStreams();
+  const configured = api.initializeMaintenanceGeneration.mock.calls[0][0];
+  expect(configured.identity).toBe(result.maintenance.identity);
+  expect(configured).not.toHaveProperty('externalCensus');
+  expect(deps.fileDomainOwners).toEqual([
     'browser',
     'schedules',
     'triggers',
@@ -77,83 +185,81 @@ test('wires all actual work facades, late browser load, and the same external ce
     'fileDeletion',
     'fileLibrary',
     'uploads',
-    'auth',
+    'databaseBootstrap',
+    'history',
+    'startupCollections',
   ]);
-  expect(deps.workOwners.skillSync).toBe(context.skillSyncMaintenance);
-  expect(deps.workOwners.fileDeletion).toBe(context.fileDeletionWorkOwner.maintenance);
-  expect(deps.workOwners.fileLibrary).toBe(context.fileLibraryMaintenance);
-  for (const method of ['pauseAdmissions', 'resumeAdmissions', 'getMaintenanceCensus']) {
-    const result = method === 'getMaintenanceCensus' ? Promise.resolve({ complete: false }) : false;
-    uploads[method].mockReturnValue(result);
-    expect(deps.workOwners.uploads[method]('op')).toBe(result);
-    expect(uploads[method]).toHaveBeenCalledWith('op');
+  const tasks = api.registerShutdownTask.mock.calls;
+  expect(tasks.map(([name]) => name)).toEqual([
+    'file deletion admission',
+    'file deletion settlement',
+    'file library admission',
+    'file library settlement',
+    'history admission',
+    'history settlement',
+    'authentication admission',
+    'authentication settlement',
+    'code lifecycle admission',
+    'code lifecycle settlement',
+    'permission admission',
+    'permission settlement',
+    'Mongo cache admission',
+    'Mongo cache settlement',
+    'startup collection admission',
+    'startup collection settlement',
+    'MCP catalog admission',
+    'MCP catalog settlement',
+    'generation job manager prepare',
+    'generation job manager settlement',
+    'generation job manager',
+  ]);
+  for (const [index, owner] of [
+    [2, input.fileLibraryMaintenance],
+    [4, input.historyMaintenance],
+    [6, input.legacyAuthMaintenance],
+    [8, api.codeEnvironmentLifecycleMaintenance],
+    [10, input.permissionMaintenance],
+    [12, input.mongoCacheMaintenance],
+    [14, input.startupMigrationMaintenance],
+    [16, input.mcpCatalogMaintenance],
+  ]) {
+    tasks[index][1]();
+    tasks[index + 1][1]();
+    expect(owner.stopAdmissions).toHaveBeenCalledTimes(1);
+    expect(owner.drain).toHaveBeenCalledTimes(1);
+    expect(tasks[index][2]).toEqual({ phase: 'pre-drain', priority: 110 });
+    expect(tasks[index + 1][2]).toEqual({ phase: 'pre-drain', priority: 90 });
   }
-  expect(deps.workOwners.auth).toBe(context.legacyAuthMaintenance);
-  expect(deps.workOwners).not.toHaveProperty('history');
-  expect(deps.unqualifiedOwners).toContain(
-    'history request completion is not exhaustively measured',
-  );
-  expect(deps.unqualifiedOwners.join(' ')).toMatch(
-    /authentication.*standalone tag\/share.*background/,
-  );
-  const initialize = jest.fn();
-  const begin = source.indexOf('  await initializeMaintenanceGeneration({');
-  const end = source.indexOf('\n  const streamServices', begin);
-  await vm.runInNewContext(`(async () => {${source.slice(begin, end)}})()`, {
-    ...context,
-    initializeMaintenanceGeneration: initialize,
-    agentEventMethods: {},
-    GenerationJobManager: {},
-    maintenance: context.createAppMaintenance.mock.results[0].value,
-  });
-  expect(initialize.mock.calls[0][0].externalCensus).toBe(
-    context.createAppMaintenance.mock.results[0].value.externalCensus,
-  );
-  expect(source.indexOf('browserMaintenance = routes.auth.browserMaintenance')).toBeGreaterThan(
-    source.indexOf("const routes = require('./routes')"),
+  expect(source).toContain(
+    'routes.auth.browserMaintenance.pauseAdmissions !== browserMaintenance.pauseAdmissions',
   );
 });
 
 test('web runtime initializes existing owners without importing or starting a File timer', async () => {
   const appConfig = {};
-  const api = new Proxy(
-    {},
-    {
-      get(target, key) {
-        return (target[key] ??= jest.fn());
-      },
-    },
-  );
   const initializeUploads = jest.fn().mockResolvedValue(undefined);
-  const modules = {
-    axios: {},
-    '@librechat/data-schemas': { runAsSystem: (run) => run() },
-    '@librechat/api': api,
-    '~/db': {},
-    '~/models': { seedDatabase: jest.fn(), sweepOrphanedPreviews: jest.fn() },
-    '../Skills/sync': { initializeGitHubSkillSync: jest.fn() },
-    '../Uploads': { initializeUploads },
-    '../Endpoints/agents/subagentThreadStore': { configureSubagentTaskRouting: jest.fn() },
-    '../Config': { getAppConfig: jest.fn().mockResolvedValue(appConfig) },
-    '../status/usage': {},
-  };
-  const module = { exports: {} };
-  vm.runInNewContext(runtimeSource, {
-    module,
-    require(id) {
-      if (!(id in modules)) throw new Error(`Unexpected startup dependency: ${id}`);
-      return modules[id];
-    },
-  });
+  const { initializeApplicationRuntime, api, modules } = loadRuntime(initializeUploads, appConfig);
   const identity = { incarnation: 'web' };
-  await expect(
-    module.exports.initializeApplicationRuntime({ identity, projectRoot: '/unused' }),
-  ).resolves.toEqual({ appConfig, uploads: undefined });
+  const signal = new AbortController().signal;
+  const onFailure = jest.fn();
+  const prepared = await initializeApplicationRuntime({
+    identity,
+    projectRoot: '/unused',
+    signal,
+    onFailure,
+  });
+  expect(prepared.appConfig).toBe(appConfig);
+  expect(prepared.uploads).toBeUndefined();
   expect(initializeUploads).toHaveBeenCalledWith({
     registry: undefined,
     identity,
     recordOriginalPublication: undefined,
+    trustedFile: undefined,
+    signal,
+    onFailure,
   });
+  expect(modules['~/models'].sweepOrphanedPreviews).not.toHaveBeenCalled();
+  await prepared.start();
   expect(modules['~/models'].sweepOrphanedPreviews).toHaveBeenCalledTimes(1);
   expect(api.initializeFileStorage).toHaveBeenCalledWith(appConfig);
 });
@@ -220,8 +326,11 @@ test('establishes auth admission before Passport and session setup', () => {
 });
 
 test('joins the actual orphan-preview boot write before further startup', async () => {
-  const start = runtimeSource.indexOf('  await runAsSystem(sweepOrphanedPreviews);');
+  const statement = 'await fileLibraryMaintenance.run(() => runAsSystem(sweepOrphanedPreviews));';
+  const start = runtimeSource.indexOf(statement);
   expect(start).toBeGreaterThan(0);
+  const { createFileLibraryMaintenance } = require('../services/Files/LibraryMaintenance');
+  const fileLibraryMaintenance = createFileLibraryMaintenance();
   const write = {};
   let finish;
   const pending = new Promise((resolve) => {
@@ -231,12 +340,21 @@ test('joins the actual orphan-preview boot write before further startup', async 
   const runAsSystem = jest.fn(() => pending);
   const run = vm.runInNewContext(
     `(async () => {${runtimeSource.slice(start, runtimeSource.indexOf('\n', start))}\nnextStartupStep();})()`,
-    { runAsSystem, sweepOrphanedPreviews: write, nextStartupStep },
+    { fileLibraryMaintenance, runAsSystem, sweepOrphanedPreviews: write, nextStartupStep },
   );
-  expect(runAsSystem).toHaveBeenCalledWith(write);
-  expect(nextStartupStep).not.toHaveBeenCalled();
-  finish();
-  await run;
+  try {
+    // The real maintenance owner dispatches the original in a promise continuation.
+    await Promise.resolve();
+    expect(runAsSystem).toHaveBeenCalledWith(write);
+    expect(nextStartupStep).not.toHaveBeenCalled();
+  } finally {
+    finish();
+    try {
+      await run;
+    } finally {
+      await fileLibraryMaintenance.drain();
+    }
+  }
   expect(nextStartupStep).toHaveBeenCalledTimes(1);
 });
 
@@ -251,6 +369,12 @@ test.each(['index', 'runtime'])('registers models before %s startup consumers', 
   const instance = new mongoose.Mongoose();
   instance.set('autoIndex', false);
   instance.set('autoCreate', false);
+  // Disconnected fixture: Mongoose reads connection config before base options in Model.init.
+  Object.assign(instance.connection.config, {
+    autoCreate: false,
+    autoIndex: false,
+    autoSearchIndex: false,
+  });
   const apiRoot = path.dirname(path.dirname(require.resolve('~/models')));
   const trace = [];
   const cache = new Map();
@@ -262,6 +386,13 @@ test.each(['index', 'runtime'])('registers models before %s startup consumers', 
     trace.push('usage');
     return { recordOriginalPublication: noop };
   });
+  const connector = jest.requireActual('../../db/connect').createDbConnector({
+    mongoose: instance,
+    env: { MONGO_URI: 'mongodb://fixture-only' },
+    instrumentMongooseQueryMetrics: noop,
+    optionalEnabled: noop,
+    logger: { info: noop, error: noop },
+  });
   const inertAdapters = new Set();
   function load(name) {
     if (cache.has(name)) return cache.get(name).exports;
@@ -271,23 +402,30 @@ test.each(['index', 'runtime'])('registers models before %s startup consumers', 
     let contents;
     if (name === 'server/index.js') contents = source;
     else if (name === 'server/services/start/runtime.js') contents = runtimeSource;
+    else if (name === 'server/services/start/maintenance.js') contents = maintenanceSource;
     else contents = fs.readFileSync(path.join(apiRoot, name), 'utf8');
     if (name === 'server/index.js') {
       const end = "const agentEventMethods = require('~/models');";
       expect(contents).toContain(end);
-      contents = contents.slice(0, contents.indexOf(end) + end.length);
+      const begin = contents.indexOf("  database = require('../db/connect')");
+      contents = `let database; const failStartup = () => {};\n${contents.slice(begin, contents.indexOf(end) + end.length)}`;
     }
     const localRequire = (id) => {
       if (id === 'mongoose') return instance;
       if (id === '@librechat/data-schemas') return schema;
       if (id === '@librechat/api')
         return { ...api, startCodeEnvironmentLifecycleReconciler: lifecycle };
+      if (id === '../db/connect') return { getDbConnector: () => connector };
+      if (id === './services/LegacyAuthMaintenance') return { installAuthPassport: noop };
+      if (id === './services/start/maintenance')
+        return load('server/services/start/maintenance.js');
       if (id === '~/db') return load('db/index.js');
       if (id === '~/models') return load('models/index.js');
       if (id === './services/initializeOAuthReconnectManager')
         return load('server/services/initializeOAuthReconnectManager.js');
       if (id === './services/start/runtime') return load('server/services/start/runtime.js');
-      if (name === 'db/index.js' && id === './connect') return { connectDb };
+      if (name === 'db/index.js' && id === './connect')
+        return { connectDb, getDbConnector: () => connector };
       if (name === 'db/index.js' && id === './indexSync') {
         expect(instance.models.Message).toBeDefined();
         expect(instance.models.Conversation).toBeDefined();
@@ -303,7 +441,7 @@ test.each(['index', 'runtime'])('registers models before %s startup consumers', 
     };
     const execute = vm.runInNewContext(
       `(function(require,module,exports,__dirname){${contents}\n})`,
-      {},
+      { passport: {} },
       { filename: path.join(apiRoot, name) },
     );
     execute(localRequire, module, module.exports, path.dirname(path.join(apiRoot, name)));
@@ -320,15 +458,19 @@ test.each(['index', 'runtime'])('registers models before %s startup consumers', 
   expect(indexSync).not.toHaveBeenCalled();
   expect(inertAdapters.size).toBeGreaterThan(0);
   if (entry === 'runtime') {
-    await result.initializeConnectedRuntime({
+    const connected = await result.initializeConnectedRuntime({
       mongoose: instance,
       identity: { incarnation: 'test' },
     });
     expect(connectDb).toHaveBeenCalledTimes(1);
+    expect(trace).not.toContain('reconciler');
+    await connected.start();
     expect(
       trace.filter((name) => ['connect', 'usage', 'reconciler', 'indexSync'].includes(name)),
     ).toEqual(['connect', 'usage', 'reconciler', 'indexSync']);
   }
+  await connector.modelBootstrap.join();
+  await connector.close();
 });
 
 test.each(['index.js', 'experimental.js'])(
@@ -338,16 +480,23 @@ test.each(['index.js', 'experimental.js'])(
       '../../../packages/api/src/files/deletion',
     );
     const fileDeletionWorkOwner = createFileDeletionWorkOwner();
-    const entrySource = fs.readFileSync(path.join(__dirname, '..', entry), 'utf8');
     const tasks = [];
-    const statements = entrySource.match(
-      /registerShutdownTask\('file deletion (?:admission|settlement)'[\s\S]*?\n\s*}\);/g,
-    );
-    expect(statements).toHaveLength(2);
-    vm.runInNewContext(statements.join('\n'), {
-      fileDeletionWorkOwner,
-      registerShutdownTask: (name, fn, options) => tasks.push({ name, fn, ...options }),
-    });
+    const registerShutdownTask = (name, fn, options) => {
+      if (name.startsWith('file deletion ')) tasks.push({ name, fn, ...options });
+    };
+    if (entry === 'index.js') {
+      loadMaintenance({
+        fileDeletionWorkOwner,
+        registerShutdownTask,
+      }).registerWebMaintenanceShutdown(maintenanceInputs());
+    } else {
+      const entrySource = fs.readFileSync(path.join(__dirname, '..', entry), 'utf8');
+      const statements = entrySource.match(
+        /registerShutdownTask\('file deletion (?:admission|settlement)'[\s\S]*?\n\s*}\);/g,
+      );
+      expect(statements).toHaveLength(2);
+      vm.runInNewContext(statements.join('\n'), { fileDeletionWorkOwner, registerShutdownTask });
+    }
     expect(tasks.map(({ phase, priority }) => ({ phase, priority }))).toEqual([
       { phase: 'pre-drain', priority: 110 },
       { phase: 'pre-drain', priority: 90 },
@@ -393,13 +542,10 @@ test('foreground File shutdown retains original deletion through the actual shut
   const operation = fileDeletionWorkOwner.run((scope) => scope.effect(() => write));
   const teardown = jest.fn();
   try {
-    const statements = source.match(
-      /registerShutdownTask\('file deletion (?:admission|settlement)'[\s\S]*?\n\s*}\);/g,
-    );
-    vm.runInNewContext(statements.join('\n'), {
+    loadMaintenance({
       fileDeletionWorkOwner,
       registerShutdownTask: shutdown.registerShutdownTask,
-    });
+    }).registerWebMaintenanceShutdown(maintenanceInputs());
     shutdown.registerShutdownTask(
       'generation prepare',
       async () => {
@@ -429,6 +575,80 @@ test('foreground File shutdown retains original deletion through the actual shut
   } finally {
     finish();
     await operation;
+    shutdown.__resetShutdownStateForTests();
+    exit.mockRestore();
+    jest.useRealTimers();
+  }
+});
+
+test('generation shutdown wiring retains deferred pre-drain custody and the original budget', async () => {
+  const { Server } = require('node:http');
+  const shutdown = jest.requireActual('../../../packages/api/src/app/shutdown');
+  const setups = source.match(/setupGracefulShutdown\((?:null|server)(?:, [^;]+)?\);/g);
+  expect(setups).toHaveLength(2);
+  const GenerationJobManager = {
+    prepareForShutdown: jest.fn(),
+    awaitGenerationSettlements: jest.fn(),
+    destroy: jest.fn(),
+  };
+  let reject;
+  const original = new Promise((_, fail) => {
+    reject = fail;
+  });
+  GenerationJobManager.awaitGenerationSettlements.mockReturnValue(original);
+  const teardown = jest.fn();
+  shutdown.__resetShutdownStateForTests();
+  jest.useFakeTimers();
+  const exit = jest.spyOn(process, 'exit').mockImplementation(() => undefined);
+  const previous = new Set(process.listeners('SIGTERM'));
+  try {
+    const context = {
+      server: new Server(),
+      GenerationJobManager,
+      setupGracefulShutdown: shutdown.setupGracefulShutdown,
+      registerShutdownTask: shutdown.registerShutdownTask,
+      getRemainingShutdownMs: shutdown.getRemainingShutdownMs,
+      SHUTDOWN_TEARDOWN_RESERVE_MS: 10_000,
+    };
+    vm.runInNewContext(
+      setups.find((line) => line.includes('(null')),
+      context,
+    );
+    vm.runInNewContext(
+      setups.find((line) => line.includes('(server')),
+      context,
+    );
+    const composition = loadMaintenance({
+      ...context,
+      GenerationJobManager: {
+        configure: noop,
+        configureGenerationAdmission: noop,
+        setApprovalExpiredHandler: noop,
+        setTerminalHostActionHandler: noop,
+        initialize: noop,
+        ...GenerationJobManager,
+      },
+    }).createWebMaintenance(maintenanceInputs());
+    await composition.configureGenerationStreams();
+    shutdown.registerShutdownTask('storage teardown', teardown, { priority: 105 });
+    const signal = process.listeners('SIGTERM').find((listener) => !previous.has(listener));
+    signal('SIGTERM');
+    await jest.advanceTimersByTimeAsync(10);
+    expect(GenerationJobManager.prepareForShutdown).toHaveBeenCalledTimes(1);
+    expect(GenerationJobManager.awaitGenerationSettlements).toHaveBeenCalledWith(50_000);
+    expect(teardown).not.toHaveBeenCalled();
+    reject(new Error('original generation unconfirmed'));
+    await jest.advanceTimersByTimeAsync(10);
+    expect(GenerationJobManager.destroy).not.toHaveBeenCalled();
+    expect(teardown).not.toHaveBeenCalled();
+    expect(exit).not.toHaveBeenCalled();
+    expect(shutdown.getRemainingShutdownMs()).toBe(59_980);
+    await jest.advanceTimersByTimeAsync(59_980);
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(teardown).not.toHaveBeenCalled();
+  } finally {
+    reject(new Error('fixture settled'));
+    await original.catch(() => undefined);
     shutdown.__resetShutdownStateForTests();
     exit.mockRestore();
     jest.useRealTimers();

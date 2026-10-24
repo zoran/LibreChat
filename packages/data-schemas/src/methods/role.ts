@@ -7,8 +7,10 @@ import {
   removeNullishValues,
 } from 'librechat-data-provider';
 import type { Model } from 'mongoose';
+import type { AuthPersistenceObserver } from './authPersistence';
 import type { CacheStore, IRole, IUser } from '~/types';
 import { scopedCacheKey, getTenantId, runAsSystem, SYSTEM_TENANT_ID } from '~/config/tenantContext';
+import { observeAuthPersistence } from './authPersistence';
 import { escapeRegExp } from '~/utils/string';
 import logger from '~/config/winston';
 
@@ -35,6 +37,12 @@ export interface RoleDeps {
   getCache?: (key: string) => CacheStore | undefined;
 }
 
+/** Optional observation of this lookup's existing lazy role and cache writes. */
+interface RoleLookupObservation {
+  persistence: AuthPersistenceObserver;
+  observeCache: (cache: CacheStore) => Pick<CacheStore, 'get' | 'set'>;
+}
+
 export function createRoleMethods(
   mongoose: typeof import('mongoose'),
   deps: RoleDeps = {},
@@ -45,7 +53,11 @@ export function createRoleMethods(
   }) => Promise<Pick<IRole, '_id' | 'name' | 'description'>[]>;
   countRoles: () => Promise<number>;
   initializeRoles: () => Promise<void>;
-  getRoleByName: (roleName: string, fieldsToSelect?: string | string[] | null) => Promise<IRole>;
+  getRoleByName: (
+    roleName: string,
+    fieldsToSelect?: string | string[] | null,
+    observation?: RoleLookupObservation,
+  ) => Promise<IRole>;
   findRolesByNames: (
     roleNames: string[],
     fieldsToSelect?: string | string[] | null,
@@ -166,8 +178,10 @@ export function createRoleMethods(
   async function getRoleByName(
     roleName: string,
     fieldsToSelect: string | string[] | null = null,
+    observation?: RoleLookupObservation,
   ): Promise<IRole> {
-    const cache = deps.getCache?.(CacheKeys.ROLES);
+    const sourceCache = deps.getCache?.(CacheKeys.ROLES);
+    const cache = sourceCache && observation ? observation.observeCache(sourceCache) : sourceCache;
     try {
       if (cache) {
         const cachedRole = await cache.get(scopedCacheKey(roleName));
@@ -183,7 +197,9 @@ export function createRoleMethods(
       const role = await query.lean().exec();
 
       if (!role && systemRoleValues.has(roleName)) {
-        const newRole = await new Role(roleDefaults[roleName as keyof typeof roleDefaults]).save();
+        const newRole = await observeAuthPersistence(observation?.persistence, async () =>
+          new Role(roleDefaults[roleName as keyof typeof roleDefaults]).save(),
+        );
         if (cache) {
           await cache.set(scopedCacheKey(roleName), newRole);
         }

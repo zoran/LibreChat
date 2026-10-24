@@ -10,7 +10,9 @@ import {
 } from '@librechat/data-schemas';
 import type { GenerationAdmissionInput } from '@librechat/data-schemas';
 import type { GenerationJobManagerOptions } from '../GenerationJobManager';
+import { InMemoryEventTransport } from '../implementations/InMemoryEventTransport';
 import { RedisEventTransport } from '../implementations/RedisEventTransport';
+import { InMemoryJobStore } from '../implementations/InMemoryJobStore';
 import { GenerationJobManagerClass } from '../GenerationJobManager';
 import { prepareSourceReplayForTest } from './helpers/sourceReplay';
 import { generationRequestBinding } from '../generationAdmission';
@@ -28,7 +30,14 @@ function deferred() {
 describe('manager checkpoint recovery start gates', () => {
   let mongo: MongoMemoryReplSet;
   let methods: ReturnType<typeof createGenerationAdmissionMethods>;
-  const managers: GenerationJobManagerClass[] = [];
+  const managers: Array<{
+    manager: GenerationJobManagerClass;
+    store: NonNullable<GenerationJobManagerOptions['jobStore']>;
+    transport: NonNullable<GenerationJobManagerOptions['eventTransport']>;
+    held: boolean;
+    originals: Promise<void>[];
+    releases: Array<() => void>;
+  }> = [];
   const clients: Redis[] = [];
   beforeAll(async () => {
     mongo = await MongoMemoryReplSet.create({ replSet: { count: 1, ip: '127.0.0.1' } });
@@ -40,25 +49,134 @@ describe('manager checkpoint recovery start gates', () => {
     await mongoose.models.GenerationAdmission.deleteMany({});
   });
   afterEach(async () => {
-    for (const manager of managers.splice(0).reverse())
-      await manager.destroy({ settlementBudgetMs: 0 });
-    for (const client of clients.splice(0)) client.disconnect();
+    const fixtures = managers.splice(0).reverse();
+    jest.restoreAllMocks();
+    for (const fixture of fixtures) for (const release of fixture.releases) release();
+    const results = await Promise.allSettled(
+      fixtures.map(async (fixture) => {
+        const { manager, store, transport } = fixture;
+        await Promise.all(fixture.originals);
+        await Promise.allSettled(
+          [...manager['openProviderExecutions'].values()].flatMap((entry) =>
+            [entry.drain, entry.settlement].filter((original) => original !== undefined),
+          ),
+        );
+        async function assertCustodyAndDestroy(): Promise<void> {
+          const custody = manager['durableAdmission'].getLocalCustody();
+          expect(custody.pending).toBe(0);
+          if (fixture.held) {
+            expect(custody.unresolved).toBeGreaterThan(0);
+            expect((await manager.getGenerationAdmissionCensus()).pendingWrites).toBe(0);
+            // The synthetic terminated predecessor/unknown native outcome remains
+            // held. Closing owned test resources is not positive maintenance proof.
+          } else {
+            expect(custody.unresolved).toBe(0);
+            expect((await manager.getGenerationAdmissionCensus()).providerExecutions).toBe(0);
+            await manager.destroy({ settlementBudgetMs: 1_000 });
+          }
+        }
+        const outcome = await Promise.allSettled([assertCustodyAndDestroy()]);
+        // An expired observer never authorizes disposal of the retained shutdown original.
+        const shutdown = await Promise.allSettled([manager['shutdownSettlement']]);
+        const prepare = await Promise.allSettled([
+          Promise.resolve().then(() => manager.prepareForShutdown()),
+        ]);
+        const subscribers = await Promise.allSettled([manager['drainSubscriberCleanups']()]);
+        const resources = await Promise.allSettled([
+          store.destroy(),
+          Promise.resolve().then(() => transport.destroy()),
+        ]);
+        const failures = [...outcome, ...shutdown, ...prepare, ...subscribers, ...resources].filter(
+          (result): result is PromiseRejectedResult => result.status === 'rejected',
+        );
+        if (failures.length)
+          throw Object.assign(
+            new Error(failures.map((result) => String(result.reason)).join('\n')),
+            { errors: failures.map((result) => result.reason) },
+          );
+      }),
+    );
+    // Always close every captured connection, even if a manager assertion or
+    // resource destructor failed. Await actual local socket closure.
+    const connections = await Promise.allSettled(
+      clients.splice(0).map(
+        (client) =>
+          new Promise<void>((resolve) => {
+            if (client.status === 'end') return resolve();
+            client.once('end', resolve);
+            client.disconnect();
+          }),
+      ),
+    );
+    const failures = [...results, ...connections].filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    if (failures.length)
+      throw Object.assign(
+        new Error(
+          'Checkpoint fixture disposal failed:\n' +
+            failures.map((result) => String(result.reason)).join('\n'),
+        ),
+        { errors: failures.map((result) => result.reason) },
+      );
   });
   afterAll(async () => {
-    await mongoose.disconnect();
-    await mongo?.stop();
+    const disconnected = await Promise.allSettled([mongoose.disconnect()]);
+    const stopped = await Promise.allSettled([mongo?.stop()]);
+    const failures = [...disconnected, ...stopped].filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    if (failures.length)
+      throw Object.assign(new Error(failures.map((result) => String(result.reason)).join('\n')), {
+        errors: failures.map((result) => result.reason),
+      });
   });
   function owner(services: GenerationJobManagerOptions = {}, boot = 'manager-boot') {
-    const manager = new GenerationJobManagerClass({ ...services, cleanupOnComplete: false });
+    const store = services.jobStore ?? new InMemoryJobStore({ ttlAfterComplete: 0, maxJobs: 1000 });
+    const transport = services.eventTransport ?? new InMemoryEventTransport();
+    const manager = new GenerationJobManagerClass({
+      ...services,
+      jobStore: store,
+      eventTransport: transport,
+      cleanupOnComplete: false,
+    });
     manager.configureGenerationAdmission({
       required: true,
       methods,
       ownerInstanceId: 'manager-pod',
       processBootId: boot,
-      externalCensus: async () => ({ queuedContinuations: 0, pendingWrites: 0, complete: true }),
     });
-    managers.push(manager);
+    managers.push({ manager, store, transport, held: false, originals: [], releases: [] });
     return manager;
+  }
+  function retain<T>(
+    manager: GenerationJobManagerClass,
+    original: Promise<T>,
+    release: () => void,
+  ): Promise<T> {
+    const fixture = managers.find((entry) => entry.manager === manager)!;
+    fixture.releases.push(release);
+    fixture.originals.push(
+      original.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return original;
+  }
+  function preserveHeld(manager: GenerationJobManagerClass): void {
+    expect(manager['durableAdmission'].getLocalCustody().unresolved).toBeGreaterThan(0);
+    managers.find((entry) => entry.manager === manager)!.held = true;
+  }
+  async function finish(
+    manager: GenerationJobManagerClass,
+    job: Awaited<ReturnType<GenerationJobManagerClass['createJob']>>,
+    segment = job.metadata.providerExecutionId!,
+  ): Promise<void> {
+    expect(await manager.completeJob(job.streamId, undefined, job.createdAt)).toBe(true);
+    expect(await manager.settleGenerationExecution(job.streamId, job.createdAt, segment)).toBe(
+      true,
+    );
   }
   const options = () => ({
     generationAdmission: generationRequestBinding('request', { text: 'hello' }),
@@ -75,7 +193,11 @@ describe('manager checkpoint recovery start gates', () => {
       return result;
     });
     const manager = owner();
-    const creating = manager.createJob('held-start', 'owner', 'held-start', options());
+    const creating = retain(
+      manager,
+      manager.createJob('held-start', 'owner', 'held-start', options()),
+      release.resolve,
+    );
     try {
       await entered.promise;
       const stored = (await manager.getJobStore().getJob('held-start'))!;
@@ -103,6 +225,7 @@ describe('manager checkpoint recovery start gates', () => {
         job.metadata.providerExecutionId!,
       ),
     ).toBe(true);
+    await finish(manager, job);
   });
 
   it.each(
@@ -147,10 +270,14 @@ describe('manager checkpoint recovery start gates', () => {
         return ++reads === (boundary === 'first job read' ? 1 : 3) ? wait(result) : result;
       });
     }
-    const starting = manager.beginProviderExecution(
-      job.streamId,
-      job.createdAt,
-      job.metadata.providerExecutionId!,
+    const starting = retain(
+      manager,
+      manager.beginProviderExecution(
+        job.streamId,
+        job.createdAt,
+        job.metadata.providerExecutionId!,
+      ),
+      release.resolve,
     );
     try {
       await entered.promise;
@@ -181,7 +308,16 @@ describe('manager checkpoint recovery start gates', () => {
     expect((await manager.getGenerationAdmissionCensus()).providerExecutions).toBe(
       boundary === 'first job read' ? 0 : 1,
     );
-    if (boundary === 'first job read') return;
+    if (boundary === 'first job read') {
+      expect(
+        await manager.cancelGenerationInitialization(
+          job.streamId,
+          job.createdAt,
+          job.metadata.providerExecutionId!,
+        ),
+      ).toBe(true);
+      return;
+    }
     // The true provider caller still owns drain, even though this start returned false.
     expect(
       await manager.markProviderExecutionDrained(
@@ -191,6 +327,8 @@ describe('manager checkpoint recovery start gates', () => {
       ),
     ).toBe(true);
     expect((await manager.getGenerationAdmissionCensus()).providerExecutions).toBe(0);
+    expect((await manager.getGenerationAdmissionCensus()).unresolved).toBe(1);
+    preserveHeld(manager);
   });
   it('keeps an uncertain provider mutation open until exact drain and never retries it', async () => {
     const manager = owner();
@@ -229,6 +367,7 @@ describe('manager checkpoint recovery start gates', () => {
     ).toBe(true);
     expect((await manager.getGenerationAdmissionCensus()).providerExecutions).toBe(0);
     expect((await manager.getGenerationAdmissionCensus()).unresolved).toBe(1);
+    preserveHeld(manager);
   });
   // These adoption fault cases use actual Mongo/Valkey with controlled death/effect ports.
   // Only continuation.process.integration supplies actual predecessor OS termination evidence.
@@ -301,6 +440,9 @@ describe('manager checkpoint recovery start gates', () => {
     });
     if (!row.ok || !row.value) throw new Error('Missing actual predecessor admission');
     const prior = snapshotGenerationCheckpointAdmission(row.value);
+    // This fixture models a terminated process through a synthetic proof. Its
+    // old manager must never manufacture a successful graceful shutdown proof.
+    preserveHeld(predecessor.manager);
     const ports = {
       authorize: async () => true,
       confirmTerminatedOwner: async (input: GenerationAdmissionInput) => ({
@@ -360,7 +502,11 @@ describe('manager checkpoint recovery start gates', () => {
       return result;
     });
     const start = jest.spyOn(store, 'beginProviderExecution');
-    const recovering = manager.recoverCheckpointGeneration(job.streamId, prior, segment, ports);
+    const recovering = retain(
+      manager,
+      manager.recoverCheckpointGeneration(job.streamId, prior, segment, ports),
+      release.resolve,
+    );
     try {
       await entered.promise;
       expect(await store.getJob(job.streamId)).toMatchObject({
@@ -379,6 +525,7 @@ describe('manager checkpoint recovery start gates', () => {
     expect(await manager.beginProviderExecution(job.streamId, job.createdAt, segment)).toBe(true);
     expect(await manager.beginProviderExecution(job.streamId, job.createdAt, segment)).toBe(false);
     expect(start).toHaveBeenCalledTimes(1);
+    await finish(manager, job, segment);
   });
 
   it.each([
@@ -450,6 +597,7 @@ describe('manager checkpoint recovery start gates', () => {
     expect((await manager.getGenerationAdmissionCensus()).unresolved).toBe(1);
     if (failure === 'conflicting ownership')
       expect(manager['ownedJobs'].get(job.streamId)).toBe(job.createdAt + 1);
+    preserveHeld(manager);
   });
 
   it.each(['pending existing runtime', 'abort', 'runtime replacement', 'newer generation'])(
@@ -467,9 +615,15 @@ describe('manager checkpoint recovery start gates', () => {
       });
       const cas = jest.spyOn(store, 'transitionStatus');
       const pending =
-        failure === 'pending existing runtime' ? manager.getJob(job.streamId) : undefined;
+        failure === 'pending existing runtime'
+          ? retain(manager, manager.getJob(job.streamId), release.resolve)
+          : undefined;
       if (pending) await entered.promise;
-      const recovering = manager.recoverCheckpointGeneration(job.streamId, prior, segment, ports);
+      const recovering = retain(
+        manager,
+        manager.recoverCheckpointGeneration(job.streamId, prior, segment, ports),
+        release.resolve,
+      );
       let replacement;
       try {
         await entered.promise;
@@ -510,6 +664,7 @@ describe('manager checkpoint recovery start gates', () => {
         ok: true,
         value: { state: 'admitted', active: true, segmentId: segment },
       });
+      preserveHeld(manager);
     },
   );
 });

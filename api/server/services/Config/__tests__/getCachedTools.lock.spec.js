@@ -16,6 +16,7 @@ const mockWaitForRedis = jest.fn(() => mockRedisReady);
 
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
+  ...jest.requireActual('../../../../../packages/api/src/mcp/catalog/store'),
   cacheConfig: { FORCED_IN_MEMORY_CACHE_NAMESPACES: [] },
   evalKeyvRedisScript: (...args) => mockKeyvRedisClient.eval(...args),
   mcpConfig: { USER_CONNECTION_IDLE_TIMEOUT: 15 * 60 * 1000 },

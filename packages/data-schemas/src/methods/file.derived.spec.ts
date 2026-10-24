@@ -15,7 +15,9 @@ import {
 } from 'librechat-data-provider';
 import type { UploadDerivedIntent, UploadDerivedOrigin } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
+import type { FileCleanupProgressResult } from '../types/fileCleanup';
 import type { ManagedUploadAcceptance } from '~/types/file';
+import type { JobClaim } from '../types/housekeeping';
 import {
   createFileRetentionMethods,
   FileSourceCapacityError,
@@ -23,12 +25,152 @@ import {
   resolveFileSources,
   resizeRetainedDerivatives,
 } from './fileRetention';
+import { createFileCleanupLifecycleMethods } from './fileCleanupLifecycle';
+import { createFileCleanupProgressMethods } from './fileCleanupProgress';
 import { createUploadManagementRepository } from './uploadManagement';
+import { managedFileRetrievalDeletionSettled } from './fileRetrieval';
+import { createFileCleanupClaimMethods } from './fileCleanupClaim';
+import { createUploadFileCleanupOwner } from './uploadFileCleanup';
 import { createHousekeepingStore } from './housekeepingStore';
 import { currentFileDeadline } from './fileSourceAuthority';
 import { tenantStorage } from '~/config/tenantContext';
+import { createMessageMethods } from './message';
 import { createFileMethods } from './file';
 import { createModels } from '~/models';
+
+/** Real File/Upload/HK transitions; these fixtures create no generation or checkpoint rows. */
+async function prepareCleanupReceipts(database: typeof mongoose, fileIds: string[]) {
+  const observed = (result: FileCleanupProgressResult) => {
+    if (result.state !== 'progress') throw new Error(JSON.stringify(result));
+    return result;
+  };
+  const signal = new AbortController().signal;
+  const jobs = createHousekeepingStore(database);
+  await jobs.initialize();
+  const generation = createFileCleanupProgressMethods(database, jobs);
+  await generation.initialize();
+  const upload = createUploadFileCleanupOwner(database);
+  const retention = createFileRetentionMethods(database);
+  const cleanup = createFileCleanupLifecycleMethods(database, jobs, upload, retention, {
+    purgeRetrieval: async (scope, ids) => {
+      const rows = await database.models.File.collection
+        .find<Parameters<typeof managedFileRetrievalDeletionSettled>[0]>({
+          user: new mongoose.Types.ObjectId(scope.userId),
+          tenantId: scope.tenantId ?? null,
+          file_id: { $in: [...ids] },
+        })
+        .toArray();
+      expect(rows).toHaveLength(ids.length);
+      for (const row of rows) expect(managedFileRetrievalDeletionSettled(row)).toBe(true);
+    },
+    purgeCheckpoints: async () => {
+      const collections = await database.connection
+        .db!.listCollections({}, { nameOnly: true })
+        .toArray();
+      expect(collections.filter(({ name }) => name.includes('checkpoint'))).toEqual([]);
+    },
+    redactFileSourceContent: createMessageMethods(database).redactFileSourceContent,
+  });
+  const claims = new Map<string, JobClaim>();
+  for (let index = 0; index < fileIds.length; index++) {
+    const claim = await jobs.claimNext('file.cleanup', {
+      podUid: 'retention-fixture',
+      incarnation: 'boot',
+      source: 'fixture',
+      hostId: 'local',
+    });
+    if (!claim || claim.work.handler !== 'file.cleanup')
+      throw new Error('Expected actual revoked File cleanup claim');
+    claims.set(claim.work.subject.fileId, claim);
+  }
+  expect([...claims.keys()].sort()).toEqual([...fileIds].sort());
+  const claimFor = (fileId: string) => {
+    const claim = claims.get(fileId);
+    if (!claim) throw new Error('File cleanup claim missing');
+    return claim;
+  };
+  for (const [fileId, claim] of claims) {
+    expect(
+      await createFileCleanupClaimMethods(database, jobs, retention).enter(claim, signal),
+    ).toMatchObject({ state: 'progress' });
+    observed(await cleanup.begin(claim, signal));
+    let step = observed(await generation.beginCapture(claim, signal));
+    step = observed(
+      await generation.recordCapturePage(
+        claim,
+        step.expected,
+        { targets: [], complete: true },
+        signal,
+      ),
+    );
+    step = observed(await generation.finishGenerationStage(claim, step.expected, signal));
+    for (let attempt = 0; attempt < 5; attempt++) {
+      step = observed(await cleanup.purgeDerivatives(claim, signal));
+      if (step.progress.lifecycle!.derivatives.messages === 'complete') break;
+    }
+    expect(step.progress.lifecycle!.derivatives).toMatchObject({
+      retrieval: 'complete',
+      checkpoints: 'complete',
+      messages: 'complete',
+    });
+    step = observed(await cleanup.prepareStorage(claim, signal));
+    const request = step.progress.lifecycle!.storage!;
+    if (request.state !== 'binding') throw new Error('Persisted storage request missing');
+    step = observed(
+      await cleanup.bindStorage(
+        claim,
+        step.expected,
+        {
+          ...request.request,
+          bucket: 'originals-fixture',
+          key: step.progress.lifecycle!.upload.originalKey,
+        },
+        signal,
+      ),
+    );
+    const storage = step.progress.lifecycle!.storage!;
+    if (storage.state !== 'observing') throw new Error('Persisted storage binding missing');
+    // Native storage is outside this Mongo fixture; the actual owner validates and retains its receipt.
+    observed(
+      await cleanup.recordStorage(
+        claim,
+        step.expected,
+        {
+          ...storage.binding,
+          state: 'durable_delete_complete',
+          obligationId: `native-fixture-${fileId}`,
+          aggregateRevision: '1',
+          proofSHA256: 'e'.repeat(64),
+        },
+        signal,
+      ),
+    );
+  }
+  return {
+    upload,
+    commit: (fileId: string) => cleanup.commitConsumption(claimFor(fileId), signal),
+    async finish(fileId: string) {
+      const claim = claimFor(fileId);
+      const step = observed(await cleanup.commitConsumption(claim, signal));
+      const storage = step.progress.lifecycle!.storage!;
+      if (storage.state !== 'committed') throw new Error('Actual Upload acknowledgment missing');
+      observed(
+        await cleanup.recordConsumption(
+          claim,
+          step.expected,
+          {
+            state: 'recorded',
+            obligationId: storage.receipt.obligationId,
+            receiptSHA256: storage.receiptSHA256,
+            consumerCommitId: storage.consumerCommitId,
+          },
+          signal,
+        ),
+      );
+      observed(await cleanup.finalize(claim, signal));
+    },
+  };
+}
 
 describe('private derived File lifecycle using actual Mongo transactions', () => {
   const db = new mongoose.Mongoose();
@@ -739,13 +881,23 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
       (await db.models.UploadCounter.findById('global').lean<{ value: { textBytes: number } }>())!
         .value.textBytes;
     const originalCharge = await total();
+    const childTextCharge = (await db.models.UploadOperation.findById('child').lean<{
+      textBytes: number;
+    }>())!.textBytes;
+    const rootTextCharge = (await db.models.UploadOperation.findById('root').lean<{
+      textBytes: number;
+    }>())!.textBytes;
     expect(originalCharge).toBeGreaterThan(512);
+    expect(childTextCharge).toBeGreaterThan(0);
+    expect(rootTextCharge).toBeGreaterThan(0);
     // Synthetic retained-copy liability, charged through the actual shared accounting owner.
     await transaction((session) =>
       resizeRetainedDerivatives(db, owner, [], [{ fileId: 'child', bytes: 2048 }], session),
     );
     expect(await total()).toBe(originalCharge + 2048);
     await lifecycle.revokeFileSources(owner, ['root']);
+    const cleanup = await prepareCleanupReceipts(db, ['root', 'child']);
+    expect(await total()).toBe(originalCharge + 2048);
     expect(await lifecycle.prepareFileSourceDeletion(owner, ['root'])).toEqual({
       preparedFileIds: [],
     });
@@ -765,7 +917,17 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
     expect(derivedDeadline.kind).toBe('derived');
     await expect(capture(['child'])).rejects.toBeInstanceOf(FileSourceUnavailableError);
     expect(await total()).toBe(originalCharge);
-    // Unknown external Uploadfinish acknowledgement: deliberately do not finalize the child.
+    // A lost Upload acknowledgment rolls back its transaction and retains the child's lineage.
+    const acknowledge = jest
+      .spyOn(cleanup.upload, 'acknowledgeAcceptedFileCleanup')
+      .mockRejectedValueOnce(new Error('Lost Upload cleanup acknowledgment'));
+    try {
+      expect(await cleanup.commit('child')).toEqual({ state: 'unknown' });
+    } finally {
+      acknowledge.mockRestore();
+    }
+    expect(await total()).toBe(originalCharge);
+    expect((await raw('child'))!.deletionCompletedAt).toBeFalsy();
     const freshSweep = createFileRetentionMethods(db, { securityPolicySha256: policy });
     expect((await freshSweep.revokeFileSources(owner, ['root'])).revokedFileIds.sort()).toEqual([
       'child',
@@ -778,6 +940,8 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
       preparedFileIds: ['child'],
     });
     expect(await total()).toBe(originalCharge);
+    await cleanup.finish('child');
+    expect(await total()).toBe(originalCharge - childTextCharge);
     expect(await freshSweep.finalizeFileSourceDeletion(owner, ['child'])).toEqual({
       completedFileIds: ['child'],
     });
@@ -789,11 +953,13 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
     expect(originalDeadline.kind).toBe('original');
     expect((await freshSweep.revokeFileSources(owner, ['root'])).revokedFileIds).toEqual(['root']);
     await expect(capture(['root'])).rejects.toBeInstanceOf(FileSourceUnavailableError);
+    await cleanup.finish('root');
     expect(await freshSweep.finalizeFileSourceDeletion(owner, ['root'])).toEqual({
       completedFileIds: ['root'],
     });
     expect(currentFileDeadline((await raw('root')) as never)).toEqual(originalDeadline);
-    expect(await total()).toBe(originalCharge);
+    expect(await total()).toBe(originalCharge - childTextCharge - rootTextCharge);
+    expect(await total()).toBe(512);
   });
 
   it('settles expired historical derived custody after the real v2 migration barrier and cleanup re-entry', async () => {
@@ -888,6 +1054,11 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
       await unavailable();
       const deletion = createFileRetentionMethods(targetDb, { securityPolicySha256: policy });
       await deletion.revokeFileSources(owner, ['legacy-child']);
+      const childTextCharge = (await targetDb.models.UploadOperation.findById('legacy-child').lean<{
+        textBytes: number;
+      }>())!.textBytes;
+      expect(childTextCharge).toBeGreaterThan(0);
+      const cleanup = await prepareCleanupReceipts(targetDb, ['legacy-child']);
       expect(await deletion.prepareFileSourceDeletion(owner, ['legacy-child'])).toEqual({
         preparedFileIds: ['legacy-child'],
       });
@@ -904,6 +1075,7 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
         preparedFileIds: ['legacy-child'],
       });
       await unavailable();
+      await cleanup.finish('legacy-child');
       expect(await resumed.finalizeFileSourceDeletion(owner, ['legacy-child'])).toEqual({
         completedFileIds: ['legacy-child'],
       });
@@ -912,7 +1084,7 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
       });
       expect((await file())!.derivedOrigin).toBeUndefined();
       expect(currentFileDeadline((await file()) as never)).toEqual(deadline);
-      expect(await total()).toBe(global.textBytes - 2048);
+      expect(await total()).toBe(global.textBytes - 2048 - childTextCharge);
       await unavailable();
     } finally {
       await targetDb.disconnect();
@@ -924,12 +1096,21 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
     await derived('child', ['root']);
     const result = await lifecycle.revokeFileSources(owner, ['root']);
     expect(result.revokedFileIds.sort()).toEqual(['child', 'root']);
+    const cleanup = await prepareCleanupReceipts(db, ['root', 'child']);
+    expect(await cleanup.commit('root')).toMatchObject({
+      state: 'pending',
+      reason: 'descendant_pending',
+    });
     expect(await lifecycle.finalizeFileSourceDeletion(owner, ['root'])).toEqual({
       completedFileIds: [],
     });
     expect(await raw('root')).toMatchObject({ storageKey: acceptance('root').receipt.storageKey });
     expect((await raw('root'))!.deletionCompletedAt).toBeFalsy();
-    // Only exercises File finalization after a synthetic cleanup acknowledgement, not S3 deletion.
+    // Native storage replies are fixtures; actual File/Upload owners finalize child before parent.
+    await cleanup.finish('child');
+    expect(await raw('root')).toMatchObject({ storageKey: acceptance('root').receipt.storageKey });
+    expect((await raw('root'))!.deletionCompletedAt).toBeFalsy();
+    await cleanup.finish('root');
     expect(await lifecycle.finalizeFileSourceDeletion(owner, ['root', 'child'])).toEqual({
       completedFileIds: ['child', 'root'],
     });

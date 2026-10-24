@@ -51,7 +51,7 @@ describe('importConversations content filtering', () => {
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
-  it('awaits final unlink and logs its failure after a successful import', async () => {
+  it('awaits final unlink and reports its failure before a successful import settles', async () => {
     const { logger } = require('@librechat/data-schemas');
     const logged = jest.spyOn(logger, 'error').mockImplementation(() => {});
     getImporter.mockReturnValue(async () => {});
@@ -66,15 +66,23 @@ describe('importConversations content filtering', () => {
       });
     });
     let settled = false;
-    const result = importConversations({ filepath, requestUserId: 'user-123' }).then(() => {
+    const onCleanupFailure = jest.fn(() => expect(settled).toBe(false));
+    const result = importConversations({
+      filepath,
+      requestUserId: 'user-123',
+      onCleanupFailure,
+    }).then(() => {
       settled = true;
     });
     try {
       await entered;
       expect(settled).toBe(false);
+      expect(onCleanupFailure).not.toHaveBeenCalled();
       const error = new Error('unlink failed');
       reject(error);
       await expect(result).resolves.toBeUndefined();
+      expect(onCleanupFailure).toHaveBeenCalledTimes(1);
+      expect(onCleanupFailure).toHaveBeenCalledWith(error);
       expect(logged).toHaveBeenCalledWith(
         `user: user-123 | Failed to delete file: ${filepath}`,
         error,
@@ -82,6 +90,25 @@ describe('importConversations content filtering', () => {
     } finally {
       unlink.mockRestore();
       logged.mockRestore();
+    }
+  });
+
+  it('reports failed cleanup without replacing the original import error', async () => {
+    const importError = new Error('original import failed');
+    const cleanupError = new Error('final unlink failed');
+    getImporter.mockReturnValue(async () => {
+      throw importError;
+    });
+    const onCleanupFailure = jest.fn();
+    const unlink = jest.spyOn(fs, 'unlink').mockRejectedValueOnce(cleanupError);
+    try {
+      await expect(
+        importConversations({ filepath, requestUserId: 'user-123', onCleanupFailure }),
+      ).rejects.toBe(importError);
+      expect(onCleanupFailure).toHaveBeenCalledTimes(1);
+      expect(onCleanupFailure).toHaveBeenCalledWith(cleanupError);
+    } finally {
+      unlink.mockRestore();
     }
   });
 

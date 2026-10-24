@@ -134,6 +134,7 @@ function fixture(options = {}) {
     original: receipt,
   };
   const owner = {
+    runFileOperation: jest.fn((work) => work()),
     allowedOrigins: Object.freeze(['https://cortex.example']),
     principal: jest.fn(async () => user),
     management: {
@@ -1074,6 +1075,89 @@ describe('managed read admission regression', () => {
 
 /** Repository is an external port here. Its exactly-once transaction is covered by the File owner. */
 describe('finite managed read response boundary', () => {
+  it.each(['download', 'preview', 'downloadURL', 'list'])(
+    'requires File admission before the %s GET can reach a repository',
+    async (method) => {
+      const f = fixture();
+      f.owner.runFileOperation.mockRejectedValue(
+        Object.assign(new Error('paused'), {
+          code: 'admission_paused',
+        }),
+      );
+      await f.handlers[method](f.req, f.res);
+      expect(f.res.statusCode).toBe(503);
+      expect(f.owner.principal).not.toHaveBeenCalled();
+      expect(f.owner.management.list).not.toHaveBeenCalled();
+      expect(f.owner.fileReads.claimManagedFileRead).not.toHaveBeenCalled();
+      expect(f.owner.fileReads.admitManagedFileRead).not.toHaveBeenCalled();
+    },
+  );
+
+  it('holds a late claim after HTTP abort and abandons it before releasing the File operation', async () => {
+    const f = fixture();
+    const claim = f.owner.fileReads.claimManagedFileRead.getMockImplementation();
+    let release;
+    let entered;
+    let settled = false;
+    const began = new Promise((resolve) => {
+      entered = resolve;
+    });
+    f.owner.fileReads.claimManagedFileRead.mockImplementation(async (...args) => {
+      entered();
+      await new Promise((resolve) => {
+        release = resolve;
+      });
+      return claim(...args);
+    });
+    const pending = f.handlers.download(f.req, f.res).then(() => {
+      settled = true;
+    });
+    await began;
+    f.req.emit('aborted');
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+    expect(f.owner.fileReads.abandonManagedFileRead).not.toHaveBeenCalled();
+    release();
+    await pending;
+    expect(f.owner.fileReads.abandonManagedFileRead).toHaveBeenCalledWith(
+      user,
+      expect.objectContaining({ claimId: 'claim-a' }),
+      { reason: 'aborted' },
+    );
+    expect(f.owner.fileReads.completeManagedFileRead).not.toHaveBeenCalled();
+    expect(f.owner.runFileOperation).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps an aborted completion original held through the final Mongo/session effect', async () => {
+    const f = fixture();
+    let release;
+    let entered;
+    let settled = false;
+    const began = new Promise((resolve) => {
+      entered = resolve;
+    });
+    f.owner.fileReads.completeManagedFileRead.mockImplementation(async () => {
+      entered();
+      await new Promise((resolve) => {
+        release = resolve;
+      });
+      return { status: 'completed', firstCompletion: true };
+    });
+    const pending = f.handlers.download(f.req, f.res).then(() => {
+      settled = true;
+    });
+    await began;
+    f.req.emit('aborted');
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+    expect(f.res.chunks).toEqual([]);
+    release();
+    await pending;
+    expect(f.res.chunks).toEqual([]);
+    expect(f.owner.fileReads.completeManagedFileRead).toHaveBeenCalledTimes(1);
+    expect(f.owner.fileReads.abandonManagedFileRead).not.toHaveBeenCalled();
+  });
+
   it('withholds the final bytes until the File owner confirms full verified-body completion', async () => {
     const f = fixture();
     let release;

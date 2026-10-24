@@ -2,12 +2,11 @@ const {
   authAdmissionMiddleware,
   ownAuthHandler,
   authPersistence,
+  getBrowserAuth,
 } = require('~/server/services/LegacyAuthMaintenance');
 const express = require('express');
-const { getTenantId, tenantStorage, DEFAULT_SESSION_EXPIRY } = require('@librechat/data-schemas');
+const { tenantStorage } = require('@librechat/data-schemas');
 const {
-  createBrowserAuth,
-  math,
   limiterCache,
   createSetBalanceConfig,
   requireTwoFactorSetupToken,
@@ -56,7 +55,6 @@ const {
 const { logoutController } = require('~/server/controllers/auth/LogoutController');
 const { loginController } = require('~/server/controllers/auth/LoginController');
 const { findBalanceByUser, upsertBalanceFields } = require('~/models');
-const browserMethods = require('~/models');
 const { getAppConfig } = require('~/server/services/Config');
 const middleware = require('~/server/middleware');
 const emailCodeAuth = require('~/server/controllers/auth/emailCodeController');
@@ -104,15 +102,7 @@ router.post(
   middleware.checkBan,
   ownAuthHandler(emailCodeAuth.verifyCode),
 );
-const browserAuth = createBrowserAuth({
-  ...browserMethods,
-  getAppConfig: () => getAppConfig({ baseOnly: true }),
-  getTenantId,
-  origin: process.env.DOMAIN_CLIENT,
-  store: limiterCache('browser_enrollment_limiter', authPersistence),
-  mintToken: (user) =>
-    browserMethods.generateToken(user, math(process.env.SESSION_EXPIRY, DEFAULT_SESSION_EXPIRY)),
-});
+const browserAuth = getBrowserAuth();
 const twoFactorManagementLimiter = ownAuthHandler(
   createTwoFactorManagementLimiter({
     getAppConfig: () => getAppConfig({ baseOnly: true }),

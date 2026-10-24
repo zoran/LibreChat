@@ -77,6 +77,7 @@ async function main() {
       env: process.env,
       identity,
       workOwners: { scanner: service.maintenance },
+      fileDomainOwners: ['scanner'],
       startupReady: () => !closing,
     });
     await maintenance.listen();

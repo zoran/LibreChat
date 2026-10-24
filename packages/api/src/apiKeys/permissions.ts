@@ -1,11 +1,12 @@
 import { Types } from 'mongoose';
+import { SYSTEM_TENANT_ID, getTenantId, permissionBitSupersets } from '@librechat/data-schemas';
 import {
   ResourceType,
   PrincipalType,
   PermissionBits,
   AccessRoleIds,
 } from 'librechat-data-provider';
-import { SYSTEM_TENANT_ID, getTenantId, permissionBitSupersets } from '@librechat/data-schemas';
+import type { AuthContinuationObserver } from '@librechat/data-schemas';
 import type { PipelineStage, AnyBulkWriteOperation } from 'mongoose';
 
 export interface Principal {
@@ -126,14 +127,15 @@ export async function enrichRemoteAgentPrincipals(
   return { principals: enrichedPrincipals, entriesToBackfill };
 }
 
-/** Backfills REMOTE_AGENT ACL entries for AGENT owners (fire-and-forget) */
+/** The caller may detach its response, but retains this entire lookup/write original. */
 export function backfillRemoteAgentPermissions(
   deps: EnricherDependencies,
   resourceId: string | Types.ObjectId,
   entriesToBackfill: Types.ObjectId[],
-): void {
+  observer?: AuthContinuationObserver,
+): Promise<void> {
   if (entriesToBackfill.length === 0) {
-    return;
+    return Promise.resolve();
   }
 
   const { logger } = deps;
@@ -143,7 +145,7 @@ export function backfillRemoteAgentPermissions(
       ? Types.ObjectId.createFromHexString(resourceId)
       : resourceId;
 
-  deps
+  return deps
     .findRoleByIdentifier(AccessRoleIds.REMOTE_AGENT_OWNER)
     .then((role) => {
       if (!role) {
@@ -176,9 +178,12 @@ export function backfillRemoteAgentPermissions(
         },
       }));
 
-      return deps.bulkWriteAclEntries(bulkOps, { ordered: false });
+      const write = () => deps.bulkWriteAclEntries(bulkOps, { ordered: false });
+      return observer ? observer.write(write) : write();
     })
+    .then(() => undefined)
     .catch((err: unknown) => {
+      observer?.markUncertain();
       logger.error('[backfillRemoteAgentPermissions] Failed to backfill:', err);
     });
 }

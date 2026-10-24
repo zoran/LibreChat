@@ -9,6 +9,8 @@ import type {
 } from '@librechat/data-schemas';
 import type { RunFileProvenance, TFile } from 'librechat-data-provider';
 import type { CodeExecutionContext } from '~/agents/execution';
+import type { FileDeletionWorkScope } from '../deletion';
+import { fileDeletionWorkOwner } from '../deletion';
 
 export type CodeOutputStoredFile = CodeFileCommitData;
 
@@ -193,6 +195,8 @@ export interface RunArtifactDescriptor {
 }
 
 export interface ProcessPublishedCodeOutputInput {
+  /** Internal File owner inheritance; never supplied by the HTTP request. */
+  work?: FileDeletionWorkScope;
   id: string;
   name: string;
   session_id: string;
@@ -209,6 +213,8 @@ export interface ProcessPublishedCodeOutputInput {
 
 export interface CodeOutputResult {
   file: CodeOutputStoredFile | CodeOutputDownloadFallback | null;
+  /** Joins original File work, including preview, failure-marker and temp cleanup.
+   * Resolves null when there is no preview update to publish to the client. */
   finalize?: () => Promise<CodeOutputStoredFile | null>;
   previewRevision?: string;
 }
@@ -239,89 +245,108 @@ export function createRunArtifactPublisher({
   processCodeOutput: (input: ProcessPublishedCodeOutputInput) => Promise<CodeOutputResult | null>;
   prepare: (artifact: RunArtifactDescriptor, signal?: AbortSignal) => Promise<Buffer>;
   discard: CodeOutputPublication['discard'];
-  finalize: (result: PublishedCodeOutputResult) => void;
+  finalize: (result: PublishedCodeOutputResult) => Promise<unknown>;
 }): (input: PublishGeneratedRunArtifactInput) => Promise<RunArtifactFile> {
   return async ({ scope, provenance, artifact, signal }) => {
-    signal?.throwIfAborted();
-    if (
-      provenance.sourceFileId !== scope.sourceFileId ||
-      provenance.runId !== scope.runId ||
-      provenance.executionId !== scope.executionId ||
-      provenance.agentId !== scope.agentId ||
-      artifact.sessionId.trim().length === 0
-    ) {
-      throw new Error('The generated artifact does not match its publication identity');
-    }
-    const existing = await claimRunArtifactFile(scope);
-    signal?.throwIfAborted();
-    if (existing.file != null) {
-      return existing.file;
-    }
-    const preparedBuffer = await prepare(artifact, signal);
-    signal?.throwIfAborted();
-    const publicationResult: { file: RunArtifactFile | null } = { file: null };
-    const pendingObjects = new Map<string, TFile>();
-    const objectKey = (file: TFile): string =>
-      JSON.stringify([file.source, file.storageKey ?? file.filepath]);
-    try {
-      const result = await processCodeOutput({
-        id: artifact.id,
-        name: artifact.name,
-        session_id: artifact.sessionId,
-        conversationId: scope.conversationId,
-        messageId: scope.runId,
-        agentId: scope.agentId,
-        preparedBuffer,
-        codeApiBaseUrl: artifact.codeExecutionContext?.baseUrl,
-        executionProfile: artifact.codeExecutionContext?.executionProfile,
-        executionRouteKey: artifact.codeExecutionContext?.executionRouteKey,
-        bridgeWorkerId: artifact.codeExecutionContext?.bridgeWorkerId,
-        publication: {
-          scope,
-          provenance,
-          signal,
-          trackStored: (file) => pendingObjects.set(objectKey(file), file),
-          releaseStored: (file) => pendingObjects.delete(objectKey(file)),
-          publish: async (input) => {
-            signal?.throwIfAborted();
-            const file = await publishRunArtifactFile(input);
-            publicationResult.file = file;
-            pendingObjects.delete(objectKey(file));
-            return file;
-          },
-          find: async (identity) => {
-            const file = await findRunArtifactFile(identity);
-            publicationResult.file = file;
-            if (file != null) pendingObjects.delete(objectKey(file));
-            return file;
-          },
-          discard,
-        },
-      });
-      const file = result?.file;
-      if (
-        file == null ||
-        !('file_id' in file) ||
-        file.context !== FileContext.run_artifact ||
-        file.source === FileSources.execute_code
-      ) {
+    let failed = false;
+    let failure: unknown;
+    const result = await fileDeletionWorkOwner.run(async (work) => {
+      try {
         signal?.throwIfAborted();
-        throw new Error('The generated artifact could not be published to durable storage');
+        if (
+          provenance.sourceFileId !== scope.sourceFileId ||
+          provenance.runId !== scope.runId ||
+          provenance.executionId !== scope.executionId ||
+          provenance.agentId !== scope.agentId ||
+          artifact.sessionId.trim().length === 0
+        ) {
+          throw new Error('The generated artifact does not match its publication identity');
+        }
+        const existing = await claimRunArtifactFile(scope);
+        signal?.throwIfAborted();
+        if (existing.file != null) {
+          return existing.file;
+        }
+        const preparedBuffer = await prepare(artifact, signal);
+        signal?.throwIfAborted();
+        const publicationResult: { file: RunArtifactFile | null } = { file: null };
+        const pendingObjects = new Map<string, TFile>();
+        const objectKey = (file: TFile): string =>
+          JSON.stringify([file.source, file.storageKey ?? file.filepath]);
+        try {
+          const result = await processCodeOutput({
+            work,
+            id: artifact.id,
+            name: artifact.name,
+            session_id: artifact.sessionId,
+            conversationId: scope.conversationId,
+            messageId: scope.runId,
+            agentId: scope.agentId,
+            preparedBuffer,
+            codeApiBaseUrl: artifact.codeExecutionContext?.baseUrl,
+            executionProfile: artifact.codeExecutionContext?.executionProfile,
+            executionRouteKey: artifact.codeExecutionContext?.executionRouteKey,
+            bridgeWorkerId: artifact.codeExecutionContext?.bridgeWorkerId,
+            publication: {
+              scope,
+              provenance,
+              signal,
+              trackStored: (file) => pendingObjects.set(objectKey(file), file),
+              releaseStored: (file) => pendingObjects.delete(objectKey(file)),
+              publish: async (input) => {
+                signal?.throwIfAborted();
+                const file = await work.effect(() => publishRunArtifactFile(input));
+                publicationResult.file = file;
+                pendingObjects.delete(objectKey(file));
+                return file;
+              },
+              find: async (identity) => {
+                const file = await findRunArtifactFile(identity);
+                publicationResult.file = file;
+                if (file != null) pendingObjects.delete(objectKey(file));
+                return file;
+              },
+              discard: (file) => work.effect(() => discard(file)),
+            },
+          });
+          const file = result?.file;
+          if (
+            file == null ||
+            !('file_id' in file) ||
+            file.context !== FileContext.run_artifact ||
+            file.source === FileSources.execute_code
+          ) {
+            signal?.throwIfAborted();
+            throw new Error('The generated artifact could not be published to durable storage');
+          }
+          const published = publicationResult.file;
+          if (published == null || published.file_id !== file.file_id) {
+            throw new Error('The generated artifact publication could not be verified');
+          }
+          // Complete previews for a record that committed before cancellation; emitting
+          // the attachment still waits for the cancellation check below.
+          await finalize({ ...result, file });
+          signal?.throwIfAborted();
+          return published;
+        } finally {
+          // The legacy processor can fail after saving bytes but before it constructs
+          // its complete metadata. Its storage notifications make those failures owned
+          // by this attempt, while committed or uncertain objects were released above.
+          await Promise.allSettled(
+            [...pendingObjects.values()].map((file) => work.effect(() => discard(file))),
+          ).then((results) => {
+            const failure = results.find((result) => result.status === 'rejected');
+            if (failure?.status === 'rejected') throw failure.reason;
+          });
+        }
+      } catch (error) {
+        // Cancellation or validation after a known commit is a settled outcome.
+        // Actual rejected writes were observed by effect before any fallback.
+        failed = true;
+        failure = error;
       }
-      const published = publicationResult.file;
-      if (published == null || published.file_id !== file.file_id) {
-        throw new Error('The generated artifact publication could not be verified');
-      }
-      // Complete previews for a record that committed before cancellation; emitting
-      // the attachment still waits for the cancellation check below.
-      finalize({ ...result, file });
-      signal?.throwIfAborted();
-      return published;
-    } finally {
-      // The legacy processor can fail after saving bytes but before it constructs
-      // its complete metadata. Its storage notifications make those failures owned
-      // by this attempt, while committed or uncertain objects were released above.
-      await Promise.all([...pendingObjects.values()].map((file) => discard(file)));
-    }
+    });
+    if (failed) throw failure;
+    return result!;
   };
 }

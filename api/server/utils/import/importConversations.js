@@ -8,7 +8,7 @@ const maxFileSize = resolveImportMaxFileSize();
 
 /**
  * Job definition for importing a conversation.
- * @param {{ filepath: string, requestUserId: string, userRole?: string, interfaceConfig?: object, filters?: object, legacyPii?: object }} job
+ * @param {{ filepath: string, requestUserId: string, userRole?: string, interfaceConfig?: object, filters?: object, legacyPii?: object, onCleanupFailure?: (error: unknown) => void }} job
  */
 const importConversations = async (job) => {
   const { filepath, requestUserId, userRole, interfaceConfig, filters, legacyPii } = job;
@@ -45,6 +45,7 @@ const importConversations = async (job) => {
       await fs.unlink(filepath);
     } catch (error) {
       logger.error(`user: ${requestUserId} | Failed to delete file: ${filepath}`, error);
+      job.onCleanupFailure?.(error);
     }
   }
 };

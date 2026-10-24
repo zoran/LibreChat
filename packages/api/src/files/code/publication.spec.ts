@@ -8,6 +8,7 @@ import type {
   CodeOutputStoredFile,
 } from './publication';
 import { createCodeOutputPersistence, createRunArtifactPublisher } from './publication';
+import { createFileDeletionWorkOwner, fileDeletionWorkOwner } from '../deletion';
 
 const scope: RunArtifactScope = {
   userId: 'user-a',
@@ -257,6 +258,7 @@ describe('Code output publication gateway', () => {
 
 describe('Run artifact publisher', () => {
   const artifact = { id: scope.sourceFileId, name: 'report.csv', sessionId: 'child-sandbox' };
+  beforeEach(() => Object.assign(fileDeletionWorkOwner, createFileDeletionWorkOwner()));
 
   function dependencies() {
     return {
@@ -268,7 +270,7 @@ describe('Run artifact publisher', () => {
       })),
       prepare: jest.fn(async () => Buffer.from('a,b\n1,2')),
       discard: jest.fn(async () => undefined),
-      finalize: jest.fn(),
+      finalize: jest.fn(async (): Promise<void> => undefined),
     };
   }
 
@@ -283,10 +285,29 @@ describe('Run artifact publisher', () => {
     expect(deps.processCodeOutput).not.toHaveBeenCalled();
   });
 
-  it('reuses inspected bytes and starts preview finalization after durable verification', async () => {
+  it('reuses inspected bytes and retains preview settlement after durable verification', async () => {
     const deps = dependencies();
+    let finishPreview!: () => void;
+    deps.finalize.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          finishPreview = resolve;
+        }),
+    );
     const publish = createRunArtifactPublisher(deps);
-    expect(await publish({ scope, provenance, artifact })).toEqual(publishedFile());
+    let settled = false;
+    const publication = publish({ scope, provenance, artifact }).then((file) => {
+      settled = true;
+      return file;
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+    expect(await fileDeletionWorkOwner.maintenance.getMaintenanceCensus(null)).toMatchObject({
+      pendingWrites: 1,
+      complete: true,
+    });
+    finishPreview();
+    expect(await publication).toEqual(publishedFile());
     expect(deps.processCodeOutput).toHaveBeenCalledWith(
       expect.objectContaining({
         id: artifact.id,

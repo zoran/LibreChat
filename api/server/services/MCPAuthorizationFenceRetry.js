@@ -27,6 +27,12 @@ function getRetryService() {
 }
 
 module.exports = {
+  // Stable App port; construction registers shutdown without dispatching raw database work.
+  mcpAuthorizationFenceRetryMaintenance: {
+    pauseAdmissions: (...args) => getRetryService().maintenance.pauseAdmissions(...args),
+    resumeAdmissions: (...args) => getRetryService().maintenance.resumeAdmissions(...args),
+    getMaintenanceCensus: (...args) => getRetryService().maintenance.getMaintenanceCensus(...args),
+  },
   clearMCPAuthorizationFenceRetry: (...args) => getRetryService().clear(...args),
   drainMCPAuthorizationFenceRetries: (...args) => getRetryService().drain(...args),
   persistMCPAuthorizationFenceRetry: (...args) => getRetryService().persist(...args),

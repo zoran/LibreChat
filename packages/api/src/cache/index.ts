@@ -1,7 +1,12 @@
 export * from './cacheConfig';
 export * from './redisClients';
 export * from './keyvFiles';
-export { default as keyvMongo } from './keyvMongo';
+export {
+  default as keyvMongo,
+  mongoCacheMaintenance,
+  ownMongoCache,
+  runMongoDomainParser,
+} from './keyvMongo';
 export * from './cacheFactory';
 export * from './principals';
 export * from './redisUtils';

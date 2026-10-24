@@ -3,14 +3,296 @@
 import mongoose from 'mongoose';
 import { createHash, randomUUID } from 'node:crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import { canonicalStorageDeletionReceipt } from 'librechat-data-provider';
 import type {
   ManagedDocumentResult,
   UploadLease,
   UploadPrincipal,
   UploadCleanupProof,
 } from 'librechat-data-provider';
+import type { FileCleanupProgressResult } from '../types/fileCleanup';
+import type { IMongoFile } from '../types/file';
+import { createFileCleanupLifecycleMethods } from './fileCleanupLifecycle';
+import { createFileCleanupProgressMethods } from './fileCleanupProgress';
 import { createUploadManagementRepository } from './uploadManagement';
+import { managedFileRetrievalDeletionSettled } from './fileRetrieval';
+import { createUploadFileCleanupOwner } from './uploadFileCleanup';
+import { createHousekeepingStore } from './housekeepingStore';
+import { createFileRetentionMethods } from './fileRetention';
+import { createMessageMethods } from './message';
 import { createModels } from '~/models';
+
+/** Copy the File owner's frozen database rows before importing its accepted Upload rows. */
+export async function copyFrozenUploadFiles(
+  source: mongoose.Mongoose,
+  target: mongoose.Mongoose,
+): Promise<void> {
+  // Completed deletion tombstones intentionally lack live-file fields. Preserve every frozen
+  // field without applying new-File validation, defaults, timestamps or private-field projections.
+  // eslint-disable-next-line no-restricted-syntax -- Isolated frozen Mongo fixture must read every retained BSON field, including completed File tombstones.
+  const files = await source.models.File.collection.find({}).toArray();
+  if (files.length > 0) {
+    // eslint-disable-next-line no-restricted-syntax -- Isolated frozen Mongo fixture restores existing File rows without new-File validation, defaults or timestamps.
+    await target.models.File.collection.insertMany(files);
+  }
+}
+
+/** Local exit is separate from storage deletion and consumption; only storage is a protocol fixture. */
+export async function completeUnacceptedUploadCleanup(
+  repository: ReturnType<typeof createUploadManagementRepository>,
+  principal: UploadPrincipal,
+  lease: UploadLease,
+): Promise<void> {
+  const authority = {
+    operationId: lease.operationId,
+    generation: lease.generation,
+    attemptGeneration: lease.generation,
+    principal,
+  };
+  const prepared = await repository.prepareCleanupStorage(authority);
+  if (prepared.state !== 'binding') throw Error('Expected storage binding preparation');
+  const binding = {
+    ...prepared.request,
+    bucket: 'private-bucket',
+    key: `${principal.tenantId === null ? '' : `t/${principal.tenantId}/`}managed-uploads/${principal.userId}/${lease.operationId}.${lease.generation}__original`,
+  };
+  expect(await repository.prepareCleanupStorage(authority, binding)).toMatchObject({
+    state: 'observe',
+    binding,
+  });
+  const receipt = {
+    ...binding,
+    state: 'durable_delete_complete' as const,
+    obligationId: 'native-obligation',
+    aggregateRevision: '4',
+    proofSHA256: 'a'.repeat(64),
+  };
+  const committed = await repository.recordCleanupStorage(authority, { result: receipt });
+  if (committed.state !== 'consume') throw Error('Expected exact persisted consumer commit');
+  const receiptSHA256 = createHash('sha256')
+    .update(canonicalStorageDeletionReceipt(receipt))
+    .digest('hex');
+  expect(
+    await repository.recordCleanupStorage(authority, { consumption: { state: 'unknown' } }),
+  ).toEqual(committed);
+  expect(
+    await repository.recordCleanupStorage(authority, {
+      consumption: {
+        state: 'recorded',
+        obligationId: receipt.obligationId,
+        receiptSHA256,
+        consumerCommitId: committed.consumerCommitId,
+      },
+    }),
+  ).toEqual({ state: 'complete', receiptRef: receiptSHA256 });
+}
+
+/** Complete the actual File/HK/Upload join for an empty generation census and settled retrieval. */
+export async function completeAcceptedUploadFileCleanup(
+  db: mongoose.Mongoose,
+  principal: UploadPrincipal,
+  fileId: string,
+  checkpointUri?: string,
+): Promise<void> {
+  let ownsCheckpointConnection = false;
+  try {
+    if (db !== mongoose) {
+      if (!checkpointUri || mongoose.connection.readyState !== 0)
+        throw Error('Expected an unused checkpoint fixture connection');
+      const uri = new URL(checkpointUri);
+      if (
+        uri.protocol !== 'mongodb:' ||
+        uri.username ||
+        uri.password ||
+        uri.hostname !== '127.0.0.1' ||
+        uri.port !== String(db.connection.port) ||
+        uri.pathname !== `/${db.connection.name}` ||
+        db.connection.readyState !== 1
+      )
+        throw Error('Checkpoint connection must use the same local fixture database');
+      ownsCheckpointConnection = true;
+      await mongoose.connect(checkpointUri);
+      expect(mongoose.connection.name).toBe(db.connection.name);
+      expect(mongoose.connection.host).toBe(db.connection.host);
+      expect(mongoose.connection.port).toBe(db.connection.port);
+      createModels(mongoose);
+    }
+    const observed = (result: FileCleanupProgressResult) => {
+      if (result.state !== 'progress') throw Error(JSON.stringify(result));
+      return result;
+    };
+    const jobs = createHousekeepingStore(db);
+    await jobs.initialize();
+    const generation = createFileCleanupProgressMethods(db, jobs);
+    await generation.initialize();
+    const retention = createFileRetentionMethods(db);
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- Actual cross-package owner composition in the existing Mongo fixture.
+    const { InMemoryJobStore } = require('@librechat/api');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- Actual cross-package owner composition in the existing Mongo fixture.
+    const { createGenerationCleanupPort } = require('../../../api/src/stream/sourceCleanup');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- Actual checkpoint owner shares the default Mongoose connection.
+    const { purgeCheckpointRows } = require('../../../api/src/agents/checkpoints/source-retention');
+    // eslint-disable-next-line @typescript-eslint/no-require-imports -- Use the checkpoint owner's canonical namespace.
+    const { checkpointOwnerNamespacePrefix } = require('../../../api/src/stream/checkpoints');
+    const source = new InMemoryJobStore();
+    const unavailable = async () => {
+      throw Error('Unexpected nonempty generation transport');
+    };
+    const port = createGenerationCleanupPort({
+      store: source,
+      transport: {
+        emitAbortConfirmed: unavailable,
+        purgeSourceRetention: unavailable,
+        hasProviderDrain: unavailable,
+      },
+      close: () => source.destroy(),
+    });
+    const lifecycle = createFileCleanupLifecycleMethods(
+      db,
+      jobs,
+      createUploadFileCleanupOwner(db),
+      retention,
+      {
+        purgeRetrieval: async (owner, fileIds) => {
+          expect(fileIds).toEqual([fileId]);
+          const current = await db.models.File.findOne({
+            file_id: fileId,
+            tenantId: owner.tenantId,
+            user: owner.userId,
+          })
+            .select('+retrievalCreation +managedRetrieval')
+            .lean<IMongoFile>();
+          if (!current || !managedFileRetrievalDeletionSettled(current))
+            throw Error('Retrieval requires actual transport settlement before File cleanup');
+        },
+        purgeCheckpoints: async (owner, fileIds) =>
+          purgeCheckpointRows(
+            {
+              checkpointCollectionName: 'fixture_checkpoints',
+              checkpointWritesCollectionName: 'fixture_writes',
+            },
+            { lc_owner: checkpointOwnerNamespacePrefix(owner.userId, owner.tenantId ?? undefined) },
+            { sourceFileIds: fileIds },
+          ),
+        redactFileSourceContent: createMessageMethods(db).redactFileSourceContent,
+      },
+    );
+    const signal = new AbortController().signal;
+    try {
+      const claim = await jobs.claimNext('file.cleanup', {
+        podUid: 'fixture-pod',
+        incarnation: 'fixture-boot',
+        source: 'fixture-source',
+        hostId: 'fixture-host',
+      });
+      if (!claim) throw Error('Expected actual revoked File claim');
+      const session = await db.startSession();
+      try {
+        await session.withTransaction(() =>
+          jobs.advance(
+            claim,
+            { revision: claim.progressRevision, phase: 'awaiting_deadline' },
+            { phase: 'revoked', code: 'progress' },
+            session,
+          ),
+        );
+      } finally {
+        await session.endSession();
+      }
+      observed(await lifecycle.begin(claim, signal));
+      let step = observed(await generation.beginCapture(claim, signal));
+      const scope = {
+        userId: principal.userId,
+        tenantId: principal.tenantId ?? undefined,
+        revocationId: step.progress.revocationId,
+        sourceFileIds: [fileId],
+      };
+      let cursor: string | undefined;
+      // Even an empty tenant has separate scoped, legacy-owner and replay-intent pages.
+      for (let pageIndex = 0; pageIndex < 4; pageIndex++) {
+        const page = await port.capture(scope, cursor);
+        expect(page.targets).toEqual([]);
+        expect(page.reason).toBeUndefined();
+        step = observed(await generation.recordCapturePage(claim, step.expected, page, signal));
+        if (page.complete) break;
+        expect(page.cursor).toEqual(expect.any(String));
+        expect(page.cursor).not.toBe(cursor);
+        cursor = page.cursor;
+      }
+      expect(step.progress.capture.complete).toBe(true);
+      expect(step.progress.capture.recoveryUnresolved).toBe(false);
+      step = observed(await generation.finishGenerationStage(claim, step.expected, signal));
+      for (let i = 0; i < 4; i++) {
+        step = observed(await lifecycle.purgeDerivatives(claim, signal));
+        if (step.progress.lifecycle!.derivatives.messages === 'complete') break;
+      }
+      expect(step.progress.lifecycle!.derivatives).toMatchObject({
+        retrieval: 'complete',
+        checkpoints: 'complete',
+        messages: 'complete',
+      });
+      step = observed(await lifecycle.prepareStorage(claim, signal));
+      const prepared = step.progress.lifecycle!.storage!;
+      if (prepared.state !== 'binding') throw Error('Expected File storage request');
+      step = observed(
+        await lifecycle.bindStorage(
+          claim,
+          step.expected,
+          {
+            ...prepared.request,
+            bucket: 'originals',
+            key: step.progress.lifecycle!.upload.originalKey,
+          },
+          signal,
+        ),
+      );
+      const bound = step.progress.lifecycle!.storage!;
+      if (bound.state !== 'observing') throw Error('Expected bound File storage');
+      observed(
+        await lifecycle.recordStorage(
+          claim,
+          step.expected,
+          {
+            ...bound.binding,
+            state: 'durable_delete_complete',
+            obligationId: 'native-fixture',
+            aggregateRevision: '1',
+            proofSHA256: 'e'.repeat(64),
+          },
+          signal,
+        ),
+      );
+      step = observed(await lifecycle.commitConsumption(claim, signal));
+      const committed = step.progress.lifecycle!.storage!;
+      if (committed.state !== 'committed') throw Error('Expected accepted File consumer commit');
+      step = observed(
+        await lifecycle.recordConsumption(
+          claim,
+          step.expected,
+          {
+            state: 'recorded',
+            obligationId: committed.receipt.obligationId,
+            receiptSHA256: committed.receiptSHA256,
+            consumerCommitId: committed.consumerCommitId,
+          },
+          signal,
+        ),
+      );
+      expect(step.progress.lifecycle!.storage!.state).toBe('consumed');
+      observed(await lifecycle.finalize(claim, signal));
+      expect(
+        await lifecycle.observeCompletion(principal, [fileId], {
+          deadlineAt: Date.now() + 5000,
+          signal,
+        }),
+      ).toEqual([{ fileId, state: 'complete', completionRef: expect.any(String) }]);
+    } finally {
+      await port.close();
+    }
+  } finally {
+    if (ownsCheckpointConnection) await mongoose.connection.close();
+  }
+}
 
 interface UploadStructureFixture {
   db: mongoose.Mongoose;
@@ -72,7 +354,14 @@ export function useUploadStructureFixture(): UploadStructureFixture {
     await db.models.File.init();
   });
   beforeEach(async () => {
-    for (const name of ['User', 'File', 'Message', 'UploadOperation', 'UploadCounter'])
+    for (const name of [
+      'User',
+      'File',
+      'Message',
+      'UploadOperation',
+      'UploadCounter',
+      'HousekeepingJob',
+    ])
       if (db.models[name]) await db.models[name].deleteMany({});
     await db.models.User.create({
       _id: user.userId,

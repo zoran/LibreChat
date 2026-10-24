@@ -7,6 +7,7 @@ import {
 } from 'librechat-data-provider';
 import type {
   FileCoverageAction,
+  FileCoverageCatalog,
   FileCoverageRun,
   FileCoverageNativeBinding,
   FileCoverageSource,
@@ -171,10 +172,72 @@ export function createFileHousekeepingCoverageMethods(
     };
   }
   async function owner(session: ClientSession, end: number, signal: AbortSignal) {
-    const row = await counters.findOne({ _id: 'global' }, options(session, end, signal));
+    const row = await counters.findOne(
+      { _id: 'global' },
+      {
+        ...options(session, end, signal),
+        readPreference: 'primary',
+      },
+    );
     if (!row || !integer(row.revision) || !row.value || typeof row.value.storeId !== 'string')
       fail('unavailable');
     return row;
+  }
+  /** Actual primary catalog, bracketed with the same original read/session custody.
+   * Equal observations do not supply writer/controller or historical-operation exclusion. */
+  async function inspectCatalog(session: ClientSession, end: number, signal: AbortSignal) {
+    const db = mongoose.connection.db;
+    if (!db) fail('unavailable');
+    const readOptions = () => ({
+      ...options(session, end, signal),
+      readPreference: 'primary' as const,
+    });
+    const cursor = db.listCollections({ name: 'files' }, readOptions());
+    let collections: mongo.CollectionInfo[];
+    try {
+      collections = await cursor.toArray();
+    } finally {
+      await cursor.close();
+    }
+    const info = collections[0],
+      uuid = info?.info?.uuid;
+    if (
+      collections.length !== 1 ||
+      info.type !== 'collection' ||
+      Object.keys(info.options ?? {}).length !== 0 ||
+      uuid?._bsontype !== 'Binary' ||
+      uuid.sub_type !== 4 ||
+      uuid.buffer.byteLength !== 16
+    )
+      fail('unavailable');
+    const indexCursor = db.collection('files').listIndexes(readOptions());
+    let indexes: mongo.Document[];
+    try {
+      indexes = await indexCursor.toArray();
+    } finally {
+      await indexCursor.close();
+    }
+    if (indexes.length > 64) fail('capacity');
+    indexes.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    if (
+      indexes.some((index) => !id(index.name)) ||
+      new Set(indexes.map((index) => index.name)).size !== indexes.length
+    )
+      fail('unavailable');
+    const ttl = indexes.filter((index) =>
+      Object.prototype.hasOwnProperty.call(index, 'expireAfterSeconds'),
+    );
+    if (ttl.length > 16) fail('capacity');
+    const metadataDigest = (value: unknown) =>
+      digest(censusValue(JSON.parse(JSON.stringify(value))));
+    const catalog: FileCoverageCatalog = {
+      collectionUuid: uuid.toUUID().toHexString(),
+      fileTtlIndexes: ttl.map((index) => ({
+        name: index.name as string,
+        indexSha256: metadataDigest(index),
+      })),
+    };
+    return { catalog, metadataSha256: metadataDigest([collections, indexes]) };
   }
   function current(global: GlobalState, request: FileCoverageRun): FileCoverageMigrationState {
     const state = global.migration;
@@ -499,6 +562,75 @@ export function createFileHousekeepingCoverageMethods(
       runSha256 = digest(request);
     if (!same(request.native, hold.binding) || !same(request.source, hold.source))
       fail('native_changed');
+    if (input.action === 'prepare-ttl') {
+      // This observation runs inside the SAME executable native hold, before native DDL.
+      // Neither its counts nor its selector can discharge other original-work obligations.
+      const session = mongoose.connection.getClient().startSession();
+      try {
+        const row = await owner(session, end, signal);
+        if (row.value.storeId !== request.storeId) fail('store_changed');
+        if ((row.value.fileHousekeepingCoverage?.generation ?? 0) + 1 !== request.generation)
+          fail('generation_conflict');
+        if (row.value.migration || row.value.migrationEpoch) fail('migration_conflict');
+      } finally {
+        try {
+          await session.endSession();
+        } catch {
+          fail('unknown_commit');
+        }
+      }
+      const observation = await observeFileHousekeepingInventory(
+        mongoose,
+        {
+          action: 'inventory',
+          version: 1,
+          requestId: request.requestId,
+          source: request.source,
+          target: {
+            namespaceUid: request.native.namespaceUid,
+            mongoReplicaSet: request.native.mongoReplicaSet,
+            mongoDatabase: request.native.mongoDatabase,
+          },
+          originalDeadline: request.originalDeadline,
+          lookAheadMs: 0,
+        },
+        signal,
+        input,
+      );
+      if (observation.outcome !== 'inventoried') fail(observation.code);
+      await hold.assertCurrent(signal);
+      const { counts } = observation;
+      if (
+        counts.totalFiles !== counts.expiresAtAbsentOrNull ||
+        counts.expiresAtScalarDate !== 0 ||
+        counts.expiresAtArray !== 0 ||
+        counts.expiresAtOther !== 0
+      )
+        fail('unclassified');
+      if (
+        !observation.catalogStable ||
+        !observation.primaryStable ||
+        observation.ttl.semantics !== 'supported-scalar'
+      )
+        fail('unavailable');
+      return {
+        outcome: 'prepared',
+        storeId: request.storeId,
+        generation: request.generation,
+        runSha256,
+        collectionUuid: input.collectionUuid,
+        indexName: input.indexName,
+        indexSha256: input.indexSha256,
+        snapshot: observation.snapshot,
+        population: {
+          totalFiles: counts.totalFiles,
+          expiresAtAbsentOrNull: counts.expiresAtAbsentOrNull,
+          expiresAtScalarDate: counts.expiresAtScalarDate,
+          expiresAtArray: counts.expiresAtArray,
+          expiresAtOther: counts.expiresAtOther,
+        },
+      };
+    }
     if (input.action === 'begin')
       return transaction(end, signal, async (row) => {
         if (row.value.storeId !== request.storeId) fail('store_changed');
@@ -630,26 +762,49 @@ export function createFileHousekeepingCoverageMethods(
         if (!action(input) || Buffer.byteLength(canonicalManagedJson(input)) > 16384)
           fail('invalid_input');
         if (input.action === 'inspect') {
+          const end = performance.now() + BUDGET;
           const session = mongoose.connection.getClient().startSession();
+          let result: Extract<FileCoverageResult, { outcome: 'observed' }>;
           try {
-            const row = await owner(session, performance.now() + BUDGET, signal);
+            const row = await owner(session, end, signal);
             if (row.value.storeId !== input.storeId) fail('store_changed');
+            const first = await inspectCatalog(session, end, signal);
             const state = row.value.fileHousekeepingCoverage;
+            if (
+              state &&
+              (!integer(state.generation) ||
+                !['invalid', 'preparing', 'sealed'].includes(state.phase))
+            )
+              fail('unavailable');
             const receipt =
               state?.phase === 'sealed' &&
               state.generation === input.generation &&
               state.runSha256 === input.runSha256
                 ? readFileCoverageReceipt(state.receipt, input.storeId)
                 : null;
-            return {
+            if (
+              receipt &&
+              (receipt.generation !== input.generation || receipt.runSha256 !== input.runSha256)
+            )
+              fail('unavailable');
+            const last = await inspectCatalog(session, end, signal);
+            const current = await owner(session, end, signal);
+            if (current.value.storeId !== input.storeId) fail('store_changed');
+            if (!same(current.value.fileHousekeepingCoverage ?? null, state ?? null))
+              fail('generation_conflict');
+            if (first.metadataSha256 !== last.metadataSha256) fail('unavailable');
+            result = {
               outcome: 'observed',
               generation: state?.generation ?? null,
               phase: state?.phase ?? 'absent',
               receipt,
+              catalog: last.catalog,
             };
           } finally {
             await session.endSession();
           }
+          if (signal.aborted || performance.now() >= end) fail('deadline');
+          return result;
         }
         return await guarded(input, signal);
       } catch (error) {
@@ -669,10 +824,22 @@ export async function inspectFileHousekeepingInventory(
   request: FileInventoryRequest,
   signal: AbortSignal,
 ): Promise<FileInventoryResult> {
+  return observeFileHousekeepingInventory(mongoose, request, signal);
+}
+
+/** Shared raw observation; a preparation selector is supplied only by the guarded owner above. */
+async function observeFileHousekeepingInventory(
+  mongoose: Pick<Mongoose, 'connection'>,
+  request: FileInventoryRequest,
+  signal: AbortSignal,
+  selector?: Extract<FileCoverageAction, { action: 'prepare-ttl' }>,
+): Promise<FileInventoryResult> {
   if (!isFileInventoryRequest(request)) return { outcome: 'refused', code: 'invalid_input' };
   const remainingDeadline = Date.parse(request.originalDeadline) - Date.now();
   if (remainingDeadline <= 0 || signal.aborted) return { outcome: 'refused', code: 'deadline' };
-  if (remainingDeadline > 300_000) return { outcome: 'refused', code: 'invalid_input' };
+  // A preparation inherits A's original deadline; its local observation is still bounded by BUDGET.
+  if (!selector && remainingDeadline > 300_000)
+    return { outcome: 'refused', code: 'invalid_input' };
   const end = performance.now() + Math.min(BUDGET, remainingDeadline);
   let session: ClientSession | undefined;
   let result: FileInventoryResult = { outcome: 'refused', code: 'unavailable' };
@@ -714,7 +881,11 @@ export async function inspectFileHousekeepingInventory(
       try {
         collections = await cursor.toArray();
       } finally {
-        await cursor.close();
+        try {
+          await cursor.close();
+        } catch {
+          fail(selector ? 'unknown_commit' : 'unavailable');
+        }
       }
       if (collections.length > 1 || (collections[0] && collections[0].type !== 'collection'))
         fail('unavailable');
@@ -724,10 +895,36 @@ export async function inspectFileHousekeepingInventory(
         try {
           indexes = await cursor.toArray();
         } finally {
-          await cursor.close();
+          try {
+            await cursor.close();
+          } catch {
+            fail(selector ? 'unknown_commit' : 'unavailable');
+          }
         }
       }
       if (indexes.length > 64) fail('capacity');
+      if (selector) {
+        const info = collections[0];
+        const uuid = info?.info?.uuid;
+        if (
+          collections.length !== 1 ||
+          Object.keys(info.options ?? {}).length !== 0 ||
+          uuid?._bsontype !== 'Binary' ||
+          uuid.sub_type !== 4 ||
+          uuid.buffer.byteLength !== 16 ||
+          uuid.toUUID().toHexString() !== selector.collectionUuid
+        )
+          fail('unavailable');
+        const ttl = indexes.filter((index) =>
+          Object.prototype.hasOwnProperty.call(index, 'expireAfterSeconds'),
+        );
+        if (
+          ttl.length !== 1 ||
+          ttl[0].name !== selector.indexName ||
+          metadataDigest(ttl[0]) !== selector.indexSha256
+        )
+          fail('unavailable');
+      }
       indexes.sort((a, b) => String(a.name).localeCompare(String(b.name)));
       return {
         present: collections.length === 1,
@@ -858,7 +1055,11 @@ export async function inspectFileHousekeepingInventory(
     try {
       rows = await cursor.toArray();
     } finally {
-      await cursor.close();
+      try {
+        await cursor.close();
+      } catch {
+        fail(selector ? 'unknown_commit' : 'unavailable');
+      }
     }
     if (rows.length > 1) fail('unavailable');
     const row = rows[0] ?? Object.fromEntries(Object.keys(group).map((key) => [key, 0]));
@@ -915,6 +1116,8 @@ export async function inspectFileHousekeepingInventory(
       },
     };
   } catch (error) {
+    if (selector && (!(error instanceof CoverageError) || error.code === 'unknown_commit'))
+      fail('unknown_commit');
     const code =
       error instanceof CoverageError &&
       ['invalid_input', 'deadline', 'capacity'].includes(error.code)
@@ -926,6 +1129,7 @@ export async function inspectFileHousekeepingInventory(
     try {
       await session?.endSession();
     } catch {
+      if (selector) fail('unknown_commit');
       result = { outcome: 'refused', code: 'unavailable' };
     }
   }

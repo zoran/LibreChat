@@ -1,5 +1,6 @@
 import * as os from 'os';
 import * as path from 'path';
+import * as fs from 'fs/promises';
 import { logger } from '@librechat/data-schemas';
 import {
   extractCodeArtifactRawText,
@@ -10,7 +11,17 @@ import {
   MAX_TEXT_CACHE_BYTES,
   MAX_TEXT_EXTRACT_BYTES,
 } from './extract';
+import { createFileDeletionWorkOwner, fileDeletionWorkOwner } from '~/files/deletion';
 import { parseDocument } from '~/files/documents/crud';
+
+jest.mock('fs/promises', () => {
+  const actual = jest.requireActual<typeof import('fs/promises')>('fs/promises');
+  return {
+    ...actual,
+    writeFile: jest.fn(actual.writeFile),
+    unlink: jest.fn(actual.unlink),
+  };
+});
 
 jest.mock('@librechat/data-schemas', () => ({
   logger: {
@@ -735,6 +746,202 @@ describe('getExtractedTextFormat', () => {
     expect(getExtractedTextFormat('noext', 'application/octet-stream', 'whatever')).toBe('text');
     expect(getExtractedTextFormat('', '', 'whatever')).toBe('text');
   });
+});
+
+describe('extractCodeArtifactText File custody beyond preview timeouts', () => {
+  const html = '<!DOCTYPE html><html><body>preview</body></html>';
+  const parsed = {
+    text: docxText,
+    filename: 'held.pdf',
+    bytes: docxText.length,
+    filepath: 'document_parser',
+    images: [],
+  };
+
+  beforeEach(async () => {
+    // Settle earlier real temp-file cleanups before replacing only external IO.
+    await fileDeletionWorkOwner.drain();
+    Object.assign(fileDeletionWorkOwner, createFileDeletionWorkOwner());
+    jest.useFakeTimers();
+    jest.mocked(fs.writeFile).mockClear().mockResolvedValue(undefined);
+    jest.mocked(fs.unlink).mockClear().mockResolvedValue(undefined);
+    jest.mocked(parseDocument).mockClear();
+    mockOfficeHtml.mockReset().mockResolvedValue(html);
+  });
+
+  afterEach(async () => {
+    await fileDeletionWorkOwner.drain().catch(() => undefined);
+    Object.assign(fileDeletionWorkOwner, createFileDeletionWorkOwner());
+    const actual = jest.requireActual<typeof import('fs/promises')>('fs/promises');
+    jest.mocked(fs.writeFile).mockImplementation(actual.writeFile);
+    jest.mocked(fs.unlink).mockImplementation(actual.unlink);
+    jest.useRealTimers();
+  });
+
+  // Exercise the real extractor's inner timeout, actual File owner and cleanup
+  // ordering. Mocking the outer extractor would miss both orphaned originals.
+  it.each([false, true])(
+    'keeps a timed-out parser and later unlink in the same File hold (parser rejects: %s)',
+    async (parserRejects) => {
+      let finishParse!: (result: typeof parsed) => void;
+      let failParse!: (error: Error) => void;
+      const parser = new Promise<typeof parsed>((resolve, reject) => {
+        finishParse = resolve;
+        failParse = reject;
+      });
+      let finishUnlink!: () => void;
+      const unlink = new Promise<void>((resolve) => {
+        finishUnlink = resolve;
+      });
+      jest.mocked(parseDocument).mockReturnValueOnce(parser);
+      jest.mocked(fs.unlink).mockReturnValueOnce(unlink);
+      let observed!: Promise<string | null>;
+      const original = fileDeletionWorkOwner.run(async (work) => {
+        observed = extractCodeArtifactText(
+          Buffer.from('pdf'),
+          'held.pdf',
+          'application/pdf',
+          'document',
+          work,
+        );
+        return observed;
+      });
+      try {
+        await jest.advanceTimersByTimeAsync(0);
+        expect(parseDocument).toHaveBeenCalledTimes(1);
+        expect(fileDeletionWorkOwner.maintenance.pauseAdmissions('parser-hold')).toBe(true);
+        await jest.advanceTimersByTimeAsync(8_000);
+        await expect(observed).resolves.toBeNull();
+        expect(fs.unlink).not.toHaveBeenCalled();
+        await expect(
+          fileDeletionWorkOwner.maintenance.getMaintenanceCensus('parser-hold'),
+        ).resolves.toMatchObject({ admissionClosed: true, pendingWrites: 1, complete: true });
+        let drained = false;
+        const drain = fileDeletionWorkOwner.drain().then(() => {
+          drained = true;
+        });
+        if (parserRejects) failParse(new Error('known parser failure after timeout'));
+        else finishParse(parsed);
+        await jest.advanceTimersByTimeAsync(0);
+        expect(fs.unlink).toHaveBeenCalledWith(
+          jest.mocked(parseDocument).mock.calls[0][0].file.path,
+        );
+        expect(drained).toBe(false);
+        await expect(
+          fileDeletionWorkOwner.maintenance.getMaintenanceCensus('parser-hold'),
+        ).resolves.toMatchObject({ pendingWrites: 1, complete: true });
+        finishUnlink();
+        await original;
+        await drain;
+        expect(drained).toBe(true);
+        await expect(
+          fileDeletionWorkOwner.maintenance.getMaintenanceCensus('parser-hold'),
+        ).resolves.toMatchObject({ pendingWrites: 0, complete: true });
+      } finally {
+        finishParse(parsed);
+        finishUnlink();
+        await original;
+      }
+    },
+  );
+
+  it('holds timed-out render originals and FIFO slots while later previews remain queued', async () => {
+    let finishRender!: (value: string) => void;
+    let failRender!: (error: Error) => void;
+    mockOfficeHtml
+      .mockImplementationOnce(
+        () =>
+          new Promise<string>((resolve) => {
+            finishRender = resolve;
+          }),
+      )
+      .mockImplementationOnce(
+        () =>
+          new Promise<string>((_resolve, reject) => {
+            failRender = reject;
+          }),
+      );
+    const observed: Array<Promise<string | null>> = [];
+    const originals = Array.from({ length: 3 }, (_, index) =>
+      fileDeletionWorkOwner.run(async (work) => {
+        // A prior metadata write must not turn a settled optional renderer
+        // failure into uncertainty for all later File maintenance.
+        await work.effect(async () => undefined);
+        observed[index] = extractCodeArtifactText(
+          Buffer.from('PK'),
+          `held-${index}.docx`,
+          'application/zip',
+          'document',
+          work,
+        );
+        return observed[index];
+      }),
+    );
+    try {
+      await jest.advanceTimersByTimeAsync(0);
+      expect(mockOfficeHtml).toHaveBeenCalledTimes(2);
+      expect(fileDeletionWorkOwner.maintenance.pauseAdmissions('render-hold')).toBe(true);
+      await jest.advanceTimersByTimeAsync(12_000);
+      await expect(observed[0]).resolves.toBeNull();
+      await expect(observed[1]).resolves.toBeNull();
+      expect(mockOfficeHtml).toHaveBeenCalledTimes(2);
+      await expect(
+        fileDeletionWorkOwner.maintenance.getMaintenanceCensus('render-hold'),
+      ).resolves.toMatchObject({ admissionClosed: true, pendingWrites: 3, complete: true });
+      let drained = false;
+      const drain = fileDeletionWorkOwner.drain().then(() => {
+        drained = true;
+      });
+      expect(drained).toBe(false);
+      finishRender(html);
+      failRender(new Error('known renderer failure after timeout'));
+      await jest.advanceTimersByTimeAsync(0);
+      await expect(observed[2]).resolves.toBe(html);
+      await Promise.all(originals);
+      await drain;
+      expect(mockOfficeHtml).toHaveBeenCalledTimes(3);
+      expect(parseDocument).not.toHaveBeenCalled();
+      await expect(
+        fileDeletionWorkOwner.maintenance.getMaintenanceCensus('render-hold'),
+      ).resolves.toMatchObject({ pendingWrites: 0, complete: true });
+    } finally {
+      finishRender(html);
+      failRender(new Error('settled renderer failure'));
+      await Promise.all(originals);
+    }
+  });
+
+  it.each([
+    ['ENOENT', true],
+    ['EIO', false],
+  ] as const)(
+    'distinguishes confirmed missing temporary files from an ambiguous unlink failure: %s',
+    async (code, complete) => {
+      jest.mocked(parseDocument).mockResolvedValueOnce(parsed);
+      jest
+        .mocked(fs.unlink)
+        .mockRejectedValueOnce(Object.assign(new Error('unlink failed'), { code }));
+      const original = fileDeletionWorkOwner.run((work) =>
+        extractCodeArtifactText(
+          Buffer.from('pdf'),
+          'held.pdf',
+          'application/pdf',
+          'document',
+          work,
+        ),
+      );
+      await expect(original).resolves.toBe(docxText);
+      expect(fs.unlink).toHaveBeenCalledTimes(1);
+      await expect(
+        fileDeletionWorkOwner.maintenance.getMaintenanceCensus(null),
+      ).resolves.toMatchObject({ pendingWrites: 0, complete });
+      if (complete) await expect(fileDeletionWorkOwner.drain()).resolves.toBeUndefined();
+      else
+        await expect(fileDeletionWorkOwner.drain()).rejects.toThrow(
+          'FILE_DELETION_SETTLEMENT_UNCONFIRMED',
+        );
+    },
+  );
 });
 
 describe('extractCodeArtifactText office-html concurrency', () => {

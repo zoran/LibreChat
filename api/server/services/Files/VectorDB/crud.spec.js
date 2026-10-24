@@ -8,6 +8,15 @@ jest.mock('@librechat/data-schemas', () => ({
   runAsSystem: (fn) => fn(),
 }));
 jest.mock('@librechat/api', () => ({
+  // Keep the current File lifecycle real while simulating the external vector provider.
+  requiresLegacyVectorDeletion: jest.requireActual('../../../../../packages/api/src/files/deletion')
+    .requiresLegacyVectorDeletion,
+  requestManagedFileDeletion: jest.requireActual(
+    '../../../../../packages/api/src/files/managedDeletion',
+  ).requestManagedFileDeletion,
+  fileDeletionWorkOwner: jest
+    .requireActual('../../../../../packages/api/src/files/deletion')
+    .createFileDeletionWorkOwner(),
   ...jest.requireActual('../../../../../packages/api/src/utils/errors'),
   logAxiosError: jest.fn(
     jest.requireActual('../../../../../packages/api/src/utils/axios').logAxiosError,

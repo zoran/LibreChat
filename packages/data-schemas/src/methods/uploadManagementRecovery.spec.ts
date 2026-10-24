@@ -13,6 +13,7 @@ import type {
   UploadStorageReceipt,
 } from 'librechat-data-provider';
 import type { StoredUpload } from './uploadManagementStore';
+import { completeUnacceptedUploadCleanup } from './uploadManagement.structure.fixture';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createModels } from '~/models';
 
@@ -253,15 +254,17 @@ describe('bound technical Intake recovery using actual Mongo transactions', () =
         now,
       ),
     ).toMatchObject({ acknowledged: false });
-    expect(await row()).toMatchObject({ state: 'failed', stagingHeld: true, originalBytes: 0 });
+    expect(await row()).toMatchObject({ state: 'failed', stagingHeld: true, originalBytes: 8 });
     expect(await confirm(lease)).toMatchObject({ acknowledged: true });
     expect(await row()).toMatchObject({
       intake: { closed: true, cleanupAcknowledged: true, generation: lease.generation },
       writerStopped: true,
       stagingHeld: false,
-      originalBytes: 0,
-      cleanupPending: false,
+      originalBytes: 8,
+      cleanupPending: true,
     });
+    await completeUnacceptedUploadCleanup(first, user, lease);
+    expect(await row()).toMatchObject({ originalBytes: 0, cleanupPending: false });
     expect(await first.usage(user, now)).toMatchObject({
       reservedBytes: 0,
       usedBytes: 0,
@@ -430,10 +433,14 @@ describe('bound technical Intake recovery using actual Mongo transactions', () =
       await expect(accept(lease)).rejects.toMatchObject({ code: 'lease_lost' });
       expect(await row()).toMatchObject({
         state: 'failed',
-        originalBytes: outcome === 'durable' ? 8 : 0,
-        cleanupPending: outcome === 'durable',
+        originalBytes: 8,
+        cleanupPending: true,
         stagingHeld: false,
       });
+      if (outcome !== 'durable') {
+        await completeUnacceptedUploadCleanup(first, user, lease);
+        expect(await row()).toMatchObject({ originalBytes: 0, cleanupPending: false });
+      }
       expect(await b.models.File.countDocuments({})).toBe(0);
     },
   );

@@ -1,8 +1,9 @@
 import { logger } from '@librechat/data-schemas';
 import { AccessRoleIds, ResourceType, PrincipalType } from 'librechat-data-provider';
-import { ensureRequiredCollectionsExist } from '../db/utils';
 import type { AccessRoleMethods, IAgent } from '@librechat/data-schemas';
 import type { Model, Mongoose } from 'mongoose';
+import type { MigrationCheckObserver } from '../db/utils';
+import { ensureRequiredCollectionsExist } from '../db/utils';
 
 const GLOBAL_PROJECT_NAME = 'instance';
 
@@ -14,6 +15,8 @@ export interface MigrationCheckParams {
   mongoose: Mongoose;
   methods: MigrationCheckDbMethods;
   AgentModel: Model<IAgent>;
+  /** The actual startup owner observes originals before best-effort result normalization. */
+  observer?: MigrationCheckObserver;
 }
 
 interface AgentMigrationData {
@@ -38,19 +41,20 @@ export interface MigrationCheckResult {
 
 /**
  * Check if agents need to be migrated to the new permission system
- * This performs a dry-run check similar to the migration script
+ * Collection preparation precedes the permission census; startup retains its original effects.
  */
 export async function checkAgentPermissionsMigration({
   methods,
   mongoose,
   AgentModel,
+  observer,
 }: MigrationCheckParams): Promise<MigrationCheckResult> {
   logger.debug('Checking if agent permissions migration is needed');
 
   try {
     const db = mongoose.connection.db;
     if (db) {
-      await ensureRequiredCollectionsExist(db);
+      await ensureRequiredCollectionsExist(db, observer);
     }
 
     const ownerRole = await methods.findRoleByIdentifier(AccessRoleIds.AGENT_OWNER);
@@ -146,6 +150,7 @@ export async function checkAgentPermissionsMigration({
 
     return result;
   } catch (error) {
+    observer?.markUncertain(error);
     logger.error('Failed to check agent permissions migration', error);
     return {
       totalToMigrate: 0,

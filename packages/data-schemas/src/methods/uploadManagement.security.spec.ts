@@ -4,6 +4,7 @@ import { createHash } from 'crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import type { UploadLease, UploadPrincipal, UploadSecurityApproval } from 'librechat-data-provider';
 import type { StoredUpload } from './uploadManagementStore';
+import { completeAcceptedUploadFileCleanup } from './uploadManagement.structure.fixture';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createModels } from '~/models';
 
@@ -119,7 +120,14 @@ describe('durable upload security approval', () => {
   });
   beforeEach(async () => {
     for (const db of [a, replacement]) {
-      for (const name of ['User', 'File', 'Message', 'UploadOperation', 'UploadCounter'])
+      for (const name of [
+        'User',
+        'File',
+        'Message',
+        'UploadOperation',
+        'UploadCounter',
+        'HousekeepingJob',
+      ])
         if (db.models[name]) await db.models[name].deleteMany({});
       await db.models.User.create({
         _id: user.userId,
@@ -355,6 +363,13 @@ describe('durable upload security approval', () => {
       await changed.confirmCleanup(
         { ...localGone(lease), originalAbsent: true, textAndHistoryRemoved: true },
         now,
+      );
+      expect((await changed.usage(user, now)).retainedBytes).toBe(8);
+      await completeAcceptedUploadFileCleanup(
+        a,
+        user,
+        original.operationId,
+        mongo.getUri('security'),
       );
       expect(await changed.usage(user, now)).toMatchObject({
         usedBytes: 8,

@@ -2,6 +2,7 @@ import { Keyv } from 'keyv';
 import http from 'node:http';
 import express from 'express';
 import { EventEmitter } from 'node:events';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { createAuthMaintenance, observeAuthCacheWrite } from './maintenance';
 
 const deferred = () => {
@@ -273,3 +274,165 @@ test('a captured data continuation can retain the caller after response and repo
     complete: false,
   });
 });
+
+test('joins the callback and returned original before retiring auth custody', async () => {
+  const owner = createAuthMaintenance();
+  const original = deferred();
+  let complete!: () => void;
+  const work = owner.run(undefined, (operation) =>
+    operation.callback<void>((done) => {
+      complete = done;
+      return original.promise;
+    }),
+  );
+  complete();
+  owner.pauseAdmissions('callback-original');
+  await new Promise((resolve) => setImmediate(resolve));
+  try {
+    expect(await owner.getMaintenanceCensus('callback-original')).toMatchObject({
+      queuedContinuations: 1,
+      pendingWrites: 1,
+      complete: true,
+    });
+  } finally {
+    original.resolve();
+    await work;
+  }
+});
+
+test('stop joins callback delivery and accepted descendants after the returned promise settles', async () => {
+  const owner = createAuthMaintenance();
+  const requestContext = new AsyncLocalStorage<string>();
+  const returned = deferred();
+  const delivery = deferred();
+  const child = deferred();
+  let complete!: (error?: unknown, value?: string) => unknown;
+  let nested!: Promise<void>;
+  const receiver = {};
+  const callback = jest.fn(function (this: unknown, error, value) {
+    expect(this).toBe(receiver);
+    expect(error).toBeNull();
+    expect(value).toBe('result');
+    expect(requestContext.getStore()).toBe('tenant-request');
+    nested = owner.current()!.write(() => child.promise);
+    return delivery.promise;
+  });
+  const work = requestContext.run('tenant-request', () =>
+    owner.run(undefined, (operation) =>
+      operation.callback<string>(
+        (done) => {
+          complete = done;
+          return returned.promise;
+        },
+        { write: false, complete: callback },
+      ),
+    ),
+  );
+  returned.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  expect(owner.pauseAdmissions('stop-original')).toBe(true);
+  let settled = false;
+  const drain = owner.drain().then(() => {
+    settled = true;
+  });
+  const start = jest.fn();
+  await expect(owner.run(undefined, start)).rejects.toThrow('APP_QUIESCING');
+  expect(start).not.toHaveBeenCalled();
+  complete.call(receiver, null, 'result');
+  complete.call(receiver, new Error('duplicate'));
+  expect(callback).toHaveBeenCalledTimes(1);
+  delivery.resolve();
+  await work;
+  expect(settled).toBe(false);
+  expect(await owner.getMaintenanceCensus('stop-original')).toMatchObject({
+    pendingWrites: 1,
+    admissionClosed: true,
+  });
+  child.resolve();
+  await nested;
+  await drain;
+  expect(settled).toBe(true);
+  expect(owner.resumeAdmissions('stop-original')).toBe(false);
+});
+
+test.each([
+  { write: false, callbackFirst: false },
+  { write: false, callbackFirst: true },
+  { write: true, callbackFirst: false },
+  { write: true, callbackFirst: true },
+])(
+  'returned rejection retains the actual callback with write=$write callbackFirst=$callbackFirst',
+  async ({ write, callbackFirst }) => {
+    const owner = createAuthMaintenance();
+    const original = deferred();
+    const failure = new Error('original failed');
+    const delivered = jest.fn();
+    let complete!: () => unknown;
+    const work = owner.run(undefined, (operation) =>
+      operation.callback<void>(
+        (done) => {
+          complete = done;
+          return original.promise;
+        },
+        { write, complete: delivered },
+      ),
+    );
+    const outcome = work.catch((error) => error);
+    if (callbackFirst) complete();
+    owner.pauseAdmissions('failed-original');
+    original.reject(failure);
+    await new Promise((resolve) => setImmediate(resolve));
+    if (!callbackFirst) {
+      expect(delivered).not.toHaveBeenCalled();
+      expect(await owner.getMaintenanceCensus('failed-original')).toMatchObject({
+        queuedContinuations: 1,
+        pendingWrites: write ? 1 : 0,
+        complete: !write,
+      });
+    }
+    let drained = false;
+    const drain = owner.drain().then(
+      () => {
+        drained = true;
+      },
+      (error) => {
+        drained = true;
+        return error;
+      },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    if (!callbackFirst) expect(drained).toBe(false);
+    complete();
+    expect(await outcome).toBe(failure);
+    expect(delivered).toHaveBeenCalledTimes(1);
+    expect(delivered).toHaveBeenCalledWith();
+    expect(await owner.getMaintenanceCensus('failed-original')).toMatchObject({
+      queuedContinuations: 0,
+      pendingWrites: 0,
+      complete: !write,
+    });
+    if (write) expect((await drain).message).toBe('AUTH_SETTLEMENT_UNCONFIRMED');
+    else expect(await drain).toBeUndefined();
+  },
+);
+
+test.each(['throw', 'reject'])(
+  'callback delivery %s retains uncertainty after the original settles',
+  async (mode) => {
+    const owner = createAuthMaintenance();
+    const failure = new Error('delivery failed');
+    const work = owner.run(undefined, (operation) =>
+      operation.callback<void>((done) => done(), {
+        write: false,
+        complete() {
+          if (mode === 'throw') throw failure;
+          return Promise.reject(failure);
+        },
+      }),
+    );
+    await expect(work).rejects.toBe(failure);
+    owner.pauseAdmissions('delivery-failure');
+    expect((await owner.getMaintenanceCensus('delivery-failure')).complete).toBe(false);
+    await expect(owner.drain()).rejects.toThrow('AUTH_SETTLEMENT_UNCONFIRMED');
+  },
+);

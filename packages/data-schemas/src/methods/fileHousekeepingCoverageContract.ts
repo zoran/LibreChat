@@ -121,7 +121,11 @@ function population(v: unknown): v is FileCoveragePopulation {
   );
 }
 /** Structural/hash validation only; the producer's native authority is never reconstructed here. */
-export function readFileCoverageReceipt(v: unknown, storeId: string): FileCoverageReceipt | null {
+export function readFileCoverageReceipt(
+  v: unknown,
+  storeId: string,
+  expectedRun?: FileCoverageRun,
+): FileCoverageReceipt | null {
   try {
     if (
       !shape(v, [
@@ -162,6 +166,14 @@ export function readFileCoverageReceipt(v: unknown, storeId: string): FileCovera
         hash(v[k]),
       ) ||
       !instant(v.sealedAt)
+    )
+      return null;
+    if (
+      expectedRun &&
+      (v.generation !== expectedRun.generation ||
+        v.runSha256 !== digest(expectedRun) ||
+        !same(v.source, expectedRun.source) ||
+        !same(v.native, expectedRun.native))
     )
       return null;
     const { receiptSha256, ...body } = v;
@@ -205,6 +217,15 @@ function action(v: unknown): v is FileCoverageAction {
       ['source_changed', 'writer_admission', 'migration', 'restore', 'owner_conflict'].includes(
         a.reason,
       )
+    );
+  if (a.action === 'prepare-ttl')
+    return (
+      shape(a, ['action', 'run', 'collectionUuid', 'indexName', 'indexSha256']) &&
+      run(a.run) &&
+      typeof a.collectionUuid === 'string' &&
+      UUID.test(a.collectionUuid) &&
+      id(a.indexName) &&
+      hash(a.indexSha256)
     );
   if (!['begin', 'advance', 'verify-seal'].includes(a.action)) return false;
   return (

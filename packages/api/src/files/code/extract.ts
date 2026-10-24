@@ -3,9 +3,11 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import { randomUUID } from 'crypto';
 import { logger } from '@librechat/data-schemas';
+import type { FileDeletionWorkScope } from '~/files/deletion';
 import type { CodeArtifactCategory } from './classify';
 import { bufferToOfficeHtml, officeHtmlBucket } from '~/files/documents/html';
 import { createConcurrencyLimiter, withTimeout } from '~/utils/promise';
+import { fileDeletionWorkOwner } from '~/files/deletion';
 import { parseDocument } from '~/files/documents/crud';
 import { isBinaryBuffer } from '~/skills/binary';
 
@@ -183,38 +185,69 @@ const extractDocumentText = async (
   buffer: Buffer,
   name: string,
   mimeType: string,
+  work?: FileDeletionWorkScope,
 ): Promise<string | null> => {
   const canonicalMime = documentMimeFromExtension(name) ?? mimeType;
   const tempPath = path.join(os.tmpdir(), `code-artifact-${randomUUID()}`);
-  await fs.writeFile(tempPath, buffer);
-  try {
-    const result = await withTimeout(
-      parseDocument({
-        file: {
-          path: tempPath,
-          size: buffer.length,
-          mimetype: canonicalMime,
-          originalname: path.basename(name),
-        } as Express.Multer.File,
-      }),
-      DOCUMENT_PARSE_TIMEOUT_MS,
-      `parseDocument exceeded ${DOCUMENT_PARSE_TIMEOUT_MS}ms`,
-    );
-    if (!result?.text) {
-      return null;
+  let resolveText!: (text: string | null) => void;
+  let rejectText!: (error: unknown) => void;
+  const observed = new Promise<string | null>((resolve, reject) => {
+    resolveText = resolve;
+    rejectText = reject;
+  });
+  const original = fileDeletionWorkOwner.run(async (scope) => {
+    try {
+      await scope.effect(() => fs.writeFile(tempPath, buffer));
+      const parsed = fileDeletionWorkOwner.run(
+        () =>
+          parseDocument({
+            file: {
+              path: tempPath,
+              size: buffer.length,
+              mimetype: canonicalMime,
+              originalname: path.basename(name),
+            } as Express.Multer.File,
+          }),
+        scope,
+      );
+      // The timeout only bounds the preview observer. Keep the parser's original
+      // and its input file until parsing actually settles, even after timeout.
+      void withTimeout(
+        parsed,
+        DOCUMENT_PARSE_TIMEOUT_MS,
+        `parseDocument exceeded ${DOCUMENT_PARSE_TIMEOUT_MS}ms`,
+      ).then((result) => resolveText(result?.text || null), rejectText);
+      await parsed;
+    } catch (error) {
+      // A settled parser failure is an optional-preview failure. Only the actual
+      // file effects below mark uncertainty before the observer converts to null.
+      rejectText(error);
+    } finally {
+      try {
+        await scope.effect(async () => {
+          try {
+            await fs.unlink(tempPath);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+          }
+        });
+      } catch (error) {
+        logger.debug('[extractDocumentText] Temporary file cleanup failed');
+        rejectText(error);
+      }
     }
-    return result.text;
-  } finally {
-    fs.unlink(tempPath).catch(() => {});
-  }
+  }, work);
+  void original.catch(rejectText);
+  return observed;
 };
 
 const extractDocument = async (
   buffer: Buffer,
   name: string,
   mimeType: string,
+  work?: FileDeletionWorkScope,
 ): Promise<string | null> => {
-  const text = await extractDocumentText(buffer, name, mimeType);
+  const text = await extractDocumentText(buffer, name, mimeType, work);
   return text == null ? null : truncate(text);
 };
 
@@ -254,15 +287,37 @@ const renderOfficeHtml = async (
   buffer: Buffer,
   name: string,
   mimeType: string,
+  work?: FileDeletionWorkScope,
 ): Promise<string | null> => {
+  let resolveHtml!: (html: string | null) => void;
+  let rejectHtml!: (error: unknown) => void;
+  const observed = new Promise<string | null>((resolve, reject) => {
+    resolveHtml = resolve;
+    rejectHtml = reject;
+  });
+  const original = fileDeletionWorkOwner.run(async (scope) => {
+    try {
+      await officeHtmlLimit(async () => {
+        const rendered = fileDeletionWorkOwner.run(
+          () => bufferToOfficeHtml(buffer, name, mimeType),
+          scope,
+        );
+        void withTimeout(
+          rendered,
+          OFFICE_HTML_TIMEOUT_MS,
+          `bufferToOfficeHtml exceeded ${OFFICE_HTML_TIMEOUT_MS}ms`,
+        ).then(resolveHtml, rejectHtml);
+        // A timed-out observer does not release either File custody or the
+        // concurrency slot while the actual renderer is still running.
+        await rendered;
+      });
+    } catch (error) {
+      rejectHtml(error);
+    }
+  }, work);
+  void original.catch(rejectHtml);
   try {
-    const html = await officeHtmlLimit(() =>
-      withTimeout(
-        bufferToOfficeHtml(buffer, name, mimeType),
-        OFFICE_HTML_TIMEOUT_MS,
-        `bufferToOfficeHtml exceeded ${OFFICE_HTML_TIMEOUT_MS}ms`,
-      ),
-    );
+    const html = await observed;
     if (html == null) {
       return null;
     }
@@ -293,12 +348,16 @@ const renderOfficeHtml = async (
  * - utf8-text: decodes the buffer (with a binary safety net)
  * - document: dispatches to the existing PDF/ODT parser
  * - other: returns null (binary file, no inline preview)
+ *
+ * `work` inherits the calling File operation. Parser/render timeouts bound this
+ * observer only; File retains the actual originals and temporary-file cleanup.
  */
 export async function extractCodeArtifactText(
   buffer: Buffer,
   name: string,
   mimeType: string,
   category: CodeArtifactCategory,
+  work?: FileDeletionWorkScope,
 ): Promise<string | null> {
   if (buffer.length > MAX_TEXT_EXTRACT_BYTES) {
     return null;
@@ -325,7 +384,7 @@ export async function extractCodeArtifactText(
      * text gate keep the artifact off the panel and fall back to the
      * regular download UI, matching what PPTX already does. */
     if (hasOfficeHtmlPath(name, mimeType)) {
-      const html = await renderOfficeHtml(buffer, name, mimeType);
+      const html = await renderOfficeHtml(buffer, name, mimeType, work);
       return html;
     }
     if (category === 'other') {
@@ -339,7 +398,7 @@ export async function extractCodeArtifactText(
        * is routed to an HTML preview bucket on the client (PDF has no
        * client routing, ODT routes to PLAIN_TEXT which renders through
        * the markdown viewer with proper escaping). Plain text is safe. */
-      return await extractDocument(buffer, name, mimeType);
+      return await extractDocument(buffer, name, mimeType, work);
     }
     /* category === 'presentation' that didn't go through the office HTML path
      * (shouldn't happen — presentation extensions use the office HTML path — but
@@ -371,6 +430,7 @@ export async function extractCodeArtifactInspectionText(
   name: string,
   mimeType: string,
   category: CodeArtifactCategory,
+  work?: FileDeletionWorkScope,
 ): Promise<CodeArtifactInspectionText> {
   const incomplete = (text: string | null = null): CodeArtifactInspectionText => ({
     text,
@@ -398,12 +458,12 @@ export async function extractCodeArtifactInspectionText(
       }
       if (category === 'document') {
         try {
-          return bounded(await extractDocumentText(buffer, name, mimeType));
+          return bounded(await extractDocumentText(buffer, name, mimeType, work));
         } catch {
           // Compatibility mode can still inspect the available preview below.
         }
       }
-      return incomplete(await renderOfficeHtml(buffer, name, mimeType));
+      return incomplete(await renderOfficeHtml(buffer, name, mimeType, work));
     }
     if (category === 'utf8-text') {
       return bounded(extractCodeArtifactRawText(buffer, category));
@@ -412,7 +472,7 @@ export async function extractCodeArtifactInspectionText(
       return incomplete();
     }
 
-    return bounded(await extractDocumentText(buffer, name, mimeType));
+    return bounded(await extractDocumentText(buffer, name, mimeType, work));
   } catch {
     logger.debug('[extractCodeArtifactInspectionText] Artifact inspection failed');
     return incomplete();

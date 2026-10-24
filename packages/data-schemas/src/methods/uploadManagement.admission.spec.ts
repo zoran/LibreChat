@@ -519,8 +519,44 @@ describe('durable upload admission pause', () => {
     const seal = await first.completeExport('current-security-cutover');
     const input = { receipt: seal, baseline, lifecycleReconciled: true as const };
     await target.completeImport(input);
+    await expect(target.completeImport(input)).resolves.toBeUndefined();
+    const execution = {
+      version: 2,
+      custody: { kind: 'none' },
+      attemptId: 'current-fixture.1',
+      instanceId: '11111111-1111-4111-8111-111111111111',
+      executionId: '22222222-2222-4222-8222-222222222222',
+      expiresAt: '2099-01-01T00:00:00.000Z',
+    };
+    const settlement = { execution, writerStopped: true, transientDataRemoved: true };
+    const currentRecord = {
+      _id: 'current-fixture',
+      tenantId: user.tenantId,
+      userId: user.userId,
+      idempotencyKey: fixtureKey('current-fixture'),
+      mediaType: 'text/plain',
+      attemptGeneration: 1,
+      securityExecution: execution,
+      securitySettlement: settlement,
+    };
+    const current = replacement.connection.db!.collection<typeof currentRecord>(
+      replacement.models.UploadOperation.collection.name,
+    );
+    await current.insertOne(currentRecord);
+    await expect(target.completeImport(input)).resolves.toBeUndefined();
+    await current.updateOne({ _id: 'current-fixture' }, { $unset: { securitySettlement: 1 } });
+    await expect(target.completeImport(input)).rejects.toMatchObject({ code: 'not_ready' });
+    expect(await current.countDocuments({ _id: 'current-fixture' })).toBe(1);
+    await current.updateOne(
+      { _id: 'current-fixture' },
+      { $set: { securitySettlement: settlement } },
+    );
+    await expect(target.completeImport(input)).resolves.toBeUndefined();
     const legacy = {
       _id: 'legacy-fixture',
+      tenantId: user.tenantId,
+      userId: user.userId,
+      idempotencyKey: fixtureKey('legacy-fixture'),
       mediaType: 'text/plain',
       attemptGeneration: 1,
       securityExecution: {

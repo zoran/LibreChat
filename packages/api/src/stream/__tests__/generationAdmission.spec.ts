@@ -5,14 +5,23 @@ import type { GenerationCheckpointBinding } from '@librechat/data-schemas';
 import type { CreateGenerationJobOptions } from '../GenerationJobManager';
 import type { SerializableJobData } from '../interfaces/IJobStore';
 import { buildPendingAction, buildToolApprovalPayload } from '~/agents/hitl/policy';
+import { InMemoryEventTransport } from '../implementations/InMemoryEventTransport';
 import { RedisEventTransport } from '../implementations/RedisEventTransport';
+import { InMemoryJobStore } from '../implementations/InMemoryJobStore';
 import { GenerationJobManagerClass } from '../GenerationJobManager';
 import { generationRequestBinding } from '../generationAdmission';
 import { createCheckpointNamespace } from '../checkpoints';
 
 describe('generation owner durable integration', () => {
   let mongo: MongoMemoryReplSet;
-  const managers: GenerationJobManagerClass[] = [];
+  const managers: Array<{
+    manager: GenerationJobManagerClass;
+    store: InMemoryJobStore;
+    transport: InMemoryEventTransport;
+    held: boolean;
+    originals: Promise<void>[];
+    releases: Array<() => void>;
+  }> = [];
   let methods: ReturnType<typeof createGenerationAdmissionMethods>;
   beforeAll(async () => {
     mongo = await MongoMemoryReplSet.create({
@@ -24,29 +33,130 @@ describe('generation owner durable integration', () => {
     await methods.ensureGenerationAdmissionIndexes();
   }, 30_000);
   afterAll(async () => {
-    await mongoose.disconnect();
-    await mongo?.stop();
+    const disconnected = await Promise.allSettled([mongoose.disconnect()]);
+    const stopped = await Promise.allSettled([mongo?.stop()]);
+    const failures = [...disconnected, ...stopped].filter(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    if (failures.length)
+      throw Object.assign(new Error(failures.map((result) => String(result.reason)).join('\n')), {
+        errors: failures.map((result) => result.reason),
+      });
   });
   beforeEach(async () => {
     await mongoose.models.GenerationAdmission.deleteMany({});
   });
   afterEach(async () => {
-    await mongoose.connection
-      .db!.admin()
-      .command({ configureFailPoint: 'failCommand', mode: 'off' });
-    for (const manager of managers.splice(0)) await manager.destroy();
+    const failures: unknown[] = [];
+    const reset = await Promise.allSettled([
+      mongoose.connection.db!.admin().command({ configureFailPoint: 'failCommand', mode: 'off' }),
+    ]);
+    for (const result of reset) if (result.status === 'rejected') failures.push(result.reason);
+    jest.restoreAllMocks();
+    const fixtures = managers.splice(0);
+    for (const fixture of fixtures) for (const release of fixture.releases) release();
+    const results = await Promise.allSettled(
+      fixtures.map(async (fixture) => {
+        const { manager: m, store, transport } = fixture;
+        await Promise.all(fixture.originals);
+        // These are exact effect/settlement originals, not the deliberately retained
+        // provider tracker promise of an unknown test outcome.
+        await Promise.allSettled(
+          [...m['openProviderExecutions'].values()].flatMap((entry) =>
+            [entry.drain, entry.settlement].filter((original) => original !== undefined),
+          ),
+        );
+        async function assertCustodyAndDestroy(): Promise<void> {
+          const custody = m['durableAdmission'].getLocalCustody();
+          expect(custody.pending).toBe(0);
+          if (fixture.held) {
+            expect(custody.unresolved).toBeGreaterThan(0);
+            expect((await m.getGenerationAdmissionCensus()).pendingWrites).toBe(0);
+            // Physical fixture disposal below does not settle this durable obligation.
+          } else {
+            expect(custody.unresolved).toBe(0);
+            expect((await m.getGenerationAdmissionCensus()).providerExecutions).toBe(0);
+            await m.destroy({ settlementBudgetMs: 1_000 });
+          }
+        }
+        const outcome = await Promise.allSettled([assertCustodyAndDestroy()]);
+        // Stop local timers/subscriptions and close the captured resources even if
+        // an assertion failed. Never clear held state or replay an ambiguous write.
+        // An expired observer never authorizes disposal of the retained shutdown original.
+        const shutdown = await Promise.allSettled([m['shutdownSettlement']]);
+        const prepare = await Promise.allSettled([
+          Promise.resolve().then(() => m.prepareForShutdown()),
+        ]);
+        const subscribers = await Promise.allSettled([m['drainSubscriberCleanups']()]);
+        const resources = await Promise.allSettled([
+          store.destroy(),
+          Promise.resolve().then(() => transport.destroy()),
+        ]);
+        const rejected = [...outcome, ...shutdown, ...prepare, ...subscribers, ...resources].filter(
+          (result): result is PromiseRejectedResult => result.status === 'rejected',
+        );
+        if (rejected.length)
+          throw Object.assign(
+            new Error(rejected.map((result) => String(result.reason)).join('\n')),
+            { errors: rejected.map((result) => result.reason) },
+          );
+      }),
+    );
+    for (const result of results) if (result.status === 'rejected') failures.push(result.reason);
+    if (failures.length)
+      throw Object.assign(
+        new Error('Generation fixture disposal failed:\n' + failures.map(String).join('\n')),
+        { errors: failures },
+      );
   });
-  function manager(instance = 'pod', ownerMethods = methods) {
-    const m = new GenerationJobManagerClass({ cleanupOnComplete: false });
+  function manager(instance = 'pod', ownerMethods = methods, required = true) {
+    const store = new InMemoryJobStore({ ttlAfterComplete: 0, maxJobs: 1000 });
+    const transport = new InMemoryEventTransport();
+    const m = new GenerationJobManagerClass({
+      jobStore: store,
+      eventTransport: transport,
+      cleanupOnComplete: false,
+    });
     m.configureGenerationAdmission({
-      required: true,
+      required,
       methods: ownerMethods,
       ownerInstanceId: instance,
       processBootId: 'boot',
-      externalCensus: async () => ({ queuedContinuations: 0, pendingWrites: 0, complete: true }),
     });
-    managers.push(m);
+    managers.push({ manager: m, store, transport, held: false, originals: [], releases: [] });
     return m;
+  }
+  function retain<T>(
+    m: GenerationJobManagerClass,
+    original: Promise<T>,
+    release: () => void,
+  ): Promise<T> {
+    const fixture = managers.find((entry) => entry.manager === m)!;
+    fixture.releases.push(release);
+    fixture.originals.push(
+      original.then(
+        () => undefined,
+        () => undefined,
+      ),
+    );
+    return original;
+  }
+  function preserveHeld(m: GenerationJobManagerClass): void {
+    expect(m['durableAdmission'].getLocalCustody().unresolved).toBeGreaterThan(0);
+    managers.find((entry) => entry.manager === m)!.held = true;
+  }
+  async function finish(
+    m: GenerationJobManagerClass,
+    job: Awaited<ReturnType<GenerationJobManagerClass['createJob']>>,
+  ): Promise<void> {
+    expect(await m.completeJob(job.streamId, undefined, job.createdAt)).toBe(true);
+    expect(
+      await m.settleGenerationExecution(
+        job.streamId,
+        job.createdAt,
+        job.metadata.providerExecutionId!,
+      ),
+    ).toBe(true);
   }
   const options = () => ({
     generationAdmission: generationRequestBinding('request', { text: 'hello' }),
@@ -129,6 +239,7 @@ describe('generation owner durable integration', () => {
       generationEpoch: job.createdAt,
       segmentId: job.metadata.providerExecutionId,
     });
+    await finish(m, job);
   });
 
   it.each(['begin', 'complete', 'source'] as const)(
@@ -189,6 +300,7 @@ describe('generation owner durable integration', () => {
         m.releaseGeneration('principal', 'request', 'conversation', claim.existing!),
       ).rejects.toThrow();
       expect(await m.getJobStore().getJob('conversation')).toBeNull();
+      preserveHeld(m);
     },
   );
 
@@ -236,6 +348,7 @@ describe('generation owner durable integration', () => {
       state: 'dispatching',
       active: true,
     });
+    await finish(m, job);
   });
 
   it('captures continuation, request and tenant before the replay check yields', async () => {
@@ -260,7 +373,11 @@ describe('generation owner durable integration', () => {
       await barrier;
       return get(query);
     });
-    const creating = m.createJob('conversation', 'principal', 'conversation', input);
+    const creating = retain(
+      m,
+      m.createJob('conversation', 'principal', 'conversation', input),
+      release,
+    );
     await checking;
     Object.assign(input.checkpointContinuation!, {
       runId: 'changed',
@@ -293,6 +410,7 @@ describe('generation owner durable integration', () => {
         job.metadata.providerExecutionId!,
       ),
     ).toBe(true);
+    await finish(m, job);
   });
 
   it.each(['option', 'binding', 'request'] as const)(
@@ -393,6 +511,7 @@ describe('generation owner durable integration', () => {
         job.metadata.providerExecutionId!,
       ),
     ).toBe(true);
+    await finish(m, job);
   });
 
   it.each([
@@ -500,6 +619,7 @@ describe('generation owner durable integration', () => {
       state: 'admitted',
       active: true,
     });
+    preserveHeld(m);
   });
   it('never invokes a second provider when Redis job and claim projections are lost', async () => {
     const first = manager();
@@ -520,6 +640,7 @@ describe('generation owner durable integration', () => {
     ).rejects.toThrow('held');
     expect(provider).toHaveBeenCalledTimes(1);
     expect((await first.getGenerationAdmissionCensus()).unresolved).toBe(1);
+    await finish(first, job);
   });
   it('holds uncertain committed dispatch without invoking a provider or reporting drained', async () => {
     const m = manager();
@@ -547,6 +668,7 @@ describe('generation owner durable integration', () => {
       ),
     ).toBe(false);
     expect((await m.getGenerationAdmissionCensus()).unresolved).toBeGreaterThan(0);
+    preserveHeld(m);
   });
   it.each([
     ['complete', 'completed'],
@@ -608,6 +730,7 @@ describe('generation owner durable integration', () => {
       active: true,
     });
     expect((await m.getGenerationAdmissionCensus()).unresolved).toBe(1);
+    preserveHeld(m);
   });
   it.each(['terminalPersistencePending', 'terminalHostActionPending'] as const)(
     'holds a terminal error while %s remains unresolved',
@@ -644,12 +767,12 @@ describe('generation owner durable integration', () => {
       active: true,
     });
     expect((await m.getGenerationAdmissionCensus()).unresolved).toBe(1);
+    preserveHeld(m);
   });
   it.each(['running', 'complete', 'error', 'aborted'] as const)(
     'preserves ordinary %s execution drain when durable admission is disabled',
     async (status) => {
-      const m = new GenerationJobManagerClass({ cleanupOnComplete: false });
-      managers.push(m);
+      const m = manager('pod', methods, false);
       const job = await m.createJob('conversation', 'principal', 'conversation');
       const segment = job.metadata.providerExecutionId!;
       expect(await m.beginProviderExecution(job.streamId, job.createdAt, segment)).toBe(true);
@@ -681,11 +804,12 @@ describe('generation owner durable integration', () => {
     const late = new Promise<void>((resolve) => {
       finish = resolve;
     });
-    const settlement = m.settleGenerationExecution(
-      job.streamId,
-      job.createdAt,
-      job.metadata.providerExecutionId!,
-      [late],
+    const settlement = retain(
+      m,
+      m.settleGenerationExecution(job.streamId, job.createdAt, job.metadata.providerExecutionId!, [
+        late,
+      ]),
+      finish,
     );
     m.closeGenerationAdmission('maintenance');
     expect((await m.getGenerationAdmissionCensus()).unresolved).toBe(1);
@@ -715,6 +839,7 @@ describe('generation owner durable integration', () => {
     ).toBe(false);
     m.abandonProviderExecution(job.streamId, job.createdAt, job.metadata.providerExecutionId!);
     expect((await m.getGenerationAdmissionCensus()).unresolved).toBe(1);
+    preserveHeld(m);
   });
   it('retains rejected original writes even when the caller logs and resolves them', async () => {
     const m = manager();
@@ -735,6 +860,7 @@ describe('generation owner durable integration', () => {
       false,
     );
     expect((await m.getGenerationAdmissionCensus()).unresolved).toBe(1);
+    preserveHeld(m);
   });
   it('releases exact never-dispatched admission and fences new initialization synchronously', async () => {
     const m = manager();
@@ -754,7 +880,7 @@ describe('generation owner durable integration', () => {
     await expect(m.createJob('other', 'principal', 'other', options())).rejects.toThrow('held');
     expect((await m.getGenerationAdmissionCensus()).unresolved).toBe(0);
   });
-  it('selected mode refuses missing ports and cannot invent external queue coverage', async () => {
+  it('selected mode refuses missing durable generation ports', async () => {
     const m = manager();
     m.configureGenerationAdmission({
       required: true,
@@ -780,7 +906,11 @@ describe('generation owner durable integration', () => {
         await barrier;
         return acquire(input);
       });
-    const creating = m.createJob('conversation', 'principal', 'conversation', options());
+    const creating = retain(
+      m,
+      m.createJob('conversation', 'principal', 'conversation', options()),
+      release,
+    );
     while (!spy.mock.calls.length) await new Promise((resolve) => setImmediate(resolve));
     m.closeGenerationAdmission('maintenance');
     expect((await m.getGenerationAdmissionCensus()).initializing).toBe(1);
@@ -924,8 +1054,8 @@ describe('generation owner durable integration', () => {
   });
 });
 
-describe('external work census composition', () => {
-  it('forwards the actual application callback through startup and counts it once', async () => {
+describe('generation and application work census composition', () => {
+  it('samples independent generation and declared File work once without an App callback cycle', async () => {
     const { createAppMaintenance, initializeMaintenanceGeneration } = await import(
       '../../app/maintenance'
     );
@@ -943,6 +1073,12 @@ describe('external work census composition', () => {
     let queued = 2;
     let writes = 3;
     let generationWrites = 5;
+    const sampleOwner = jest.fn(async () => ({
+      admissionClosed: closed,
+      queuedContinuations: queued,
+      pendingWrites: writes,
+      complete,
+    }));
     const app = createAppMaintenance({
       env: {},
       requiredSharedState: false,
@@ -959,14 +1095,10 @@ describe('external work census composition', () => {
             closed = false;
             return true;
           },
-          getMaintenanceCensus: async () => ({
-            admissionClosed: closed,
-            queuedContinuations: queued,
-            pendingWrites: writes,
-            complete,
-          }),
+          getMaintenanceCensus: sampleOwner,
         },
       },
+      fileDomainOwners: ['actualOwner'],
       unqualifiedOwners: [],
       generation: {
         closeGenerationAdmission: (id) => coordinator.close(id),
@@ -984,7 +1116,6 @@ describe('external work census composition', () => {
       required: true,
       methods,
       identity: app.identity,
-      externalCensus: app.externalCensus,
       configure: (config) => coordinator.configure(config),
     });
     expect(ensure).toHaveBeenCalledTimes(1);
@@ -997,12 +1128,22 @@ describe('external work census composition', () => {
       known: true,
       phase: 'quiescing',
       census: { queuedContinuations: 2, pendingWrites: 8 },
+      fileDomain: { known: true, census: { queuedContinuations: 2, pendingWrites: 8 } },
     });
+    expect(sampleOwner).toHaveBeenCalledTimes(1);
     queued = 0;
     writes = 0;
     generationWrites = 0;
     expect(await app.status()).toMatchObject({ known: true, phase: 'drained' });
     complete = false;
-    expect((await app.status()).known).toBe(false);
+    expect(await app.status()).toMatchObject({
+      known: false,
+      fileDomain: { known: false, census: null },
+    });
+    const beforeGenerationOnly = sampleOwner.mock.calls.length;
+    expect(
+      await coordinator.census({ providerExecutions: 0, pendingWrites: 2, activeStreams: 0 }),
+    ).toMatchObject({ complete: true, queuedContinuations: 0, pendingWrites: 2 });
+    expect(sampleOwner).toHaveBeenCalledTimes(beforeGenerationOnly);
   });
 });

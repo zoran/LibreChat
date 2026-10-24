@@ -22,6 +22,7 @@ import {
   inspectFileHousekeepingInventory,
 } from './fileHousekeepingCoverage';
 import { createFileHousekeepingDiscoveryMethods } from './fileHousekeepingDiscovery';
+import { fileCoverageDigest } from './fileHousekeepingCoverageContract';
 import { initialFileRetentionActivity } from './fileActivityTransition';
 import { projectFileHousekeeping } from './fileHousekeepingProjection';
 import { importFileRetryFloor } from './housekeepingProjection';
@@ -121,6 +122,11 @@ describe('File coverage existing-owner census', () => {
     upload = createUploadStore(mongoose, {});
     jobs = createHousekeepingStore(mongoose);
     await Promise.all([File.init(), upload.initialize(), jobs.initialize()]);
+    // Actual historical catalog fixture; the successor schema no longer declares this index.
+    await File.collection.createIndex(
+      { expiresAt: 1 },
+      { name: 'expiresAt_1', expireAfterSeconds: 3600 },
+    );
   });
   beforeEach(async () => {
     await Promise.all([
@@ -160,6 +166,453 @@ describe('File coverage existing-owner census', () => {
   afterAll(async () => {
     await mongoose.disconnect();
     await mongo?.stop();
+  });
+
+  function inspection(): Extract<FileCoverageAction, { action: 'inspect' }> {
+    return {
+      action: 'inspect',
+      version: 1,
+      storeId: request.storeId,
+      generation: request.generation,
+      runSha256: fileCoverageDigest(request),
+    };
+  }
+
+  test('cutover inspect: actual catalog preserves TTL visibility and observes exact index absence without mutations', async () => {
+    const sealed = await seal();
+    expect(sealed.outcome).toBe('sealed');
+    const prepared = await preparation();
+    const before = await upload.Counter.findById('global').lean();
+    const commands: string[] = [];
+    const observe = (event: { commandName: string }) => commands.push(event.commandName);
+    mongoose.connection.getClient().on('commandStarted', observe);
+    try {
+      expect(await coverage.execute(inspection(), signal)).toMatchObject({
+        outcome: 'observed',
+        phase: 'sealed',
+        receipt: (sealed as { receipt: unknown }).receipt,
+        catalog: {
+          collectionUuid: prepared.collectionUuid,
+          fileTtlIndexes: [{ name: prepared.indexName, indexSha256: prepared.indexSha256 }],
+        },
+      });
+      expect(
+        commands.some((name) =>
+          [
+            'insert',
+            'update',
+            'delete',
+            'create',
+            'createIndexes',
+            'dropIndexes',
+            'collMod',
+          ].includes(name),
+        ),
+      ).toBe(false);
+    } finally {
+      mongoose.connection.getClient().off('commandStarted', observe);
+    }
+    await File.collection.dropIndex('expiresAt_1'); // Exact local fixture DDL, never production proof.
+    try {
+      const indexes = await File.collection.listIndexes().toArray();
+      expect(await coverage.execute(inspection(), signal)).toMatchObject({
+        outcome: 'observed',
+        phase: 'sealed',
+        catalog: {
+          collectionUuid: prepared.collectionUuid,
+          fileTtlIndexes: [],
+        },
+      });
+      expect(await File.collection.listIndexes().toArray()).toEqual(indexes);
+      expect(await upload.Counter.findById('global').lean()).toEqual(before);
+    } finally {
+      await File.collection.createIndex(
+        { expiresAt: 1 },
+        { name: 'expiresAt_1', expireAfterSeconds: 3600 },
+      );
+    }
+  });
+
+  test.each(['catalog', 'generation', 'collection'] as const)(
+    'cutover inspect: actual %s change during original reads cannot become an observation',
+    async (change) => {
+      await seal();
+      const db = mongoose.connection.db!;
+      const list = db.listCollections.bind(db);
+      const originalIndexes = await File.collection.listIndexes().toArray();
+      let changed = false,
+        catalogReads = 0;
+      const spy = jest.spyOn(db, 'listCollections').mockImplementation((...args) => {
+        const cursor = list(...args);
+        const read = cursor.toArray.bind(cursor);
+        cursor.toArray = async () => {
+          if (++catalogReads === 2) {
+            changed = true;
+            if (change === 'catalog')
+              await File.collection.createIndex(
+                { other: 1 },
+                { name: 'cutover-other', expireAfterSeconds: 3600 },
+              );
+            else if (change === 'collection') {
+              await File.collection.drop();
+              await db.createCollection('files');
+            } else
+              await upload.Counter.updateOne(
+                { _id: 'global' },
+                {
+                  $set: {
+                    'value.fileHousekeepingCoverage': {
+                      version: 1,
+                      generation: 2,
+                      phase: 'invalid',
+                      requestSha256: '0'.repeat(64),
+                      reason: 'restore',
+                    },
+                  },
+                },
+              );
+          }
+          return read();
+        };
+        return cursor;
+      });
+      try {
+        expect(await coverage.execute(inspection(), signal)).toEqual({
+          outcome: 'refused',
+          code: change === 'generation' ? 'generation_conflict' : 'unavailable',
+        });
+        expect(changed).toBe(true);
+      } finally {
+        spy.mockRestore();
+        if (change === 'catalog' && changed) await File.collection.dropIndex('cutover-other');
+        if (change === 'collection' && changed)
+          for (const index of originalIndexes) {
+            if (index.name !== '_id_') {
+              const { key, v: _v, ...options } = index;
+              await File.collection.createIndex(key, options);
+            }
+          }
+      }
+    },
+  );
+
+  test.each([false, true])(
+    'cutover inspect: original session closure is retained (rejection %s)',
+    async (rejectClose) => {
+      await seal();
+      const entered = barrier(),
+        release = barrier();
+      const client = mongoose.connection.getClient();
+      const start = client.startSession.bind(client);
+      const spy = jest.spyOn(client, 'startSession').mockImplementation((...args) => {
+        const session = start(...args),
+          end = session.endSession.bind(session);
+        session.endSession = async (...values) => {
+          entered.release();
+          await release.promise;
+          await end(...values);
+          if (rejectClose) throw new Error('fixture original session close rejected');
+        };
+        return session;
+      });
+      let settled = false;
+      const pending = coverage.execute(inspection(), signal).then((result) => {
+        settled = true;
+        return result;
+      });
+      try {
+        await entered.promise;
+        expect(settled).toBe(false);
+      } finally {
+        release.release();
+      }
+      try {
+        expect(await pending).toMatchObject(
+          rejectClose
+            ? { outcome: 'refused', code: 'unavailable' }
+            : {
+                outcome: 'observed',
+                phase: 'sealed',
+                catalog: { collectionUuid: expect.any(String) },
+              },
+        );
+      } finally {
+        spy.mockRestore();
+      }
+    },
+  );
+
+  test('cutover inspect: current state cannot attach a self-hashed receipt for a different generation', async () => {
+    const sealed = await seal();
+    if (sealed.outcome !== 'sealed') throw new Error('fixture did not seal');
+    const { receiptSha256: _hash, ...body } = { ...sealed.receipt, generation: 2 };
+    await upload.Counter.updateOne(
+      { _id: 'global' },
+      {
+        $set: {
+          'value.fileHousekeepingCoverage.receipt': {
+            ...body,
+            receiptSha256: fileCoverageDigest(body),
+          },
+        },
+      },
+    );
+    expect(await coverage.execute(inspection(), signal)).toEqual({
+      outcome: 'refused',
+      code: 'unavailable',
+    });
+  });
+
+  async function preparation(): Promise<Extract<FileCoverageAction, { action: 'prepare-ttl' }>> {
+    const [catalog] = await mongoose.connection
+      .db!.listCollections({ name: 'files' }, { nameOnly: false })
+      .toArray();
+    const index = (await File.collection.listIndexes().toArray()).find(
+      (value) => value.name === 'expiresAt_1',
+    )!;
+    const observation = await inspectFileHousekeepingInventory(
+      mongoose,
+      inventoryRequest(),
+      signal,
+    );
+    if (observation.outcome !== 'inventoried') throw new Error('fixture catalog unavailable');
+    return {
+      action: 'prepare-ttl',
+      run: request,
+      collectionUuid: catalog.info!.uuid!.toUUID().toHexString(),
+      indexName: index.name!,
+      indexSha256: observation.ttl.indexes[0].specSha256,
+    };
+  }
+
+  test('temporary absence: expiry-only and managed orphan rows cannot disappear before exclusion or preparation', async () => {
+    const rows = [
+      new Date(Date.now() - 1000),
+      new Date(Date.now() + 86_400_000),
+      [null, new Date()],
+      'unknown',
+    ].flatMap((expiresAt, n) => [
+      {
+        _id: new mongoose.Types.ObjectId(),
+        file_id: `expiry-only-${n}`,
+        user,
+        expiresAt,
+        filepath: '/private/original',
+        usage: 0,
+      },
+      {
+        _id: new mongoose.Types.ObjectId(),
+        file_id: `expiry-managed-${n}`,
+        uploadOperationId: `missing-operation-${n}`,
+        user,
+        expiresAt,
+        filepath: '/private/original',
+        usage: 0,
+      },
+    ]);
+    await File.collection.insertMany(rows as never[]);
+    const commands: string[] = [];
+    const observe = (event: { commandName: string }) => commands.push(event.commandName);
+    mongoose.connection.getClient().on('commandStarted', observe);
+    try {
+      expect(await coverage.execute(await preparation(), signal)).toEqual({
+        outcome: 'refused',
+        code: 'unclassified',
+      });
+      const progress = await ready();
+      expect(progress.population).toMatchObject({
+        filesSeen: rows.length,
+        excludedFiles: 0,
+        unclassifiedFiles: rows.length,
+      });
+      expect(
+        await coverage.execute(
+          { action: 'verify-seal', run: request, expectedCheckpoint: progress.checkpoint },
+          signal,
+        ),
+      ).toEqual({ outcome: 'refused', code: 'unclassified' });
+      expect(await File.collection.find({}).sort({ _id: 1 }).toArray()).toEqual(rows);
+      expect(commands).not.toContain('dropIndexes');
+      expect(commands).not.toContain('collMod');
+    } finally {
+      mongoose.connection.getClient().off('commandStarted', observe);
+    }
+  });
+
+  test('temporary absence: preparation observes a nonempty complete population and retains original snapshot closure', async () => {
+    request = { ...request, originalDeadline: new Date(Date.now() + 600_000).toISOString() };
+    await File.collection.insertMany([
+      { file_id: 'permanent', user },
+      { file_id: 'null-expiry', user, expiresAt: null },
+      fixture(7),
+    ] as never[]);
+    const input = await preparation();
+    const client = mongoose.connection.getClient();
+    const startSession = client.startSession.bind(client);
+    const closing = barrier(),
+      release = barrier();
+    const spy = jest.spyOn(client, 'startSession').mockImplementation((...args) => {
+      const session = startSession(...args);
+      if (args[0]?.snapshot) {
+        const end = session.endSession.bind(session);
+        session.endSession = async (...values) => {
+          closing.release();
+          await release.promise;
+          await end(...values);
+        };
+      }
+      return session;
+    });
+    const counter = await upload.Counter.findById('global').lean();
+    const result = coverage.execute(input, signal);
+    let settled = false;
+    void result.then(() => {
+      settled = true;
+      closing.release();
+    });
+    try {
+      await closing.promise;
+      expect(held).toBe(true);
+      expect(settled).toBe(false);
+    } finally {
+      release.release();
+      spy.mockRestore();
+    }
+    const observed = await result;
+    expect(observed).toMatchObject({
+      outcome: 'prepared',
+      storeId: request.storeId,
+      generation: request.generation,
+      runSha256: fileCoverageDigest(request),
+      collectionUuid: input.collectionUuid,
+      indexName: input.indexName,
+      indexSha256: input.indexSha256,
+      population: {
+        totalFiles: 3,
+        expiresAtAbsentOrNull: 3,
+        expiresAtScalarDate: 0,
+        expiresAtArray: 0,
+        expiresAtOther: 0,
+      },
+    });
+    if (observed.outcome !== 'prepared') throw new Error('preparation refused');
+    expect(observed.snapshot.seconds).toBeGreaterThan(0);
+    expect(held).toBe(false);
+    expect(await upload.Counter.findById('global').lean()).toEqual(counter);
+  });
+
+  test('temporary absence: preparation refuses missing authority, forged selectors and extra counts without DDL', async () => {
+    const input = await preparation();
+    const commands: string[] = [];
+    const observe = (event: { commandName: string }) => commands.push(event.commandName);
+    mongoose.connection.getClient().on('commandStarted', observe);
+    try {
+      expect(await createFileHousekeepingCoverageMethods(upload).execute(input, signal)).toEqual({
+        outcome: 'refused',
+        code: 'native_unavailable',
+      });
+      for (const changed of [
+        { collectionUuid: randomUUID() },
+        { indexName: 'not-the-index' },
+        { indexSha256: '0'.repeat(64) },
+      ])
+        expect(await coverage.execute({ ...input, ...changed }, signal)).toEqual({
+          outcome: 'refused',
+          code: 'unavailable',
+        });
+      expect(
+        await coverage.execute({ ...input, population: { totalFiles: 0 } } as never, signal),
+      ).toEqual({ outcome: 'refused', code: 'invalid_input' });
+      await File.collection.createIndex(
+        { extraExpiry: 1 },
+        { name: 'unsupported-preparation', expireAfterSeconds: 3600 },
+      );
+      try {
+        expect(await coverage.execute(input, signal)).toEqual({
+          outcome: 'refused',
+          code: 'unavailable',
+        });
+      } finally {
+        await File.collection.dropIndex('unsupported-preparation');
+      }
+      expect(commands.filter((name) => name === 'dropIndexes')).toHaveLength(1); // fixture cleanup only
+      expect(commands).not.toContain('collMod');
+    } finally {
+      mongoose.connection.getClient().off('commandStarted', observe);
+    }
+  });
+
+  test('temporary absence: original snapshot closure rejection remains unknown', async () => {
+    const input = await preparation();
+    const client = mongoose.connection.getClient();
+    const startSession = client.startSession.bind(client);
+    const spy = jest.spyOn(client, 'startSession').mockImplementation((...args) => {
+      const session = startSession(...args);
+      if (args[0]?.snapshot) {
+        const end = session.endSession.bind(session);
+        session.endSession = async (...values) => {
+          await end(...values);
+          throw new Error('fixture original closure rejected');
+        };
+      }
+      return session;
+    });
+    try {
+      expect(await coverage.execute(input, signal)).toEqual({
+        outcome: 'unknown',
+        code: 'unknown_commit',
+      });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('temporary absence: successor initialization cannot recreate File TTL or alter unrelated indexes', async () => {
+    const successor = new mongoose.Mongoose();
+    await successor.connect(mongo.getUri('successor-indexes'));
+    try {
+      const collection = await successor.connection.db!.createCollection('files');
+      await collection.createIndex({ context: 1 }, { name: 'unrelated-index' });
+      const model = successor.model('File', fileSchema);
+      await model.init();
+      const indexes = await collection.listIndexes().toArray();
+      expect(indexes.some((index) => index.name === 'unrelated-index')).toBe(true);
+      expect(indexes.some((index) => 'expireAfterSeconds' in index)).toBe(false);
+      const uuid = (
+        await successor.connection
+          .db!.listCollections({ name: 'files' }, { nameOnly: false })
+          .toArray()
+      )[0]
+        .info!.uuid!.toUUID()
+        .toHexString();
+      const input = {
+        ...(await preparation()),
+        collectionUuid: uuid,
+        run: { ...request, native: { ...request.native, mongoDatabase: 'successor-indexes' } },
+      };
+      // An already absent index is not this exact-index branch's automatic retry success.
+      const successorStore = createUploadStore(successor as unknown as typeof mongoose, {});
+      await successorStore.initialize();
+      const owner = await successorStore.Counter.findById('global').lean();
+      input.run.storeId = (owner!.value as { storeId: string }).storeId;
+      const producer: FileCoverageNativeProducer = {
+        async withCurrentQuiescence(_action, _signal, callback) {
+          return callback({
+            binding: input.run.native,
+            source: input.run.source,
+            async assertCurrent() {},
+          });
+        },
+      };
+      expect(
+        await createFileHousekeepingCoverageMethods(successorStore, producer).execute(
+          input,
+          signal,
+        ),
+      ).toEqual({ outcome: 'refused', code: 'unavailable' });
+    } finally {
+      await successor.disconnect();
+    }
   });
 
   it('refuses production mutation without an actual native producer and rejects a caller grant', async () => {
@@ -834,7 +1287,7 @@ describe('File coverage existing-owner census', () => {
 
   test('inventory counts raw cohorts and actual TTL horizon without exposing row data', async () => {
     const now = new Date();
-    const secret = 'test-private-filename-owner-content';
+    const secret = randomUUID();
     await File.collection.insertMany(
       [
         {

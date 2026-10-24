@@ -115,6 +115,7 @@ export function createHousekeepingApplication(
     env,
     identity: maintenanceIdentity,
     workOwners: { housekeeping: runtime },
+    fileDomainOwners: ['housekeeping'],
     startupReady: () => started && !stopping,
   });
   const metrics = createMetrics({ collectHousekeepingObservation: () => runtime.observe() });

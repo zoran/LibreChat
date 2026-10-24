@@ -10,6 +10,7 @@ export default defineConfig({
   entry: ['src/index.ts', 'src/admin/capabilities.ts', 'src/admin/fileCoverageAdmin.ts'],
   format: ['esm', 'cjs'],
   platform: 'node',
+  treeshake: false,
   dts: { oxc: true },
   outDir: 'dist',
   sourcemap: true,

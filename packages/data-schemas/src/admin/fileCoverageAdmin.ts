@@ -24,6 +24,7 @@ import {
   isFileInventoryRequest,
   fileCoverageDigest,
   sameFileCoverageData,
+  readFileCoverageReceipt,
 } from '../methods/fileHousekeepingCoverageContract';
 import {
   createFileHousekeepingCoverageMethods,
@@ -221,8 +222,9 @@ function opening(value: unknown): Opening {
 
 /** Exactly one closed data-owner action, original connection and actual close per exec.
  * Ordinary application/worker factories never import this finite admin subpath.
- * The native broker alone drives begin/advance/verify-seal, then a separate fixed
- * inspect under the SAME held invocation; no request/deadline is renewed here.
+ * The native broker alone drives prepare-ttl/begin/advance/verify-seal, then a separate fixed
+ * inspect under A or a separate bounded B invocation. The immutable original run is
+ * only an inspect selector after its deadline; no mutation deadline is renewed here.
  */
 export async function runFileCoverageAdmin(
   input: Readable = process.stdin,
@@ -260,6 +262,7 @@ export async function runFileCoverageAdmin(
     try {
       request = opening(await channel.receive());
       const { podUid } = request;
+      // prepare-ttl is read-only Mongo work but requires the same held original closure.
       mutation = request.kind === 'open' && request.action.action !== 'inspect';
       const originalDeadline =
         request.kind === 'inventory'
@@ -379,11 +382,17 @@ export async function runFileCoverageAdmin(
             }
           },
         };
+        if (action.action === 'inspect') await assertCurrent('before-action');
         dispatched = true;
         result = await createFileHousekeepingCoverageMethods(store, producer).execute(
           action,
           abort.signal,
         );
+        if (action.action === 'inspect') {
+          if (result.outcome === 'observed' && result.receipt)
+            requireValue(readFileCoverageReceipt(result.receipt, run.storeId, run));
+          await assertCurrent('owner');
+        }
       }
     } catch {
       result =

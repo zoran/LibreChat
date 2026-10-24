@@ -21,7 +21,7 @@ const {
   warnOnUnreachableDeliveryPaths,
   loadManagedFileDeploymentConfiguration,
 } = require('@librechat/api');
-const { connectDb, indexSync } = require('~/db');
+const { connectDb, indexSync, modelBootstrap } = require('~/db');
 const {
   updateAccessPermissions,
   sweepOrphanedPreviews,
@@ -30,6 +30,7 @@ const {
 } = require('~/models');
 const { initializeGitHubSkillSync } = require('../Skills/sync');
 const { initializeUploads } = require('../Uploads');
+const { fileLibraryMaintenance } = require('../Files/LibraryMaintenance');
 const { configureSubagentTaskRouting } = require('../Endpoints/agents/subagentThreadStore');
 const { getAppConfig } = require('../Config');
 async function initializeApplicationRuntime({
@@ -59,26 +60,8 @@ async function initializeApplicationRuntime({
     onFailure,
   });
   signal.throwIfAborted();
-  await runAsSystem(seedDatabase);
-  signal.throwIfAborted();
-  /* Recover stuck `status: 'pending'` records from a crash mid-render.
-   * `runAsSystem` is required — `File` is tenant-isolated and strict
-   * mode rejects unscoped queries. Lazy sweep in the preview endpoint
-   * covers anything younger than the boot cutoff. */
-  // Complete the only boot sweep before readiness or the maintenance listener.
-  // An unknown write outcome prevents startup instead of reporting an idle owner.
-  await runAsSystem(sweepOrphanedPreviews);
-  signal.throwIfAborted();
   const appConfig = await getAppConfig({ baseOnly: true });
   signal.throwIfAborted();
-  await configureSubagentTaskRouting(appConfig?.endpoints?.agents?.subagentActivity);
-  signal.throwIfAborted();
-  registerBackgroundTaskShutdown({
-    interruptGraceMs: appConfig?.endpoints?.agents?.backgroundTasks?.shutdownInterruptGraceMs,
-  });
-  configureAgentEventRuntime(appConfig?.endpoints?.agents?.eventDriven);
-  warnOnUnreachableDeliveryPaths(appConfig);
-  initializeFileStorage(appConfig);
   let uploadsOriginal;
   registerShutdownTask(
     'managed upload workers',
@@ -92,58 +75,83 @@ async function initializeApplicationRuntime({
     { priority: 105 },
   );
   // Register custody before starting the original; a late owner stays reachable during shutdown.
-  uploadsOriginal = Promise.resolve().then(() => {
-    signal.throwIfAborted();
-    return initializeUploads({
-      registry,
-      identity,
-      trustedFile,
-      recordOriginalPublication,
-      signal,
-      onFailure,
-    });
-  });
+  uploadsOriginal = Promise.resolve()
+    .then(() => {
+      signal.throwIfAborted();
+      return initializeUploads({
+        registry,
+        identity,
+        trustedFile,
+        recordOriginalPublication,
+        signal,
+        onFailure,
+      });
+    })
+    .finally(() => modelBootstrap.capture());
   const uploads = await uploadsOriginal;
   signal.throwIfAborted();
-  // Plugin hooks execute only when the operator opts in via DEPLOYMENT_PLUGIN_HOOKS;
-  // without it, declared hook documents load as parsed-but-inert with a warning.
-  await initializeDeploymentPlugins({
-    projectRoot,
-    hookCapabilities: getDeploymentPluginHookCapabilities(),
-  });
-  signal.throwIfAborted();
-  // Hand the run seam its plugin-hook source without a packages/api-internal
-  // agents -> plugins import (see agents/hooks/source.ts).
-  setPluginHookSource({
-    hasHooks: hasDeploymentPluginHooks,
-    hasToolApprovalHooks: hasDeploymentPluginToolApprovalHooks,
-    register: registerDeploymentPluginHooks,
-  });
-  await initializeDeploymentSkills({
-    projectRoot,
-    additionalSkills: getDeploymentPluginSkills(),
-  });
-  signal.throwIfAborted();
-  initializeGitHubSkillSync(appConfig);
-  // Register any programmatic tool-approval policy hooks declared in
-  // `endpoints.agents.toolApproval.hooks`. Honor the `enabled` kill switch: when tool
-  // approval is off we pass no hooks, so a disabled endpoint imports/runs nothing (and any
-  // previously loaded batch is unregistered). Hooks are read from the BASE config only —
-  // they register once, process-wide; per-user/tenant differences belong inside the hook
-  // (via its context), not in per-override module lists.
-  const toolApproval = appConfig?.endpoints?.agents?.toolApproval;
-  await loadToolApprovalHooks(toolApproval?.enabled ? toolApproval.hooks : undefined, {
-    basePath: projectRoot,
-  });
-  signal.throwIfAborted();
-  await runAsSystem(async () => {
-    await performStartupChecks(appConfig);
-    signal.throwIfAborted();
-    await updateInterfacePermissions({ appConfig, getRoleByName, updateAccessPermissions });
-  });
-  signal.throwIfAborted();
-
-  return { appConfig, uploads };
+  let starting;
+  return {
+    appConfig,
+    uploads,
+    // Creation does not dispatch this continuation; the existing web owner waits for exact B.
+    start() {
+      starting ??= Promise.resolve().then(async () => {
+        signal.throwIfAborted();
+        await runAsSystem(seedDatabase);
+        signal.throwIfAborted();
+        // The post-release File original remains visible if a later native hold begins here.
+        await fileLibraryMaintenance.run(() => runAsSystem(sweepOrphanedPreviews));
+        signal.throwIfAborted();
+        await configureSubagentTaskRouting(appConfig?.endpoints?.agents?.subagentActivity);
+        signal.throwIfAborted();
+        registerBackgroundTaskShutdown({
+          interruptGraceMs: appConfig?.endpoints?.agents?.backgroundTasks?.shutdownInterruptGraceMs,
+        });
+        configureAgentEventRuntime(appConfig?.endpoints?.agents?.eventDriven);
+        warnOnUnreachableDeliveryPaths(appConfig);
+        initializeFileStorage(appConfig);
+        // Plugin hooks execute only when the operator opts in via DEPLOYMENT_PLUGIN_HOOKS;
+        // without it, declared hook documents load as parsed-but-inert with a warning.
+        await initializeDeploymentPlugins({
+          projectRoot,
+          hookCapabilities: getDeploymentPluginHookCapabilities(),
+        });
+        signal.throwIfAborted();
+        // Hand the run seam its plugin-hook source without a packages/api-internal
+        // agents -> plugins import (see agents/hooks/source.ts).
+        setPluginHookSource({
+          hasHooks: hasDeploymentPluginHooks,
+          hasToolApprovalHooks: hasDeploymentPluginToolApprovalHooks,
+          register: registerDeploymentPluginHooks,
+        });
+        await initializeDeploymentSkills({
+          projectRoot,
+          additionalSkills: getDeploymentPluginSkills(),
+        });
+        signal.throwIfAborted();
+        initializeGitHubSkillSync(appConfig);
+        // Register any programmatic tool-approval policy hooks declared in
+        // `endpoints.agents.toolApproval.hooks`. Honor the `enabled` kill switch: when tool
+        // approval is off we pass no hooks, so a disabled endpoint imports/runs nothing (and any
+        // previously loaded batch is unregistered). Hooks are read from the BASE config only —
+        // they register once, process-wide; per-user/tenant differences belong inside the hook
+        // (via its context), not in per-override module lists.
+        const toolApproval = appConfig?.endpoints?.agents?.toolApproval;
+        await loadToolApprovalHooks(toolApproval?.enabled ? toolApproval.hooks : undefined, {
+          basePath: projectRoot,
+        });
+        signal.throwIfAborted();
+        await runAsSystem(async () => {
+          await performStartupChecks(appConfig);
+          signal.throwIfAborted();
+          await updateInterfacePermissions({ appConfig, getRoleByName, updateAccessPermissions });
+        });
+        signal.throwIfAborted();
+      });
+      return starting;
+    },
+  };
 }
 const { initializeStatusUsage } = require('../status/usage');
 const { startCodeEnvironmentLifecycleReconciler } = require('@librechat/api');
@@ -157,11 +165,19 @@ async function initializeConnectedRuntime({ mongoose, identity }) {
   const statusUsage = await initializeStatusUsage({ mongoose, identity });
 
   logger.info('Connected to MongoDB');
-  startCodeEnvironmentLifecycleReconciler({ mongoose });
-  indexSync().catch((err) => {
-    logger.error('[indexSync] Background sync failed:', err);
-  });
-
-  return statusUsage;
+  let starting;
+  return {
+    statusUsage,
+    // The existing web startup calls this only after all preparation, including generation owners.
+    completeBootstrap: () => modelBootstrap.seal(),
+    // Join the first reconciliation before launching the original index operation.
+    start() {
+      starting ??= Promise.resolve().then(async () => {
+        await startCodeEnvironmentLifecycleReconciler({ mongoose });
+        await indexSync();
+      });
+      return starting;
+    },
+  };
 }
 module.exports = { initializeApplicationRuntime, initializeConnectedRuntime };

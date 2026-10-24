@@ -4,39 +4,29 @@ import { timingSafeEqual, createHash } from 'node:crypto';
 import type { GenerationAdmissionMethods } from '@librechat/data-schemas';
 import type { IncomingMessage, ServerResponse, Server } from 'node:http';
 import type { RequestHandler } from 'express';
+import type {
+  ExternalApplicationWorkCensus,
+  ApplicationWorkPort,
+  GenerationMaintenanceCensus,
+  MaintenanceOwnerSample,
+} from './maintenanceCensus';
 import type { MaintenanceIdentity } from './identity';
+import {
+  MAINTENANCE_COUNTERS as counters,
+  captureFileDomainOwners,
+  aggregateMaintenanceOwners,
+  composeMaintenanceCensus,
+} from './maintenanceCensus';
 import { createMaintenanceIdentity } from './identity';
 
 export type { MaintenanceIdentity } from './identity';
-
-/** Existing application owners report their own admitted work; no provider registry here. */
-export interface ApplicationWorkCensus {
-  admissionClosed: boolean;
-  queuedContinuations: number;
-  pendingWrites: number;
-  complete: boolean;
-}
-export type ExternalApplicationWorkCensus = Pick<
+export type {
   ApplicationWorkCensus,
-  'queuedContinuations' | 'pendingWrites' | 'complete'
->;
-export interface ApplicationWorkPort {
-  pauseAdmissions(requestId: string): boolean;
-  resumeAdmissions(requestId: string): boolean;
-  getMaintenanceCensus(requestId: string | null): Promise<ApplicationWorkCensus>;
-}
+  ExternalApplicationWorkCensus,
+  ApplicationWorkPort,
+  GenerationMaintenanceCensus,
+} from './maintenanceCensus';
 
-/** The generation owner, not this composition, accounts for admitted work and persistence. */
-export interface GenerationMaintenanceCensus {
-  admissionClosed: boolean;
-  initializing: number;
-  providerExecutions: number;
-  queuedContinuations: number;
-  pendingWrites: number;
-  activeStreams: number;
-  unresolved: number;
-  complete: boolean;
-}
 export interface GenerationMaintenancePort {
   closeGenerationAdmission(requestId: string): boolean;
   reopenGenerationAdmission(requestId: string): boolean;
@@ -44,10 +34,14 @@ export interface GenerationMaintenancePort {
   getGenerationRuntimeHealth(): Promise<boolean>;
 }
 export interface MaintenanceDependencies {
+  /** The native web entry selects this before dispatch; this is no File/native readiness grant. */
+  startupAdmission?: 'closed';
   env: Record<string, string | undefined>;
   requiredSharedState: boolean;
   generation: GenerationMaintenancePort;
   workOwners?: Readonly<Record<string, ApplicationWorkPort>>;
+  /** Existing owner keys; [] explicitly declares no qualified File-domain coverage. */
+  fileDomainOwners: readonly string[];
   unqualifiedOwners?: readonly string[];
   startupReady(): boolean;
   probeDatabase(): Promise<boolean>;
@@ -57,11 +51,17 @@ export interface WorkloadMaintenanceDependencies {
   env: Record<string, string | undefined>;
   identity: MaintenanceIdentity;
   workOwners: Readonly<Record<string, ApplicationWorkPort>>;
+  fileDomainOwners: readonly string[];
   startupReady(): boolean;
 }
 type LifecycleDependencies =
   | (MaintenanceDependencies & { kind: 'application'; identity: MaintenanceIdentity })
   | (WorkloadMaintenanceDependencies & { kind: 'workload' });
+/** Local File-affecting work under the enclosing identity/request/revision, never a native hold. */
+export interface FileDomainStatus {
+  known: boolean;
+  census: GenerationMaintenanceCensus | null;
+}
 export interface MaintenanceStatus {
   identity: MaintenanceIdentity;
   requestId: string | null;
@@ -70,6 +70,7 @@ export interface MaintenanceStatus {
   known: boolean;
   census: GenerationMaintenanceCensus | null;
   blockingReasons: string[];
+  fileDomain: FileDomainStatus;
 }
 export interface AppMaintenance {
   identity: MaintenanceIdentity;
@@ -77,6 +78,8 @@ export interface AppMaintenance {
   ready(): Promise<boolean>;
   status(): Promise<MaintenanceStatus>;
   operation(action: 'begin' | 'cancel', body: unknown): number;
+  /** Retain the original startup continuation until this incarnation's exact startup cancel. */
+  waitForStartupRelease(signal: AbortSignal): Promise<void>;
   handler(req: IncomingMessage, res: ServerResponse): void;
   readinessHandler: RequestHandler;
   admissionMiddleware: RequestHandler;
@@ -84,14 +87,6 @@ export interface AppMaintenance {
   listen(): Promise<void>;
   close(): Promise<void>;
 }
-const counters = [
-  'initializing',
-  'providerExecutions',
-  'queuedContinuations',
-  'pendingWrites',
-  'activeStreams',
-  'unresolved',
-] as const;
 const loopback = (address?: string) =>
   ['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(address ?? '');
 const hash = (value: string) => createHash('sha256').update(value).digest();
@@ -117,15 +112,6 @@ async function observe<T>(read: () => Promise<T>): Promise<T | undefined> {
   } finally {
     cancelTimer?.();
   }
-}
-function validCensus(value: unknown): value is GenerationMaintenanceCensus {
-  return (
-    object(value) &&
-    exactKeys(value, ['admissionClosed', 'complete', ...counters]) &&
-    typeof value.admissionClosed === 'boolean' &&
-    typeof value.complete === 'boolean' &&
-    counters.every((key) => Number.isSafeInteger(value[key]) && Number(value[key]) >= 0)
-  );
 }
 function reply(res: ServerResponse, status: number, value: unknown): void {
   res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
@@ -214,12 +200,24 @@ function createMaintenanceController(deps: LifecycleDependencies): AppMaintenanc
     throw new Error('Invalid private maintenance configuration');
   }
   const tokenHash = hash(token ?? '');
+  const startupId =
+    deps.kind === 'application' && deps.startupAdmission === 'closed'
+      ? `startup_${identity.incarnation}`
+      : undefined;
+  if (startupId && !controlEnabled) throw new Error('Closed startup requires private maintenance');
+  let releaseStartup: (() => void) | undefined;
+  const startupRelease = startupId
+    ? new Promise<void>((resolve) => {
+        releaseStartup = resolve;
+      })
+    : undefined;
   let requestId: string | null = null;
   let revision = 0;
   let uncertain = false;
   let cancelled: { requestId: string; revision: number } | undefined;
   let listener: Server | undefined;
   const owners = Object.entries(deps.workOwners ?? {});
+  const fileDomainOwners = captureFileDomainOwners(deps.fileDomainOwners, owners);
   const unqualifiedOwners =
     deps.kind === 'application'
       ? [...(deps.unqualifiedOwners ?? ['application coverage undeclared'])]
@@ -249,47 +247,28 @@ function createMaintenanceController(deps: LifecycleDependencies): AppMaintenanc
     return successful;
   }
 
+  function sampleOwners(id: string | null): Promise<MaintenanceOwnerSample[]> {
+    return Promise.all(
+      owners.map(
+        async ([name, owner]) =>
+          [name, await observe(() => owner.getMaintenanceCensus(id))] as const,
+      ),
+    );
+  }
+
   async function externalCensus(): Promise<ExternalApplicationWorkCensus> {
     const sampledRevision = revision;
     const sampledRequest = requestId;
-    const samples = await Promise.all(
-      owners.map(([, owner]) => observe(() => owner.getMaintenanceCensus(sampledRequest))),
+    const samples = await sampleOwners(sampledRequest);
+    return aggregateMaintenanceOwners(
+      samples,
+      sampledRequest !== null,
+      coverageDeclared &&
+        unqualifiedOwners.length === 0 &&
+        !uncertain &&
+        sampledRevision === revision &&
+        sampledRequest === requestId,
     );
-    let queuedContinuations = 0;
-    let pendingWrites = 0;
-    let complete = coverageDeclared && unqualifiedOwners.length === 0 && !uncertain;
-    for (const sample of samples) {
-      if (
-        !object(sample) ||
-        !exactKeys(sample, [
-          'admissionClosed',
-          'queuedContinuations',
-          'pendingWrites',
-          'complete',
-        ]) ||
-        typeof sample.complete !== 'boolean' ||
-        sample.admissionClosed !== (sampledRequest !== null) ||
-        !Number.isSafeInteger(sample.queuedContinuations) ||
-        Number(sample.queuedContinuations) < 0 ||
-        !Number.isSafeInteger(sample.pendingWrites) ||
-        Number(sample.pendingWrites) < 0
-      ) {
-        complete = false;
-        continue;
-      }
-      queuedContinuations += Number(sample.queuedContinuations);
-      pendingWrites += Number(sample.pendingWrites);
-      complete = complete && sample.complete;
-    }
-    if (!Number.isSafeInteger(queuedContinuations) || !Number.isSafeInteger(pendingWrites)) {
-      return { queuedContinuations: 0, pendingWrites: 0, complete: false };
-    }
-    return {
-      queuedContinuations,
-      pendingWrites,
-      complete:
-        complete && sampledRevision === revision && sampledRequest === requestId && !uncertain,
-    };
   }
 
   async function ready(): Promise<boolean> {
@@ -320,37 +299,42 @@ function createMaintenanceController(deps: LifecycleDependencies): AppMaintenanc
   }
   async function status(): Promise<MaintenanceStatus> {
     const sampledRevision = revision;
-    const [generationCensus, external] = await Promise.all([
+    const sampledRequest = requestId;
+    const closed = sampledRequest !== null;
+    const [generation, samples] = await Promise.all([
       deps.kind === 'application'
         ? observe(() => deps.generation.getGenerationAdmissionCensus())
-        : undefined,
-      externalCensus(),
-    ]);
-    // These services have no generation subsystem; actual work still supplies queue/write counts.
-    const census =
-      deps.kind === 'application'
-        ? generationCensus
-        : {
-            admissionClosed: requestId !== null,
+        : Promise.resolve({
+            admissionClosed: closed,
             initializing: 0,
             providerExecutions: 0,
+            queuedContinuations: 0,
+            pendingWrites: 0,
             activeStreams: 0,
             unresolved: 0,
-            ...external,
-          };
-    const known =
-      sampledRevision === revision &&
-      validCensus(census) &&
-      census.complete &&
-      external.complete &&
-      !uncertain;
-    const drained =
-      requestId !== null &&
-      known &&
-      census.admissionClosed &&
-      external.queuedContinuations === 0 &&
-      external.pendingWrites === 0 &&
-      counters.every((key) => census[key] === 0);
+            complete: true,
+          }),
+      sampleOwners(sampledRequest),
+    ]);
+    const current = sampledRevision === revision && sampledRequest === requestId && !uncertain;
+    const census = composeMaintenanceCensus(
+      generation,
+      aggregateMaintenanceOwners(
+        samples,
+        closed,
+        coverageDeclared && unqualifiedOwners.length === 0,
+      ),
+      closed,
+      current,
+    );
+    const fileCensus = composeMaintenanceCensus(
+      generation,
+      aggregateMaintenanceOwners(samples, closed, fileDomainOwners.size > 0, fileDomainOwners),
+      closed,
+      current,
+    );
+    const known = census !== null;
+    const drained = closed && census !== null && counters.every((key) => census[key] === 0);
     let phase: MaintenanceStatus['phase'] = requestId !== null ? 'quiescing' : 'running';
     if (drained) phase = 'drained';
     return {
@@ -359,12 +343,13 @@ function createMaintenanceController(deps: LifecycleDependencies): AppMaintenanc
       revision,
       phase,
       known,
-      census: known ? census : null,
+      census,
       blockingReasons: [
         ...unqualifiedOwners,
         ...(!coverageDeclared ? ['application coverage undeclared'] : []),
         ...(!known ? ['census incomplete or admission uncertain'] : []),
       ],
+      fileDomain: { known: fileCensus !== null, census: fileCensus },
     };
   }
   function operation(action: 'begin' | 'cancel', body: unknown): number {
@@ -414,14 +399,20 @@ function createMaintenanceController(deps: LifecycleDependencies): AppMaintenanc
       return 503;
     }
     cancelled = { requestId, revision: revision + 1 };
+    const releasesStartup = requestId === startupId && revision === 1;
     requestId = null;
     revision++;
+    if (releasesStartup) releaseStartup?.();
     return 200;
   }
   const handler = (req: IncomingMessage, res: ServerResponse): void => {
     void (async () => {
       if (!controlEnabled || !loopback(req.socket.remoteAddress)) {
         reply(res, 403, { code: 'FORBIDDEN' });
+        return;
+      }
+      if (req.url === '/livez' && req.method === 'GET') {
+        reply(res, 200, { live: true });
         return;
       }
       if (req.url === '/readyz' && req.method === 'GET') {
@@ -505,12 +496,37 @@ function createMaintenanceController(deps: LifecycleDependencies): AppMaintenanc
       error: 'Application admission is closed for maintenance.',
     });
   };
+  if (
+    startupId &&
+    operation('begin', { requestId: startupId, identity, expectedRevision: 0 }) !== 200
+  )
+    throw new Error('Application startup hold unconfirmed');
   return {
     identity,
     externalCensus,
     ready,
     status,
     operation,
+    async waitForStartupRelease(signal) {
+      if (!startupRelease) throw new Error('Application has no owned startup hold');
+      signal.throwIfAborted();
+      let stop: (() => void) | undefined;
+      try {
+        await Promise.race([
+          startupRelease,
+          new Promise<never>((_resolve, reject) => {
+            stop = () => reject(signal.reason ?? new Error('Application startup aborted'));
+            signal.addEventListener('abort', stop, { once: true });
+            if (signal.aborted) stop();
+          }),
+        ]);
+        signal.throwIfAborted();
+        if (requestId !== null || revision !== 2 || uncertain)
+          throw new Error('Application startup admission changed before dispatch');
+      } finally {
+        if (stop) signal.removeEventListener('abort', stop);
+      }
+    },
     handler,
     readinessHandler,
     admissionMiddleware,
@@ -571,13 +587,11 @@ export async function initializeMaintenanceGeneration(deps: {
   required: boolean;
   methods: GenerationAdmissionMethods;
   identity: MaintenanceIdentity;
-  externalCensus?: () => Promise<ExternalApplicationWorkCensus>;
   configure(options: {
     required: boolean;
     methods?: GenerationAdmissionMethods;
     ownerInstanceId: string;
     processBootId: string;
-    externalCensus?: () => Promise<ExternalApplicationWorkCensus>;
   }): void;
 }): Promise<void> {
   const methods: GenerationAdmissionMethods = {
@@ -610,6 +624,5 @@ export async function initializeMaintenanceGeneration(deps: {
     methods: deps.required ? methods : undefined,
     ownerInstanceId: deps.identity.podUid,
     processBootId: deps.identity.incarnation,
-    externalCensus: deps.externalCensus,
   });
 }

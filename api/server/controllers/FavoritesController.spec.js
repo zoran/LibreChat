@@ -2,6 +2,10 @@ jest.mock('~/models', () => ({
   updateUser: jest.fn(),
   getUserById: jest.fn(),
 }));
+// Payload validation stays isolated; settings-maintenance.spec exercises the actual Auth owner.
+jest.mock('~/server/services/LegacyAuthMaintenance', () => ({
+  authUserUpdate: (method, ...args) => method(...args),
+}));
 
 const { updateUser, getUserById } = require('~/models');
 const { updateFavoritesController, getFavoritesController } = require('./FavoritesController');

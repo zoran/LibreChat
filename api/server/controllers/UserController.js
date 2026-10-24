@@ -21,6 +21,7 @@ const {
   deleteAllSharedLinksWithCleanup,
   revokeUserCodeEnvironmentWorkers,
   finalizeMCPAuthorizationMutation,
+  fileDeletionWorkOwner,
 } = require('@librechat/api');
 const { Tools, Constants, FileSources, ResourceType } = require('librechat-data-provider');
 const { updateUserPluginAuth, deleteUserPluginAuth } = require('~/server/services/PluginService');
@@ -155,7 +156,7 @@ const acceptTermsController = async (req, res) => {
   }
 };
 
-const deleteUserFiles = async (req) => {
+const deleteUserFiles = async (req, work) => {
   const owner = { userId: req.user.id, tenantId: req.user.tenantId || null };
   const userFiles = await db.getAccountFileCleanupCandidates(owner);
   if (
@@ -165,7 +166,7 @@ const deleteUserFiles = async (req) => {
     throw new Error('Account file inventory is not confirmed');
   }
   const requestedIds = userFiles.map((file) => file.file_id);
-  const result = await processDeleteRequest({ req, files: userFiles });
+  const result = await processDeleteRequest({ req, files: userFiles, work });
   const deletedIds = new Set(Array.isArray(result?.deletedFileIds) ? result.deletedFileIds : []);
   if (
     !result ||
@@ -543,18 +544,22 @@ const deleteUserController = async (req, res) => {
     await checkpointDeletion.acknowledge();
 
     // Preserve a retryable account/session and all retained custody until physical cleanup is confirmed.
-    await deleteUserFiles(req);
-    if (
-      !(triggerDeletionFence instanceof Date) ||
-      !Number.isFinite(triggerDeletionFence.getTime())
-    ) {
-      throw new Error('Account deletion fence is unavailable');
-    }
-    await db.deleteAccountDocumentWorkspaces(
-      { userId: user.id, tenantId: user.tenantId || null },
-      triggerDeletionFence,
-    );
-    await db.deleteFiles(null, user.id);
+    await fileDeletionWorkOwner.run(async (work) => {
+      await deleteUserFiles(req, work);
+      if (
+        !(triggerDeletionFence instanceof Date) ||
+        !Number.isFinite(triggerDeletionFence.getTime())
+      ) {
+        throw new Error('Account deletion fence is unavailable');
+      }
+      await work.effect(() =>
+        db.deleteAccountDocumentWorkspaces(
+          { userId: user.id, tenantId: user.tenantId || null },
+          triggerDeletionFence,
+        ),
+      );
+      await work.effect(() => db.deleteFiles(null, user.id));
+    });
     await db.deleteMessages({ user: user.id });
     await db.deleteAllUserSessions({ userId: user.id });
     await db.deletePasskeysByUser(user.id);

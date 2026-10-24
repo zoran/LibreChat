@@ -2,9 +2,16 @@ jest.mock('@librechat/data-schemas', () => ({
   logger: { error: jest.fn() },
 }));
 const { logger } = require('@librechat/data-schemas');
-const { createHistoryImportStorage } = require('./historyStorage');
+const { createHistoryImportStorage: wrapStorage } = require('./historyStorage');
+const { createHistoryMaintenance } = require('~/server/services/HistoryMaintenance');
+let owner;
+const createHistoryImportStorage = (storage) => wrapStorage(storage, owner);
+const tick = () => new Promise((resolve) => setImmediate(resolve));
 
-beforeEach(() => jest.clearAllMocks());
+beforeEach(() => {
+  jest.clearAllMocks();
+  owner = createHistoryMaintenance();
+});
 
 describe('import storage cleanup', () => {
   it.each([false, true])(
@@ -41,10 +48,31 @@ describe('import storage cleanup', () => {
       await accepted;
       req.destroy(new Error('client aborted'));
       expect(await handled).toBeInstanceOf(Error);
+      expect(owner.pauseAdmissions('import-abort')).toBe(true);
+      expect((await owner.getMaintenanceCensus('import-abort')).pendingWrites).toBe(1);
       completeWrite(null, { path: '/synthetic/late-import' });
       expect(completeRemoval).toEqual(expect.any(Function));
+      await tick();
+      expect((await owner.getMaintenanceCensus('import-abort')).pendingWrites).toBe(1);
+      let drained = false;
+      const drain = owner.drain().then(
+        () => {
+          drained = true;
+        },
+        (error) => error,
+      );
+      await tick();
+      expect(drained).toBe(false);
       const error = fails ? new Error('late unlink failed') : null;
       completeRemoval(error);
+      await tick();
+      expect(await owner.getMaintenanceCensus('import-abort')).toMatchObject({
+        pendingWrites: 0,
+        complete: !fails,
+      });
+      const result = await drain;
+      if (fails) expect(result.message).toBe('HISTORY_SETTLEMENT_UNCONFIRMED');
+      else expect(drained).toBe(true);
       if (fails) {
         expect(logger.error).toHaveBeenCalledWith(
           '[importStorage] Failed to remove temporary import file',

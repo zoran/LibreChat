@@ -39,7 +39,13 @@ describe('createBackgroundCodeResultHandler generated-file preflight', () => {
       file: { file_id: 'persisted-file' },
     });
     const updateToolCallResult = jest.fn().mockResolvedValue({ matched: true, unfinished: false });
-    const runPreviewFinalize = jest.fn();
+    let finishPreview!: () => void;
+    const runPreviewFinalize = jest.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finishPreview = resolve;
+        }),
+    );
     const handler = createBackgroundCodeResultHandler({
       req,
       preflightCodeOutputBatch,
@@ -48,7 +54,12 @@ describe('createBackgroundCodeResultHandler generated-file preflight', () => {
       runPreviewFinalize,
     });
 
-    await expect(handler(params)).resolves.toEqual({
+    const completion = handler(params);
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(runPreviewFinalize).toHaveBeenCalledTimes(1);
+    expect(updateToolCallResult).not.toHaveBeenCalled();
+    finishPreview();
+    await expect(completion).resolves.toEqual({
       attachments: [{ file_id: 'persisted-file', stepId: 'step-1' }],
     });
 

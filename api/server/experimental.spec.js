@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const vm = require('node:vm');
 
 describe('Experimental server configuration', () => {
   const source = fs.readFileSync(path.join(__dirname, 'experimental.js'), 'utf8');
@@ -69,6 +70,68 @@ describe('Experimental server configuration', () => {
       source.match(/startCodeEnvironmentLifecycleReconciler\(\{ mongoose \}\);/g),
     ).toHaveLength(1);
   });
+
+  it.each(['resolved', 'rejected'])(
+    'retains the first lifecycle reconciliation before worker startup advances: %s',
+    async (outcome) => {
+      const start = source.indexOf('const startServer = async () => {');
+      const boundary = source.indexOf('/** Background index sync', start);
+      expect(start).toBeGreaterThan(-1);
+      expect(boundary).toBeGreaterThan(start);
+      let resolveOriginal, rejectOriginal, markEntered;
+      const original = new Promise((resolve, reject) => {
+        resolveOriginal = resolve;
+        rejectOriginal = reject;
+      });
+      const entered = new Promise((resolve) => {
+        markEntered = resolve;
+      });
+      const failure = new Error('original lifecycle reconciliation failed');
+      const advance = jest.fn();
+      const run = vm.runInNewContext(
+        `${source.slice(start, boundary)}
+return advance();
+}; startServer;`,
+        {
+          process: { pid: 1 },
+          logger: { info: jest.fn() },
+          mongoose: {},
+          waitForKeyvRedisClient: jest.fn().mockResolvedValue(undefined),
+          connectDb: jest.fn().mockResolvedValue(undefined),
+          startCodeEnvironmentLifecycleReconciler: jest.fn(() => {
+            markEntered();
+            return original;
+          }),
+          advance,
+        },
+      );
+      const pending = run().then(
+        () => ({ succeeded: true }),
+        (error) => ({ error }),
+      );
+      try {
+        await Promise.race([
+          entered,
+          pending.then(() => {
+            throw new Error('startup returned before lifecycle reconciliation');
+          }),
+        ]);
+        expect(advance).not.toHaveBeenCalled();
+        if (outcome === 'resolved') {
+          resolveOriginal();
+          expect(await pending).toEqual({ succeeded: true });
+          expect(advance).toHaveBeenCalledTimes(1);
+        } else {
+          rejectOriginal(failure);
+          expect(await pending).toEqual({ error: failure });
+          expect(advance).not.toHaveBeenCalled();
+        }
+      } finally {
+        resolveOriginal();
+        await pending;
+      }
+    },
+  );
 
   it('never arms the full schedule engine in a clustered worker', () => {
     // The clustered entrypoint runs erasure-only maintenance: arming the engine here

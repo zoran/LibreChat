@@ -23,6 +23,8 @@ import { isUploadManagementError, UploadManagementError } from './errors';
 type Attachment = NonNullable<ManagedUploadView['attachment']>;
 type AuthorityOptions = { principal: UploadRequestPrincipal; allowedOrigins: readonly string[] };
 export interface UploadHttpOptions extends AuthorityOptions {
+  /** Existing Upload/File owner holds the original operation through all repository effects. */
+  runFileOperation<T>(work: () => Promise<T>): Promise<T>;
   management: Pick<
     UploadManagement,
     'list' | 'usage' | 'reserve' | 'cancel' | 'delete' | 'retryProcessing'
@@ -178,6 +180,8 @@ const parseSmallJson = json({
 /** Mount at /api/uploads before global body parsers so the 4 KiB metadata cap is effective. */
 export function createUploadHttpRouter(options: UploadHttpOptions): Router {
   const router = Router({ caseSensitive: true, strict: true });
+  const owned = (work: (request: Request, response: Response) => Promise<void>): RequestHandler =>
+    wrap((request, response) => options.runFileOperation(() => work(request, response)));
   const authenticate = authority(options);
   const principals = new WeakMap<Request, UploadPrincipal>();
   router.use((request, response, next) => {
@@ -215,7 +219,7 @@ export function createUploadHttpRouter(options: UploadHttpOptions): Router {
   };
   router.get(
     '/',
-    wrap(async (request, response) => {
+    owned(async (request, response) => {
       if (
         request.body !== undefined ||
         request.headers['transfer-encoding'] ||
@@ -223,10 +227,15 @@ export function createUploadHttpRouter(options: UploadHttpOptions): Router {
       )
         invalid();
       const owner = principal(request);
-      const [rows, usage] = await Promise.all([
+      // A rejected list cannot release custody while its sibling usage query is still original.
+      const [listed, measured] = await Promise.allSettled([
         options.management.list(owner),
         options.management.usage(owner),
       ]);
+      if (listed.status === 'rejected') throw listed.reason;
+      if (measured.status === 'rejected') throw measured.reason;
+      const rows = listed.value;
+      const usage = measured.value;
       if (rows.length > 100) throw new UploadManagementError('unavailable');
       const operations = rows.map(publicOperation);
       const attachments = await options.projectAttachments(
@@ -263,7 +272,7 @@ export function createUploadHttpRouter(options: UploadHttpOptions): Router {
   router.post(
     '/operations',
     metadata,
-    wrap(async (request, response) => {
+    owned(async (request, response) => {
       const body: unknown = request.body;
       exact(body, ['mediaType', 'declaredBytes', 'idempotencyKey', 'scope']);
       if (
@@ -297,7 +306,7 @@ export function createUploadHttpRouter(options: UploadHttpOptions): Router {
     router.post(
       `/operations/:id/${action}`,
       metadata,
-      wrap(async (request, response) => {
+      owned(async (request, response) => {
         exact(request.body, []);
         const method = action === 'cancel' ? 'cancel' : 'retryProcessing';
         await sendOperation(
@@ -311,7 +320,7 @@ export function createUploadHttpRouter(options: UploadHttpOptions): Router {
   router.post(
     '/operations/:id/intake',
     metadata,
-    wrap(async (request, response) => {
+    owned(async (request, response) => {
       exact(request.body, []);
       if (!options.issueIntake) throw new UploadManagementError('unavailable');
       const id = operationId(request);
@@ -326,7 +335,7 @@ export function createUploadHttpRouter(options: UploadHttpOptions): Router {
   );
   router.delete(
     '/operations/:id',
-    wrap(async (request, response) => {
+    owned(async (request, response) => {
       if (
         request.body !== undefined ||
         request.headers['transfer-encoding'] ||

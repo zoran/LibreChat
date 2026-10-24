@@ -36,6 +36,8 @@ const mockBulkUpdateResourcePermissions = jest.fn();
 const mockRestoreInsightsPermissionChanges = jest.fn();
 
 jest.mock('~/server/services/PermissionService', () => ({
+  permissionMaintenance: jest.requireActual('~/server/services/PermissionMaintenance')
+    .permissionMaintenance,
   bulkUpdateResourcePermissions: (...args) => mockBulkUpdateResourcePermissions(...args),
   restoreInsightsPermissionChanges: (...args) => mockRestoreInsightsPermissionChanges(...args),
   ensureGroupPrincipalExists: jest.fn(),
@@ -344,6 +346,7 @@ describe('PermissionsController', () => {
 
       expect(mockBulkUpdateResourcePermissions).toHaveBeenCalledWith(
         expect.objectContaining({ maxWriteAttempts: 7 }),
+        expect.objectContaining({ track: expect.any(Function), write: expect.any(Function) }),
       );
       expect(mockRecordAuditEntry).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -390,11 +393,10 @@ describe('PermissionsController', () => {
 
       await updateResourcePermissions(req, res);
 
-      expect(mockRestoreInsightsPermissionChanges).toHaveBeenCalledWith({
-        resourceType: ResourceType.AGENT,
-        resourceId: agentObjectId,
-        changes,
-      });
+      expect(mockRestoreInsightsPermissionChanges).toHaveBeenCalledWith(
+        { resourceType: ResourceType.AGENT, resourceId: agentObjectId, changes },
+        expect.objectContaining({ track: expect.any(Function), write: expect.any(Function) }),
+      );
       expect(res.status).toHaveBeenCalledWith(500);
     });
 

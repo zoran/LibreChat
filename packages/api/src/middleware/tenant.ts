@@ -189,6 +189,10 @@ type UploadRequest = ServerRequest & {
   files?: UploadFile[] | Record<string, UploadFile[]>;
 };
 
+type RestoreTenantOptions = {
+  onUploadCleanupFailure?: (error: unknown) => void;
+};
+
 function collectUploadPaths(req: UploadRequest): string[] {
   const paths = new Set<string>();
   if (req.file?.path) {
@@ -213,7 +217,10 @@ function collectUploadPaths(req: UploadRequest): string[] {
   return [...paths];
 }
 
-async function cleanupUploadedFiles(req: ServerRequest): Promise<void> {
+async function cleanupUploadedFiles(
+  req: ServerRequest,
+  options: RestoreTenantOptions,
+): Promise<void> {
   const paths = collectUploadPaths(req as UploadRequest);
   if (paths.length === 0) {
     return;
@@ -225,6 +232,7 @@ async function cleanupUploadedFiles(req: ServerRequest): Promise<void> {
         path: paths[index],
         error: result.reason,
       });
+      options.onUploadCleanupFailure?.(result.reason);
     }
   });
 }
@@ -233,8 +241,9 @@ async function rejectRequestWithUploadCleanup(
   req: ServerRequest,
   res: Response,
   message: string,
+  options: RestoreTenantOptions,
 ): Promise<void> {
-  await cleanupUploadedFiles(req);
+  await cleanupUploadedFiles(req, options);
   res.status(403).json({ error: message });
 }
 
@@ -243,8 +252,9 @@ function rejectRequestWithUploadCleanupInContext(
   req: ServerRequest,
   res: Response,
   message: string,
+  options: RestoreTenantOptions,
 ): Promise<void> {
-  const rejectRequest = () => rejectRequestWithUploadCleanup(req, res, message);
+  const rejectRequest = () => rejectRequestWithUploadCleanup(req, res, message, options);
   if (!hasTenantContext(context)) {
     return rejectRequest();
   }
@@ -262,6 +272,7 @@ export function restoreTenantContextFromReq(
   req: ServerRequest,
   res: Response,
   next: NextFunction,
+  options: RestoreTenantOptions = {},
 ): void | Promise<void> {
   const tenantId = resolveRequestTenantId(req as RequestTenantSource);
   const context = buildTenantContext(req, tenantId);
@@ -274,6 +285,7 @@ export function restoreTenantContextFromReq(
         req,
         res,
         'Tenant context required in strict isolation mode',
+        options,
       );
     }
     runWithTenantContext(context, next);
@@ -284,7 +296,7 @@ export function restoreTenantContextFromReq(
     logger.warn('[restoreTenantContextFromReq] Rejected system tenant for request route', {
       path: req.path,
     });
-    return rejectRequestWithUploadCleanup(req, res, SYSTEM_TENANT_REJECTION_MESSAGE);
+    return rejectRequestWithUploadCleanup(req, res, SYSTEM_TENANT_REJECTION_MESSAGE, options);
   }
 
   const currentContext = tenantStorage.getStore();

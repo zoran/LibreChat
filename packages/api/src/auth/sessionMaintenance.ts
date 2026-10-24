@@ -6,86 +6,61 @@ export function createAuthSessionStore(
   store: session.Store,
   owner: AuthMaintenance,
 ): session.Store {
+  const reads = new Set(['get', 'all', 'length']);
+  const callbacks = { get: 1, set: 2, destroy: 1, clear: 0, touch: 2, all: 0, length: 0 };
+  const methods = store as unknown as Record<string, (...values: unknown[]) => unknown>;
   class ObservedStore extends session.Store {
+    declare get: session.Store['get'];
+    declare set: session.Store['set'];
+    declare destroy: session.Store['destroy'];
+
     constructor() {
       super();
-      // Preserve optional methods: advertising touch for a store without it changes session policy.
-      for (const name of ['clear', 'touch'] as const) {
-        if (typeof store[name] === 'function') {
-          Object.defineProperty(this, name, { value: (...args: unknown[]) => invoke(name, args) });
-        }
-      }
-      for (const name of ['all', 'length'] as const) {
-        if (typeof store[name] === 'function')
-          Object.defineProperty(this, name, { value: store[name].bind(store) });
+      // Preserve optional methods and each original signature; absence affects session policy.
+      for (const [name, callbackIndex] of Object.entries(callbacks)) {
+        if (typeof methods[name] !== 'function') continue;
+        const observed = (...args: unknown[]) => invoke(name, callbackIndex, args);
+        Object.defineProperty(observed, 'length', { value: methods[name].length });
+        Object.defineProperty(this, name, { value: observed });
       }
       store.on('connect', () => this.emit('connect'));
       store.on('disconnect', () => this.emit('disconnect'));
     }
-
-    get(sid: string, callback: (err: unknown, data?: session.SessionData | null) => void) {
-      store.get(sid, callback);
-    }
-
-    set(sid: string, data: session.SessionData, callback?: (err?: unknown) => void) {
-      invoke('set', [sid, data, callback]);
-    }
-
-    destroy(sid: string, callback?: (err?: unknown) => void) {
-      invoke('destroy', [sid, callback]);
-    }
   }
-  function invoke(name: string, args: unknown[]) {
-    const operation = owner.current();
+  function invoke(name: string, callbackIndex: number, supplied: unknown[]) {
+    const args = [...supplied];
     const callback =
-      typeof args[args.length - 1] === 'function'
-        ? (args.pop() as (error?: unknown) => unknown)
+      typeof args[callbackIndex] === 'function'
+        ? (args[callbackIndex] as (...values: unknown[]) => unknown)
         : undefined;
-    if (args[args.length - 1] === undefined) args.pop();
-    if (!operation) owner.markUncertain();
-    let started = false;
-    const start = (done: (error?: unknown) => void) => {
-      started = true;
-      const method = (store as unknown as Record<string, (...values: unknown[]) => unknown>)[name];
-      let called = false;
-      const complete = (error?: unknown) => {
-        if (called) return;
-        called = true;
-        try {
-          // The caller may synchronously start another accepted session continuation.
-          // Keep its callback inside the lifetime, including express-session's final end().
-          const deliver = () => callback?.(error);
-          const delivered = operation ? operation.track(deliver) : Promise.resolve(deliver());
-          void delivered.then(
-            () => done(error),
-            (callbackError) => {
-              owner.markUncertain();
-              done(error || callbackError);
-            },
-          );
-        } catch (callbackError) {
-          owner.markUncertain();
-          done(error || callbackError);
-          return;
-        }
-      };
+    const operation = owner.current();
+    if (!operation) {
+      owner.markUncertain();
       try {
-        method.apply(store, [...args, complete]);
-      } catch (error) {
-        complete(error);
+        callback?.(new Error('AUTH_SESSION_OWNERSHIP_REQUIRED'));
+      } catch {
+        owner.markUncertain();
       }
-    };
-    const work = operation
-      ? operation.callback(start)
-      : new Promise<void>((resolve, reject) =>
-          start((error) => (error ? reject(error) : resolve())),
-        );
+      return;
+    }
+    let started = false;
+    let original;
+    const work = operation.callback(
+      (done) => {
+        started = true;
+        args[callbackIndex] = done;
+        original = Reflect.apply(methods[name], store, args);
+        return original;
+      },
+      { write: !reads.has(name), complete: callback },
+    );
     void work
       .catch((error) => {
-        owner.markUncertain();
+        // A retired owner refuses dispatch before start; still report the ordinary callback error.
         if (!started) callback?.(error);
       })
       .catch(() => owner.markUncertain());
+    return original;
   }
   return new ObservedStore();
 }

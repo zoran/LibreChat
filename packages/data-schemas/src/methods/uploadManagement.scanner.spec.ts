@@ -5,6 +5,7 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import { UPLOAD_RECORD_BYTES, UPLOAD_DERIVED_MAX_ORIGIN_BYTES } from 'librechat-data-provider';
 import type { UploadLease, UploadSecurityExecution } from 'librechat-data-provider';
 import type { StoredUpload } from './uploadManagementStore';
+import { completeUnacceptedUploadCleanup } from './uploadManagement.structure.fixture';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createModels } from '~/models';
 
@@ -376,6 +377,12 @@ describe('durable scanner execution', () => {
     });
     await second.confirmCleanup(valid, later);
     await first.confirmCleanup(valid, later);
+    expect(await row()).toMatchObject({
+      stagingHeld: false,
+      originalBytes: 8,
+      cleanupPending: true,
+    });
+    await completeUnacceptedUploadCleanup(first, user, lease);
     expect(await row()).toMatchObject({
       state: 'failed',
       stagingHeld: false,

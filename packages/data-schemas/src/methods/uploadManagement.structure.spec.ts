@@ -3,9 +3,20 @@ import mongoose from 'mongoose';
 import { createHash } from 'node:crypto';
 import { UPLOAD_MAX_TEXT_BYTES, canonicalManagedJson } from 'librechat-data-provider';
 import type { StoredUpload, CounterRow } from './uploadManagementStore';
-import { createUploadStore, createUploadActivationMethods } from './uploadManagementStore';
-import { useUploadStructureFixture } from './uploadManagement.structure.fixture';
+import type { IMongoFile } from '../types/file';
+import {
+  useUploadStructureFixture,
+  copyFrozenUploadFiles,
+  completeAcceptedUploadFileCleanup,
+} from './uploadManagement.structure.fixture';
+import {
+  createUploadStore,
+  createUploadActivationMethods,
+  hasValidUploadPublicationTime,
+} from './uploadManagementStore';
 import { captureManagedRetrievalInventoryEvidence } from './fileRetrieval';
+import { projectFileHousekeeping } from './fileHousekeepingProjection';
+import { validFileRetentionActivity } from './fileActivityTransition';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createFileRetentionMethods } from './fileRetention';
 import { createFileMethods } from './file';
@@ -144,15 +155,151 @@ describe('original-bound managed document structure', () => {
   ] as const)(
     'round-trips first publication history with legacy-unknown=%s and state=%s',
     async (legacy, state) => {
+      const historyShift = state === 'expired' ? 36 * 86_400_000 : 0;
+      const expectedPublicationAt = now + 100 - historyShift;
       const lease = await processing();
       await fixture.repository.publish(lease, result(), now + 100);
       await fixture.repository.confirmCleanup(localGone(lease), now + 101);
       if (state === 'deleted') await fixture.repository.delete(user, 'structure', now + 102);
       if (state === 'expired') {
-        const row = (await db.models.UploadOperation.findById('structure').lean<
-          StoredUpload & Required<Pick<StoredUpload, 'expiresAt'>>
-        >())!;
-        await fixture.repository.reconcile(row.expiresAt);
+        // Model an already-published historical fixture, preserving its full relative chronology.
+        // Real expiry still requires both application time and Mongo $$NOW; no live guard is mocked.
+        const session = await db.startSession();
+        try {
+          await session.withTransaction(async () => {
+            const row = (await db.models.UploadOperation.findById('structure')
+              .session(session)
+              .lean<StoredUpload>())!;
+            const file = (await db.models.File.findOne({ file_id: 'structure' })
+              .select('+securityApproval +retentionActivity +retrievalCreation')
+              .session(session)
+              .lean<IMongoFile>())!;
+            if (
+              !file.retentionActivity ||
+              !file.retentionAcceptedAt ||
+              !file.expiredAt ||
+              !file.retrievalCreation ||
+              !file.securityApproval ||
+              row.acceptedAt === undefined ||
+              row.expiresAt === undefined ||
+              row.firstPublishedAtMs === undefined ||
+              !row.securityApproval ||
+              !row.securityExecution ||
+              !row.securitySettlement ||
+              !row.parserExecution
+            )
+              throw Error('Expected complete published fixture clocks');
+            expect(row).toMatchObject({ state: 'ready', stagingHeld: false, writerStopped: true });
+            expect(row.slot).toBeUndefined();
+            expect(row.leaseExpiresAt).toBeUndefined();
+            expect(file.retrievalCreation.state).toBe('empty');
+            expect(file.managedRetrieval).toBeUndefined();
+            expect(validFileRetentionActivity(file.retentionActivity, file.expiredAt)).toBe(true);
+            const date = (value: Date) => new Date(value.getTime() - historyShift);
+            const iso = (value: string) => date(new Date(value)).toISOString();
+            const aged: StoredUpload = {
+              ...row,
+              createdAt: row.createdAt - historyShift,
+              acceptedAt: row.acceptedAt - historyShift,
+              expiresAt: row.expiresAt - historyShift,
+              firstPublishedAtMs: row.firstPublishedAtMs - historyShift,
+              securityApproval: {
+                ...row.securityApproval,
+                checkedAt: iso(row.securityApproval.checkedAt),
+              },
+              securityExecution: {
+                ...row.securityExecution,
+                expiresAt: iso(row.securityExecution.expiresAt),
+              },
+              securitySettlement: {
+                ...row.securitySettlement,
+                execution: {
+                  ...row.securitySettlement.execution,
+                  expiresAt: iso(row.securitySettlement.execution.expiresAt),
+                },
+              },
+              parserExecution: {
+                ...row.parserExecution,
+                expiresAt: iso(row.parserExecution.expiresAt),
+              },
+            };
+            for (const field of ['processingQueuedAt', 'byteLeaseUntil'] as const)
+              if (row[field] !== undefined) aged[field] = row[field]! - historyShift;
+            const activity = { ...file.retentionActivity };
+            for (const field of [
+              'baselineDeadlineAt',
+              'trackedSince',
+              'lastSuccessfulReadAt',
+              'lastSuccessfulProcessingAt',
+            ] as const)
+              if (activity[field] !== undefined) activity[field] = date(activity[field]!);
+            const next: IMongoFile = {
+              ...file,
+              retentionAcceptedAt: date(file.retentionAcceptedAt),
+              expiredAt: date(file.expiredAt),
+              retentionActivity: activity,
+              securityApproval: {
+                ...file.securityApproval,
+                checkedAt: iso(file.securityApproval.checkedAt),
+              },
+              retrievalCreation: {
+                ...file.retrievalCreation,
+                acceptedAt: file.retrievalCreation.acceptedAt - historyShift,
+              },
+            };
+            for (const field of ['createdAt', 'updatedAt'] as const)
+              if (file[field] instanceof Date) next[field] = date(file[field]);
+            expect(
+              activity.baselineDeadlineAt.getTime() - next.retentionAcceptedAt!.getTime(),
+            ).toBe(28 * 86_400_000);
+            expect(next.expiredAt!.getTime() - activity.baselineDeadlineAt.getTime()).toBe(
+              7 * 86_400_000,
+            );
+            expect(activity).toMatchObject({
+              processingCount: 1,
+              readCount: 0,
+              deadlineGeneration: 1,
+            });
+            expect(validFileRetentionActivity(activity, next.expiredAt)).toBe(true);
+            expect(hasValidUploadPublicationTime(aged)).toBe(true);
+            expect(aged.firstPublishedAtMs).toBe(expectedPublicationAt);
+            expect(aged.acceptedAt).toBe(next.retentionAcceptedAt!.getTime());
+            expect(aged.expiresAt).toBe(next.expiredAt!.getTime());
+            expect(aged.expiresAt).toBeLessThan(Date.now());
+            for (const field of [
+              'state',
+              'original',
+              'publishedDigest',
+              'originalBytes',
+              'textBytes',
+              'recordBytes',
+            ] as const)
+              expect(aged[field]).toEqual(row[field]);
+            // Only isolated historical fixture input is translated; owners still perform all transitions.
+            await (
+              db.models.UploadOperation.collection as unknown as mongoose.Collection<StoredUpload>
+            ).replaceOne({ _id: row._id }, aged, { session });
+            await db.models.File.collection.updateOne(
+              { _id: file._id },
+              {
+                $set: {
+                  retentionAcceptedAt: next.retentionAcceptedAt,
+                  expiredAt: next.expiredAt,
+                  retentionActivity: next.retentionActivity,
+                  securityApproval: next.securityApproval,
+                  retrievalCreation: next.retrievalCreation,
+                  createdAt: next.createdAt,
+                  updatedAt: next.updatedAt,
+                },
+              },
+              { session },
+            );
+            await projectFileHousekeeping(db, file, next, session);
+          });
+        } finally {
+          await session.endSession();
+        }
+        await fixture.repository.reconcile(Date.now());
       }
       expect(await db.models.UploadOperation.findById('structure').lean()).toMatchObject({ state });
       if (legacy)
@@ -165,18 +312,19 @@ describe('original-bound managed document structure', () => {
       });
       const record = page.records.find((item) => item.type === 'operation')!.value as StoredUpload;
       if (legacy) expect(record).not.toHaveProperty('firstPublishedAtMs');
-      else expect(record.firstPublishedAtMs).toBe(now + 100);
+      else expect(record.firstPublishedAtMs).toBe(expectedPublicationAt);
       const target = new mongoose.Mongoose();
       try {
         await target.connect(fixture.mongo.getUri(`publication-import-${legacy}-${state}`));
         createModels(target);
         const imported = createUploadManagementRepository(target, { securityPolicySha256: policy });
         await imported.initialize();
+        await copyFrozenUploadFiles(db, target);
         await imported.importSnapshot(page);
         await imported.importSnapshot(page);
         const stored = await target.models.UploadOperation.findById('structure').lean();
         if (legacy) expect(stored).not.toHaveProperty('firstPublishedAtMs');
-        else expect(stored).toMatchObject({ firstPublishedAtMs: now + 100 });
+        else expect(stored).toMatchObject({ firstPublishedAtMs: expectedPublicationAt });
       } finally {
         await target.disconnect();
       }
@@ -232,6 +380,7 @@ describe('original-bound managed document structure', () => {
         createModels(target);
         const imported = createUploadManagementRepository(target, { securityPolicySha256: policy });
         await imported.initialize();
+        await copyFrozenUploadFiles(db, target);
         await expect(imported.importSnapshot(forged)).rejects.toMatchObject({
           code: 'migration_conflict',
         });
@@ -469,6 +618,15 @@ describe('original-bound managed document structure', () => {
       obligations: [],
       inventoryReceipt: { evidenceSha256: evidence.evidenceSha256 },
     });
+    expect(await lifecycle.prepareFileSourceDeletion(user, ['structure'])).toEqual({
+      preparedFileIds: [],
+    });
+    await completeAcceptedUploadFileCleanup(
+      db,
+      user,
+      'structure',
+      fixture.mongo.getUri('document-structure'),
+    );
     expect(await lifecycle.prepareFileSourceDeletion(user, ['structure'])).toEqual({
       preparedFileIds: ['structure'],
     });

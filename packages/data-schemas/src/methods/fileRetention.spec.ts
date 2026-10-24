@@ -1,17 +1,163 @@
-/** Real Mongo transaction and selective-message lifecycle evidence; no external services. */
+/** Real Mongo lifecycle evidence; native storage replies and empty generation/checkpoint inventories are fixtures. */
 import mongoose from 'mongoose';
 import { v4 as uuid } from 'uuid';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import type { UploadLease, UploadPrincipal } from 'librechat-data-provider';
+import type { FileCleanupProgressResult } from '../types/fileCleanup';
+import type { JobClaim } from '../types/housekeeping';
 import type { IMessage } from '~/types';
+import {
+  createFileRetentionMethods,
+  FileSourceUnavailableError,
+  touchFileSources,
+} from './fileRetention';
 import { createCheckpointSourceMethods, snapshotCheckpointSourceBinding } from './checkpointSource';
-import { FileSourceUnavailableError, touchFileSources } from './fileRetention';
+import { createFileCleanupLifecycleMethods } from './fileCleanupLifecycle';
+import { createFileCleanupProgressMethods } from './fileCleanupProgress';
 import { CLIENT_MESSAGE_SELECT, createMessageMethods } from './message';
 import { createUploadManagementRepository } from './uploadManagement';
+import { managedFileRetrievalDeletionSettled } from './fileRetrieval';
+import { createFileCleanupClaimMethods } from './fileCleanupClaim';
+import { createUploadFileCleanupOwner } from './uploadFileCleanup';
+import { createHousekeepingStore } from './housekeepingStore';
 import { createUploadStore } from './uploadManagementStore';
 import { sourceSha256 } from './messageSource';
 import { createFileMethods } from './file';
 import { createModels } from '~/models';
+
+/** Real File/Upload/HK transitions; these fixtures create no generation or checkpoint rows. */
+async function prepareCleanupReceipts(database: typeof mongoose, fileIds: string[]) {
+  const observed = (result: FileCleanupProgressResult) => {
+    if (result.state !== 'progress') throw new Error(JSON.stringify(result));
+    return result;
+  };
+  const signal = new AbortController().signal;
+  const jobs = createHousekeepingStore(database);
+  await jobs.initialize();
+  const generation = createFileCleanupProgressMethods(database, jobs);
+  await generation.initialize();
+  const upload = createUploadFileCleanupOwner(database);
+  const retention = createFileRetentionMethods(database);
+  const cleanup = createFileCleanupLifecycleMethods(database, jobs, upload, retention, {
+    purgeRetrieval: async (scope, ids) => {
+      const rows = await database.models.File.collection
+        .find<Parameters<typeof managedFileRetrievalDeletionSettled>[0]>({
+          user: new mongoose.Types.ObjectId(scope.userId),
+          tenantId: scope.tenantId ?? null,
+          file_id: { $in: [...ids] },
+        })
+        .toArray();
+      expect(rows).toHaveLength(ids.length);
+      for (const row of rows) expect(managedFileRetrievalDeletionSettled(row)).toBe(true);
+    },
+    purgeCheckpoints: async () => {
+      const collections = await database.connection
+        .db!.listCollections({}, { nameOnly: true })
+        .toArray();
+      expect(collections.filter(({ name }) => name.includes('checkpoint'))).toEqual([]);
+    },
+    redactFileSourceContent: createMessageMethods(database).redactFileSourceContent,
+  });
+  const claims = new Map<string, JobClaim>();
+  for (let index = 0; index < fileIds.length; index++) {
+    const claim = await jobs.claimNext('file.cleanup', {
+      podUid: 'retention-fixture',
+      incarnation: 'boot',
+      source: 'fixture',
+      hostId: 'local',
+    });
+    if (!claim || claim.work.handler !== 'file.cleanup')
+      throw new Error('Expected actual revoked File cleanup claim');
+    claims.set(claim.work.subject.fileId, claim);
+  }
+  expect([...claims.keys()].sort()).toEqual([...fileIds].sort());
+  const claimFor = (fileId: string) => {
+    const claim = claims.get(fileId);
+    if (!claim) throw new Error('File cleanup claim missing');
+    return claim;
+  };
+  for (const [fileId, claim] of claims) {
+    expect(
+      await createFileCleanupClaimMethods(database, jobs, retention).enter(claim, signal),
+    ).toMatchObject({ state: 'progress' });
+    observed(await cleanup.begin(claim, signal));
+    let step = observed(await generation.beginCapture(claim, signal));
+    step = observed(
+      await generation.recordCapturePage(
+        claim,
+        step.expected,
+        { targets: [], complete: true },
+        signal,
+      ),
+    );
+    step = observed(await generation.finishGenerationStage(claim, step.expected, signal));
+    for (let attempt = 0; attempt < 5; attempt++) {
+      step = observed(await cleanup.purgeDerivatives(claim, signal));
+      if (step.progress.lifecycle!.derivatives.messages === 'complete') break;
+    }
+    expect(step.progress.lifecycle!.derivatives).toMatchObject({
+      retrieval: 'complete',
+      checkpoints: 'complete',
+      messages: 'complete',
+    });
+    step = observed(await cleanup.prepareStorage(claim, signal));
+    const request = step.progress.lifecycle!.storage!;
+    if (request.state !== 'binding') throw new Error('Persisted storage request missing');
+    step = observed(
+      await cleanup.bindStorage(
+        claim,
+        step.expected,
+        {
+          ...request.request,
+          bucket: 'originals-fixture',
+          key: step.progress.lifecycle!.upload.originalKey,
+        },
+        signal,
+      ),
+    );
+    const storage = step.progress.lifecycle!.storage!;
+    if (storage.state !== 'observing') throw new Error('Persisted storage binding missing');
+    // Native storage is outside this Mongo fixture; the actual owner validates and retains its receipt.
+    observed(
+      await cleanup.recordStorage(
+        claim,
+        step.expected,
+        {
+          ...storage.binding,
+          state: 'durable_delete_complete',
+          obligationId: `native-fixture-${fileId}`,
+          aggregateRevision: '1',
+          proofSHA256: 'e'.repeat(64),
+        },
+        signal,
+      ),
+    );
+  }
+  return {
+    upload,
+    commit: (fileId: string) => cleanup.commitConsumption(claimFor(fileId), signal),
+    async finish(fileId: string) {
+      const claim = claimFor(fileId);
+      const step = observed(await cleanup.commitConsumption(claim, signal));
+      const storage = step.progress.lifecycle!.storage!;
+      if (storage.state !== 'committed') throw new Error('Actual Upload acknowledgment missing');
+      observed(
+        await cleanup.recordConsumption(
+          claim,
+          step.expected,
+          {
+            state: 'recorded',
+            obligationId: storage.receipt.obligationId,
+            receiptSHA256: storage.receiptSHA256,
+            consumerCommitId: storage.consumerCommitId,
+          },
+          signal,
+        ),
+      );
+      observed(await cleanup.finalize(claim, signal));
+    },
+  };
+}
 
 describe('source-dependent message retention', () => {
   let mongo: MongoMemoryReplSet;
@@ -239,7 +385,14 @@ describe('source-dependent message retention', () => {
     await expect(files.deleteFiles([], user)).rejects.toBeInstanceOf(FileSourceUnavailableError);
     expect(await mongoose.models.File.countDocuments({ file_id: sourceId })).toBe(1);
     await files.revokeFileSources(owner, [sourceId]);
-    await files.finalizeFileSourceDeletion(owner, [sourceId]);
+    expect(await files.finalizeFileSourceDeletion(owner, [sourceId])).toEqual({
+      completedFileIds: [],
+    });
+    const cleanup = await prepareCleanupReceipts(mongoose, [sourceId]);
+    await cleanup.finish(sourceId);
+    expect(await files.finalizeFileSourceDeletion(owner, [sourceId])).toEqual({
+      completedFileIds: [sourceId],
+    });
     await expect(files.deleteFiles([], user)).resolves.toMatchObject({ deletedCount: 0 });
     expect(
       await mongoose.models.File.countDocuments({

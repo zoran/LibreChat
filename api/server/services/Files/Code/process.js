@@ -3,6 +3,7 @@ const { logger } = require('@librechat/data-schemas');
 const { getCodeBaseURL } = require('@librechat/agents');
 const {
   withTimeout,
+  fileDeletionWorkOwner,
   getBasePath,
   logAxiosError,
   hasOfficeHtmlPath,
@@ -391,14 +392,10 @@ const PREVIEW_FINALIZE_TIMEOUT_MS = 60_000;
  * atomically transition the DB record to `status: 'ready'` (with
  * `text`/`textFormat`) or `status: 'failed'` (with `previewError`).
  *
- * Decoupled from `processCodeOutput` so the agent's final response is
- * not blocked on potentially slow office rendering. The caller fires
- * this without awaiting; promises continue running after the HTTP
- * response closes (Node doesn't kill them) and the frontend learns of
- * completion via the `attachment` update SSE event (if the stream is
- * still open) or via React Query polling otherwise. Process restart
- * is the only thing that can lose progress — covered by the boot-time
- * orphan sweep.
+ * The existing File work scope owns extraction and the conditional DB
+ * write. A timeout chooses the failed preview state, but does not release
+ * the original extractor. Callers can emit pending metadata immediately;
+ * their completion join still retains the entire File original.
  *
  * @param {object} params
  * @param {Buffer} params.buffer - The full downloaded file contents,
@@ -433,12 +430,16 @@ const finalizePreview = async ({
   category,
   file_id,
   previewRevision,
+  work,
 }) => {
   let text = null;
   let previewError;
   try {
     text = await withTimeout(
-      extractCodeArtifactText(buffer, leafName, mimeType, category),
+      fileDeletionWorkOwner.run(
+        () => extractCodeArtifactText(buffer, leafName, mimeType, category, work),
+        work,
+      ),
       PREVIEW_FINALIZE_TIMEOUT_MS,
       `Preview extraction exceeded ${PREVIEW_FINALIZE_TIMEOUT_MS}ms`,
     );
@@ -466,15 +467,17 @@ const finalizePreview = async ({
      * emit has rotated the revision (cross-turn filename reuse),
      * `updateFile` returns null and the stale render is silently
      * discarded. (Codex P1 review on PR #12957.) */
-    const updated = await updateFile(
-      {
-        file_id,
-        text,
-        textFormat,
-        status,
-        previewError: failed ? previewError : null,
-      },
-      previewRevision ? { previewRevision } : undefined,
+    const updated = await work.effect(() =>
+      updateFile(
+        {
+          file_id,
+          text,
+          textFormat,
+          status,
+          previewError: failed ? previewError : null,
+        },
+        previewRevision ? { previewRevision } : undefined,
+      ),
     );
     if (!updated && previewRevision) {
       logger.debug(
@@ -491,22 +494,21 @@ const finalizePreview = async ({
 };
 
 /**
- * Run the background `finalize` thunk returned by `processCodeOutput`
- * and route the resolved record to the caller's emit logic. Shared
- * between `callbacks.js` (chat-completions + Open Responses) and
- * `tools.js` (direct tool endpoint) so the fire-and-forget pattern
- * doesn't drift across callsites.
+ * Join the File-owned `finalize` thunk returned by `processCodeOutput`
+ * and route the resolved record to the caller's emit logic. The returned
+ * promise includes the defensive failure-marker write; callers retain it
+ * in their existing artifact/Generation completion join.
  *
  * `onResolved` receives the post-update DB record and is the only piece
  * that varies — chat-completions writes the legacy `attachment` SSE
  * event, Open Responses writes the spec-shaped `librechat:attachment`
  * event with a sequence number, and the direct tool endpoint has no
- * stream to write to (caller passes a no-op).
+ * stream to write to (File retains completion without an emitter).
  *
  * The catch path is the safety net for unexpected programming errors
  * inside `finalizePreview` ONLY. The function is designed to never
- * throw (extraction and DB failures are translated to `status: 'failed'`
- * inside it), but a ref error or future regression would otherwise
+ * throw: extraction failure becomes failed metadata, while rejected DB
+ * writes are observed before returning null. An unexpected helper error would
  * leave the DB record stuck at `'pending'` until the boot-time orphan
  * sweep — potentially hours away on a stable server. We attempt a
  * best-effort `updateFile` to mark the record `'failed'` with
@@ -537,15 +539,19 @@ const finalizePreview = async ({
  *   doesn't override a newer turn's record.
  * @param {(updated: object) => void} [params.onResolved] - Called once
  *   on success with the post-update record.
+ * @param {import('@librechat/api').FileDeletionWorkScope} [params.work] -
+ *   Existing scope while the File owner starts the original preview.
+ * @returns {Promise<object | null>} Complete preview and fallback settlement.
  */
-const runPreviewFinalize = ({ finalize, fileId, previewRevision, onResolved }) => {
+const runPreviewFinalize = async ({ finalize, fileId, previewRevision, onResolved, work }) => {
   if (typeof finalize !== 'function') {
-    return;
+    return null;
   }
-  finalize()
+  return Promise.resolve()
+    .then(finalize)
     .then((updated) => {
       if (!updated || !onResolved) {
-        return;
+        return updated;
       }
       /* Isolated try/catch — a throw inside `onResolved` (transport-side
        * SSE write race, emitter listener error) MUST NOT propagate to
@@ -563,50 +569,95 @@ const runPreviewFinalize = ({ finalize, fileId, previewRevision, onResolved }) =
           emitError,
         );
       }
+      return updated;
     })
-    .catch((error) => {
+    .catch(async (error) => {
       logger.error('Error rendering deferred preview:', error);
       if (!fileId) {
-        return;
+        return null;
       }
-      updateFile(
-        {
-          file_id: fileId,
-          status: 'failed',
-          previewError: 'unexpected',
-        },
-        previewRevision ? { previewRevision } : undefined,
-      ).catch((updateErr) => {
+      try {
+        return await fileDeletionWorkOwner.run(
+          (scope) =>
+            scope.effect(() =>
+              updateFile(
+                {
+                  file_id: fileId,
+                  status: 'failed',
+                  previewError: 'unexpected',
+                },
+                previewRevision ? { previewRevision } : undefined,
+              ),
+            ),
+          work,
+        );
+      } catch (updateErr) {
         logger.error(
           `[runPreviewFinalize] also failed to mark ${fileId} as failed after error:`,
           updateErr,
         );
-      });
+        return null;
+      }
     });
 };
 
-const processCodeOutput = (params) =>
-  processCodeOutputWithDeps(params, {
-    getCodeOutputFileSettings,
-    downloadCodeOutputBuffer,
-    createDownloadFallback,
-    getRetentionExpiry,
-    convertImage,
-    getStrategyFunctions,
-    determineFileType,
-    claimCodeFile,
-    commitCodeFile,
-    finalizePreview,
-    hasOfficeHtmlPath,
-    sanitizeArtifactPath,
-    flattenArtifactPath,
-    classifyCodeArtifact,
-    extractCodeArtifactText,
-    getExtractedTextFormat,
-    getStorageMetadata,
-    logAxiosError,
-    logger,
+/** File owns creation through preview settlement; the early result only releases metadata. */
+const processCodeOutput = (params) => {
+  let resolveResult;
+  let rejectResult;
+  const result = new Promise((resolve, reject) => {
+    resolveResult = resolve;
+    rejectResult = reject;
   });
+  const original = fileDeletionWorkOwner.run(async (work) => {
+    const output = await processCodeOutputWithDeps(params, {
+      getCodeOutputFileSettings,
+      downloadCodeOutputBuffer,
+      createDownloadFallback,
+      getRetentionExpiry: (req) => fileDeletionWorkOwner.run(() => getRetentionExpiry(req), work),
+      convertImage: (...args) => convertImage(...args, work),
+      getStrategyFunctions: (source) => {
+        const strategy = getStrategyFunctions(source);
+        return {
+          ...strategy,
+          ...(strategy.saveBuffer && {
+            saveBuffer: (...args) => work.effect(() => strategy.saveBuffer(...args)),
+          }),
+        };
+      },
+      determineFileType,
+      claimCodeFile: (...args) => work.effect(() => claimCodeFile(...args)),
+      commitCodeFile: (...args) => work.effect(() => commitCodeFile(...args)),
+      finalizePreview: (input) => finalizePreview({ ...input, work }),
+      hasOfficeHtmlPath,
+      sanitizeArtifactPath,
+      flattenArtifactPath,
+      classifyCodeArtifact,
+      extractCodeArtifactText: (...args) => extractCodeArtifactText(...args, work),
+      getExtractedTextFormat,
+      getStorageMetadata,
+      logAxiosError,
+      logger,
+    });
+    if (!output) return null;
+    const preview =
+      typeof output.finalize === 'function'
+        ? runPreviewFinalize({
+            finalize: output.finalize,
+            fileId: output.file?.file_id,
+            previewRevision: output.previewRevision,
+            work,
+          })
+        : null;
+    // Release persisted metadata independently of original settlement, including
+    // a non-office parser still alive after its observer timed out. With no
+    // preview update the join returns null, so consumers do not emit a duplicate.
+    resolveResult({ ...output, finalize: () => original });
+    return preview;
+  }, params.work);
+  void original.then(resolveResult, rejectResult);
+  return result;
+};
 
 function getSessionFileInfo(ref, req, route = {}, signal) {
   return getCodeFileInfo({

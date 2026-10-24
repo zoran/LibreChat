@@ -2,6 +2,7 @@ import { EModelEndpoint, ResourceType } from 'librechat-data-provider';
 import { createMethods, logger, runAsSystem } from '@librechat/data-schemas';
 import type { AppConfig, CodeEnvironmentDocument } from '@librechat/data-schemas';
 import type { Types } from 'mongoose';
+import type { ApplicationWorkPort } from '~/app';
 import type { CodeBridgeFetch } from './bridge';
 import { readCodeBridgeSecret, revokeCodeBridgeWorker } from './bridge';
 import { isLeader } from '~/cluster';
@@ -11,8 +12,6 @@ const RECONCILE_LEASE_MS = 2 * 60_000;
 const REGISTRATION_STALE_MS = 5 * 60_000;
 const REGISTRATION_RETRY_MS = 5 * 60_000;
 const REVOCATION_RETRY_MS = 5 * 60_000;
-let reconcileTimer: NodeJS.Timeout | undefined;
-let reconcileInFlight: Promise<void> | undefined;
 
 function agentReferenceFilter(environmentId: string, tenantId?: string) {
   return {
@@ -21,17 +20,15 @@ function agentReferenceFilter(environmentId: string, tenantId?: string) {
   };
 }
 
-export async function reconcileCodeEnvironmentLifecycle({
-  mongoose,
-  readSecret = readCodeBridgeSecret,
-  fetchImpl,
-  limit = 25,
-}: {
-  mongoose: typeof import('mongoose');
-  readSecret?: (name: string) => string | undefined;
-  fetchImpl?: CodeBridgeFetch;
-  limit?: number;
-}): Promise<void> {
+async function reconcileOriginal(
+  {
+    mongoose,
+    readSecret = readCodeBridgeSecret,
+    fetchImpl,
+    limit = 25,
+  }: CodeEnvironmentLifecycleOptions,
+  markUncertain: () => void,
+): Promise<void> {
   await runAsSystem(async () => {
     const CodeEnvironment = mongoose.models.CodeEnvironment;
     const AclEntry = mongoose.models.AclEntry;
@@ -133,6 +130,7 @@ export async function reconcileCodeEnvironmentLifecycle({
         });
         await methods.deleteCodeEnvironmentById(environment._id);
       } catch (error) {
+        markUncertain();
         logger.error('[code-environments] interrupted removal reconciliation failed:', error);
       }
     }
@@ -213,6 +211,7 @@ export async function reconcileCodeEnvironmentLifecycle({
             fetchImpl,
           });
         } catch {
+          markUncertain();
           await deferRegistration();
           continue;
         }
@@ -356,6 +355,7 @@ export async function reconcileCodeEnvironmentLifecycle({
         });
         await methods.deleteCodeEnvironmentById(environment._id);
       } catch (error) {
+        markUncertain();
         const message = (error instanceof Error ? error.message : 'Worker revocation failed').slice(
           0,
           500,
@@ -375,29 +375,139 @@ export async function reconcileCodeEnvironmentLifecycle({
   });
 }
 
-export function startCodeEnvironmentLifecycleReconciler(
-  options: Parameters<typeof reconcileCodeEnvironmentLifecycle>[0],
-): void {
-  if (reconcileTimer != null) return;
-  const run = (): void => {
-    if (reconcileInFlight != null) return;
-    const current = isLeader()
-      .then(async (leader) => {
-        if (!leader) return;
-        await reconcileCodeEnvironmentLifecycle(options);
+/** Scheduler ownership covers reconciliation originals, not independent user worker revocation. */
+interface CodeEnvironmentLifecycleOptions {
+  mongoose: typeof import('mongoose');
+  readSecret?: (name: string) => string | undefined;
+  fetchImpl?: CodeBridgeFetch;
+  limit?: number;
+}
+
+export interface CodeEnvironmentLifecycleMaintenance extends ApplicationWorkPort {
+  reconcile(options: CodeEnvironmentLifecycleOptions): Promise<void>;
+  start(options: CodeEnvironmentLifecycleOptions): Promise<void>;
+  stopAdmissions(): void;
+  drain(): Promise<void>;
+}
+
+/** One original remains owned through leader election, raw writes and provider observation. */
+export function createCodeEnvironmentLifecycleMaintenance(): CodeEnvironmentLifecycleMaintenance {
+  let requestId: string | null = null;
+  let revision = 0;
+  let stopped = false;
+  let uncertain = false;
+  let timer: NodeJS.Timeout | undefined;
+  let schedulerOptions: CodeEnvironmentLifecycleOptions | undefined;
+  let starting: Promise<void> | undefined;
+  let scheduled: Promise<void> | undefined;
+  const originals = new Set<Promise<void>>();
+  const clearTimer = () => {
+    if (timer != null) clearInterval(timer);
+    timer = undefined;
+  };
+  const markUncertain = () => {
+    uncertain = true;
+    clearTimer();
+  };
+  const dispatch = (
+    options: CodeEnvironmentLifecycleOptions,
+    electLeader = false,
+  ): Promise<void> => {
+    if (stopped || uncertain || requestId !== null)
+      return Promise.reject(new Error('CODE_LIFECYCLE_ADMISSION_CLOSED'));
+    // Publish custody before either leader election or the first database command can run.
+    const original = Promise.resolve()
+      .then(async () => {
+        if (electLeader && !(await isLeader())) return;
+        await reconcileOriginal(options, markUncertain);
       })
+      .catch((error) => {
+        markUncertain();
+        throw error;
+      })
+      .finally(() => originals.delete(original));
+    originals.add(original);
+    return original;
+  };
+  const runScheduled = (): Promise<void> => {
+    if (scheduled != null) return scheduled;
+    const original = dispatch(schedulerOptions!, true);
+    scheduled = original;
+    void original
       .catch((error) => {
         logger.error('[code-environments] lifecycle reconciliation failed:', error);
       })
       .finally(() => {
-        if (reconcileInFlight === current) reconcileInFlight = undefined;
+        if (scheduled === original) scheduled = undefined;
       });
-    reconcileInFlight = current;
+    return original;
   };
-  run();
-  reconcileTimer = setInterval(run, RECONCILE_INTERVAL_MS);
-  reconcileTimer.unref();
+  const armTimer = () => {
+    if (timer != null || schedulerOptions == null || stopped || uncertain || requestId !== null)
+      return;
+    timer = setInterval(() => {
+      void runScheduled();
+    }, RECONCILE_INTERVAL_MS);
+    timer.unref();
+  };
+  const owner: CodeEnvironmentLifecycleMaintenance = {
+    reconcile: (options) => dispatch(options),
+    start(options) {
+      if (stopped || uncertain || requestId !== null)
+        return Promise.reject(new Error('CODE_LIFECYCLE_ADMISSION_CLOSED'));
+      if (starting != null) return starting;
+      schedulerOptions = options;
+      starting = runScheduled();
+      armTimer();
+      return starting;
+    },
+    pauseAdmissions(id) {
+      if (!id || (requestId !== null && requestId !== id)) return false;
+      if (requestId === null) {
+        requestId = id;
+        revision += 1;
+        clearTimer();
+      }
+      return true;
+    },
+    resumeAdmissions(id) {
+      if (stopped || uncertain || requestId !== id) return false;
+      requestId = null;
+      revision += 1;
+      armTimer();
+      return true;
+    },
+    async getMaintenanceCensus(id) {
+      const sampledRevision = revision;
+      const matching = id === requestId;
+      await Promise.resolve();
+      return {
+        admissionClosed: requestId !== null || stopped || uncertain,
+        queuedContinuations: originals.size,
+        pendingWrites: originals.size,
+        complete: matching && sampledRevision === revision && !uncertain,
+      };
+    },
+    stopAdmissions() {
+      if (!stopped) revision += 1;
+      stopped = true;
+      clearTimer();
+    },
+    async drain() {
+      owner.stopAdmissions();
+      await Promise.allSettled([...originals]);
+      if (uncertain) throw new Error('CODE_LIFECYCLE_SETTLEMENT_UNCONFIRMED');
+    },
+  };
+  return owner;
 }
+
+export const codeEnvironmentLifecycleMaintenance: CodeEnvironmentLifecycleMaintenance =
+  createCodeEnvironmentLifecycleMaintenance();
+export const reconcileCodeEnvironmentLifecycle: CodeEnvironmentLifecycleMaintenance['reconcile'] =
+  codeEnvironmentLifecycleMaintenance.reconcile;
+export const startCodeEnvironmentLifecycleReconciler: CodeEnvironmentLifecycleMaintenance['start'] =
+  codeEnvironmentLifecycleMaintenance.start;
 
 export async function revokeUserCodeEnvironmentWorkers({
   mongoose,

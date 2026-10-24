@@ -12,6 +12,11 @@ import {
 import type { UploadPrincipal, UploadLease, UploadMigrationPage } from 'librechat-data-provider';
 import type { StoredUpload, GlobalState } from './uploadManagementStore';
 import type { FileRetrievalOriginal } from './fileRetrievalOperation';
+import {
+  copyFrozenUploadFiles,
+  completeUnacceptedUploadCleanup,
+  completeAcceptedUploadFileCleanup,
+} from './uploadManagement.structure.fixture';
 import retrievalFixture from '../../../data-provider/src/__fixtures__/managed-retrieval-v1.json';
 import { createFileRetentionMethods, FileSourceUnavailableError } from './fileRetention';
 import { createFileRetrievalOperationOwner } from './fileRetrievalOperation';
@@ -29,7 +34,8 @@ const fixtureKey = (label: string): string => {
 
 describe('durable upload management', () => {
   let mongo: MongoMemoryReplSet;
-  const a = new mongoose.Mongoose();
+  // The real checkpoint owner uses the default connection; the other clients remain independent.
+  const a = mongoose;
   const b = new mongoose.Mongoose();
   const replacement = new mongoose.Mongoose();
   let first: ReturnType<typeof createUploadManagementRepository>;
@@ -148,7 +154,15 @@ describe('durable upload management', () => {
   });
   beforeEach(async () => {
     for (const db of [a, replacement]) {
-      for (const name of ['User', 'File', 'Message', 'UploadOperation', 'UploadCounter'])
+      for (const name of [
+        'User',
+        'File',
+        'Message',
+        'UploadOperation',
+        'UploadCounter',
+        'HousekeepingJob',
+        'FileCleanupTarget',
+      ])
         if (db.models[name]) await db.models[name].deleteMany({});
       await db.models.User.create(
         [user, other, guest, stranger].map((principal) => ({
@@ -440,6 +454,7 @@ describe('durable upload management', () => {
     }
     expect(after.cleanupPending).toBe(true);
     expect(after).not.toHaveProperty('securityApproval');
+    await copyFrozenUploadFiles(a, replacement);
     await target.importSnapshot(page);
     expect(await replacement.models.UploadOperation.findById('pending-legacy').lean()).toEqual(
       after,
@@ -1102,7 +1117,7 @@ describe('durable upload management', () => {
     expect((await second.usage(user, now)).reservedBytes).toBe(16);
   });
 
-  it('enforces exact rolling quota, immutable expiry and deletion without a refund', async () => {
+  it('enforces exact rolling quota, activity-extended expiry and deletion without a refund', async () => {
     for (let i = 0; i < 10; i++) await ready(`quota-${i}`, UPLOAD_MAX_FILE_BYTES);
     const before = await first.usage(user, now);
     expect(before).toMatchObject({
@@ -1117,7 +1132,7 @@ describe('durable upload management', () => {
     await first.delete(user, 'quota-0', now + 1);
     expect((await second.usage(user, now + 1)).usedBytes).toBe(UPLOAD_USER_WINDOW_BYTES);
     expect((await first.get(user, 'quota-0', now + 1)).expiresAt).toBe(
-      new Date(now + UPLOAD_RETENTION_MS).toISOString(),
+      new Date(now + UPLOAD_RETENTION_MS + 7 * 86_400_000).toISOString(),
     );
     expect((await second.usage(user, now + UPLOAD_WINDOW_MS - 1)).usedBytes).toBe(
       UPLOAD_USER_WINDOW_BYTES,
@@ -1152,15 +1167,13 @@ describe('durable upload management', () => {
         `managed-uploads/${guest.userId}/${pair[0].id}.1__original`,
       );
       const page = await first.exportSnapshot({ epoch: 'guest-move', limit: 100 });
+      await copyFrozenUploadFiles(a, replacement);
       await target.importSnapshot(page);
-      await replacement.models.File.insertMany(
-        await a.models.File.find({}).select('+securityApproval').lean(),
-      );
       const seal = await first.completeExport('guest-move');
       await target.completeImport({ receipt: seal, baseline, lifecycleReconciled: true });
       expect(await target.usage(guest, now)).toEqual(await first.usage(guest, now));
       expect((await target.get(guest, 'guest-1', now)).expiresAt).toBe(
-        new Date(now + UPLOAD_RETENTION_MS).toISOString(),
+        new Date(now + UPLOAD_RETENTION_MS + 7 * 86_400_000).toISOString(),
       );
       expect((await target.usage(guest, now + UPLOAD_WINDOW_MS - 1)).usedBytes).toBe(
         UPLOAD_USER_WINDOW_BYTES,
@@ -1237,6 +1250,8 @@ describe('durable upload management', () => {
       ),
     ).rejects.toMatchObject({ code: 'not_ready' });
     await first.confirmCleanup({ ...localGone(lease), originalAbsent: true }, now + 46_000);
+    expect((await second.metrics(now)).originalBytes).toBe(16);
+    await completeUnacceptedUploadCleanup(first, user, lease);
     expect((await second.metrics(now)).originalBytes).toBe(8);
     expect(
       await second.claim({
@@ -1346,11 +1361,14 @@ describe('durable upload management', () => {
     });
     expect(JSON.stringify(metrics)).not.toContain(user.userId);
     expect(JSON.stringify(metrics)).not.toContain('metrics-original');
-    await first.delete(user, 'metrics-original', now + 6000);
+    const deletionAt = Date.now();
+    await first.delete(user, 'metrics-original', deletionAt);
     await first.confirmCleanup(
       { ...localGone(lease), originalAbsent: true, textAndHistoryRemoved: true },
-      now + 6000,
+      deletionAt,
     );
+    expect((await second.metrics(now + 6000)).quota.retainedBytes).toBe(8);
+    await completeAcceptedUploadFileCleanup(a, user, 'metrics-original');
     expect((await second.metrics(now + 6000)).quota).toEqual({
       usedBytes: 8,
       reservedBytes: 5,
@@ -1592,19 +1610,20 @@ describe('durable upload management', () => {
   });
 
   it('retains lifecycle tombstone allowance without starving later reconciliation', async () => {
-    const old = now - 32 * 86_400_000;
-    const { lease } = await accepted('a-tombstone', 8, old);
-    await first.delete(user, 'a-tombstone', old);
-    await createFileRetentionMethods(a).finalizeFileSourceDeletion(user, ['a-tombstone']);
+    const { lease } = await accepted('a-tombstone');
+    const deletionAt = Date.now();
+    await first.delete(user, 'a-tombstone', deletionAt);
     await first.confirmCleanup(
       { ...localGone(lease), originalAbsent: true, textAndHistoryRemoved: true },
-      old,
+      deletionAt,
     );
-    await first.reserve(user, request('z-timeout'), now - 601_000);
-    await first.reconcile(now, 1);
-    await second.reconcile(now, 1);
-    expect((await first.get(user, 'z-timeout', now)).state).toBe('failed');
-    expect((await first.metrics(now)).bundles).toBe(2);
+    await completeAcceptedUploadFileCleanup(a, user, 'a-tombstone');
+    const later = now + 32 * 86_400_000;
+    await first.reserve(user, request('z-timeout'), later - 601_000);
+    await first.reconcile(later, 1);
+    await second.reconcile(later, 1);
+    expect((await first.get(user, 'z-timeout', later)).state).toBe('failed');
+    expect((await first.metrics(later)).bundles).toBe(2);
   });
 
   it('applies blocked admission while allowing an idempotent replay', async () => {
@@ -1745,13 +1764,10 @@ describe('durable upload management', () => {
     await expect(target.importSnapshot(pageB)).rejects.toMatchObject({
       code: 'migration_conflict',
     });
+    await copyFrozenUploadFiles(a, replacement);
     await target.importSnapshot(pageA);
     await target.importSnapshot(pageA);
     await target.importSnapshot(pageB);
-    // The owning File migration is separate; this fixture copies its already-accepted immutable data.
-    await replacement.models.File.insertMany(
-      await a.models.File.find({}).select('+securityApproval').lean(),
-    );
     await expect(target.reserve(user, request('early'), now)).rejects.toMatchObject({
       code: 'migration_conflict',
     });
@@ -2217,7 +2233,7 @@ describe('durable upload management', () => {
         { owner: fileOwner, operationId: purge.operationId, receipt: proof },
         peer,
       );
-      const clock = jest.spyOn(Date, 'now').mockReturnValue(purge.workDeadline + 1);
+      const clock = jest.spyOn(Date, 'now').mockReturnValueOnce(purge.workDeadline + 1);
       try {
         expect(await reader.admitPurge(request)).toEqual([]);
       } finally {
@@ -2239,6 +2255,10 @@ describe('durable upload management', () => {
         lifecycle().assertFileSourceDeletionReady(fileOwner, [id]),
       ).resolves.toBeUndefined();
       expect(await lifecycle().prepareFileSourceDeletion(fileOwner, [id])).toEqual({
+        preparedFileIds: [],
+      });
+      await completeAcceptedUploadFileCleanup(a, user, id);
+      expect(await lifecycle().prepareFileSourceDeletion(fileOwner, [id])).toEqual({
         preparedFileIds: [id],
       });
       expect(await lifecycle().finalizeFileSourceDeletion(fileOwner, [id])).toEqual({
@@ -2257,6 +2277,10 @@ describe('durable upload management', () => {
       await expect(
         lifecycle().assertFileSourceDeletionReady(fileOwner, [id]),
       ).resolves.toBeUndefined();
+      expect(await lifecycle().prepareFileSourceDeletion(fileOwner, [id])).toEqual({
+        preparedFileIds: [],
+      });
+      await completeAcceptedUploadFileCleanup(a, user, id);
       expect(await lifecycle().prepareFileSourceDeletion(fileOwner, [id])).toEqual({
         preparedFileIds: [id],
       });

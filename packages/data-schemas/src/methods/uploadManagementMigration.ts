@@ -273,6 +273,9 @@ export function createUploadMigrationMethods(
       delete row.intake;
     }
     await validateUploadFileCleanupMigration(store.mongoose, row, session);
+    // Reject corrupt Upload metadata before File source preparation consumes it. Keep the
+    // final validation below because historical derived normalization can also change the row.
+    validateRow(row);
     const file = await prepareFileRetentionMigration(
       store.mongoose,
       row,
@@ -608,8 +611,10 @@ export function createUploadMigrationMethods(
             lifecycleReconciled === true &&
             global.completedImport &&
             uploadDigest(global.completedImport) === uploadDigest({ receipt, baseline })
-          )
+          ) {
+            await store.assertCurrentSecurityState(session);
             return true;
+          }
           if (
             !state ||
             state.role !== 'import' ||

@@ -1,27 +1,33 @@
 /** Real HTTP consumer, initializer, input owner, native admission, saver and SDK. */
+const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const { createHash, randomUUID } = require('node:crypto');
 const mongoose = require('mongoose');
 const { MongoMemoryReplSet } = require('mongodb-memory-server');
-const { BaseChatModel } = require('@langchain/core/language_models/chat_models');
-const { AIMessage } = require('@librechat/agents/langchain/messages');
-const { Run } = require('@librechat/agents');
+const chatModels = require('@langchain/core/language_models/chat_models');
+const agentMessages = require('@librechat/agents/langchain/messages');
+const agents = require('@librechat/agents');
+const schemas = require('@librechat/data-schemas');
+const { BaseChatModel } = chatModels;
+const { AIMessage } = agentMessages;
+const { Run } = agents;
 const {
   createGenerationAdmissionMethods,
   createUploadManagementRepository,
   tenantStorage,
   logger,
-} = require('@librechat/data-schemas');
-const {
-  GenerationJobManager,
-  InMemoryJobStore,
-  InMemoryEventTransport,
-  DurableMongoSaver,
-  createPrivateTextIngress,
-  createManagedSourceResolver,
-  MANAGED_SOURCE_FILE_FIELDS,
-} = require('@librechat/api');
-const { Constants } = require('librechat-data-provider');
+} = schemas;
+const dataProvider = require('librechat-data-provider');
+const { Constants } = dataProvider;
+let GenerationJobManager;
+let InMemoryJobStore;
+let InMemoryEventTransport;
+let DurableMongoSaver;
+let createPrivateTextIngress;
+let createManagedSourceResolver;
+let MANAGED_SOURCE_FILE_FIELDS;
+let consumerApi;
+const mockConsumerApis = new WeakMap();
 
 // Model inventory is a deployment input; the selected local model never calls a provider.
 jest.mock('~/server/controllers/ModelController', () => ({
@@ -40,16 +46,36 @@ jest.mock('~/models', () => {
 // Replace only deployment bootstrap. All source reads and lifecycle decisions use real owners.
 jest.mock('~/server/services/Uploads', () => ({
   ...jest.requireActual('~/server/services/Uploads'),
-  getManagedContextSources: (req) =>
-    jest.requireActual('@librechat/api').bindManagedContextSources(req, mockManagedResolver, true),
+  getManagedContextSources: (req) => {
+    const api = mockConsumerApis.get(req);
+    if (!api) throw new Error('Request has no fixture consumer owner');
+    return api.bindManagedContextSources(req, mockManagedResolver, true);
+  },
 }));
 
+// Register real models before constructing their method consumers, as application startup does.
+const models = require('~/db/models');
+const { User, File, Message } = models;
 const db = require('~/models');
-const { User, File, Message } = require('~/db/models');
-const controller = require('../request');
-const { initializeClient } = require('~/server/services/Endpoints/agents/initialize');
-const AgentClient = require('../client');
-const { createCheckpointRunHost } = require('~/server/services/Agents/checkpointRun');
+
+// Share native database, tenant and SDK identities; each isolated consumer below
+// still loads the actual API module and all of its owner-local closures together.
+for (const [id, value] of [
+  ['mongoose', mongoose],
+  ['@librechat/data-schemas', schemas],
+  ['librechat-data-provider', dataProvider],
+  ['@librechat/agents', agents],
+  ['@langchain/core/language_models/chat_models', chatModels],
+  ['@librechat/agents/langchain/messages', agentMessages],
+  ['~/db/models', models],
+  ['~/models', db],
+]) {
+  jest.setMock(id, value);
+}
+let controller;
+let initializeClient;
+let AgentClient;
+let createCheckpointRunHost;
 
 const owner = { userId: new mongoose.Types.ObjectId().toHexString(), tenantId: 'consumer-proof' };
 const fileId = 'a8c4a219-e94c-41ee-b6df-544753859021';
@@ -59,10 +85,8 @@ let mongo;
 let modelCalls;
 let providerInputs;
 let methods;
-let pendingGeneration;
-let settleGeneration;
-let generationStarted;
 let generationDone;
+let consumerOwners;
 let requests;
 let gates;
 let mockManagedResolver;
@@ -93,25 +117,73 @@ function deferred() {
   return { promise, release };
 }
 
-function configureManager(boot = 'boot') {
-  GenerationJobManager.configure({
-    jobStore: new InMemoryJobStore(),
-    eventTransport: new InMemoryEventTransport(),
-    cleanupOnComplete: false,
+function bootstrapConsumer(boot = 'boot') {
+  jest.isolateModules(() => {
+    consumerApi = require('@librechat/api');
+    ({
+      GenerationJobManager,
+      InMemoryJobStore,
+      InMemoryEventTransport,
+      DurableMongoSaver,
+      createPrivateTextIngress,
+      createManagedSourceResolver,
+      MANAGED_SOURCE_FILE_FIELDS,
+    } = consumerApi);
+    controller = require('../request');
+    ({ initializeClient } = require('~/server/services/Endpoints/agents/initialize'));
+    AgentClient = require('../client');
+    ({ createCheckpointRunHost } = require('~/server/services/Agents/checkpointRun'));
   });
-  GenerationJobManager.configureSourceReplay({
+  const manager = GenerationJobManager;
+  const store = new InMemoryJobStore();
+  const transport = new InMemoryEventTransport();
+  const fixture = {
+    manager,
+    store,
+    transport,
+    held: false,
+    quiescent: false,
+    originals: [],
+    generationStarted: false,
+    generationDone: deferred(),
+  };
+  consumerOwners.push(fixture);
+  generationDone = fixture.generationDone;
+  manager.configure({ jobStore: store, eventTransport: transport, cleanupOnComplete: false });
+  manager.configureSourceReplay({
     quota: {
       reserveFileSourceCopies: db.reserveFileSourceCopies,
       releaseFileSourceCopies: db.releaseFileSourceCopies,
     },
   });
-  GenerationJobManager.configureGenerationAdmission({
+  manager.configureGenerationAdmission({
     required: true,
     methods,
     ownerInstanceId: 'consumer-proof',
     processBootId: boot,
-    externalCensus: async () => ({ complete: true, queuedContinuations: 0, pendingWrites: 0 }),
   });
+  const originalBegin = manager.beginProviderExecution.bind(manager);
+  jest.spyOn(manager, 'beginProviderExecution').mockImplementation(async (...args) => {
+    const acknowledged = await originalBegin(...args);
+    fixture.generationStarted ||= acknowledged;
+    return acknowledged;
+  });
+  const originalSettle = manager.settleGenerationExecution.bind(manager);
+  jest.spyOn(manager, 'settleGenerationExecution').mockImplementation((...args) => {
+    const original = originalSettle(...args);
+    fixture.originals.push(original);
+    original.then(fixture.generationDone.release, fixture.generationDone.release);
+    return original;
+  });
+}
+
+function preserveHeldPreparation(manager = GenerationJobManager) {
+  const fixture = consumerOwners.find((entry) => entry.manager === manager);
+  expect(fixture).toBeDefined();
+  const custody = manager['durableAdmission'].getLocalCustody();
+  expect(custody.pending).toBe(0);
+  expect(custody.unresolved).toBeGreaterThan(0);
+  fixture.held = true;
 }
 
 const readAdmission = async () => ({
@@ -129,6 +201,7 @@ function submit(
   title = jest.fn(),
   host = createCheckpointRunHost(),
 ) {
+  mockConsumerApis.set(req, consumerApi);
   const task = controller(req, res, jest.fn(), initialize, title, host);
   requests.push(task);
   return task;
@@ -217,6 +290,11 @@ beforeAll(async () => {
 }, 60000);
 
 beforeEach(async () => {
+  requests = [];
+  gates = [];
+  consumerOwners = [];
+  methods = createGenerationAdmissionMethods(mongoose);
+  bootstrapConsumer();
   modelCalls = 0;
   providerInputs = [];
   db.saveMessage.mockClear();
@@ -381,53 +459,133 @@ beforeEach(async () => {
       },
     },
   });
-  methods = createGenerationAdmissionMethods(mongoose);
-  configureManager();
-  requests = [];
-  gates = [];
-  generationStarted = false;
-  generationDone = deferred();
-  settleGeneration = generationDone.release;
-  const originalBegin = GenerationJobManager.beginProviderExecution.bind(GenerationJobManager);
-  jest.spyOn(GenerationJobManager, 'beginProviderExecution').mockImplementation(async (...args) => {
-    const acknowledged = await originalBegin(...args);
-    generationStarted ||= acknowledged;
-    return acknowledged;
-  });
   // Fixture providers are local; an accidental transport path must fail before external I/O.
   jest.spyOn(globalThis, 'fetch').mockImplementation(() => {
     throw new Error('External transport is forbidden in this fixture');
   });
-  pendingGeneration = undefined;
-  const originalSettle = GenerationJobManager.settleGenerationExecution.bind(GenerationJobManager);
-  jest.spyOn(GenerationJobManager, 'settleGenerationExecution').mockImplementation((...args) => {
-    pendingGeneration = originalSettle(...args);
-    pendingGeneration.then(
-      () => settleGeneration?.(),
-      () => settleGeneration?.(),
-    );
-    return pendingGeneration;
-  });
 });
 
 afterEach(async () => {
-  for (const gate of gates) gate.release();
-  await Promise.allSettled(requests);
-  if (generationStarted) await generationDone.promise;
-  await pendingGeneration;
-  await GenerationJobManager.destroy({ settlementBudgetMs: 1000 });
-  jest.restoreAllMocks();
-  await mongoose.connection.dropDatabase();
-  for (const [name, value] of Object.entries(previous)) {
-    if (value === undefined) delete process.env[name];
-    else process.env[name] = value;
+  const failures = [];
+  const collect = (results) => {
+    for (const result of results) {
+      if (result.status === 'rejected') failures.push(result.reason);
+    }
+  };
+  const fixtures = consumerOwners.splice(0).reverse();
+  let databaseQuiescent = false;
+  try {
+    collect(await Promise.allSettled(gates.map((gate) => Promise.resolve().then(gate.release))));
+    collect(await Promise.allSettled(requests));
+    collect(
+      await Promise.allSettled(
+        fixtures.map(async (fixture) => {
+          const { manager, store, transport } = fixture;
+          const results = [];
+          if (fixture.generationStarted) {
+            results.push(...(await Promise.allSettled([fixture.generationDone.promise])));
+          }
+          results.push(...(await Promise.allSettled(fixture.originals)));
+          results.push(
+            ...(await Promise.allSettled(
+              [...manager['openProviderExecutions'].values()].flatMap((entry) =>
+                [entry.drain, entry.settlement].filter((original) => original !== undefined),
+              ),
+            )),
+          );
+          const custody = manager['durableAdmission'].getLocalCustody();
+          results.push(
+            ...(await Promise.allSettled([
+              (async () => {
+                assert.strictEqual(custody.pending, 0);
+                if (fixture.held) {
+                  assert.ok(
+                    (typeof custody.unresolved === 'number' ||
+                      typeof custody.unresolved === 'bigint') &&
+                      custody.unresolved > 0,
+                    'Retained fixture must keep unresolved native custody',
+                  );
+                  assert.strictEqual(
+                    (await manager.getGenerationAdmissionCensus()).pendingWrites,
+                    0,
+                  );
+                  // Physical fixture disposal does not settle this retained durable hold.
+                } else {
+                  await manager.destroy({ settlementBudgetMs: 1000 });
+                }
+              })(),
+            ])),
+          );
+          // Join the real shutdown original and subscribers even when a drain assertion failed.
+          // Never clear retained maps or turn an unconfirmed drain into positive evidence.
+          results.push(...(await Promise.allSettled([manager['shutdownSettlement']])));
+          results.push(
+            ...(await Promise.allSettled([
+              Promise.resolve().then(() => manager.prepareForShutdown()),
+            ])),
+          );
+          results.push(...(await Promise.allSettled([manager['drainSubscriberCleanups']()])));
+          results.push(
+            ...(await Promise.allSettled([
+              (async () => {
+                assert.strictEqual(manager['durableAdmission'].getLocalCustody().pending, 0);
+                assert.strictEqual((await manager.getGenerationAdmissionCensus()).pendingWrites, 0);
+                fixture.quiescent = true;
+              })(),
+            ])),
+          );
+          results.push(
+            ...(await Promise.allSettled([
+              store.destroy(),
+              Promise.resolve().then(() => transport.destroy()),
+            ])),
+          );
+          const rejected = results.filter((result) => result.status === 'rejected');
+          if (rejected.length) {
+            throw Object.assign(
+              new Error(rejected.map((result) => String(result.reason)).join('\n')),
+              { errors: rejected.map((result) => result.reason) },
+            );
+          }
+        }),
+      ),
+    );
+    databaseQuiescent = fixtures.every((fixture) => fixture.quiescent);
+  } finally {
+    collect(await Promise.allSettled([Promise.resolve().then(() => jest.restoreAllMocks())]));
+    // Reset synthetic data only after captured originals are quiescent; it never makes drain pass.
+    if (databaseQuiescent) {
+      // Keep initialized indexes while clearing model and native checkpoint documents.
+      collect(
+        await Promise.allSettled([
+          mongoose.connection.db.collections().then(async (collections) => {
+            collect(
+              await Promise.allSettled(collections.map((collection) => collection.deleteMany({}))),
+            );
+          }),
+        ]),
+      );
+    }
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+  if (failures.length) {
+    throw Object.assign(
+      new Error('Request fixture disposal failed:\n' + failures.map(String).join('\n')),
+      { errors: failures },
+    );
   }
 });
 afterAll(async () => {
-  try {
-    await mongoose.disconnect();
-  } finally {
-    await mongo?.stop();
+  const disconnected = await Promise.allSettled([mongoose.disconnect()]);
+  const stopped = await Promise.allSettled([mongo?.stop()]);
+  const failures = [...disconnected, ...stopped].filter((result) => result.status === 'rejected');
+  if (failures.length) {
+    throw Object.assign(new Error(failures.map((result) => String(result.reason)).join('\n')), {
+      errors: failures.map((result) => result.reason),
+    });
   }
 });
 
@@ -664,6 +822,8 @@ it('rejects a source revoked during preparation before capture, checkpoint or mo
     expect(await mongoose.connection.db.collection(names[0]).countDocuments()).toBe(0);
     expect(await Message.countDocuments()).toBe(0);
     expect(modelCalls).toBe(0);
+    expect((await readAdmission()).value).toMatchObject({ active: true, state: 'preparing' });
+    preserveHeldPreparation();
   }));
 
 it.each(['begin', 'capture', 'complete'])(
@@ -713,8 +873,11 @@ it.each(['begin', 'capture', 'complete'])(
       } finally {
         clock.mockRestore();
       }
-      await GenerationJobManager.destroy({ settlementBudgetMs: 1000 });
-      configureManager('replacement-boot');
+      const predecessor = GenerationJobManager;
+      preserveHeldPreparation(predecessor);
+      predecessor.prepareForShutdown();
+      bootstrapConsumer('replacement-boot');
+      expect(GenerationJobManager).not.toBe(predecessor);
       const replacement = response();
       await submit(request(), replacement, initialize);
       expect(replacement.statusCode).toBe(503);
@@ -747,6 +910,8 @@ it.each(['tools', 'subagents', 'memory'])(
       expect(GenerationJobManager.beginProviderExecution).not.toHaveBeenCalled();
       expect(modelCalls).toBe(0);
       expect(await Message.countDocuments()).toBe(0);
+      expect((await readAdmission()).value).toMatchObject({ active: true, state: 'preparing' });
+      preserveHeldPreparation();
     }),
 );
 

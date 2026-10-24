@@ -16,6 +16,7 @@ const {
   validateInsightsPermissionUpdates,
 } = require('@librechat/api');
 const {
+  permissionMaintenance,
   bulkUpdateResourcePermissions,
   restoreInsightsPermissionChanges,
   ensureGroupPrincipalExists,
@@ -67,7 +68,7 @@ const validateResourceType = (resourceType) => {
  * @param {Object} res - Express response object
  * @returns {Promise<TUpdateResourcePermissionsResponse>} Updated permissions response
  */
-const updateResourcePermissions = async (req, res) => {
+const updateResourcePermissions = permissionMaintenance.own(async (req, res, operation) => {
   try {
     const { resourceType, resourceId } = req.params;
     validateResourceType(resourceType);
@@ -128,10 +129,10 @@ const updateResourcePermissions = async (req, res) => {
         } else if (principal.type === PrincipalType.ROLE) {
           principalId = principal.id; // Role principals use role name as ID
         } else if (principal.type === PrincipalType.USER) {
-          principalId = await ensurePrincipalExists(principal);
+          principalId = await ensurePrincipalExists(principal, operation);
         } else if (principal.type === PrincipalType.GROUP) {
           // Pass authContext to enable member fetching for Entra ID groups when available
-          principalId = await ensureGroupPrincipalExists(principal, authContext);
+          principalId = await ensureGroupPrincipalExists(principal, authContext, operation);
         } else {
           logger.error(`Unsupported principal type: ${principal.type}`);
           continue; // Skip invalid principal types
@@ -170,14 +171,17 @@ const updateResourcePermissions = async (req, res) => {
       });
     }
 
-    const results = await bulkUpdateResourcePermissions({
-      resourceType,
-      resourceId,
-      maxWriteAttempts: req.config?.config?.permissions?.maxWriteAttempts,
-      updatedPrincipals: validatedPrincipals,
-      revokedPrincipals,
-      grantedBy: userId,
-    });
+    const results = await bulkUpdateResourcePermissions(
+      {
+        resourceType,
+        resourceId,
+        maxWriteAttempts: req.config?.config?.permissions?.maxWriteAttempts,
+        updatedPrincipals: validatedPrincipals,
+        revokedPrincipals,
+        grantedBy: userId,
+      },
+      operation,
+    );
 
     await auditInsightsPermissionChanges({
       req,
@@ -186,23 +190,40 @@ const updateResourcePermissions = async (req, res) => {
       failClosed: process.env.AUDIT_LOG_FAIL_CLOSED === 'true',
       deps: {
         getAgent: db.getAgent,
-        recordAuditEntry: db.recordAuditEntry,
+        recordAuditEntry: function (...args) {
+          const receiver = this;
+          return operation.write(async () => {
+            const result = await Reflect.apply(db.recordAuditEntry, receiver, args);
+            if (result == null) operation.markUncertain();
+            return result;
+          });
+        },
         restoreInsightsPermissionChanges: (changes) =>
-          restoreInsightsPermissionChanges({
-            resourceType: ResourceType.AGENT,
-            resourceId,
-            changes,
-          }),
+          operation.write(() =>
+            restoreInsightsPermissionChanges(
+              {
+                resourceType: ResourceType.AGENT,
+                resourceId,
+                changes,
+              },
+              operation,
+            ),
+          ),
         logger,
       },
     });
 
     if (resourceType === ResourceType.CODE_ENVIRONMENT) {
-      await invalidateCodeEnvironmentConfigCache(req.user.tenantId).catch((error) => {
-        // Cached environment metadata is authorization-filtered against the live ACL on every
-        // read, so a failed revision write may delay a grant but cannot preserve a revocation.
-        logger.error('[PermissionsController] code environment cache invalidation failed:', error);
-      });
+      await operation
+        .write(() => invalidateCodeEnvironmentConfigCache(req.user.tenantId))
+        .catch((error) => {
+          // Cached environment metadata is authorization-filtered against the live ACL on every
+          // read, so a failed revision write may delay a grant but cannot preserve a revocation.
+          logger.error(
+            '[PermissionsController] code environment cache invalidation failed:',
+            error,
+          );
+        });
     }
 
     const isAgentResource =
@@ -212,9 +233,11 @@ const updateResourcePermissions = async (req, res) => {
       .map((p) => p.id);
 
     if (isAgentResource && revokedUserIds.length > 0) {
-      db.removeAgentFromUserFavorites(resourceId, revokedUserIds).catch((err) => {
-        logger.error('[removeRevokedAgentFromFavorites] Error cleaning up favorites', err);
-      });
+      operation
+        .write(() => db.removeAgentFromUserFavorites(resourceId, revokedUserIds))
+        .catch((err) => {
+          logger.error('[removeRevokedAgentFromFavorites] Error cleaning up favorites', err);
+        });
     }
 
     /** @type {TUpdateResourcePermissionsResponse} */
@@ -240,14 +263,14 @@ const updateResourcePermissions = async (req, res) => {
       details: error.message,
     });
   }
-};
+});
 
 /**
  * Get principals with their permission roles for a resource (UI-friendly format)
  * Uses efficient aggregation pipeline to join User/Group data in single query
  * @route GET /api/permissions/{resourceType}/{resourceId}
  */
-const getResourcePermissions = async (req, res) => {
+const getResourcePermissions = permissionMaintenance.own(async (req, res, operation) => {
   try {
     const { resourceType, resourceId } = req.params;
     validateResourceType(resourceType);
@@ -382,7 +405,14 @@ const getResourcePermissions = async (req, res) => {
       };
       const enrichResult = await enrichRemoteAgentPrincipals(enricherDeps, resourceId, principals);
       principals = enrichResult.principals;
-      backfillRemoteAgentPermissions(enricherDeps, resourceId, enrichResult.entriesToBackfill);
+      void operation.track(() =>
+        backfillRemoteAgentPermissions(
+          enricherDeps,
+          resourceId,
+          enrichResult.entriesToBackfill,
+          operation,
+        ),
+      );
     }
 
     // Return response in format expected by frontend
@@ -404,7 +434,7 @@ const getResourcePermissions = async (req, res) => {
       details: error.message,
     });
   }
-};
+});
 
 /**
  * Get available roles for a resource type

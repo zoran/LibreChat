@@ -7,7 +7,8 @@ const source = fs.readFileSync(path.join(__dirname, '../index.js'), 'utf8');
 test.each(['ready', 'rejected'])(
   'startup waits for the cache owner before any dependent work: %s',
   async (result) => {
-    const start = source.indexOf('const startServer = async () => {');
+    const entry = source.indexOf('const startServer = async () => {');
+    const start = source.indexOf('startupSignal.throwIfAborted();', entry);
     const end = source.indexOf('  const { metricsMiddleware', start);
     expect(start).toBeGreaterThan(0);
     expect(end).toBeGreaterThan(start);
@@ -19,11 +20,15 @@ test.each(['ready', 'rejected'])(
     });
     const waitForRedisStartup = jest.fn(() => pending);
     const entered = jest.fn();
-    const startup = vm.runInNewContext(`${source.slice(start, end)} entered(); }; startServer();`, {
-      waitForRedisStartup,
-      waitForKeyvRedisClient: jest.fn().mockResolvedValue(undefined),
-      entered,
-    });
+    const startup = vm.runInNewContext(
+      `(async () => { ${source.slice(start, end)} entered(); })();`,
+      {
+        startupSignal: new AbortController().signal,
+        waitForRedisStartup,
+        waitForKeyvRedisClient: jest.fn().mockResolvedValue(undefined),
+        entered,
+      },
+    );
     const outcome = startup.catch((error) => error);
     await new Promise(setImmediate);
     expect(entered).not.toHaveBeenCalled();
@@ -42,9 +47,6 @@ test.each(['ready', 'rejected'])(
 );
 
 test('startup supplies existing owner ports and routes readiness through maintenance only', async () => {
-  const start = source.indexOf('const maintenance = createAppMaintenance(');
-  const end = source.indexOf('const rejectChatStartsUntilReady', start);
-  expect(start).toBeGreaterThan(0);
   const owner = {
     closeGenerationAdmission: jest.fn(),
     reopenGenerationAdmission: jest.fn(),
@@ -54,30 +56,49 @@ test('startup supplies existing owner ports and routes readiness through mainten
   const create = jest.fn(() => ({}));
   const ping = jest.fn();
   const shared = jest.fn();
-  vm.runInNewContext(source.slice(start, end), {
+  const history = {};
+  const lifecycle = {};
+  const mongoCache = { maintenance: {} };
+  const startupMigration = { maintenance: {} };
+  const catalog = {};
+  const module = { exports: {} };
+  const api = {
     createAppMaintenance: create,
-    browserMaintenance: {},
-    scheduleMaintenance: {},
-    agentTriggerMaintenance: {},
-    agentQueuedTurnMaintenance: {},
-    skillSyncMaintenance: {},
     fileDeletionWorkOwner: { maintenance: {} },
-    legacyAuthMaintenance: {},
-    process: { env: {} },
+    codeEnvironmentLifecycleMaintenance: lifecycle,
     cacheConfig: { SHARED_STATE: { mode: 'sentinel' }, USE_REDIS: true },
     GenerationJobManager: owner,
-    mongoose: { connection: { db: { admin: () => ({ ping }) } } },
     probeMaintenanceRedis: shared,
     probeMaintenanceDatabase: (db) => db.ping(),
     keyvRedisClient: {},
     ioredisClient: {},
-    serverReady: true,
-  });
-  const deps = create.mock.calls[0][0];
-  expect(deps.workOwners).not.toHaveProperty('history');
-  expect(deps.unqualifiedOwners).toContain(
-    'history request completion is not exhaustively measured',
+  };
+  vm.runInNewContext(
+    fs.readFileSync(path.join(__dirname, '../services/start/maintenance.js'), 'utf8'),
+    { module, process: { env: {} }, require: () => api },
   );
+  module.exports.createWebMaintenance({
+    browserMaintenance: {},
+    historyMaintenance: history,
+    mongoCacheMaintenance: mongoCache,
+    startupMigrationMaintenance: startupMigration,
+    mcpCatalogMaintenance: catalog,
+    mongoose: { connection: { db: { admin: () => ({ ping }) } } },
+    startupReady: () => true,
+  });
+  expect(create).toHaveBeenCalledTimes(1);
+  const deps = create.mock.calls[0][0];
+  expect(deps.startupAdmission).toBe('closed');
+  expect(deps.workOwners.history).toBe(history);
+  expect(deps.workOwners.codeLifecycle).toBe(lifecycle);
+  expect(deps.workOwners.mongoCache).toBe(mongoCache.maintenance);
+  expect(deps.workOwners.startupCollections).toBe(startupMigration.maintenance);
+  expect(deps.workOwners.mcpCatalog).toBe(catalog);
+  expect(deps.unqualifiedOwners).toEqual([
+    'raw database commands, sessions and independent writers outside qualified owners',
+    'standalone tag/share and other HTTP mutations',
+    'MCP/OAuth reconnect, search indexing, code lifecycle and remaining background owners',
+  ]);
   deps.generation.closeGenerationAdmission('request');
   deps.generation.getGenerationAdmissionCensus();
   deps.generation.getGenerationRuntimeHealth();
@@ -87,7 +108,12 @@ test('startup supplies existing owner ports and routes readiness through mainten
   expect(owner.getGenerationAdmissionCensus).toHaveBeenCalledTimes(1);
   expect(owner.getGenerationRuntimeHealth).toHaveBeenCalledTimes(1);
   expect(ping).toHaveBeenCalledTimes(1);
-  expect(shared).toHaveBeenCalledWith(expect.objectContaining({ required: true }));
+  expect(shared).toHaveBeenCalledWith({
+    required: true,
+    cache: api.keyvRedisClient,
+    commands: api.ioredisClient,
+  });
+  expect(deps.startupReady()).toBe(true);
   expect(source).toContain("app.get('/readyz', maintenance.readinessHandler)");
   expect(source).toContain("app.get('/livez', (_req, res) => res.status(200).send('OK'))");
   expect(source).toContain('const rejectChatStartsUntilReady = maintenance.admissionMiddleware');

@@ -597,6 +597,76 @@ describe('isolated Intake through native authority, scanner and App promotion', 
       ).rejects.toMatchObject({ code: 'unauthorized' });
   }
 
+  it('fences real remote binding recovery absent from the App cleanup census', async () => {
+    const issued = await ticket(Buffer.from('Remote Intake vor lokalem File-Hold.'));
+    const lease = (await channel.control({
+      ...issued,
+      command: { action: 'claim' },
+      signal: AbortSignal.timeout(5000),
+    })) as UploadLease;
+    expect(lease).toMatchObject({ ...intakeWorker, operationId: issued.operationId });
+    const before = await stored(issued.operationId);
+    expect(before).toMatchObject({ state: 'transferring' });
+    expect(before).not.toHaveProperty('promotion');
+    expect((await repository.cleanupForWorker(appWorker)).tasks).toEqual([]);
+    expect(await journal.maintenance.getMaintenanceCensus(null)).toMatchObject({
+      pendingWrites: 0,
+      queuedContinuations: 0,
+      complete: true,
+    });
+    const seal = { action: 'seal-recovery', transferGeneration: lease.generation };
+    const confirm = {
+      action: 'confirm-recovery',
+      settlement: {
+        version: 1,
+        operationId: issued.operationId,
+        transferGeneration: lease.generation,
+        worker: intakeWorker,
+        localWriterStopped: true,
+        localCopiesAbsent: true,
+      },
+    };
+
+    // Even a remote binding invisible to local cleanup cannot mutate behind the local fence.
+    // This local census does not claim that the native remote cohort has drained.
+    expect(control!.maintenance.pauseAdmissions('file-hold')).toBe(true);
+    expect(await control!.maintenance.getMaintenanceCensus('file-hold')).toEqual({
+      admissionClosed: true,
+      queuedContinuations: 0,
+      pendingWrites: 0,
+      complete: true,
+    });
+    for (const command of [seal, confirm])
+      await expect(
+        channel.control({ ...issued, command, signal: AbortSignal.timeout(5000) }),
+      ).rejects.toMatchObject({ code: 'unavailable' });
+    expect(await stored(issued.operationId)).toEqual(before);
+
+    // Native A must leave this channel open during remote recovery, then take the web hold.
+    expect(control!.maintenance.resumeAdmissions('file-hold')).toBe(true);
+    await expect(
+      channel.control({ ...issued, command: seal, signal: AbortSignal.timeout(5000) }),
+    ).resolves.toMatchObject({ closed: true, acknowledged: false, worker: intakeWorker });
+    await expect(
+      channel.control({ ...issued, command: confirm, signal: AbortSignal.timeout(5000) }),
+    ).resolves.toMatchObject({
+      acknowledged: true,
+      worker: intakeWorker,
+      storageOutcome: 'not_started',
+    });
+    expect(await stored(issued.operationId)).toMatchObject({
+      intake: { closed: true, cleanupAcknowledged: true },
+    });
+    expect(control!.maintenance.pauseAdmissions('file-hold')).toBe(true);
+    expect(await control!.maintenance.getMaintenanceCensus('file-hold')).toEqual({
+      admissionClosed: true,
+      queuedContinuations: 0,
+      pendingWrites: 0,
+      complete: true,
+    });
+    await noOrdinaryContent();
+  });
+
   it.each([
     [
       'allowed',

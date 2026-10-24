@@ -5,6 +5,7 @@ const { tool } = require('@librechat/agents/langchain/tools');
 const { logger, decryptV2 } = require('@librechat/data-schemas');
 const {
   sendEvent,
+  runMongoDomainParser,
   isAbortError,
   logAxiosError,
   detachOnAbort,
@@ -119,40 +120,42 @@ function legacyDomainEncode(domain) {
  * @returns {Promise<string>} Encoded or decoded domain string.
  */
 async function domainParser(domain, inverse = false) {
-  if (!domain) {
-    return;
-  }
-
-  const domainsCache = getLogStores(CacheKeys.ENCODED_DOMAINS);
-
-  if (inverse) {
-    const hostname = stripProtocol(domain);
-    const cachedDomain = await domainsCache.get(hostname);
-    if (cachedDomain) {
-      return hostname;
+  return runMongoDomainParser(async () => {
+    if (!domain) {
+      return;
     }
 
-    if (hostname.length <= Constants.ENCODED_DOMAIN_LENGTH) {
-      return hostname.replace(/\./g, actionDomainSeparator);
+    const domainsCache = getLogStores(CacheKeys.ENCODED_DOMAINS);
+
+    if (inverse) {
+      const hostname = stripProtocol(domain);
+      const cachedDomain = await domainsCache.get(hostname);
+      if (cachedDomain) {
+        return hostname;
+      }
+
+      if (hostname.length <= Constants.ENCODED_DOMAIN_LENGTH) {
+        return hostname.replace(/\./g, actionDomainSeparator);
+      }
+
+      const modifiedDomain = Buffer.from(hostname).toString('base64');
+      const key = modifiedDomain.substring(0, Constants.ENCODED_DOMAIN_LENGTH);
+      await domainsCache.set(key, modifiedDomain);
+      return key;
     }
 
-    const modifiedDomain = Buffer.from(hostname).toString('base64');
-    const key = modifiedDomain.substring(0, Constants.ENCODED_DOMAIN_LENGTH);
-    await domainsCache.set(key, modifiedDomain);
-    return key;
-  }
+    const cachedDomain = await domainsCache.get(domain);
+    if (!cachedDomain) {
+      return domain.replace(replaceSeparatorRegex, '.');
+    }
 
-  const cachedDomain = await domainsCache.get(domain);
-  if (!cachedDomain) {
-    return domain.replace(replaceSeparatorRegex, '.');
-  }
-
-  try {
-    return Buffer.from(cachedDomain, 'base64').toString('utf-8');
-  } catch (error) {
-    logger.error(`Failed to parse domain (possibly not base64): ${domain}`, error);
-    return domain;
-  }
+    try {
+      return Buffer.from(cachedDomain, 'base64').toString('utf-8');
+    } catch (error) {
+      logger.error(`Failed to parse domain (possibly not base64): ${domain}`, error);
+      return domain;
+    }
+  });
 }
 
 /**

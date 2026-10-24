@@ -10,6 +10,7 @@ import type {
   FileCoverageRun,
   FileCoverageResult,
 } from 'librechat-data-provider';
+import { inspectFileHousekeepingInventory } from '../methods/fileHousekeepingCoverage';
 import { fileCoverageDigest } from '../methods/fileHousekeepingCoverageContract';
 import { createHousekeepingStore } from '../methods/housekeepingStore';
 import { createUploadStore } from '../methods/uploadManagementStore';
@@ -133,6 +134,195 @@ describe('fixed File coverage admin', () => {
     expect(result).toMatchObject({ outcome: 'progress', lane: 'ready' });
     return result as Extract<FileCoverageResult, { outcome: 'progress' }>;
   }
+
+  test.each([false, true])(
+    'cutover inspect: expired original run stays read-only and joins original client close (rejection %s)',
+    async (rejectClose) => {
+      const progress = await ready();
+      const sealed = await action({
+        action: 'verify-seal',
+        run,
+        expectedCheckpoint: progress.checkpoint,
+      });
+      expect(sealed.outcome).toBe('sealed');
+      const before = await store.Counter.findById('global').lean();
+      const originalRunHash = fileCoverageDigest(run);
+      const entered = deferred(),
+        release = deferred();
+      const close = mongoose.Connection.prototype.close;
+      const spy = jest
+        .spyOn(mongoose.Connection.prototype, 'close')
+        .mockImplementation(async function (this: mongoose.Connection, ...args) {
+          entered.resolve();
+          await release.promise;
+          await close.apply(this, args);
+          if (rejectClose) throw new Error('fixture original client close rejected');
+        });
+      const clock = jest.spyOn(Date, 'now').mockReturnValue(Date.parse(run.originalDeadline) + 1);
+      const invocation = invoke({
+        action: 'inspect',
+        version: 1,
+        storeId: run.storeId,
+        generation: run.generation,
+        runSha256: originalRunHash,
+      });
+      let settled = false;
+      void invocation.result.then(() => {
+        settled = true;
+      });
+      try {
+        await entered.promise;
+        expect(settled).toBe(false);
+        expect(invocation.frames.some((frame) => frame.kind === 'result')).toBe(false);
+      } finally {
+        release.resolve();
+      }
+      try {
+        expect(await invocation.result).toBe(rejectClose ? 1 : 0);
+        expect(
+          invocation.frames.filter((frame) => frame.kind === 'assert').map((frame) => frame.phase),
+        ).toEqual(['before-open', 'connected', 'before-action', 'owner', 'closed']);
+        expect(invocation.frames[invocation.frames.length - 1]?.result).toMatchObject(
+          rejectClose
+            ? { outcome: 'refused', code: 'unavailable' }
+            : {
+                outcome: 'observed',
+                phase: 'sealed',
+                receipt: (sealed as { receipt: unknown }).receipt,
+                catalog: { collectionUuid: expect.any(String), fileTtlIndexes: [] },
+              },
+        );
+        expect(fileCoverageDigest(run)).toBe(originalRunHash);
+      } finally {
+        spy.mockRestore();
+        clock.mockRestore();
+      }
+      expect(await store.Counter.findById('global').lean()).toEqual(before);
+    },
+  );
+
+  test('cutover inspect: a rehashed receipt cannot change the original native binding', async () => {
+    const progress = await ready();
+    const sealed = await action({
+      action: 'verify-seal',
+      run,
+      expectedCheckpoint: progress.checkpoint,
+    });
+    if (sealed.outcome !== 'sealed') throw new Error('fixture did not seal');
+    const { receiptSha256: _hash, ...body } = {
+      ...sealed.receipt,
+      native: { ...sealed.receipt.native, writerCohortSha256: '0'.repeat(64) },
+    };
+    await store.Counter.updateOne(
+      { _id: 'global' },
+      {
+        $set: {
+          'value.fileHousekeepingCoverage.receipt': {
+            ...body,
+            receiptSha256: fileCoverageDigest(body),
+          },
+        },
+      },
+    );
+    const invocation = invoke({
+      action: 'inspect',
+      version: 1,
+      storeId: run.storeId,
+      generation: run.generation,
+      runSha256: fileCoverageDigest(run),
+    });
+    expect(await invocation.result).toBe(1);
+    expect(invocation.frames[invocation.frames.length - 1]?.result).toEqual({
+      outcome: 'refused',
+      code: 'unavailable',
+    });
+  });
+
+  test.each([false, true])(
+    'temporary absence: prepared result waits for original admin close (rejection %s)',
+    async (rejectClose) => {
+      await file.collection.createIndex(
+        { expiresAt: 1 },
+        { name: 'expiresAt_1', expireAfterSeconds: 3600 },
+      );
+      await file.collection.insertOne({
+        file_id: 'permanent-admin',
+        user: new mongoose.Types.ObjectId(),
+      } as never);
+      const [catalog] = await mongoose.connection
+        .db!.listCollections({ name: 'files' }, { nameOnly: false })
+        .toArray();
+      const index = (await file.collection.listIndexes().toArray()).find(
+        (value) => value.name === 'expiresAt_1',
+      )!;
+      const observation = await inspectFileHousekeepingInventory(
+        mongoose,
+        {
+          action: 'inventory',
+          version: 1,
+          requestId: run.requestId,
+          source: run.source,
+          target: {
+            namespaceUid: run.native.namespaceUid,
+            mongoReplicaSet: run.native.mongoReplicaSet,
+            mongoDatabase: run.native.mongoDatabase,
+          },
+          originalDeadline: run.originalDeadline,
+          lookAheadMs: 0,
+        },
+        new AbortController().signal,
+      );
+      if (observation.outcome !== 'inventoried') throw new Error('fixture catalog unavailable');
+      const input: FileCoverageAction = {
+        action: 'prepare-ttl',
+        run,
+        collectionUuid: catalog.info!.uuid!.toUUID().toHexString(),
+        indexName: index.name!,
+        indexSha256: observation.ttl.indexes[0].specSha256,
+      };
+      const entered = deferred(),
+        release = deferred();
+      const close = mongoose.Connection.prototype.close;
+      const spy = jest
+        .spyOn(mongoose.Connection.prototype, 'close')
+        .mockImplementation(async function (this: mongoose.Connection, ...args) {
+          entered.resolve();
+          await release.promise;
+          await close.apply(this, args);
+          if (rejectClose) throw new Error('fixture original client close rejected');
+        });
+      const invocation = invoke(input);
+      let settled = false;
+      void invocation.result.then(() => {
+        settled = true;
+      });
+      try {
+        await entered.promise;
+        expect(settled).toBe(false);
+        expect(invocation.frames.some((frame) => frame.kind === 'result')).toBe(false);
+      } finally {
+        release.resolve();
+      }
+      try {
+        expect(await invocation.result).toBe(rejectClose ? 1 : 0);
+        expect(invocation.frames[invocation.frames.length - 2]).toMatchObject({
+          kind: 'assert',
+          phase: 'closed',
+        });
+        expect(invocation.frames[invocation.frames.length - 1]).toMatchObject({
+          kind: 'result',
+          result: rejectClose
+            ? { outcome: 'unknown', code: 'unknown_commit' }
+            : { outcome: 'prepared', population: { totalFiles: 1, expiresAtAbsentOrNull: 1 } },
+        });
+        expect((await store.Counter.findById('global').lean())!.value).not.toHaveProperty(
+          'fileHousekeepingCoverage',
+        );
+      } finally {
+        spy.mockRestore();
+      }
+    },
+  );
 
   test('executes the actual Mongo owner through seal and reads only its exact receipt', async () => {
     const progress = await ready();

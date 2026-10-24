@@ -9,6 +9,7 @@ const {
   getMCPToolsCacheGeneration,
   renewMCPToolsCacheGeneration,
   getNextAppToolsPublicationRevision,
+  runMCPToolPublication,
 } = require('./getCachedTools');
 
 const {
@@ -32,11 +33,11 @@ const {
 });
 
 module.exports = {
-  syncStaticTools,
-  mergeAppTools,
-  getMCPServerTools,
-  cacheMCPServerTools,
-  updateMCPServerTools,
+  syncStaticTools: (...args) => runMCPToolPublication(() => syncStaticTools(...args)),
+  mergeAppTools: (...args) => runMCPToolPublication(() => mergeAppTools(...args)),
+  getMCPServerTools: (...args) => runMCPToolPublication(() => getMCPServerTools(...args)),
+  cacheMCPServerTools: (...args) => runMCPToolPublication(() => cacheMCPServerTools(...args)),
+  updateMCPServerTools: (...args) => runMCPToolPublication(() => updateMCPServerTools(...args)),
   getMCPToolsCacheGeneration,
   renewMCPToolsCacheGeneration,
   getNextAppToolsPublicationRevision,

@@ -303,6 +303,24 @@ function serializeRunArtifact(
   return { ...fields, user: user.toString(), ...(_id == null ? {} : { _id: String(_id) }) };
 }
 
+/** Mongo upserts reject $expr; exclude arrays explicitly for the equivalent insert predicate. */
+function nonTemporaryFileFilter(upsert = false): FilterQuery<IMongoFile> {
+  return upsert
+    ? {
+        $and: [
+          { expiresAt: { $not: { $type: 'array' } } },
+          { $or: [{ expiresAt: { $exists: false } }, { expiresAt: { $type: 'null' } }] },
+        ],
+      }
+    : { $expr: { $in: [{ $type: '$expiresAt' }, ['missing', 'null']] } };
+}
+
+/** Preserve null/CAS misses; only an actual matching temporary is a policy refusal. */
+async function rejectTemporaryFile(File: Model<IMongoFile>, filter: FilterQuery<IMongoFile>) {
+  if (await File.exists({ $and: [filter, { $nor: [nonTemporaryFileFilter()] }] }))
+    throw new FileSourceUnavailableError();
+}
+
 /** Factory function that takes mongoose instance and returns the file methods */
 export function createFileMethods(mongoose: typeof import('mongoose')): ReturnType<
   typeof createFileRetentionMethods
@@ -1128,9 +1146,9 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
   }
 
   /**
-   * Creates a new file with a TTL of 1 hour.
+   * Creates an explicitly permanent file or one admitted by the retained File owner.
    * @param data - The file data to be created, must contain file_id
-   * @param disableTTL - Whether to disable the TTL
+   * @param disableTTL - Must be true for a non-retained birth
    * @returns A promise that resolves to the created file document
    */
   async function createFile(
@@ -1140,6 +1158,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
   ): Promise<IMongoFile | null> {
     if (Object.keys(data).some((key) => key.startsWith('$')))
       throw new FileSourceUnavailableError();
+    if (disableTTL !== true && !options?.retention) throw new FileSourceUnavailableError();
     const File = mongoose.models.File as Model<IMongoFile>;
     const fileData: Omit<Partial<IMongoFile> | CodeFileCommitData, 'tenantId'> & {
       tenantId?: string | null;
@@ -1147,16 +1166,10 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
       retentionAcceptedAt?: Date;
       retentionRevision?: number;
       retentionActivity?: IMongoFile['retentionActivity'];
-    } = {
-      ...data,
-      expiresAt: new Date(Date.now() + 3600 * 1000),
-    };
-
-    if (disableTTL) {
-      delete fileData.expiresAt;
-    }
+    } = { ...data };
 
     for (const key of [
+      'expiresAt',
       'retentionAcceptedAt',
       'retentionRevision',
       'retentionActivity',
@@ -1229,7 +1242,12 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
     }
     try {
       return await File.findOneAndUpdate(
-        { file_id: data.file_id, retentionAcceptedAt: { $exists: false } },
+        {
+          $and: [
+            { file_id: data.file_id, retentionAcceptedAt: { $exists: false } },
+            nonTemporaryFileFilter(true),
+          ],
+        },
         fileData,
         {
           new: true,
@@ -1243,7 +1261,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
   }
 
   /**
-   * Updates a file identified by file_id with new data and removes the TTL.
+   * Updates an admitted non-temporary file identified by file_id.
    *
    * `extraFilter` extends the by-id query with additional conditions
    * (e.g. `{ previewRevision: '<expected uuid>' }`). When provided, the
@@ -1254,7 +1272,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
    * filename reuse.
    *
    * Content timestamps advance only when the caller actually writes a
-   * field. Clearing the upload TTL alone is bookkeeping: image reuse
+   * field. An id-only image reuse is bookkeeping: image reuse
    * calls this with nothing but the id on every turn, and consumers that
    * fingerprint content by `updatedAt` (Project resume compatibility)
    * would otherwise read a new version and reject an approved turn.
@@ -1276,6 +1294,7 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
     const current = await File.findOne({ file_id }).lean<IMongoFile>();
     if (!current) return null;
     for (const key of [
+      'expiresAt',
       'retentionAcceptedAt',
       'retentionRevision',
       'retentionActivity',
@@ -1352,15 +1371,16 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
         current[key] === undefined ? { $exists: false } : { $eq: current[key], $exists: true },
       ]),
     );
-    const updateOperation = {
-      $set: update,
-      $unset: { expiresAt: '' },
-    };
+    const updateOperation = { $set: update };
     const query: FilterQuery<IMongoFile> = extraFilter ? { file_id, ...extraFilter } : { file_id };
-    return File.findOneAndUpdate({ $and: [query, lifecycle, liveFileFilter()] }, updateOperation, {
-      new: true,
-      timestamps: Object.keys(update).length > 0,
-    }).lean<IMongoFile>();
+    const filter = { $and: [query, lifecycle, liveFileFilter()] };
+    const result = await File.findOneAndUpdate(
+      { $and: [filter, nonTemporaryFileFilter()] },
+      updateOperation,
+      { new: true, timestamps: Object.keys(update).length > 0 },
+    ).lean<IMongoFile>();
+    if (!result) await rejectTemporaryFile(File, filter);
+    return result;
   }
 
   /** Background outputs commit only while their dispatch still owns the claimed filename. */
@@ -1408,11 +1428,14 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
     if (legacyRef) {
       update['metadata.codeEnvRef'] = legacyRef;
     }
-    return File.findOneAndUpdate(
-      { file_id },
-      { $set: update, $unset: { expiresAt: '' } },
+    const query = { file_id };
+    const result = await File.findOneAndUpdate(
+      { $and: [query, nonTemporaryFileFilter()] },
+      { $set: update },
       { new: true },
     ).lean<IMongoFile>();
+    if (!result) await rejectTemporaryFile(File, query);
+    return result;
   }
 
   /**
@@ -1428,15 +1451,17 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
     entityId: string;
   }): Promise<IMongoFile | null> {
     const File = mongoose.models.File as Model<IMongoFile>;
-    return File.findOneAndUpdate(
-      { file_id: data.file_id },
+    const query = { file_id: data.file_id };
+    const result = await File.findOneAndUpdate(
+      { $and: [query, nonTemporaryFileFilter()] },
       {
         $set: { embedded: true },
         $addToSet: { 'metadata.embeddedEntities': data.entityId },
-        $unset: { expiresAt: '' },
       },
       { new: true },
     ).lean<IMongoFile>();
+    if (!result) await rejectTemporaryFile(File, query);
+    return result;
   }
 
   /**
@@ -1454,17 +1479,20 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
     const { file_id, inc = 1, user, tenantId } = data;
     const updateOperation = {
       $inc: { usage: inc },
-      $unset: { expiresAt: '', temp_file_id: '' },
+      $unset: { temp_file_id: '' },
     };
     // Owner scoping is fail-closed: mismatches leave usage and TTL metadata unchanged.
     const query: FilterQuery<IMongoFile> = user
       ? withOwnerScope({ file_id }, { userId: user, tenantId })
       : { file_id };
     /** Usage and temporary-upload cleanup are bookkeeping, not content writes. */
-    return File.findOneAndUpdate(query, updateOperation, {
-      new: true,
-      timestamps: false,
-    }).lean<IMongoFile>();
+    const result = await File.findOneAndUpdate(
+      { $and: [query, nonTemporaryFileFilter()] },
+      updateOperation,
+      { new: true, timestamps: false },
+    ).lean<IMongoFile>();
+    if (!result) await rejectTemporaryFile(File, query);
+    return result;
   }
 
   /**
@@ -1669,40 +1697,8 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
   }
 
   /**
-   * Widens the upload-window TTL of owned, still-temporary files to
-   * `min(now + renewMs, createdAt + maxLifetimeMs)`.
-   *
-   * A renewable hold, not a release: unlike `updateFileUsage` this never
-   * unsets `expiresAt`, so a file that is held but never actually sent is
-   * still reaped once the hold lapses. Candidates are read first, then each
-   * doc gets a guarded write — no aggregation-pipeline update, which Amazon
-   * DocumentDB rejects. Four properties hold by construction, which is what
-   * makes the write safe to drive from a client-supplied id list:
-   * - capping the renewal at `createdAt + maxLifetimeMs` anchors it to an
-   *   immutable ceiling, so repeated calls converge on a fixed deadline
-   *   instead of walking a file's lifetime forward a window at a time;
-   * - renewing from `now` up to that ceiling lets a queue that is still
-   *   draining keep its attachments alive across successive runs, while an
-   *   abandoned queue lapses a single `renewMs` after its last touch rather
-   *   than surviving to the ceiling;
-   * - the `expiresAt: { $lt: next }` write guard means a hold only ever
-   *   widens, even against renewals landing between the read and the write;
-   * - `expiresAt: { $exists: true }` in the read filter and the write guard
-   *   means a file whose TTL was already cleared by a real send stays
-   *   permanent. Re-adding `expiresAt` there would schedule a live file for
-   *   deletion.
-   *
-   * `createdAt` is required rather than defaulted: without the anchor there
-   * is no ceiling to enforce, so such a file is skipped instead of held.
-   *
-   * The owner scope is required, not optional: an unscoped call would hold
-   * every user's matching file. A missing owner is a no-op, not a wide
-   * update.
-   *
-   * @param fileIds - File IDs to hold
-   * @param hold - `renewMs` granted from now, capped at `maxLifetimeMs` from upload
-   * @param owner - Owner scope; mismatches leave the TTL unchanged
-   * @returns Number of files whose hold was widened
+   * The successor accepts no temporary File population. Preserve this caller contract
+   * as an owner-scoped no-op for absent/null expiry; never renew or erase legacy expiry.
    */
   async function extendFilesTTL(
     fileIds: string[],
@@ -1716,42 +1712,11 @@ export function createFileMethods(mongoose: typeof import('mongoose')): ReturnTy
     }
     const File = mongoose.models.File as Model<IMongoFile>;
     const filter = withOwnerScope(
-      {
-        file_id: { $in: [...new Set(fileIds)] },
-        expiresAt: { $exists: true },
-        createdAt: { $exists: true },
-      },
+      { file_id: { $in: [...new Set(fileIds)] } },
       { userId: owner.user, tenantId: owner.tenantId },
     );
-    const renewUntil = Date.now() + renewMs;
-    const candidates = await File.find(filter)
-      .select({ _id: 1, expiresAt: 1, createdAt: 1 })
-      .lean<Pick<IMongoFile, '_id' | 'expiresAt' | 'createdAt'>[]>();
-    const holdOps = candidates.flatMap((file) => {
-      if (!file.createdAt || !file.expiresAt) {
-        return [];
-      }
-      const next = new Date(Math.min(renewUntil, file.createdAt.getTime() + maxLifetimeMs));
-      if (file.expiresAt.getTime() >= next.getTime()) {
-        return [];
-      }
-      return [
-        {
-          updateOne: {
-            filter: { _id: file._id, expiresAt: { $exists: true, $lt: next } },
-            update: { $set: { expiresAt: next } },
-          },
-        },
-      ];
-    });
-    if (holdOps.length === 0) {
-      return 0;
-    }
-    /** `timestamps: false`: a hold is TTL bookkeeping, not a content write.
-     *  Bumping `updatedAt` would also make every re-touch count as a
-     *  modification, hiding whether the deadline actually moved. */
-    const result = await tenantSafeBulkWrite(File, holdOps, { timestamps: false });
-    return result.modifiedCount ?? 0;
+    await rejectTemporaryFile(File, filter);
+    return 0;
   }
 
   /**

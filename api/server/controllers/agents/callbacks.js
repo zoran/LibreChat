@@ -76,14 +76,32 @@ async function enqueueCodeOutputBatch({
   const entries = await preflightCodeOutputBatch({ req, artifact, codeExecutionContext });
   let persistenceChain = Promise.resolve();
   for (const entry of entries) {
-    const current = persistenceChain
-      .then(() => processEntry(entry))
+    let preview = Promise.resolve();
+    const persisted = persistenceChain
+      .then(() =>
+        processEntry(entry, (original) => {
+          preview = Promise.resolve(original);
+        }),
+      )
       .catch(() => {
         logger.error('Error processing code output');
         return null;
       });
-    persistenceChain = current.then(() => undefined);
-    artifactPromises.push(current);
+    // Serialize metadata persistence, not optional preview rendering. Register
+    // each completion now: Generation may already snapshot artifactPromises
+    // while this entry is still waiting for the preceding metadata write.
+    persistenceChain = persisted.then(() => undefined);
+    artifactPromises.push(
+      persisted
+        .then(async (file) => {
+          await preview;
+          return file;
+        })
+        .catch(() => {
+          logger.error('Error completing code output preview');
+          return null;
+        }),
+    );
   }
 }
 
@@ -1137,7 +1155,10 @@ function createToolEndCallback({ req, res, artifactPromises, streamId = null, jo
       artifact: output.artifact,
       artifactPromises,
       codeExecutionContext: metadata.codeExecutionContext,
-      processEntry: async ({ file, sessionId, preparedBuffer, downloadFallback }) => {
+      processEntry: async (
+        { file, sessionId, preparedBuffer, downloadFallback },
+        retainPreview,
+      ) => {
         const result = await processCodeOutput({
           req,
           id: file.id,
@@ -1175,10 +1196,15 @@ function createToolEndCallback({ req, res, artifactPromises, streamId = null, jo
          * IIFE catch but logged as noise). Same gate the Responses
          * path uses below. */
         if (isStreamWritable(res, streamId)) {
-          writeAttachment(res, streamId, fileMetadata, jobCreatedAt);
+          try {
+            writeAttachment(res, streamId, fileMetadata, jobCreatedAt);
+          } catch (error) {
+            logger.error('Error emitting pending code attachment:', error);
+          }
         }
-        /* Deferred preview rendering: extraction continues running
-         * even after the HTTP response closes. If the stream is still
+        /* File retains the original preview even after the HTTP response
+         * closes; this artifact promise keeps it in Generation's join.
+         * If the stream is still
          * open when the preview resolves, push an `attachment`
          * update event so the UI patches in place; otherwise React
          * Query polling on `/api/files/:file_id/preview` picks it up.
@@ -1193,26 +1219,28 @@ function createToolEndCallback({ req, res, artifactPromises, streamId = null, jo
          * slot — turn-N's pending placeholder would stay stuck while
          * turn-1's already-resolved attachment got re-merged.
          * (Codex P1 review on PR #12957.) */
-        runPreviewFinalize({
-          finalize,
-          fileId: fileMetadata.file_id,
-          previewRevision: result?.previewRevision,
-          onResolved: (updated) => {
-            writeAttachmentUpdate(
-              res,
-              streamId,
-              {
-                ...updated,
-                messageId: metadata.run_id,
-                toolCallId,
-                ...(fileMetadata.workspaceChange
-                  ? { workspaceChange: fileMetadata.workspaceChange }
-                  : {}),
-              },
-              jobCreatedAt,
-            );
-          },
-        });
+        retainPreview(
+          runPreviewFinalize({
+            finalize,
+            fileId: fileMetadata.file_id,
+            previewRevision: result?.previewRevision,
+            onResolved: (updated) => {
+              writeAttachmentUpdate(
+                res,
+                streamId,
+                {
+                  ...updated,
+                  messageId: metadata.run_id,
+                  toolCallId,
+                  ...(fileMetadata.workspaceChange
+                    ? { workspaceChange: fileMetadata.workspaceChange }
+                    : {}),
+                },
+                jobCreatedAt,
+              );
+            },
+          }),
+        );
         return fileMetadata;
       },
     });
@@ -1511,7 +1539,10 @@ function createResponsesToolEndCallback({ req, res, tracker, artifactPromises })
       artifact: output.artifact,
       artifactPromises,
       codeExecutionContext: metadata.codeExecutionContext,
-      processEntry: async ({ file, sessionId, preparedBuffer, downloadFallback }) => {
+      processEntry: async (
+        { file, sessionId, preparedBuffer, downloadFallback },
+        retainPreview,
+      ) => {
         const result = await processCodeOutput({
           req,
           id: file.id,
@@ -1540,40 +1571,47 @@ function createResponsesToolEndCallback({ req, res, tracker, artifactPromises })
         /* Initial emit (Open Responses extension format). The agent's
          * response no longer blocks on extraction. */
         if (isStreamWritable(res, null)) {
-          writeResponsesAttachment(
-            res,
-            tracker,
-            buildResponsesAttachment(fileMetadata, toolCallId),
-            metadata,
-          );
-        }
-
-        /* Deferred preview rendering: extract HTML in the background
-         * and emit a follow-up `librechat:attachment` with the same
-         * `file_id` so the client merges the resolved record over the
-         * pending placeholder. Fire-and-forget — survives response
-         * close; polling covers the post-close gap. */
-        runPreviewFinalize({
-          finalize,
-          fileId: fileMetadata.file_id,
-          previewRevision: result?.previewRevision,
-          onResolved: (updated) => {
-            if (!isStreamWritable(res, null)) {
-              return;
-            }
+          try {
             writeResponsesAttachment(
               res,
               tracker,
-              buildResponsesAttachment(
-                fileMetadata.workspaceChange
-                  ? { ...updated, workspaceChange: fileMetadata.workspaceChange }
-                  : updated,
-                toolCallId,
-              ),
+              buildResponsesAttachment(fileMetadata, toolCallId),
               metadata,
             );
-          },
-        });
+          } catch (error) {
+            logger.error('Error emitting pending code attachment:', error);
+          }
+        }
+
+        /* Deferred preview rendering: the initial pending emit is immediate,
+         * while this artifact promise retains File's original completion.
+         * Extract HTML
+         * and emit a follow-up `librechat:attachment` with the same
+         * `file_id` so the client merges the resolved record over the
+         * pending placeholder. Polling covers the post-close gap. */
+        retainPreview(
+          runPreviewFinalize({
+            finalize,
+            fileId: fileMetadata.file_id,
+            previewRevision: result?.previewRevision,
+            onResolved: (updated) => {
+              if (!isStreamWritable(res, null)) {
+                return;
+              }
+              writeResponsesAttachment(
+                res,
+                tracker,
+                buildResponsesAttachment(
+                  fileMetadata.workspaceChange
+                    ? { ...updated, workspaceChange: fileMetadata.workspaceChange }
+                    : updated,
+                  toolCallId,
+                ),
+                metadata,
+              );
+            },
+          }),
+        );
 
         return fileMetadata;
       },

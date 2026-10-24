@@ -1,3 +1,4 @@
+import { Server } from 'node:http';
 import { logger } from '@librechat/data-schemas';
 import type { AbortResult } from '~/stream/interfaces/IJobStore';
 import type { AgentStartupTelemetry } from '~/agents/startup';
@@ -17,6 +18,7 @@ import { registerChunkPublicationCapability } from '~/stream/internal/chunkPubli
 import { buildPendingAction, buildToolApprovalPayload } from '~/agents/hitl/policy';
 import { GenerationPublicationFencedError } from '~/stream/interfaces/IJobStore';
 import { InMemoryJobStore } from '~/stream/implementations/InMemoryJobStore';
+import { GenerationAdmissionHeldError } from '~/stream/generationAdmission';
 
 function createTelemetry(): jest.Mocked<AgentStartupTelemetry> {
   return {
@@ -239,6 +241,7 @@ describe('GenerationJobManager startup telemetry', () => {
     await expect(
       manager.markProviderExecutionDrained(streamId, job.createdAt, 'different-segment'),
     ).resolves.toBe(false);
+    expect((await manager.getGenerationAdmissionCensus()).providerExecutions).toBe(1);
     await expect(manager.getJobStore().getJob(streamId)).resolves.toMatchObject({
       providerDrained: false,
     });
@@ -248,6 +251,10 @@ describe('GenerationJobManager startup telemetry', () => {
     ).resolves.toBe(true);
     await expect(manager.getJobStore().getJob(streamId)).resolves.toBeNull();
     await expect(manager.getCleanupBlockingJobIdsForUser('user-1')).resolves.toEqual([]);
+    expect(await manager.getGenerationAdmissionCensus()).toMatchObject({
+      providerExecutions: 0,
+      unresolved: 0,
+    });
     await manager.destroy();
   });
 
@@ -420,6 +427,16 @@ describe('GenerationJobManager startup telemetry', () => {
     const replacement = await replacing;
     expect(replacement.createdAt).not.toBe(predecessor.createdAt);
     expect(replacementSettled).toBe(true);
+    expect(await manager.getJobStore().getJob(streamId)).toMatchObject({
+      createdAt: replacement.createdAt,
+      providerExecutionId: replacement.metadata.providerExecutionId,
+      providerDrained: true,
+      status: 'running',
+    });
+    expect(await manager.getGenerationAdmissionCensus()).toMatchObject({
+      providerExecutions: 0,
+      unresolved: 0,
+    });
     await manager.destroy();
   });
 
@@ -1616,6 +1633,12 @@ describe('GenerationJobManager startup telemetry', () => {
     const oldSubscription = await manager.subscribe(streamId, () => undefined, undefined, oldError);
     await jest.advanceTimersByTimeAsync(0);
 
+    const currentJobStore = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+    const currentEventTransport = new InMemoryEventTransport();
+    const currentGetJob = jest.spyOn(currentJobStore, 'getJob');
+    const currentClearContentState = jest.spyOn(currentJobStore, 'clearContentState');
+
+    const failures: unknown[] = [];
     try {
       await manager.emitChunk(streamId, {
         event: 'on_message_delta',
@@ -1624,15 +1647,21 @@ describe('GenerationJobManager startup telemetry', () => {
       expect(oldJob.abortController.signal.aborted).toBe(true);
       expect(manager.getRuntimeStats().fencedRuntimeRetirements).toBe(1);
 
-      const currentJobStore = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
-      const currentEventTransport = new InMemoryEventTransport();
-      const currentGetJob = jest.spyOn(currentJobStore, 'getJob');
-      const currentClearContentState = jest.spyOn(currentJobStore, 'clearContentState');
-      manager.configure({
+      const services = {
         jobStore: currentJobStore,
         eventTransport: currentEventTransport,
         isRedis: false,
-      });
+      };
+      expect(() => manager.configure(services)).toThrow('generation_reconfiguration_pending');
+      expect(manager.getJobStore()).toBe(oldJobStore);
+      expect(manager['eventTransport']).toBe(oldEventTransport);
+      oldSubscription?.unsubscribe();
+      const shutdown = manager.destroy({ settlementBudgetMs: 1_000 });
+      await jest.advanceTimersByTimeAsync(0);
+      await shutdown;
+      expect(manager['shutdownSettlementComplete']).toBe(true);
+      manager.configure(services);
+      manager.initialize();
       await manager.createJob(streamId, 'user-1', 'conversation-2');
       currentGetJob.mockClear();
       currentClearContentState.mockClear();
@@ -1647,11 +1676,23 @@ describe('GenerationJobManager startup telemetry', () => {
       expect(currentClearContentState).not.toHaveBeenCalled();
       await expect(manager.hasJob(streamId)).resolves.toBe(true);
       expect(manager.getRuntimeStats().runtimeStateSize).toBe(1);
-    } finally {
-      jest.useRealTimers();
-      oldSubscription?.unsubscribe();
-      await manager.destroy();
+    } catch (error) {
+      failures.push(error);
     }
+    oldSubscription?.unsubscribe();
+    jest.useRealTimers();
+    const closing = await Promise.allSettled([manager.destroy({ settlementBudgetMs: 1_000 })]);
+    const originals = await Promise.allSettled([manager['shutdownSettlement']]);
+    const resources = await Promise.allSettled([
+      oldJobStore.destroy(),
+      currentJobStore.destroy(),
+      Promise.resolve().then(() => oldEventTransport.destroy()),
+      Promise.resolve().then(() => currentEventTransport.destroy()),
+    ]);
+    for (const result of [...closing, ...originals, ...resources])
+      if (result.status === 'rejected') failures.push(result.reason);
+    if (failures.length)
+      throw Object.assign(new Error(failures.map(String).join('\n')), { errors: failures });
   });
 
   it('cancels an in-flight fenced retirement lookup when services are reconfigured', async () => {
@@ -1676,12 +1717,19 @@ describe('GenerationJobManager startup telemetry', () => {
     const lookupGate = new Promise<void>((resolve) => {
       releaseLookup = resolve;
     });
-    const getJobSpy = jest.spyOn(oldJobStore, 'getJob').mockImplementationOnce(async (...args) => {
+    let lookupOriginal: ReturnType<typeof originalGetJob> | undefined;
+    const getJobSpy = jest.spyOn(oldJobStore, 'getJob').mockImplementationOnce((...args) => {
       signalLookupStarted?.();
-      await lookupGate;
-      return originalGetJob(...args);
+      lookupOriginal = lookupGate.then(() => originalGetJob(...args));
+      return lookupOriginal;
     });
 
+    const currentJobStore = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+    const currentEventTransport = new InMemoryEventTransport();
+    const currentGetJob = jest.spyOn(currentJobStore, 'getJob');
+    const currentClearContentState = jest.spyOn(currentJobStore, 'clearContentState');
+
+    const failures: unknown[] = [];
     try {
       await manager.emitChunk(streamId, {
         event: 'on_message_delta',
@@ -1693,21 +1741,27 @@ describe('GenerationJobManager startup telemetry', () => {
       await jest.advanceTimersByTimeAsync(REDIS_ABORT_TERMINAL_GRACE_MS);
       await lookupStarted;
 
-      const currentJobStore = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
-      const currentEventTransport = new InMemoryEventTransport();
-      const currentGetJob = jest.spyOn(currentJobStore, 'getJob');
-      const currentClearContentState = jest.spyOn(currentJobStore, 'clearContentState');
-      manager.configure({
+      const services = {
         jobStore: currentJobStore,
         eventTransport: currentEventTransport,
         isRedis: false,
-      });
+      };
+      expect(() => manager.configure(services)).toThrow('generation_reconfiguration_pending');
+      expect(manager.getJobStore()).toBe(oldJobStore);
+      expect(manager['eventTransport']).toBe(oldEventTransport);
+      oldSubscription?.unsubscribe();
+      const shutdown = manager.destroy({ settlementBudgetMs: 1_000 });
+      releaseLookup?.();
+      await lookupOriginal;
+      await jest.advanceTimersByTimeAsync(0);
+      await shutdown;
+      expect(manager['shutdownSettlementComplete']).toBe(true);
+      manager.configure(services);
+      manager.initialize();
       await manager.createJob(streamId, 'user-1', 'conversation-2');
       currentGetJob.mockClear();
       currentClearContentState.mockClear();
       expect(manager.getRuntimeStats().fencedRuntimeRetirements).toBe(0);
-      releaseLookup?.();
-      await Promise.resolve();
 
       await jest.advanceTimersByTimeAsync(
         REDIS_REPLACEMENT_HANDOFF_MAX_WAIT_MS + REDIS_EVENT_REORDER_TIMEOUT_MS * 2,
@@ -1718,13 +1772,26 @@ describe('GenerationJobManager startup telemetry', () => {
       expect(currentClearContentState).not.toHaveBeenCalled();
       await expect(manager.hasJob(streamId)).resolves.toBe(true);
       expect(manager.getRuntimeStats().runtimeStateSize).toBe(1);
-    } finally {
-      releaseLookup?.();
-      getJobSpy.mockRestore();
-      jest.useRealTimers();
-      oldSubscription?.unsubscribe();
-      await manager.destroy();
+    } catch (error) {
+      failures.push(error);
     }
+    releaseLookup?.();
+    const lookup = await Promise.allSettled([lookupOriginal]);
+    getJobSpy.mockRestore();
+    oldSubscription?.unsubscribe();
+    jest.useRealTimers();
+    const closing = await Promise.allSettled([manager.destroy({ settlementBudgetMs: 1_000 })]);
+    const originals = await Promise.allSettled([manager['shutdownSettlement']]);
+    const resources = await Promise.allSettled([
+      oldJobStore.destroy(),
+      currentJobStore.destroy(),
+      Promise.resolve().then(() => oldEventTransport.destroy()),
+      Promise.resolve().then(() => currentEventTransport.destroy()),
+    ]);
+    for (const result of [...lookup, ...closing, ...originals, ...resources])
+      if (result.status === 'rejected') failures.push(result.reason);
+    if (failures.length)
+      throw Object.assign(new Error(failures.map(String).join('\n')), { errors: failures });
   });
 
   it('cancels fenced retirement timers when the manager is destroyed', async () => {
@@ -4157,17 +4224,34 @@ describe('GenerationJobManager startup telemetry', () => {
     const onError = jest.fn();
     const subscription = await manager.subscribe('stream-6', () => undefined, undefined, onError);
 
-    manager.prepareForShutdown();
+    const broadcastAbort = jest.fn();
+    const confirmedAbort = jest.fn(async () => true);
+    manager['eventTransport'].emitAbort = broadcastAbort;
+    manager['eventTransport'].emitAbortConfirmed = confirmedAbort;
+    const failures: unknown[] = [];
+    try {
+      manager.prepareForShutdown();
 
-    expect(onError).toHaveBeenCalledWith('Server is shutting down');
-    expect(telemetry.end).toHaveBeenCalledWith('aborted');
-    expect(job.abortController.signal.aborted).toBe(false);
-    await expect(manager.createJob('stream-after-shutdown', 'user-1')).rejects.toThrow(
-      'Generation job manager is shutting down',
-    );
-
-    subscription?.unsubscribe();
-    await manager.destroy();
+      expect(onError).toHaveBeenCalledWith('Server is shutting down');
+      expect(telemetry.end).toHaveBeenCalledWith('aborted');
+      expect(job.abortController.signal.aborted).toBe(true);
+      expect(broadcastAbort).not.toHaveBeenCalled();
+      expect(confirmedAbort).not.toHaveBeenCalled();
+      await expect(manager.createJob('stream-after-shutdown', 'user-1')).rejects.toThrow(
+        GenerationAdmissionHeldError,
+      );
+    } catch (error) {
+      failures.push(error);
+    }
+    const detached = await Promise.allSettled([
+      Promise.resolve().then(() => subscription?.unsubscribe()),
+    ]);
+    const closing = await Promise.allSettled([manager.destroy()]);
+    const originals = await Promise.allSettled([manager['shutdownSettlement']]);
+    for (const result of [...detached, ...closing, ...originals])
+      if (result.status === 'rejected') failures.push(result.reason);
+    if (failures.length)
+      throw Object.assign(new Error(failures.map(String).join('\n')), { errors: failures });
   });
 
   it('durably finalizes locally owned running jobs after the HTTP drain', async () => {
@@ -4344,84 +4428,47 @@ describe('GenerationJobManager startup telemetry', () => {
     expect(destroyed).toBe(true);
   });
 
-  it('does not carry undrained executions into a re-initialized manager', async () => {
-    const { manager } = configureShutdownManager();
-    const streamId = 'stream-shutdown-stale-execution';
-    const job = await manager.createJob(streamId, 'user-1');
-    await manager.beginProviderExecution(
-      streamId,
-      job.createdAt,
-      job.metadata.providerExecutionId!,
+  it('retains undrained executions when a bare reset has no settlement budget', async () => {
+    const { manager, jobStore, eventTransport } = configureShutdownManager();
+    const job = await manager.createJob('stream-shutdown-stale-execution', 'user-1');
+    const segment = job.metadata.providerExecutionId!;
+    await manager.beginProviderExecution(job.streamId, job.createdAt, segment);
+    manager.prepareForShutdown();
+    await expect(manager.destroy()).rejects.toThrow('shutdown_pending');
+    expect(jobStore.destroy).not.toHaveBeenCalled();
+    expect(() => manager.configure({ jobStore, eventTransport })).toThrow(
+      'reconfiguration_pending',
     );
-
-    /** A bare reset: zero budget, so the execution is still open when teardown runs. */
-    manager.prepareForShutdown();
-    await manager.destroy();
-
-    const jobStore = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
-    jest.spyOn(jobStore, 'destroy').mockResolvedValue();
-    manager.configure({ jobStore, eventTransport: new InMemoryEventTransport(), isRedis: false });
-    manager.initialize();
-
-    manager.prepareForShutdown();
-    let destroyed = false;
-    const destroying = manager.destroy({ settlementBudgetMs: 5_000 }).then(() => {
-      destroyed = true;
-    });
-    await new Promise((resolve) => setImmediate(resolve));
-    /** Resolved without consuming the budget: nothing from the previous store is left to wait
-     *  on. Asserted before awaiting, or a 5s stale wait would pass this test too. */
-    expect(destroyed).toBe(true);
-    await destroying;
+    await manager.markProviderExecutionDrained(job.streamId, job.createdAt, segment);
+    eventTransport.destroy();
   });
 
-  it('does not carry undrained executions across a reconfigure', async () => {
-    const { manager } = configureShutdownManager();
-    const streamId = 'stream-shutdown-reconfigure';
-    const job = await manager.createJob(streamId, 'user-1');
-    await manager.beginProviderExecution(
-      streamId,
-      job.createdAt,
-      job.metadata.providerExecutionId!,
+  it('retains undrained executions across a refused reconfigure', async () => {
+    const { manager, jobStore, eventTransport } = configureShutdownManager();
+    const job = await manager.createJob('stream-shutdown-reconfigure', 'user-1');
+    const segment = job.metadata.providerExecutionId!;
+    await manager.beginProviderExecution(job.streamId, job.createdAt, segment);
+    expect(() => manager.configure({ jobStore, eventTransport })).toThrow(
+      'reconfiguration_pending',
     );
-
-    /** Reconfiguring after initialization replaces the store and transport the open
-     *  execution belongs to; its tracker must go with them. */
-    const jobStore = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
-    jest.spyOn(jobStore, 'destroy').mockResolvedValue();
-    manager.configure({ jobStore, eventTransport: new InMemoryEventTransport(), isRedis: false });
-
-    manager.prepareForShutdown();
-    let destroyed = false;
-    const destroying = manager.destroy({ settlementBudgetMs: 5_000 }).then(() => {
-      destroyed = true;
-    });
-    await new Promise((resolve) => setImmediate(resolve));
-    expect(destroyed).toBe(true);
-    await destroying;
+    expect(jobStore.destroy).not.toHaveBeenCalled();
+    await manager.markProviderExecutionDrained(job.streamId, job.createdAt, segment);
+    await manager.destroy({ settlementBudgetMs: 5_000 });
   });
 
-  it('releases an abandoned provider execution without recording a drain', async () => {
-    const { manager, eventTransport } = configureShutdownManager();
-    const streamId = 'stream-shutdown-abandoned';
-    const job = await manager.createJob(streamId, 'user-1');
-    const providerExecutionId = job.metadata.providerExecutionId!;
-    await manager.beginProviderExecution(streamId, job.createdAt, providerExecutionId);
+  it('refuses abandoned provider settlement without recording a drain', async () => {
+    const { manager, jobStore, eventTransport } = configureShutdownManager();
+    const job = await manager.createJob('stream-shutdown-abandoned', 'user-1');
+    const segment = job.metadata.providerExecutionId!;
+    await manager.beginProviderExecution(job.streamId, job.createdAt, segment);
     const recordProviderDrain = jest.spyOn(eventTransport, 'recordProviderDrain');
-
-    /** A remote run that settled its provider work but failed terminalization twice
-     *  deliberately publishes no drain marker; it must still stop shutdown waiting on it. */
-    manager.abandonProviderExecution(streamId, job.createdAt, providerExecutionId);
-
-    manager.prepareForShutdown();
-    let destroyed = false;
-    const destroying = manager.destroy({ settlementBudgetMs: 5_000 }).then(() => {
-      destroyed = true;
-    });
-    await new Promise((resolve) => setImmediate(resolve));
-    expect(destroyed).toBe(true);
-    await destroying;
+    manager.abandonProviderExecution(job.streamId, job.createdAt, segment);
+    await expect(manager.destroy({ settlementBudgetMs: 5_000 })).rejects.toThrow(
+      'shutdown_unconfirmed',
+    );
+    expect(jobStore.destroy).not.toHaveBeenCalled();
     expect(recordProviderDrain).not.toHaveBeenCalled();
+    eventTransport.destroy();
   });
 
   it('refuses to begin a provider execution once shutdown has started', async () => {
@@ -4673,7 +4720,7 @@ describe('GenerationJobManager startup telemetry', () => {
     subscription?.unsubscribe();
   });
 
-  it('drains replaced services without destroying the newly configured services', async () => {
+  it('refuses replacement during original disconnect cleanup, then configures settled services', async () => {
     const replacedJobStore = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
     const replacedEventTransport = new InMemoryEventTransport();
     const replacedStoreDestroy = jest.spyOn(replacedJobStore, 'destroy');
@@ -4706,6 +4753,21 @@ describe('GenerationJobManager startup telemetry', () => {
     const currentEventTransport = new InMemoryEventTransport();
     const currentStoreDestroy = jest.spyOn(currentJobStore, 'destroy');
     const currentTransportDestroy = jest.spyOn(currentEventTransport, 'destroy');
+    expect(() =>
+      manager.configure({
+        jobStore: currentJobStore,
+        eventTransport: currentEventTransport,
+        isRedis: false,
+      }),
+    ).toThrow('reconfiguration_pending');
+    expect(replacedStoreDestroy).not.toHaveBeenCalled();
+    expect(replacedTransportDestroy).not.toHaveBeenCalled();
+
+    releaseCleanup?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await manager.destroy({ settlementBudgetMs: 5_000 });
+    expect(replacedStoreDestroy).toHaveBeenCalledTimes(1);
+    expect(replacedTransportDestroy).toHaveBeenCalledTimes(1);
     manager.configure({
       jobStore: currentJobStore,
       eventTransport: currentEventTransport,
@@ -4713,23 +4775,24 @@ describe('GenerationJobManager startup telemetry', () => {
     });
     manager.initialize();
     await manager.createJob('stream-reconfigure-current', 'user-1');
-
-    expect(replacedTransportDestroy).toHaveBeenCalledTimes(1);
-    expect(currentStoreDestroy).not.toHaveBeenCalled();
-    expect(currentTransportDestroy).not.toHaveBeenCalled();
-
-    releaseCleanup?.();
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    await new Promise<void>((resolve) => setImmediate(resolve));
-
-    expect(replacedStoreDestroy).toHaveBeenCalledTimes(1);
     expect(currentStoreDestroy).not.toHaveBeenCalled();
     expect(currentTransportDestroy).not.toHaveBeenCalled();
     await expect(manager.hasJob('stream-reconfigure-current')).resolves.toBe(true);
 
+    expect(manager.closeGenerationAdmission('maintenance-reconfigure')).toBe(true);
     await manager.destroy();
     expect(currentStoreDestroy).toHaveBeenCalledTimes(1);
     expect(currentTransportDestroy).toHaveBeenCalledTimes(1);
+    manager.configure({
+      jobStore: new InMemoryJobStore({ ttlAfterComplete: 60_000 }),
+      eventTransport: new InMemoryEventTransport(),
+      isRedis: false,
+    });
+    await expect(manager.createJob('stream-reconfigure-held', 'user-1')).rejects.toThrow(
+      'Generation work is held',
+    );
+    expect(manager.reopenGenerationAdmission('maintenance-reconfigure')).toBe(true);
+    await manager.destroy();
   });
 
   it('does not deliver a stored terminal event after the subscriber detaches', async () => {
@@ -5348,5 +5411,386 @@ describe('GenerationJobManager startup telemetry', () => {
 
     subscription?.unsubscribe();
     await manager.destroy();
+  });
+});
+
+describe('original generation shutdown custody', () => {
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    let reject!: (error: Error) => void;
+    const promise = new Promise<T>((done, failed) => {
+      resolve = done;
+      reject = failed;
+    });
+    return { promise, resolve, reject };
+  }
+
+  function fixture() {
+    const store = new InMemoryJobStore({ ttlAfterComplete: 60_000 });
+    const transport = new InMemoryEventTransport();
+    const manager = new GenerationJobManagerClass();
+    manager.configure({ jobStore: store, eventTransport: transport, cleanupOnComplete: false });
+    manager.initialize();
+    return { manager, store, transport };
+  }
+
+  // Test-owned operations are joined before physical fixture cleanup. Cleaning a test's
+  // inert resources is not evidence that the manager acknowledged its retained unknown work.
+  async function cleanup(view: ReturnType<typeof fixture>) {
+    if (view.manager['cleanupInterval']) clearInterval(view.manager['cleanupInterval']);
+    await view.store.destroy();
+    view.transport.destroy();
+  }
+
+  it('refuses a deadline without releasing the original provider or allowing reconfiguration', async () => {
+    const view = fixture();
+    const { manager, store, transport } = view;
+    const job = await manager.createJob('held-original', 'owner');
+    const segment = job.metadata.providerExecutionId!;
+    await manager.beginProviderExecution(job.streamId, job.createdAt, segment);
+    const original = [...manager['openProviderExecutions'].values()][0].promise;
+    let discharged = false;
+    void original.then(() => {
+      discharged = true;
+    });
+    const destroyStore = jest.spyOn(store, 'destroy');
+    const destroyTransport = jest.spyOn(transport, 'destroy');
+    try {
+      await expect(manager.destroy({ settlementBudgetMs: 10 })).rejects.toThrow('shutdown_pending');
+      expect(discharged).toBe(false);
+      expect([...manager['openProviderExecutions'].values()][0].promise).toBe(original);
+      expect(destroyStore).not.toHaveBeenCalled();
+      expect(destroyTransport).not.toHaveBeenCalled();
+      expect(() => manager.configure({ jobStore: store, eventTransport: transport })).toThrow(
+        'generation_reconfiguration_pending',
+      );
+    } finally {
+      await manager.markProviderExecutionDrained(job.streamId, job.createdAt, segment);
+      await original;
+      await cleanup(view);
+    }
+  });
+
+  it.each(['store', 'transport'] as const)(
+    'joins the original sibling when the %s drain rejects and never repeats that attempt',
+    async (failing) => {
+      const view = fixture();
+      const { manager, store, transport } = view;
+      const job = await manager.createJob(`sibling-${failing}`, 'owner');
+      const segment = job.metadata.providerExecutionId!;
+      await manager.beginProviderExecution(job.streamId, job.createdAt, segment);
+      const storeWrite = deferred<boolean>();
+      const transportWrite = deferred<boolean>();
+      const mark = jest
+        .spyOn(store, 'markProviderExecutionDrained')
+        .mockReturnValue(storeWrite.promise);
+      const record = jest
+        .spyOn(transport, 'recordProviderDrain')
+        .mockReturnValue(transportWrite.promise);
+      let finished = false;
+      const original = manager.markProviderExecutionDrained(job.streamId, job.createdAt, segment);
+      const observed = original.then(
+        () => {
+          finished = true;
+        },
+        () => {
+          finished = true;
+        },
+      );
+      try {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(mark).toHaveBeenCalledTimes(1);
+        expect(record).toHaveBeenCalledTimes(1);
+        const failed = failing === 'store' ? storeWrite : transportWrite;
+        const sibling = failing === 'store' ? transportWrite : storeWrite;
+        failed.reject(new Error('original acknowledgement lost'));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(finished).toBe(false);
+        expect((await manager.getGenerationAdmissionCensus()).providerExecutions).toBe(1);
+        sibling.resolve(true);
+        await expect(original).rejects.toThrow('original acknowledgement lost');
+        await expect(
+          manager.markProviderExecutionDrained(job.streamId, job.createdAt, segment),
+        ).rejects.toThrow('original acknowledgement lost');
+        expect(mark).toHaveBeenCalledTimes(1);
+        expect(record).toHaveBeenCalledTimes(1);
+        await expect(manager.destroy({ settlementBudgetMs: 100 })).rejects.toThrow(
+          'shutdown_unconfirmed',
+        );
+      } finally {
+        storeWrite.resolve(true);
+        transportWrite.resolve(true);
+        await observed;
+        await cleanup(view);
+      }
+    },
+  );
+
+  it('retains an unacknowledged transport result without retry or destruction', async () => {
+    const view = fixture();
+    const { manager, store, transport } = view;
+    const job = await manager.createJob('transport-unconfirmed', 'owner');
+    const segment = job.metadata.providerExecutionId!;
+    await manager.beginProviderExecution(job.streamId, job.createdAt, segment);
+    const record = jest.spyOn(transport, 'recordProviderDrain').mockResolvedValue(false);
+    const destroy = jest.spyOn(store, 'destroy');
+    try {
+      expect(await manager.markProviderExecutionDrained(job.streamId, job.createdAt, segment)).toBe(
+        false,
+      );
+      expect(await manager.markProviderExecutionDrained(job.streamId, job.createdAt, segment)).toBe(
+        false,
+      );
+      expect(record).toHaveBeenCalledTimes(1);
+      await expect(manager.destroy({ settlementBudgetMs: 100 })).rejects.toThrow(
+        'shutdown_unconfirmed',
+      );
+      expect(destroy).not.toHaveBeenCalled();
+    } finally {
+      await cleanup(view);
+    }
+  });
+
+  it('rechecks a no-effect readiness refusal, then joins the original durable settlement', async () => {
+    const view = fixture();
+    const { manager, store, transport } = view;
+    const terminal = deferred<{ ok: true; value: undefined }>();
+    const durable = jest.fn(() => terminal.promise);
+    manager.configureGenerationAdmission({
+      required: true,
+      ownerInstanceId: 'owner-instance',
+      processBootId: 'boot',
+      methods: {
+        getGenerationAdmission: async () => ({ ok: true, value: null }),
+        acquireGenerationAdmission: async () => ({ ok: true, value: { acquired: true } }),
+        dispatchGenerationAdmission: async () => ({ ok: true, value: undefined }),
+        settleGenerationAdmission: durable,
+        countUnsettledGenerationAdmissions: async () => ({ ok: true, value: 0 }),
+      } as unknown as import('@librechat/data-schemas').GenerationAdmissionMethods,
+    });
+    const job = await manager.createJob('durable-original', 'owner', 'conversation', {
+      generationAdmission: { clientRequestId: 'request', requestFingerprint: 'a'.repeat(64) },
+    });
+    const segment = job.metadata.providerExecutionId!;
+    await manager.beginProviderExecution(job.streamId, job.createdAt, segment);
+    await manager.completeJob(job.streamId, 'provider failed', job.createdAt);
+    await store.updateJob(job.streamId, { terminalPersistencePending: true }, job.createdAt);
+    const mark = jest.spyOn(store, 'markProviderExecutionDrained');
+    const record = jest.spyOn(transport, 'recordProviderDrain');
+    let first: Promise<boolean> | undefined;
+    let second: Promise<boolean> | undefined;
+    try {
+      expect(await manager.settleGenerationExecution(job.streamId, job.createdAt, segment)).toBe(
+        false,
+      );
+      expect(mark).not.toHaveBeenCalled();
+      expect(record).not.toHaveBeenCalled();
+      expect(durable).not.toHaveBeenCalled();
+      await store.updateJob(job.streamId, { terminalPersistencePending: false }, job.createdAt);
+      first = manager.settleGenerationExecution(job.streamId, job.createdAt, segment);
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(durable).toHaveBeenCalledTimes(1);
+      second = manager.settleGenerationExecution(job.streamId, job.createdAt, segment);
+      expect((await manager.getGenerationAdmissionCensus()).providerExecutions).toBe(1);
+      let drained = false;
+      const waiting = manager.awaitGenerationSettlements(1_000).then(() => {
+        drained = true;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(drained).toBe(false);
+      terminal.resolve({ ok: true, value: undefined });
+      expect(await first).toBe(true);
+      expect(await second).toBe(true);
+      await waiting;
+      expect(mark).toHaveBeenCalledTimes(1);
+      expect(record).toHaveBeenCalledTimes(1);
+      expect(durable).toHaveBeenCalledTimes(1);
+      await manager.destroy();
+    } finally {
+      terminal.resolve({ ok: true, value: undefined });
+      await Promise.allSettled([first, second].filter(Boolean));
+      await cleanup(view);
+    }
+  });
+
+  it('retains original owned-job finalization and sibling writes before shared shutdown teardown', async () => {
+    const shutdown = jest.requireActual<typeof import('../../app/shutdown')>('../../app/shutdown');
+    const view = fixture();
+    const { manager } = view;
+    await manager.createJob('finalizer-first', 'owner');
+    await manager.createJob('finalizer-second', 'owner');
+    const first = deferred<void>();
+    const second = deferred<void>();
+    const finish = jest
+      .spyOn(manager, 'finishTerminalJob')
+      .mockImplementation((claim) =>
+        claim.streamId === 'finalizer-first' ? first.promise : second.promise,
+      );
+    shutdown.__resetShutdownStateForTests();
+    jest.useFakeTimers();
+    const exit = jest.spyOn(process, 'exit').mockImplementation(() => undefined as never);
+    const previous = new Set(process.listeners('SIGTERM'));
+    const teardown = jest.fn();
+    try {
+      shutdown.setupGracefulShutdown(new Server(), { deferHttpCloseUntilPreDrain: true });
+      shutdown.registerShutdownTask(
+        'generation original settlement',
+        () =>
+          manager.awaitGenerationSettlements(
+            Math.max(0, shutdown.getRemainingShutdownMs()! - 10_000),
+          ),
+        { phase: 'pre-drain', priority: 90 },
+      );
+      shutdown.registerShutdownTask('storage teardown', teardown, { priority: 105 });
+      shutdown.registerShutdownTask('generation destroy', () => manager.destroy(), {
+        priority: 100,
+      });
+      const signal = process.listeners('SIGTERM').find((listener) => !previous.has(listener))!;
+      signal('SIGTERM');
+      await jest.advanceTimersByTimeAsync(10);
+      expect(finish).toHaveBeenCalledTimes(2);
+      expect(teardown).not.toHaveBeenCalled();
+      first.reject(new Error('original finalizer acknowledgement lost'));
+      await jest.advanceTimersByTimeAsync(10);
+      expect(teardown).not.toHaveBeenCalled();
+      second.resolve();
+      await jest.advanceTimersByTimeAsync(10);
+      expect(teardown).not.toHaveBeenCalled();
+      expect(exit).not.toHaveBeenCalled();
+      await expect(manager.destroy({ settlementBudgetMs: 120_000 })).rejects.toThrow(
+        'original finalizer acknowledgement lost',
+      );
+      expect(finish).toHaveBeenCalledTimes(2);
+      expect(shutdown.getRemainingShutdownMs()).toBe(59_970);
+      await jest.advanceTimersByTimeAsync(59_970);
+      expect(exit).toHaveBeenCalledWith(1);
+      expect(teardown).not.toHaveBeenCalled();
+    } finally {
+      first.resolve();
+      second.resolve();
+      await Promise.allSettled([first.promise, second.promise]);
+      await jest.advanceTimersByTimeAsync(0);
+      shutdown.__resetShutdownStateForTests();
+      exit.mockRestore();
+      jest.useRealTimers();
+      await cleanup(view);
+    }
+  });
+
+  it('retains the first observer while supplied trailing writes are still pending', async () => {
+    const view = fixture();
+    const { manager, store, transport } = view;
+    const job = await manager.createJob('supplied-original', 'owner');
+    const segment = job.metadata.providerExecutionId!;
+    await manager.beginProviderExecution(job.streamId, job.createdAt, segment);
+    const trailing = deferred<void>();
+    const mark = jest.spyOn(store, 'markProviderExecutionDrained');
+    const record = jest.spyOn(transport, 'recordProviderDrain');
+    const first = manager.settleGenerationExecution(job.streamId, job.createdAt, segment, [
+      trailing.promise,
+    ]);
+    const duplicate = manager.settleGenerationExecution(job.streamId, job.createdAt, segment);
+    try {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(mark).not.toHaveBeenCalled();
+      expect(record).not.toHaveBeenCalled();
+      expect((await manager.getGenerationAdmissionCensus()).providerExecutions).toBe(1);
+      trailing.resolve();
+      await expect(first).resolves.toBe(true);
+      await expect(duplicate).resolves.toBe(true);
+      expect(mark).toHaveBeenCalledTimes(1);
+      expect(record).toHaveBeenCalledTimes(1);
+      expect((await manager.getGenerationAdmissionCensus()).providerExecutions).toBe(0);
+    } finally {
+      trailing.resolve();
+      await Promise.allSettled([first, duplicate]);
+      await cleanup(view);
+    }
+  });
+
+  it('retains the first observer failure after joining every supplied original write', async () => {
+    const view = fixture();
+    const { manager, store, transport } = view;
+    const job = await manager.createJob('supplied-failure', 'owner');
+    const segment = job.metadata.providerExecutionId!;
+    await manager.beginProviderExecution(job.streamId, job.createdAt, segment);
+    const failed = deferred<void>();
+    const sibling = deferred<void>();
+    const mark = jest.spyOn(store, 'markProviderExecutionDrained');
+    const record = jest.spyOn(transport, 'recordProviderDrain');
+    const first = manager.settleGenerationExecution(job.streamId, job.createdAt, segment, [
+      failed.promise,
+      sibling.promise,
+    ]);
+    let finished = false;
+    void first.then(() => {
+      finished = true;
+    });
+    let duplicate: Promise<boolean> | undefined;
+    try {
+      failed.reject(new Error('original trailing write acknowledgement lost'));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(finished).toBe(false);
+      expect(mark).not.toHaveBeenCalled();
+      expect(record).not.toHaveBeenCalled();
+      sibling.resolve();
+      await expect(first).resolves.toBe(false);
+      duplicate = manager.settleGenerationExecution(job.streamId, job.createdAt, segment);
+      await expect(duplicate).resolves.toBe(false);
+      expect(mark).not.toHaveBeenCalled();
+      expect(record).not.toHaveBeenCalled();
+      expect((await manager.getGenerationAdmissionCensus()).providerExecutions).toBe(1);
+      await expect(manager.destroy({ settlementBudgetMs: 100 })).rejects.toThrow(
+        'shutdown_unconfirmed',
+      );
+    } finally {
+      failed.resolve();
+      sibling.resolve();
+      await Promise.allSettled([first, ...(duplicate ? [duplicate] : [])]);
+      await cleanup(view);
+    }
+  });
+
+  it('observes the same original provider after its first shutdown observation expires', async () => {
+    const view = fixture();
+    const { manager, store, transport } = view;
+    const job = await manager.createJob('late-original-observation', 'owner');
+    const segment = job.metadata.providerExecutionId!;
+    await manager.beginProviderExecution(job.streamId, job.createdAt, segment);
+    const provider = [...manager['openProviderExecutions'].values()][0].promise;
+    const mark = jest.spyOn(store, 'markProviderExecutionDrained');
+    const record = jest.spyOn(transport, 'recordProviderDrain');
+    const finalize = jest.spyOn(manager, 'finishTerminalJob');
+    const destroyStore = jest.spyOn(store, 'destroy');
+    const destroyTransport = jest.spyOn(transport, 'destroy');
+    try {
+      await expect(manager.awaitGenerationSettlements(10)).rejects.toThrow('shutdown_pending');
+      const original = manager['shutdownSettlement'];
+      const deadline = manager['shutdownSettlementDeadline'];
+      expect([...manager['openProviderExecutions'].values()][0].promise).toBe(provider);
+      await expect(manager.awaitGenerationSettlements(1_000)).rejects.toThrow('shutdown_pending');
+      expect(manager['shutdownSettlement']).toBe(original);
+      expect(manager['shutdownSettlementDeadline']).toBe(deadline);
+      expect(destroyStore).not.toHaveBeenCalled();
+      expect(destroyTransport).not.toHaveBeenCalled();
+      expect(mark).not.toHaveBeenCalled();
+      expect(record).not.toHaveBeenCalled();
+      await expect(
+        manager.markProviderExecutionDrained(job.streamId, job.createdAt, segment),
+      ).resolves.toBe(true);
+      await expect(original).resolves.toBeUndefined();
+      await expect(manager.awaitGenerationSettlements(1_000)).resolves.toBeUndefined();
+      expect(manager['shutdownSettlement']).toBe(original);
+      expect(manager['shutdownSettlementDeadline']).toBe(deadline);
+      expect(mark).toHaveBeenCalledTimes(1);
+      expect(record).toHaveBeenCalledTimes(1);
+      expect(finalize).toHaveBeenCalledTimes(1);
+      await manager.destroy();
+      expect(finalize).toHaveBeenCalledTimes(1);
+      expect(destroyStore).toHaveBeenCalledTimes(1);
+      expect(destroyTransport).toHaveBeenCalledTimes(1);
+    } finally {
+      await cleanup(view);
+    }
   });
 });

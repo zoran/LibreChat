@@ -1,6 +1,8 @@
 const mongoose = require('mongoose');
 const { MongoMemoryServer } = require('mongodb-memory-server');
 
+let mockFileDeletionWorkOwner;
+
 const mockGetActiveJobIdsForUser = jest.fn().mockResolvedValue([]);
 const mockGetAgentJob = jest.fn().mockResolvedValue(null);
 const mockAbortJob = jest.fn().mockResolvedValue({ success: true });
@@ -106,6 +108,9 @@ jest.mock('sharp', () =>
 
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
+  fileDeletionWorkOwner: {
+    run: (...args) => mockFileDeletionWorkOwner.run(...args),
+  },
   createEmailChangeService: (...args) => mockCreateEmailChangeService(...args),
   needsRefresh: jest.fn(),
   getNewS3URL: jest.fn(),
@@ -572,6 +577,7 @@ describe('deleteUserController', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     mockQuiesceUserSchedules.mockResolvedValue(true);
+    mockFileDeletionWorkOwner = jest.requireActual('@librechat/api').createFileDeletionWorkOwner();
   });
 
   it('passes every private file lifecycle candidate through existing cleanup with authenticated scope', async () => {
@@ -606,7 +612,11 @@ describe('deleteUserController', () => {
 
     expect(db.getAccountFileCleanupCandidates).toHaveBeenCalledWith({ userId, tenantId });
     expect(db.getFiles).not.toHaveBeenCalled();
-    expect(processDeleteRequest).toHaveBeenCalledWith({ req, files });
+    expect(processDeleteRequest).toHaveBeenCalledWith({
+      req,
+      files,
+      work: expect.objectContaining({ effect: expect.any(Function) }),
+    });
     expect(db.deleteAccountDocumentWorkspaces).toHaveBeenCalledWith(
       { userId, tenantId },
       beginAgentTriggerUserDeletion.mock.calls[0][1],
@@ -625,6 +635,98 @@ describe('deleteUserController', () => {
       db.deleteUserById.mock.invocationCallOrder[0],
     );
   });
+
+  it.each(['resolves', 'rejects'])(
+    'retains the original final account File mutation until it %s',
+    async (settlement) => {
+      const db = require('~/models');
+      const { processDeleteRequest } = require('~/server/services/Files/process');
+      const owner = mockFileDeletionWorkOwner;
+      const id = new mongoose.Types.ObjectId();
+      let resolveOriginal;
+      let rejectOriginal;
+      const original = new Promise((resolve, reject) => {
+        resolveOriginal = resolve;
+        rejectOriginal = reject;
+      });
+      let signalStarted;
+      const started = new Promise((resolve) => {
+        signalStarted = resolve;
+      });
+      db.deleteFiles.mockImplementationOnce(() => {
+        signalStarted();
+        return original;
+      });
+      const operation = deleteUserController(
+        { user: { id: String(id), _id: id, tenantId: 'tenant-a' } },
+        mockRes,
+      );
+      let draining;
+      try {
+        await Promise.race([
+          started,
+          operation.then(() => {
+            throw new Error('Final account File mutation was not reached');
+          }),
+        ]);
+        expect(owner.maintenance.pauseAdmissions('account-files')).toBe(true);
+        expect(await owner.maintenance.getMaintenanceCensus('account-files')).toEqual({
+          admissionClosed: true,
+          queuedContinuations: 0,
+          pendingWrites: 1,
+          complete: true,
+        });
+        const inheritedWork = processDeleteRequest.mock.calls[0][0].work;
+        await owner.run(async (scope) => expect(scope).toBe(inheritedWork), inheritedWork);
+        expect(db.deleteFiles).toHaveBeenCalledWith(null, String(id));
+        expect(db.deleteMessages).not.toHaveBeenCalled();
+        expect(db.deleteAllUserSessions).not.toHaveBeenCalled();
+        expect(db.deleteUserById).not.toHaveBeenCalled();
+        let drainSettled = false;
+        draining = owner.drain().then(
+          () => {
+            drainSettled = true;
+            return undefined;
+          },
+          (error) => {
+            drainSettled = true;
+            return error;
+          },
+        );
+        await Promise.resolve();
+        expect(drainSettled).toBe(false);
+        if (settlement === 'rejects') {
+          rejectOriginal(new Error('Final account File mutation is unconfirmed'));
+        } else {
+          resolveOriginal({ deletedCount: 0 });
+        }
+        await operation;
+        const drainError = await draining;
+        expect(await owner.maintenance.getMaintenanceCensus('account-files')).toEqual({
+          admissionClosed: true,
+          queuedContinuations: 0,
+          pendingWrites: 0,
+          complete: settlement === 'resolves',
+        });
+        if (settlement === 'rejects') {
+          expect(drainError).toEqual(new Error('FILE_DELETION_SETTLEMENT_UNCONFIRMED'));
+          expect(mockRes.status).toHaveBeenCalledWith(500);
+          expect(db.deleteMessages).not.toHaveBeenCalled();
+          expect(db.deleteAllUserSessions).not.toHaveBeenCalled();
+          expect(db.deleteUserById).not.toHaveBeenCalled();
+          expect(mockRestoreUserSchedules).toHaveBeenCalled();
+          expect(cancelAgentTriggerUserDeletion).toHaveBeenCalled();
+        } else {
+          expect(drainError).toBeUndefined();
+          expect(mockRes.status).toHaveBeenCalledWith(200);
+        }
+      } finally {
+        resolveOriginal({ deletedCount: 0 });
+        await operation;
+        await draining;
+      }
+    },
+  );
 
   it('does not fall back to ordinary files when account file enumeration rejects the scope', async () => {
     const db = require('~/models');

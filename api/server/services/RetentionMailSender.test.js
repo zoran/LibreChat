@@ -1,9 +1,9 @@
-jest.mock('@librechat/api', () => ({ composeRetentionMailSender: jest.fn() }));
+jest.mock('@librechat/api/mail', () => ({ composeRetentionMailSender: jest.fn() }));
 jest.mock('./OutboundMail', () => ({
   readLogo: jest.fn(),
   createOutboundMailDependencies: jest.fn(),
 }));
-const { composeRetentionMailSender } = require('@librechat/api');
+const { composeRetentionMailSender } = require('@librechat/api/mail');
 const outbound = require('./OutboundMail');
 const { createRetentionMailSender } = require('./RetentionMailSender');
 

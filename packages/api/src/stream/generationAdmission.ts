@@ -14,7 +14,7 @@ import type {
   GenerationAdmissionRecoveryReceipt,
   GenerationCheckpointSourceRecovery,
 } from '@librechat/data-schemas';
-import type { ExternalApplicationWorkCensus } from '~/app';
+import type { GenerationMaintenanceCensus } from '~/app';
 
 /** Only the issuing live coordinator may consume this acknowledged preparation once. */
 export interface GenerationPreparationReceipt {
@@ -30,7 +30,6 @@ export interface GenerationAdmissionConfiguration {
   methods?: GenerationAdmissionMethods;
   ownerInstanceId: string;
   processBootId: string;
-  externalCensus?: () => Promise<ExternalApplicationWorkCensus>;
 }
 /** Server-owned proof ports. Process termination alone never proves remote effects settled. */
 export interface GenerationCheckpointRecoveryPorts {
@@ -52,16 +51,7 @@ export interface GenerationCheckpointRecoveryPorts {
     effectsEvidenceSha256: string;
   } | null>;
 }
-export interface GenerationAdmissionCensus {
-  admissionClosed: boolean;
-  initializing: number;
-  providerExecutions: number;
-  queuedContinuations: number;
-  pendingWrites: number;
-  activeStreams: number;
-  unresolved: number;
-  complete: boolean;
-}
+export type GenerationAdmissionCensus = GenerationMaintenanceCensus;
 export class GenerationAdmissionHeldError extends Error {
   readonly code = 'GENERATION_ADMISSION_HELD';
   readonly status = 409;
@@ -128,7 +118,6 @@ interface LocalAdmission {
   sourceExpiresAt?: number;
   pending?: Set<Promise<void>>;
 }
-
 /** The manager's sole durable admission adapter. Time and Redis state never grant takeover. */
 export class GenerationAdmissionCoordinator {
   private config?: GenerationAdmissionConfiguration;
@@ -146,6 +135,22 @@ export class GenerationAdmissionCoordinator {
     if (this.local.size || this.initializing || this.writes || this.prepared.size)
       throw new GenerationAdmissionHeldError();
     this.config = config;
+  }
+
+  /** Local original custody only; App maintenance composes the other owners separately. */
+  getLocalCustody(): { pending: number; unresolved: number } {
+    return {
+      pending: this.initializing + this.writes,
+      unresolved: this.local.size + this.uncertain + this.prepared.size,
+    };
+  }
+
+  hasLocalAdmission(stream: string, epoch: number, segment: string): boolean {
+    return this.local.has(localKey(stream, epoch, segment));
+  }
+
+  canCancelInitialization(stream: string, epoch: number, segment: string): boolean {
+    return this.required && this.local.get(localKey(stream, epoch, segment))?.phase === 'admitted';
   }
 
   get required(): boolean {
@@ -678,27 +683,18 @@ export class GenerationAdmissionCoordinator {
       unresolved: this.local.size + this.uncertain,
       complete: false,
     };
-    if (!this.required || !this.config?.methods || !this.config.externalCensus) return base;
+    if (!this.required || !this.config?.methods) return base;
     try {
-      const [durable, external] = await Promise.all([
-        this.config.methods.countUnsettledGenerationAdmissions(this.config.ownerInstanceId),
-        this.config.externalCensus(),
-      ]);
-      if (
-        !durable.ok ||
-        !Number.isSafeInteger(external.queuedContinuations) ||
-        external.queuedContinuations < 0 ||
-        !Number.isSafeInteger(external.pendingWrites) ||
-        external.pendingWrites < 0
-      )
-        return base;
+      const durable = await this.config.methods.countUnsettledGenerationAdmissions(
+        this.config.ownerInstanceId,
+      );
+      if (!durable.ok) return base;
       return {
         ...base,
         initializing: this.initializing,
-        queuedContinuations: external.queuedContinuations,
-        pendingWrites: local.pendingWrites + this.writes + external.pendingWrites,
+        pendingWrites: local.pendingWrites + this.writes,
         unresolved: Math.max(durable.value, this.local.size) + this.uncertain,
-        complete: external.complete === true,
+        complete: true,
       };
     } catch {
       return base;

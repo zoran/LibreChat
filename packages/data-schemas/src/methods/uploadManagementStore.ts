@@ -528,9 +528,9 @@ export function createUploadStore(
     }
   }
   async function save(row: StoredUpload, session: ClientSession): Promise<void> {
-    assertUploadCleanupCapacity(row, mongoose.mongo.BSON.calculateObjectSize);
-    if (mongoose.mongo.BSON.calculateObjectSize(row) > UPLOAD_RECORD_BYTES)
-      reject('capacity_exceeded');
+    // BSON can grow when revision crosses int32, including historical rows without custody.
+    const persisted = { ...row, revision: row.revision + 1 };
+    assertUploadCleanupCapacity(persisted, mongoose.mongo.BSON.calculateObjectSize);
     if (!hasValidUploadPublicationTime(row)) reject('unavailable');
     // Compare the persisted time in this replacement write, preserving the original in
     // the same transaction. First assignment requires never-published processing.
@@ -558,7 +558,7 @@ export function createUploadStore(
       .maxTimeMS(3_000)
       .lean<StoredUpload>();
     if (!previous) reject('unavailable');
-    row.revision++;
+    row.revision = persisted.revision;
     const saved = await Operation.replaceOne({ _id: row._id, ...publication }, row, { session });
     if (saved.matchedCount !== 1) reject('unavailable');
     await projectUploadHousekeeping(mongoose, previous, row, session);

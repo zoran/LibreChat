@@ -101,7 +101,6 @@ process.once('message', async (input) => {
         methods,
         ownerInstanceId: nativeIdentity.podUid,
         processBootId: nativeIdentity.incarnation,
-        externalCensus: async () => ({ queuedContinuations: 0, pendingWrites: 0, complete: true }),
       });
       managers.push(result);
       if (input.storeCommitUnknown) {

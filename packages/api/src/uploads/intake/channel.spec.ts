@@ -84,6 +84,233 @@ describe('isolated intake channel', () => {
     ).resolves.toEqual({ ok: true });
     expect(control.mock.calls[0]?.[0]).toEqual({ operationId, capability, worker });
   });
+
+  it('fences every new control and promotion request for the local File hold', async () => {
+    const { service, channel, control, promote } = await setup();
+    expect(service.maintenance.pauseAdmissions('maintenance')).toBe(true);
+    expect(service.maintenance.pauseAdmissions('foreign')).toBe(false);
+    for (const action of [
+      'authorize',
+      'get',
+      'claim',
+      'prepare-promotion',
+      'get-promotion',
+      'renew',
+      'fail',
+      'cancel',
+      'bind-security',
+      'settle-security',
+      'claim-bytes',
+      'complete-bytes',
+      'accept',
+      'confirm-cleanup',
+      'seal-recovery',
+      'confirm-recovery',
+    ])
+      await expect(
+        channel.control({
+          operationId,
+          capability,
+          command: { action },
+          signal: AbortSignal.timeout(5000),
+        }),
+      ).rejects.toMatchObject({ code: 'unavailable' });
+    await expect(
+      channel.promote({
+        operationId,
+        capability,
+        promotionId,
+        bytes: 5,
+        integrity,
+        body: (async function* () {
+          yield Buffer.from('hello');
+        })(),
+        signal: AbortSignal.timeout(5000),
+      }),
+    ).rejects.toMatchObject({ code: 'unavailable' });
+    expect(control).not.toHaveBeenCalled();
+    expect(promote).not.toHaveBeenCalled();
+    expect(await service.maintenance.getMaintenanceCensus('maintenance')).toMatchObject({
+      admissionClosed: true,
+      pendingWrites: 0,
+      complete: true,
+    });
+    expect(service.maintenance.resumeAdmissions('foreign')).toBe(false);
+    expect(service.maintenance.resumeAdmissions('maintenance')).toBe(true);
+    await channel.control({
+      operationId,
+      capability,
+      command: { action: 'claim' },
+      signal: AbortSignal.timeout(5000),
+    });
+    expect(control).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains a request admitted before pause even when its body arrives after pause', async () => {
+    const { service, control } = await setup();
+    const command = JSON.stringify({ action: 'claim' });
+    let pending!: ReturnType<typeof request>;
+    const response = new Promise<{ status: number; body: unknown }>((resolve, reject) => {
+      pending = request(
+        {
+          host: '127.0.0.1',
+          port: service.address.port,
+          path: `/v1/intake/control/${operationId}`,
+          method: 'POST',
+          ca: pem('ca.pem'),
+          cert: pem('client.pem'),
+          key: pem('client.key'),
+          agent: false,
+          signal: AbortSignal.timeout(5000),
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(command),
+            'X-Upload-Worker-Host': worker.hostId,
+            'X-Upload-Worker-Instance': worker.instanceId,
+            'X-Upload-Capability': capability,
+          },
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+          res.once('error', reject);
+          res.once('end', () => {
+            try {
+              resolve({
+                status: res.statusCode!,
+                body: JSON.parse(Buffer.concat(chunks).toString()),
+              });
+            } catch (error) {
+              reject(error);
+            }
+          });
+        },
+      );
+      pending.once('error', reject);
+      pending.flushHeaders();
+    });
+    void response.catch(() => undefined);
+    try {
+      // Observe actual server dispatch before closing admission, without delivering the body.
+      const until = Date.now() + 4000;
+      while (
+        (await service.maintenance.getMaintenanceCensus(null)).pendingWrites === 0 &&
+        Date.now() < until
+      )
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      expect((await service.maintenance.getMaintenanceCensus(null)).pendingWrites).toBe(1);
+      expect(control).not.toHaveBeenCalled();
+      expect(service.maintenance.pauseAdmissions('maintenance')).toBe(true);
+      expect(await service.maintenance.getMaintenanceCensus('maintenance')).toMatchObject({
+        admissionClosed: true,
+        pendingWrites: 1,
+      });
+      pending.end(command);
+      await expect(response).resolves.toEqual({ status: 200, body: { ok: true } });
+      expect(control).toHaveBeenCalledTimes(1);
+      expect(await service.maintenance.getMaintenanceCensus('maintenance')).toMatchObject({
+        admissionClosed: true,
+        pendingWrites: 0,
+        complete: true,
+      });
+    } finally {
+      pending.destroy();
+      await response.catch(() => undefined);
+    }
+  });
+
+  it('retains the original control transaction after client abort and an interrupted close', async () => {
+    let entered!: () => void;
+    let release!: () => void;
+    const began = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const { service, channel } = await setup({
+      handlers: {
+        control: async () => {
+          entered();
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          return { committed: true };
+        },
+        promote: async () => ({ consume: async () => undefined, close: async () => undefined }),
+      },
+    });
+    const controller = new AbortController();
+    const response = channel
+      .control({
+        operationId,
+        capability,
+        command: { action: 'claim' },
+        signal: controller.signal,
+      })
+      .catch((error: unknown) => error);
+    await began;
+    expect(service.maintenance.pauseAdmissions('maintenance')).toBe(true);
+    controller.abort();
+    await response;
+    expect((await service.maintenance.getMaintenanceCensus('maintenance')).pendingWrites).toBe(1);
+    expect(await service.close(AbortSignal.abort())).toEqual({ complete: false });
+    expect(
+      (await service.maintenance.getMaintenanceCensus('maintenance')).pendingWrites,
+    ).toBeGreaterThan(0);
+    release();
+    expect(await service.close()).toEqual({ complete: true });
+    expect(await service.maintenance.getMaintenanceCensus('maintenance')).toMatchObject({
+      admissionClosed: true,
+      pendingWrites: 0,
+    });
+  });
+
+  it('retains the promotion original through its actual cleanup after disconnect', async () => {
+    let entered!: () => void;
+    let release!: () => void;
+    const began = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const close = jest.fn(async () => {
+      entered();
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    });
+    const { service, channel } = await setup({
+      handlers: {
+        control: async () => undefined,
+        promote: async () => ({
+          consume: async (body) => {
+            for await (const chunk of body) expect(Buffer.from(chunk).length).toBeGreaterThan(0);
+          },
+          close,
+        }),
+      },
+    });
+    const controller = new AbortController();
+    const response = channel
+      .promote({
+        operationId,
+        capability,
+        promotionId,
+        bytes: 5,
+        integrity,
+        body: (async function* () {
+          yield Buffer.from('hello');
+        })(),
+        signal: controller.signal,
+      })
+      .catch((error: unknown) => error);
+    await began;
+    service.maintenance.pauseAdmissions('maintenance');
+    controller.abort();
+    await response;
+    expect((await service.maintenance.getMaintenanceCensus('maintenance')).pendingWrites).toBe(1);
+    expect(await service.close(AbortSignal.abort())).toEqual({ complete: false });
+    release();
+    expect(await service.close()).toEqual({ complete: true });
+    expect(close).toHaveBeenCalledTimes(1);
+    expect((await service.maintenance.getMaintenanceCensus('maintenance')).pendingWrites).toBe(0);
+  });
   it('preserves worker identifiers accepted by the native durable contract', async () => {
     const nativeWorker = { hostId: 'intake.node', instanceId: 'intake_pod' };
     const { channel, control } = await setup(

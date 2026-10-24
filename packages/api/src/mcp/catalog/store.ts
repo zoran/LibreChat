@@ -1,6 +1,8 @@
 import { randomUUID } from 'crypto';
 import { logger } from '@librechat/data-schemas';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { CacheKeys, Time } from 'librechat-data-provider';
+import type { ApplicationWorkPort } from '../../app/maintenance';
 import type { LCAvailableTools } from '../types';
 
 const GLOBAL_LOCK_TTL_MS = 30_000;
@@ -143,6 +145,8 @@ export interface CatalogCache {
   get(key: string): Promise<unknown>;
   set(key: string, value: unknown, ttl?: number): Promise<boolean | void>;
   delete(key: string): Promise<boolean | void>;
+  on?: (event: 'error', listener: (error: unknown) => void) => unknown;
+  off?: (event: 'error', listener: (error: unknown) => void) => unknown;
 }
 
 interface LockRedisClient {
@@ -200,6 +204,12 @@ interface OwnershipFence {
 }
 
 export interface MCPCatalogStore {
+  maintenance: ApplicationWorkPort & {
+    stopAdmissions(): void;
+    drain(): Promise<void>;
+  };
+  /** Same-instance custody for the existing cache service and finite startup preparation. */
+  trackPublication: <T>(operation: () => T | Promise<T>) => Promise<T>;
   getCachedTools: (options?: CachedToolsOptions) => Promise<LCAvailableTools | null>;
   updateCachedGlobalTools: (update: (tools: LCAvailableTools) => LCAvailableTools) => Promise<void>;
   setCachedTools: (tools: LCAvailableTools, options?: CachedToolsOptions) => Promise<boolean>;
@@ -280,6 +290,140 @@ function parseAppToolsRevision(revision: string): number {
 }
 
 export function createMCPCatalogStore(deps: CatalogStoreDeps): MCPCatalogStore {
+  const context = new AsyncLocalStorage<{ pending: number }>();
+  const originals = new Set<{ pending: number }>();
+  const drained = new Set<() => void>();
+  let requestId: string | null = null;
+  let stopped = false;
+  let revision = 0;
+  let writes = 0;
+  let uncertain = false;
+  let firstFailure: unknown;
+  const failed = (error: unknown): void => {
+    if (!uncertain) firstFailure = error;
+    uncertain = true;
+  };
+  const refuse = (): Error => Object.assign(new Error('APP_QUIESCING'), { status: 503 });
+  async function trackPublication<T>(operation: () => T | Promise<T>): Promise<T> {
+    let original = context.getStore();
+    if (original) {
+      if (!originals.has(original)) {
+        const error = new Error('MCP catalog continuation used after settlement');
+        failed(error);
+        throw error;
+      }
+    } else {
+      if (stopped || requestId !== null) throw refuse();
+      original = { pending: 0 };
+      originals.add(original);
+    }
+    // Membership and pending count precede callback invocation, including initial App pause.
+    original.pending++;
+    try {
+      return await context.run(original, operation);
+    } finally {
+      original.pending--;
+      if (original.pending === 0) {
+        originals.delete(original);
+        if (originals.size === 0) {
+          drained.forEach((resolve) => resolve());
+          drained.clear();
+        }
+      }
+    }
+  }
+  const write = <T>(operation: () => Promise<T>): Promise<T> =>
+    trackPublication(async () => {
+      writes++;
+      try {
+        return await operation();
+      } catch (error) {
+        failed(error);
+        throw error;
+      } finally {
+        writes--;
+      }
+    });
+  const observedCaches = new WeakMap<CatalogCache, { count: number; remove: () => void }>();
+  async function cacheOperation<T>(
+    cache: CatalogCache,
+    method: 'get' | 'set' | 'delete',
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    return write(async () => {
+      let observation = observedCaches.get(cache);
+      if (!observation && cache.on && cache.off) {
+        const remove = cache.off.bind(cache);
+        cache.on('error', failed);
+        observation = { count: 0, remove: () => remove('error', failed) };
+        observedCaches.set(cache, observation);
+      }
+      if (observation) observation.count++;
+      try {
+        const result = await operation();
+        // DELETE false can acknowledge absence; a Keyv SET false is a rejected write.
+        if (method === 'set' && result === false)
+          failed(new Error('MCP catalog cache rejected a write'));
+        return result;
+      } catch (error) {
+        failed(error);
+        throw error;
+      } finally {
+        if (observation && --observation.count === 0) {
+          observedCaches.delete(cache);
+          observation.remove();
+        }
+      }
+    });
+  }
+  const evalCatalogScript = (
+    client: KeyvRedisClient,
+    script: string,
+    options: { keys: string[]; arguments: string[] },
+  ): Promise<unknown> => write(() => client.eval(script, options));
+  const maintenance: MCPCatalogStore['maintenance'] = {
+    pauseAdmissions(id) {
+      if (!id || (requestId !== null && requestId !== id)) return false;
+      if (requestId === null) {
+        requestId = id;
+        revision++;
+      }
+      return true;
+    },
+    resumeAdmissions(id) {
+      if (stopped || uncertain || requestId !== id) return false;
+      requestId = null;
+      revision++;
+      return true;
+    },
+    async getMaintenanceCensus(id) {
+      const sampled = revision;
+      const matches = id === requestId;
+      await Promise.resolve();
+      return {
+        admissionClosed: stopped || requestId !== null,
+        queuedContinuations: originals.size,
+        pendingWrites: writes,
+        complete: matches && id === requestId && sampled === revision && !uncertain,
+      };
+    },
+    stopAdmissions() {
+      if (!stopped) {
+        stopped = true;
+        revision++;
+      }
+    },
+    async drain() {
+      maintenance.stopAdmissions();
+      if (originals.size !== 0) await new Promise<void>((resolve) => drained.add(resolve));
+      for (const timer of appRevisionExpiryTimers.values()) clearTimeout(timer);
+      appRevisionExpiryTimers.clear();
+      if (uncertain)
+        throw Object.assign(new Error('MCP_CATALOG_SETTLEMENT_UNCONFIRMED'), {
+          cause: firstFailure,
+        });
+    },
+  };
   const generationTtl = Math.max(
     Time.ONE_DAY,
     Number.isFinite(Number(deps.userConnectionIdleTimeout))
@@ -303,7 +447,12 @@ export function createMCPCatalogStore(deps: CatalogStoreDeps): MCPCatalogStore {
     if (sharedRedis()) {
       await deps.waitForRedis?.();
     }
-    return deps.getCache();
+    const cache = deps.getCache();
+    return {
+      get: (key) => cacheOperation(cache, 'get', () => cache.get(key)),
+      set: (key, value, ttl) => cacheOperation(cache, 'set', () => cache.set(key, value, ttl)),
+      delete: (key) => cacheOperation(cache, 'delete', () => cache.delete(key)),
+    };
   };
 
   const rawKey = (key: string): string => {
@@ -362,12 +511,13 @@ export function createMCPCatalogStore(deps: CatalogStoreDeps): MCPCatalogStore {
     }
     await deps.waitForRedis?.();
     const redis = deps.ioredisClient!;
+    const releaseLock = redis.eval.bind(redis);
     const token = randomUUID();
     const deadline = Date.now() + ttl + LOCK_RETRY_MS;
     let leaseExpiresAt = 0;
     while (true) {
       const attemptedLeaseExpiry = Date.now() + ttl;
-      if ((await redis.set(lockKey, token, 'PX', ttl, 'NX')) === 'OK') {
+      if ((await write(() => redis.set(lockKey, token, 'PX', ttl, 'NX'))) === 'OK') {
         leaseExpiresAt = attemptedLeaseExpiry;
         break;
       }
@@ -378,9 +528,12 @@ export function createMCPCatalogStore(deps: CatalogStoreDeps): MCPCatalogStore {
     }
     try {
       return await operation(token, leaseExpiresAt);
+    } catch (error) {
+      failed(error);
+      throw error;
     } finally {
       try {
-        await redis.eval(RELEASE_LOCK_SCRIPT, 1, lockKey, token);
+        await write(() => releaseLock(RELEASE_LOCK_SCRIPT, 1, lockKey, token));
       } catch (error) {
         logger.warn(`[MCP Cache] Failed to release tool cache lock ${lockKey}:`, error);
       }
@@ -400,7 +553,9 @@ export function createMCPCatalogStore(deps: CatalogStoreDeps): MCPCatalogStore {
     if (fenceTtl <= 0) {
       throw new Error('Tool cache lock expired before ownership could be fenced');
     }
-    const claimed = await deps.keyvRedisClient!.eval(CLAIM_OWNERSHIP_FENCE_SCRIPT, {
+    const client = deps.keyvRedisClient!;
+    const releaseFence = client.eval.bind(client);
+    const claimed = await evalCatalogScript(client, CLAIM_OWNERSHIP_FENCE_SCRIPT, {
       keys: [fenceKey],
       arguments: [token, String(leaseExpiresAt), String(LOCK_FENCE_SAFETY_MS)],
     });
@@ -409,12 +564,17 @@ export function createMCPCatalogStore(deps: CatalogStoreDeps): MCPCatalogStore {
     }
     try {
       return await operation({ key: fenceKey, token });
+    } catch (error) {
+      failed(error);
+      throw error;
     } finally {
       try {
-        await deps.keyvRedisClient!.eval(RELEASE_LOCK_SCRIPT, {
-          keys: [fenceKey],
-          arguments: [token],
-        });
+        await write(() =>
+          releaseFence(RELEASE_LOCK_SCRIPT, {
+            keys: [fenceKey],
+            arguments: [token],
+          }),
+        );
       } catch (error) {
         logger.warn(`[MCP Cache] Failed to release tool cache fence ${fenceKey}:`, error);
       }
@@ -454,7 +614,7 @@ export function createMCPCatalogStore(deps: CatalogStoreDeps): MCPCatalogStore {
     publicationGeneration: string,
   ): Promise<boolean> {
     if (sharedRedis()) {
-      const renewed = await deps.keyvRedisClient!.eval(RENEW_GENERATION_SCRIPT, {
+      const renewed = await evalCatalogScript(deps.keyvRedisClient!, RENEW_GENERATION_SCRIPT, {
         keys: [rawKey(key)],
         arguments: [
           publicationGeneration,
@@ -484,7 +644,7 @@ export function createMCPCatalogStore(deps: CatalogStoreDeps): MCPCatalogStore {
     if (!globalLockToken) {
       throw new Error('Global tool cache write requires lock ownership');
     }
-    const written = await deps.keyvRedisClient!.eval(WRITE_GLOBAL_IF_OWNER_SCRIPT, {
+    const written = await evalCatalogScript(deps.keyvRedisClient!, WRITE_GLOBAL_IF_OWNER_SCRIPT, {
       keys: [globalFenceKey, globalCacheRawKey],
       arguments: [globalLockToken, JSON.stringify(tools), String(Date.now() + ttl), String(ttl)],
     });
@@ -502,7 +662,7 @@ export function createMCPCatalogStore(deps: CatalogStoreDeps): MCPCatalogStore {
     if (!globalLockToken) {
       throw new Error('Global tool cache invalidation requires lock ownership');
     }
-    const deleted = await deps.keyvRedisClient!.eval(DELETE_GLOBAL_IF_OWNER_SCRIPT, {
+    const deleted = await evalCatalogScript(deps.keyvRedisClient!, DELETE_GLOBAL_IF_OWNER_SCRIPT, {
       keys: [globalFenceKey, globalCacheRawKey],
       arguments: [globalLockToken],
     });
@@ -581,18 +741,22 @@ export function createMCPCatalogStore(deps: CatalogStoreDeps): MCPCatalogStore {
             throw new Error('Legacy tool migration requires lock ownership');
           }
           const toolsTtl = Time.TWELVE_HOURS;
-          const written = await deps.keyvRedisClient!.eval(MIGRATE_USER_TOOLS_IF_OWNER_SCRIPT, {
-            keys: [fence.key, rawKey(legacyFenceKey), rawKey(generationKey), rawKey(toolsKey)],
-            arguments: [
-              fence.token,
-              publicationGeneration,
-              String(Date.now() + generationTtl),
-              String(generationTtl),
-              JSON.stringify(migrated),
-              String(Date.now() + toolsTtl),
-              String(toolsTtl),
-            ],
-          });
+          const written = await evalCatalogScript(
+            deps.keyvRedisClient!,
+            MIGRATE_USER_TOOLS_IF_OWNER_SCRIPT,
+            {
+              keys: [fence.key, rawKey(legacyFenceKey), rawKey(generationKey), rawKey(toolsKey)],
+              arguments: [
+                fence.token,
+                publicationGeneration,
+                String(Date.now() + generationTtl),
+                String(generationTtl),
+                JSON.stringify(migrated),
+                String(Date.now() + toolsTtl),
+                String(toolsTtl),
+              ],
+            },
+          );
           if (Number(written) < 0) {
             throw new Error('Tool cache lock ownership was lost before legacy migration');
           }
@@ -679,15 +843,19 @@ export function createMCPCatalogStore(deps: CatalogStoreDeps): MCPCatalogStore {
         if (!fence) {
           throw new Error('Tool publication generation creation requires lock ownership');
         }
-        const created = await deps.keyvRedisClient!.eval(CREATE_GENERATION_IF_OWNER_SCRIPT, {
-          keys: [fence.key, rawKey(key)],
-          arguments: [
-            fence.token,
-            generation,
-            String(Date.now() + generationTtl),
-            String(generationTtl),
-          ],
-        });
+        const created = await evalCatalogScript(
+          deps.keyvRedisClient!,
+          CREATE_GENERATION_IF_OWNER_SCRIPT,
+          {
+            keys: [fence.key, rawKey(key)],
+            arguments: [
+              fence.token,
+              generation,
+              String(Date.now() + generationTtl),
+              String(generationTtl),
+            ],
+          },
+        );
         if (Number(created) < 0) {
           throw new Error('Tool cache lock ownership was lost before generation creation');
         }
@@ -744,7 +912,7 @@ export function createMCPCatalogStore(deps: CatalogStoreDeps): MCPCatalogStore {
         );
       }
       const ttl = options.ttl ?? Time.TWELVE_HOURS;
-      const written = await deps.keyvRedisClient!.eval(WRITE_USER_TOOLS_SCRIPT, {
+      const written = await evalCatalogScript(deps.keyvRedisClient!, WRITE_USER_TOOLS_SCRIPT, {
         keys: [
           rawKey(generationKey),
           rawKey(
@@ -794,10 +962,14 @@ export function createMCPCatalogStore(deps: CatalogStoreDeps): MCPCatalogStore {
     }
     const toolsRawKey = rawKey(toolsKey);
     const revisionKey = rawKey(`tools:mcp:app-revision:{${redisHashTag(toolsRawKey)}}`);
-    const revision = await deps.keyvRedisClient!.eval(NEXT_APP_TOOLS_REVISION_SCRIPT, {
-      keys: [revisionKey],
-      arguments: [String(cachedRevision), String(Time.TWELVE_HOURS)],
-    });
+    const revision = await evalCatalogScript(
+      deps.keyvRedisClient!,
+      NEXT_APP_TOOLS_REVISION_SCRIPT,
+      {
+        keys: [revisionKey],
+        arguments: [String(cachedRevision), String(Time.TWELVE_HOURS)],
+      },
+    );
     const parsedRevision = parseAppToolsRevision(String(revision));
     return String(parsedRevision);
   }
@@ -839,16 +1011,20 @@ export function createMCPCatalogStore(deps: CatalogStoreDeps): MCPCatalogStore {
     const committedRevisionKey = rawKey(
       `tools:mcp:app-committed-revision:{${redisHashTag(toolsRawKey)}}`,
     );
-    const written = await deps.keyvRedisClient!.eval(WRITE_APP_TOOLS_IF_CURRENT_SCRIPT, {
-      keys: [committedRevisionKey, toolsRawKey],
-      arguments: [
-        publicationRevision,
-        JSON.stringify(entry),
-        String(Date.now() + ttl),
-        String(ttl),
-        String(ttl),
-      ],
-    });
+    const written = await evalCatalogScript(
+      deps.keyvRedisClient!,
+      WRITE_APP_TOOLS_IF_CURRENT_SCRIPT,
+      {
+        keys: [committedRevisionKey, toolsRawKey],
+        arguments: [
+          publicationRevision,
+          JSON.stringify(entry),
+          String(Date.now() + ttl),
+          String(ttl),
+          String(ttl),
+        ],
+      },
+    );
     return Number(written) === 1;
   }
 
@@ -895,17 +1071,24 @@ export function createMCPCatalogStore(deps: CatalogStoreDeps): MCPCatalogStore {
   }
 
   return {
-    getCachedTools,
-    updateCachedGlobalTools,
-    setCachedTools,
-    setCachedToolsIfCurrent,
-    getMCPToolsCacheGeneration,
-    renewMCPToolsCacheGeneration,
-    setCachedToolsWithinGlobalLock,
-    getCachedAppServerTools,
-    getNextAppToolsPublicationRevision,
-    setCachedAppServerTools,
-    runWithGlobalCacheLock,
-    invalidateCachedTools,
+    maintenance,
+    trackPublication,
+    getCachedTools: (...args) => trackPublication(() => getCachedTools(...args)),
+    updateCachedGlobalTools: (...args) => trackPublication(() => updateCachedGlobalTools(...args)),
+    setCachedTools: (...args) => trackPublication(() => setCachedTools(...args)),
+    setCachedToolsIfCurrent: (...args) => trackPublication(() => setCachedToolsIfCurrent(...args)),
+    getMCPToolsCacheGeneration: (...args) =>
+      trackPublication(() => getMCPToolsCacheGeneration(...args)),
+    renewMCPToolsCacheGeneration: (...args) =>
+      trackPublication(() => renewMCPToolsCacheGeneration(...args)),
+    setCachedToolsWithinGlobalLock: (...args) =>
+      trackPublication(() => setCachedToolsWithinGlobalLock(...args)),
+    getCachedAppServerTools: (...args) => trackPublication(() => getCachedAppServerTools(...args)),
+    getNextAppToolsPublicationRevision: (...args) =>
+      trackPublication(() => getNextAppToolsPublicationRevision(...args)),
+    setCachedAppServerTools: (...args) => trackPublication(() => setCachedAppServerTools(...args)),
+    runWithGlobalCacheLock: (operation) =>
+      trackPublication(() => runWithGlobalCacheLock(operation)),
+    invalidateCachedTools: (...args) => trackPublication(() => invalidateCachedTools(...args)),
   };
 }

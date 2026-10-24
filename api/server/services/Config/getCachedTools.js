@@ -20,4 +20,10 @@ const store = createMCPCatalogStore({
   getCache: () => getLogStores(CacheKeys.TOOL_CACHE),
 });
 
-module.exports = { ToolCacheKeys, ...store };
+const { maintenance, trackPublication, ...methods } = store;
+module.exports = {
+  ToolCacheKeys,
+  ...methods,
+  mcpCatalogMaintenance: maintenance,
+  runMCPToolPublication: trackPublication,
+};

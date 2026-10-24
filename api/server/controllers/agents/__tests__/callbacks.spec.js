@@ -71,7 +71,7 @@ jest.mock('~/server/services/Files/Code/process', () => ({
     if (typeof finalize !== 'function') {
       return;
     }
-    finalize()
+    return finalize()
       .then((updated) => {
         if (!updated || !onResolved) {
           return;
@@ -1114,8 +1114,6 @@ describe('createToolEndCallback', () => {
       });
       await toolEndCallback({ output: event.output }, event.metadata);
       await Promise.all(artifactPromises);
-      // Wait one more tick so the fire-and-forget finalize() chain settles.
-      await new Promise((resolve) => setImmediate(resolve));
 
       // Two SSE writes: the initial emit (pending) and the deferred render (ready).
       expect(res.write).toHaveBeenCalledTimes(2);
@@ -1178,58 +1176,156 @@ describe('createToolEndCallback', () => {
       expect(res.write).toHaveBeenCalledTimes(1);
     });
 
-    it('the preview update emit is skipped when the response stream has already closed', async () => {
-      res.headersSent = true;
-      /* Hand-rolled deferred so we can hold finalize() open until
-       * AFTER setting `res.writableEnded = true`. Otherwise the mock
-       * resolves synchronously, the .then() runs in the same microtask
-       * queue as the artifactPromises await, and writableEnded is set
-       * too late. */
-      let resolveFinalize;
-      const finalizeDeferred = new Promise((resolve) => {
-        resolveFinalize = resolve;
-      });
-      processCodeOutput.mockResolvedValue({
-        file: {
+    it.each(['chat', 'responses'])(
+      'publishes the second pending artifact before the first preview settles (%s)',
+      async (transport) => {
+        res.headersSent = true;
+        const { createResponsesToolEndCallback } = require('../callbacks');
+        const { writeAttachmentEvent } = require('@librechat/api');
+        const { waitForAgentExecutionWrites } = jest.requireActual('@librechat/api');
+        let publishFirst;
+        const firstMetadata = new Promise((resolve) => {
+          publishFirst = resolve;
+        });
+        let finishPreview;
+        const preview = new Promise((resolve) => {
+          finishPreview = resolve;
+        });
+        const first = {
+          file: { file_id: 'first', filename: 'first.csv', status: 'pending' },
+          finalize: jest.fn(() => preview),
+        };
+        const second = {
+          file: { file_id: 'second', filename: 'second.csv', status: 'pending' },
+          finalize: jest.fn(async () => null),
+        };
+        processCodeOutput.mockImplementationOnce(() => firstMetadata).mockResolvedValueOnce(second);
+        const callback =
+          transport === 'chat'
+            ? createToolEndCallback({ req, res, artifactPromises })
+            : createResponsesToolEndCallback({
+                req,
+                res,
+                artifactPromises,
+                tracker: { nextSequence: jest.fn(() => 1) },
+              });
+        const event = makeCodeExecutionEvent({
+          runId: 'run',
+          threadId: 'thread',
+          toolCallId: 'tool',
+          fileId: 'first',
+          name: 'first.csv',
+        });
+        event.output.artifact.files.push({
+          id: 'second',
+          name: 'second.csv',
+          session_id: 'sess-1',
+        });
+        let settlement;
+        try {
+          await callback({ output: event.output }, event.metadata);
+          expect(artifactPromises).toHaveLength(2);
+          let joined = false;
+          settlement = waitForAgentExecutionWrites(artifactPromises).then(() => {
+            joined = true;
+          });
+          await new Promise((resolve) => setImmediate(resolve));
+          expect(processCodeOutput).toHaveBeenCalledTimes(1);
+          expect(res.write).not.toHaveBeenCalled();
+          expect(writeAttachmentEvent).not.toHaveBeenCalled();
+          publishFirst(first);
+          await new Promise((resolve) => setImmediate(resolve));
+          expect(processCodeOutput.mock.calls.map(([input]) => input.id)).toEqual([
+            'first',
+            'second',
+          ]);
+          const emitted =
+            transport === 'chat'
+              ? res.write.mock.calls.map(parseSseAttachment)
+              : writeAttachmentEvent.mock.calls.map((call) => call[2]);
+          expect(emitted).toEqual([
+            expect.objectContaining({ file_id: 'first', status: 'pending' }),
+            expect.objectContaining({ file_id: 'second', status: 'pending' }),
+          ]);
+          await expect(artifactPromises[1]).resolves.toBe(second.file);
+          expect(joined).toBe(false);
+          finishPreview(null);
+          await settlement;
+          expect(joined).toBe(true);
+        } finally {
+          publishFirst(first);
+          finishPreview(null);
+          await settlement;
+        }
+      },
+    );
+
+    it.each([false, true])(
+      'joins preview after stream closure, including initial emit failure: %s',
+      async (emitFails) => {
+        res.headersSent = true;
+        if (emitFails)
+          res.write.mockImplementationOnce(() => {
+            throw new Error('stream write failed');
+          });
+        /* Hand-rolled deferred so we can hold finalize() open until
+         * AFTER setting `res.writableEnded = true`. Otherwise the mock
+         * resolves synchronously, the .then() runs in the same microtask
+         * queue as the artifactPromises await, and writableEnded is set
+         * too late. */
+        let resolveFinalize;
+        const finalizeDeferred = new Promise((resolve) => {
+          resolveFinalize = resolve;
+        });
+        processCodeOutput.mockResolvedValue({
+          file: {
+            file_id: 'fid-1',
+            filename: 'data.xlsx',
+            filepath: '/uploads/data.xlsx',
+            type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            messageId: 'run-1',
+            toolCallId: 'tool-1',
+            status: 'pending',
+          },
+          finalize: jest.fn().mockReturnValue(finalizeDeferred),
+        });
+
+        const toolEndCallback = createToolEndCallback({ req, res, artifactPromises });
+        const event = makeCodeExecutionEvent({
+          runId: 'run-1',
+          threadId: 'thread-1',
+          toolCallId: 'tool-1',
+          fileId: 'fid-1',
+          name: 'data.xlsx',
+        });
+        await toolEndCallback({ output: event.output }, event.metadata);
+        const { waitForAgentExecutionWrites } = jest.requireActual('@librechat/api');
+        let joined = false;
+        const settlement = waitForAgentExecutionWrites(artifactPromises).then(() => {
+          joined = true;
+        });
+        await new Promise((resolve) => setImmediate(resolve));
+        expect(res.write).toHaveBeenCalledTimes(1);
+        expect(joined).toBe(false);
+        // Simulate the response closing AFTER the initial emit fires but BEFORE
+        // the deferred render lands. The frontend's polling path will catch the
+        // resolved record on its next tick.
+        res.writableEnded = true;
+        // Now resolve finalize and let the .then() chain run.
+        resolveFinalize({
           file_id: 'fid-1',
           filename: 'data.xlsx',
-          filepath: '/uploads/data.xlsx',
-          type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
           messageId: 'run-1',
-          toolCallId: 'tool-1',
-          status: 'pending',
-        },
-        finalize: jest.fn().mockReturnValue(finalizeDeferred),
-      });
+          status: 'ready',
+          text: '<x/>',
+          textFormat: 'html',
+        });
+        await settlement;
 
-      const toolEndCallback = createToolEndCallback({ req, res, artifactPromises });
-      const event = makeCodeExecutionEvent({
-        runId: 'run-1',
-        threadId: 'thread-1',
-        toolCallId: 'tool-1',
-        fileId: 'fid-1',
-        name: 'data.xlsx',
-      });
-      await toolEndCallback({ output: event.output }, event.metadata);
-      await Promise.all(artifactPromises);
-      // Simulate the response closing AFTER the initial emit fires but BEFORE
-      // the deferred render lands. The frontend's polling path will catch the
-      // resolved record on its next tick.
-      res.writableEnded = true;
-      // Now resolve finalize and let the .then() chain run.
-      resolveFinalize({
-        file_id: 'fid-1',
-        filename: 'data.xlsx',
-        messageId: 'run-1',
-        status: 'ready',
-        text: '<x/>',
-        textFormat: 'html',
-      });
-      await new Promise((resolve) => setImmediate(resolve));
-
-      // Initial emit wrote; preview update noop'd because writableEnded.
-      expect(res.write).toHaveBeenCalledTimes(1);
-    });
+        // Initial emit wrote; preview update noop'd because writableEnded.
+        expect(res.write).toHaveBeenCalledTimes(1);
+      },
+    );
 
     it('does not call finalize for a non-office file (no preview expected)', async () => {
       res.headersSent = true;

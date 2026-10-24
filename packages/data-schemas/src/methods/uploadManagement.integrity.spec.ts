@@ -10,6 +10,10 @@ import {
 } from 'librechat-data-provider';
 import type { UploadLease, UploadPrincipal, UploadStorageReceipt } from 'librechat-data-provider';
 import type { StoredUpload } from './uploadManagementStore';
+import {
+  completeAcceptedUploadFileCleanup,
+  copyFrozenUploadFiles,
+} from './uploadManagement.structure.fixture';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createModels } from '~/models';
 
@@ -366,11 +370,15 @@ describe('durable managed original integrity', () => {
   it('round-trips the exact live manifest and retained quota through the existing replacement protocol', async () => {
     const { lease, original } = await accepted();
     const page = await first.exportSnapshot({ epoch: 'move' });
-    await target.importSnapshot(page);
-    await target.importSnapshot(page);
     await replacement.models.File.insertMany(
-      await a.models.File.find({}).select('+securityApproval').lean(),
+      await a.models.File.find({})
+        .select(
+          '+securityApproval +retentionActivity +derivedRetention +derivedOrigin +retentionRevocationId',
+        )
+        .lean(),
     );
+    await target.importSnapshot(page);
+    await target.importSnapshot(page);
     const seal = await first.completeExport('move');
     await target.completeImport({ receipt: seal, baseline, lifecycleReconciled: true });
     expect(
@@ -383,16 +391,43 @@ describe('durable managed original integrity', () => {
   });
 
   it('preserves fully removed legacy history and its debit without fabricating an original identity', async () => {
-    const { lease } = await accepted();
+    const { lease, original } = await accepted();
+    const fileQuery = { file_id: lease.operationId };
+    expect(await a.models.File.collection.findOne(fileQuery)).toMatchObject({
+      filename: 'note.txt',
+      type: 'text/plain',
+      filepath: original.filepath,
+      bytes: original.bytes,
+    });
     await first.delete(user, lease.operationId, now + 1);
     await first.confirmCleanup(
       { ...localGone(lease), originalAbsent: true, textAndHistoryRemoved: true },
       now + 1,
     );
+    await completeAcceptedUploadFileCleanup(a, user, lease.operationId, mongo.getUri('integrity'));
+    expect(
+      await a.models.UploadOperation.findById(lease.operationId).lean<StoredUpload>(),
+    ).toMatchObject({
+      originalBytes: 0,
+      originalRemoved: true,
+      textRemoved: true,
+      cleanupPending: false,
+      actualBytes: 8,
+    });
+    const cleanedFile = await a.models.File.collection.findOne(fileQuery);
+    expect(cleanedFile).toMatchObject({
+      deletionCompletedAt: expect.any(Date),
+      retainedDerivativeBytes: 0,
+    });
+    const removedFields = ['filename', 'type', 'filepath', 'bytes'];
+    for (const field of removedFields) expect(cleanedFile).not.toHaveProperty(field);
+    // Model a historical tombstone that predates receipt custody after actual owner cleanup.
+    // Remove both current proof projections instead of rebinding them to a missing identity.
     await a.models.UploadOperation.updateOne(
       { _id: lease.operationId },
       {
         $unset: {
+          cleanupCustody: 1,
           'original.integrity': 1,
           securityApproval: 1,
           securityExecution: 1,
@@ -400,14 +435,25 @@ describe('durable managed original integrity', () => {
         },
       },
     );
+    await a.models.File.updateOne(
+      { file_id: lease.operationId, user: user.userId, tenantId: user.tenantId },
+      { $unset: { retentionCleanup: 1 } },
+    );
     const page = await first.exportSnapshot({ epoch: 'removed' });
+    const frozenFile = await a.models.File.collection.findOne(fileQuery);
+    await copyFrozenUploadFiles(a, replacement);
+    expect(await replacement.models.File.collection.findOne(fileQuery)).toEqual(frozenFile);
     await target.importSnapshot(page);
     const seal = await first.completeExport('removed');
     await target.completeImport({ receipt: seal, baseline, lifecycleReconciled: true });
+    const importedFile = await replacement.models.File.collection.findOne(fileQuery);
+    expect(importedFile).toMatchObject({ deletionCompletedAt: cleanedFile!.deletionCompletedAt });
+    for (const field of removedFields) expect(importedFile).not.toHaveProperty(field);
     const stored = await replacement.models.UploadOperation.findById(
       lease.operationId,
     ).lean<StoredUpload>();
     expect(stored!.original).not.toHaveProperty('integrity');
+    expect(stored).not.toHaveProperty('cleanupCustody');
     expect(stored).not.toHaveProperty('securityApproval');
     expect(stored).not.toHaveProperty('securityExecution');
     expect(stored).not.toHaveProperty('securitySettlement');

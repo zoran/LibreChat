@@ -45,9 +45,11 @@ describe('upload HTTP boundary', () => {
   let body: jest.Mock;
   let admissionsPaused: boolean | null;
   let issueIntake: jest.Mock;
+  let runFileOperation: jest.Mock;
 
   beforeEach(async () => {
     admissionsPaused = false;
+    runFileOperation = jest.fn((work: () => Promise<unknown>) => work());
     issueIntake = jest.fn(async () => ({
       version: 1,
       operationId: 'operation',
@@ -79,6 +81,7 @@ describe('upload HTTP boundary', () => {
       res.status(202).json({ bytes: Buffer.concat(chunks).length, parsed: req.body !== undefined });
     });
     const options = {
+      runFileOperation,
       management: management as never,
       principal: strongPrincipal,
       allowedOrigins: [origin],
@@ -114,6 +117,63 @@ describe('upload HTTP boundary', () => {
     expect(response.status).toBe(200);
     expect(response.data).toMatchObject({ operationId: 'operation', capability: 'A'.repeat(43) });
     expect(issueIntake).toHaveBeenCalledWith(expect.anything(), user, 'operation');
+    expect(runFileOperation).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['GET', '/api/uploads', undefined],
+    [
+      'POST',
+      '/api/uploads/operations',
+      {
+        mediaType: 'text/plain',
+        declaredBytes: 5,
+        idempotencyKey: '00000000-0000-4000-8000-000000000001',
+      },
+    ],
+    ['POST', '/api/uploads/operations/operation/cancel', {}],
+    ['POST', '/api/uploads/operations/operation/retry', {}],
+    ['POST', '/api/uploads/operations/operation/intake', {}],
+    ['DELETE', '/api/uploads/operations/operation', undefined],
+  ] as const)('closes %s %s before its File operation begins', async (method, path, payload) => {
+    runFileOperation.mockRejectedValue(new UploadManagementError('admission_paused'));
+    const response = await call(method, path, payload);
+    expect(response).toEqual({ status: 503, data: { code: 'admission_paused' } });
+    expect(runFileOperation).toHaveBeenCalledTimes(1);
+    for (const operation of Object.values(management)) expect(operation).not.toHaveBeenCalled();
+    expect(issueIntake).not.toHaveBeenCalled();
+  });
+
+  it('retains the usage original when its sibling list fails before Mongo settles', async () => {
+    let held = 0;
+    let release!: () => void;
+    let entered!: () => void;
+    const began = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    runFileOperation.mockImplementation(async (work: () => Promise<unknown>) => {
+      held++;
+      try {
+        return await work();
+      } finally {
+        held--;
+      }
+    });
+    management.list.mockRejectedValue(new Error('List failed'));
+    management.usage.mockImplementation(async () => {
+      entered();
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      return usage;
+    });
+    const response = call('GET');
+    await began;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(held).toBe(1);
+    release();
+    expect((await response).status).toBe(503);
+    expect(held).toBe(0);
   });
 
   it('rejects document metadata and a forged ticket operation before exposing a capability', async () => {

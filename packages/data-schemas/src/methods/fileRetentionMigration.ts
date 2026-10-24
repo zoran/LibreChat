@@ -409,6 +409,8 @@ export async function verifyFrozenFileRetentionMigration(
 
 /** Standalone retained admission has an actual deadline; generic legacy policies remain unknown. */
 export function classifyFileCoverage(file: IMongoFile): 'excluded' | 'retained' | 'unknown' {
+  // An expiry-only legacy File still depends on TTL; inspect it before exclusion.
+  if (file.expiresAt != null) return 'unknown';
   const retained = [
     file.expiredAt,
     file.retentionAcceptedAt,
@@ -448,7 +450,6 @@ export function classifyFileCoverage(file: IMongoFile): 'excluded' | 'retained' 
     !Number.isSafeInteger(file.retentionRevision) ||
     file.retentionRevision! < 0 ||
     file.retentionRevision! >= Number.MAX_SAFE_INTEGER ||
-    file.expiresAt != null ||
     ((file.deletionRequestedAt || file.deletionCompletedAt) && !file.retentionRevocationId)
   )
     return 'unknown';
