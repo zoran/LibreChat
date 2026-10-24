@@ -1,4 +1,5 @@
 /** Current Pod composition. Durable ownership, parser execution and advisory policy stay separate. */
+import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import type { UploadLease, UploadLocalReservations, UploadWorker } from 'librechat-data-provider';
 import type {
@@ -7,6 +8,7 @@ import type {
   UploadResourceKey,
   UploadResourceSnapshot,
 } from '../control/types';
+import type { UploadBackendCapture } from '../../storage/providerObservation';
 import type { UploadSnapshotOptions } from '../control/snapshotClient';
 import type { UploadBackendObservation } from '../metrics/metrics';
 import type { ResourcePort, UploadRepository } from '../contract';
@@ -20,6 +22,7 @@ import {
   LOCAL_FLOOR_BYTES,
 } from './local';
 import { createUploadParserResourceClient, parserResourcesSafe } from './parserResources';
+import { immutableUploadBackendBinding } from '../../storage/providerObservation';
 import { createUploadSnapshotClient } from '../control/snapshotClient';
 import { createUploadResourcePort } from '../control/hardGuards';
 import { createUploadBackendClient } from './backendClient';
@@ -53,6 +56,7 @@ export interface UploadPlatformRuntime {
   bindMetrics(metrics: UploadPlatformMetrics): void;
   start(): Promise<void>;
   close(): Promise<void>;
+  readStorageBackend(): UploadBackendCapture | undefined;
 }
 export interface UploadPlatformRuntimeOptions {
   repository: Pick<UploadRepository, 'localReservations'>;
@@ -81,6 +85,11 @@ export function createUploadPlatformRuntime(
   ) {
     throw new Error('invalid_upload_platform_identity');
   }
+  const binding =
+    options.backendBinding === undefined
+      ? undefined
+      : immutableUploadBackendBinding(options.backendBinding, options.expectedHosts);
+  const backendCapture = binding && Object.freeze({ instanceId: randomUUID(), binding });
   const clock = options.clock ?? (() => ({ nowMs: Date.now(), monotonicMs: performance.now() }));
   const expected: UploadResourceKey[] = options.expectedHosts.flatMap((node) =>
     (['cpu', 'cpu_psi', 'memory_psi', 'io_psi', 'memory', 'nic'] as const).map((signal) => ({
@@ -101,7 +110,7 @@ export function createUploadPlatformRuntime(
   const disk = createUploadLocalSampler({ root: options.stagingRoot, clock });
   const parser = createUploadParserResourceClient({ socketPath: options.parserSocketPath, clock });
   const backend = createUploadBackendClient({
-    binding: options.backendBinding,
+    binding,
     ca: options.backendCa ?? '',
     clock,
   });
@@ -257,6 +266,7 @@ export function createUploadPlatformRuntime(
     ]).finally(() => clearTimeout(timeout));
   }
   return {
+    readStorageBackend: () => (closed ? undefined : backendCapture),
     expected,
     snapshots,
     resources: {

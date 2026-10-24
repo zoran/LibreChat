@@ -72,6 +72,7 @@ function createHousekeepingService(configuration) {
     let acquisitionOriginal;
     let transferred = false;
     let closing;
+    let providerClosing = false;
 
     const failStartup = () => {
       void api.requestGracefulShutdown('startup_failure').catch(() => undefined);
@@ -80,6 +81,7 @@ function createHousekeepingService(configuration) {
     // The application's original work settles before this callback. During partial acquisition,
     // pre-drain joins acquisitionOriginal instead. Neither close path ever waits for app.start().
     function close(signal) {
+      providerClosing = true;
       closing ??= (async () => {
         const results = await Promise.allSettled([
           Promise.resolve().then(() => retrieval?.close(signal)),
@@ -182,6 +184,12 @@ function createHousekeepingService(configuration) {
       const cleanup = api.createManagedUploadCleanup({ repository: uploads, storage });
       return {
         env,
+        readStorageProviders: () => ({
+          ordinaryS3: { state: 'not-owned' },
+          managedS3: providerClosing
+            ? { state: 'unavailable' }
+            : api.getManagedS3Provider(storage, null),
+        }),
         repository,
         fileNotice: schemas.createFileNoticePort(mongoose, jobs, { allowedDomains, timezone }),
         fileCleanup: api.createFileCleanupPort({

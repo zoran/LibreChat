@@ -2,6 +2,7 @@
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import type { AppMaintenance } from '../../app/maintenance';
+import { NOT_OWNED_STORAGE_PROVIDERS } from '../../storage/providerObservation';
 import { createHttpUploadSecurityPort } from '../security/transport';
 import { createWorkloadMaintenance } from '../../app/maintenance';
 import { createMaintenanceIdentity } from '../../app/identity';
@@ -67,6 +68,7 @@ async function main(): Promise<void> {
       identity,
       workOwners: { intake: service.maintenance },
       fileDomainOwners: ['intake'],
+      readStorageProviders: () => NOT_OWNED_STORAGE_PROVIDERS,
       startupReady: () => !closing,
     });
     await maintenance.listen();

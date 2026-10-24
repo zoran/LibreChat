@@ -5,6 +5,7 @@ import type { HousekeepingRepository, WorkerIdentity } from '@librechat/data-sch
 import type { Server } from 'node:http';
 import type { AppMaintenance, MaintenanceIdentity } from '../app/maintenance';
 import type { HousekeepingRuntime, HousekeepingDrain } from './runtime';
+import type { StorageProviders } from '../storage/providerObservation';
 import type { HousekeepingHandlerDependencies } from './handlers';
 import {
   registerShutdownTask,
@@ -21,6 +22,7 @@ import { createMetrics } from '../app/metrics';
 export interface HousekeepingApplicationDependencies extends HousekeepingHandlerDependencies {
   env: Record<string, string | undefined>;
   repository: HousekeepingRepository;
+  readStorageProviders(): StorageProviders;
   /** Close only this process's actual resources after original runtime and startup work settles. */
   close(signal: AbortSignal): Promise<void>;
 }
@@ -38,6 +40,7 @@ export interface HousekeepingApplication {
 function requirePorts(deps: HousekeepingApplicationDependencies): void {
   const methods = [
     deps.close,
+    deps.readStorageProviders,
     ...(
       [
         'discover',
@@ -116,6 +119,7 @@ export function createHousekeepingApplication(
     identity: maintenanceIdentity,
     workOwners: { housekeeping: runtime },
     fileDomainOwners: ['housekeeping'],
+    readStorageProviders: () => deps.readStorageProviders(),
     startupReady: () => started && !stopping,
   });
   const metrics = createMetrics({ collectHousekeepingObservation: () => runtime.observe() });

@@ -113,6 +113,7 @@ describe('standalone Housekeeping service custody', () => {
       optionalEnabled: (value) => (value === undefined ? undefined : value === 'true'),
       createManagedS3Client: jest.fn(() => client),
       createManagedS3Storage: jest.fn(() => ({})),
+      getManagedS3Provider: jest.fn(() => ({ state: 'unavailable' })),
       createManagedFilePurge: jest.fn(async () => retrieval),
       createManagedUploadCleanup: jest.fn(() => ({ reconcileCleanupOperation: jest.fn() })),
       createFileCleanupPort: jest.fn(() => ({})),
@@ -215,6 +216,14 @@ describe('standalone Housekeeping service custody', () => {
     expect(fileDiscovery.coverage).toHaveBeenCalledWith('file.cleanup', signal, session);
     expect(uploads.coverageUploadHousekeeping).toHaveBeenCalledWith(signal, session);
     const dependencies = api.createHousekeepingApplication.mock.calls[0][0];
+    expect(dependencies.readStorageProviders()).toEqual({
+      ordinaryS3: { state: 'not-owned' },
+      managedS3: { state: 'unavailable' },
+    });
+    expect(api.getManagedS3Provider).toHaveBeenLastCalledWith(
+      api.createManagedS3Storage.mock.results[0].value,
+      null,
+    );
     const cleanup = api.createManagedUploadCleanup.mock.results[0].value;
     const claim = { retained: 'claim' };
     dependencies.uploadCleanup.step(claim, signal);
@@ -240,6 +249,14 @@ describe('standalone Housekeeping service custody', () => {
       policySnapshot,
     });
     expect(mailFactory.mock.calls[0].slice(0, 2)).toEqual([config.env, config.allowedDomains]);
+    const reads = api.getManagedS3Provider.mock.calls.length;
+    const closing = dependencies.close();
+    expect(dependencies.readStorageProviders()).toEqual({
+      ordinaryS3: { state: 'not-owned' },
+      managedS3: { state: 'unavailable' },
+    });
+    expect(api.getManagedS3Provider).toHaveBeenCalledTimes(reads);
+    await closing;
     await shutdown.requestGracefulShutdown('startup_failure');
     expect(redis.close).toHaveBeenCalledWith();
     expect(effects.at(-1)).toBe('mongo.close');

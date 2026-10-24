@@ -31,7 +31,7 @@ export {
 export { instrumentMongooseQueryMetrics } from './app/metrics';
 export { optionalEnabled } from './utils/common';
 export { createManagedS3Client } from './storage/s3/managedClient';
-export { createManagedS3Storage } from './storage/s3/managed';
+export { createManagedS3Storage, getManagedS3Provider } from './storage/s3/managed';
 export { createManagedUploadCleanup } from './uploads/cleanup';
 
 export { createFileCleanupPort } from './files/lifecycleCleanup';

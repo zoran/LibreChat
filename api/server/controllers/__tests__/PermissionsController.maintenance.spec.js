@@ -533,6 +533,10 @@ function permissionApp() {
     complete: true,
   };
   const app = createAppMaintenance({
+    readStorageProviders: () => ({
+      ordinaryS3: { state: 'not-owned' },
+      managedS3: { state: 'not-owned' },
+    }),
     env: {
       LIBRECHAT_MAINTENANCE_TOKEN: 'a'.repeat(32),
       POD_UID: '12345678-1234-1234-1234-123456789012',

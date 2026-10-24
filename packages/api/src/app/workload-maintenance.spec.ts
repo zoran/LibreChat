@@ -1,6 +1,7 @@
 import { Readable } from 'node:stream';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { AppMaintenance, ApplicationWorkPort } from './maintenance';
+import { NOT_OWNED_STORAGE_PROVIDERS } from '../storage/providerObservation';
 import { createUploadAttemptJournal } from '../uploads/attempts';
 import { createWorkloadMaintenance } from './maintenance';
 import { createMaintenanceIdentity } from './identity';
@@ -47,6 +48,7 @@ function options(owner = observedOwner()) {
     identity,
     workOwners: { owner },
     fileDomainOwners: ['owner'],
+    readStorageProviders: () => NOT_OWNED_STORAGE_PROVIDERS,
     startupReady: () => true,
   };
 }
@@ -94,6 +96,7 @@ describe('generation-free native workload maintenance', () => {
       identity,
       workOwners: { attempts: journal.maintenance },
       fileDomainOwners: ['attempts'],
+      readStorageProviders: () => NOT_OWNED_STORAGE_PROVIDERS,
       startupReady: () => true,
     });
     try {
@@ -280,4 +283,10 @@ describe('generation-free native workload maintenance', () => {
     expect((await http(app, 'POST', '/cancel', request(app, 1))).body.phase).toBe('running');
     await app.close();
   });
+});
+
+it('requires explicit provider ownership for a generation-free workload', () => {
+  expect(() =>
+    createWorkloadMaintenance({ ...options(), readStorageProviders: undefined } as never),
+  ).toThrow('Storage provider observation owner is required');
 });

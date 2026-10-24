@@ -10,6 +10,8 @@ import type {
   FileCoveragePopulation,
   FileInventoryRequest,
 } from 'librechat-data-provider';
+import { historyHasBlockers } from './fileHousekeepingHistoryAccounting';
+import { isHistorySummary } from './fileHousekeepingHistoryContract';
 
 const HASH = /^[a-f0-9]{64}$/;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
@@ -66,7 +68,7 @@ function native(v: unknown): v is FileCoverageNativeBinding {
       'mongoReplicaSet',
       'mongoDatabase',
       'writerCohortSha256',
-      'oldTimerDrainSha256',
+      'oldApplicationCessationSha256',
     ]) &&
     id(v.invocationId) &&
     integer(v.invocationGeneration) &&
@@ -76,7 +78,7 @@ function native(v: unknown): v is FileCoverageNativeBinding {
     id(v.mongoReplicaSet) &&
     id(v.mongoDatabase) &&
     hash(v.writerCohortSha256) &&
-    hash(v.oldTimerDrainSha256)
+    hash(v.oldApplicationCessationSha256)
   );
 }
 function run(v: unknown): v is FileCoverageRun {
@@ -138,6 +140,7 @@ export function readFileCoverageReceipt(
         'native',
         'snapshot',
         'population',
+        'history',
         'filesSha256',
         'jobsSha256',
         'projectionSha256',
@@ -159,6 +162,9 @@ export function readFileCoverageReceipt(
       !integer(v.snapshot.increment) ||
       v.snapshot.increment > 0xffffffff ||
       !instant(v.snapshot.observedAt) ||
+      !isHistorySummary(v.history) ||
+      v.history.lane !== 'ready' ||
+      historyHasBlockers(v.history) ||
       !population(v.population) ||
       v.population.unclassifiedFiles !== 0 ||
       v.population.unclassifiedJobs !== 0 ||

@@ -285,6 +285,10 @@ describe('built standalone scanner entry', () => {
         body: {
           phase: 'running',
           revision: 0,
+          storageProviders: {
+            ordinaryS3: { state: 'not-owned' },
+            managedS3: { state: 'not-owned' },
+          },
           identity: {
             podUid: environment.POD_UID,
             source: environment.BUILD_COMMIT,
@@ -377,6 +381,10 @@ describe('built standalone scanner entry', () => {
         body: {
           phase: 'running',
           revision: 0,
+          storageProviders: {
+            ordinaryS3: { state: 'not-owned' },
+            managedS3: { state: 'not-owned' },
+          },
           identity: {
             incarnation: current.instanceId,
             podUid: environment.POD_UID,

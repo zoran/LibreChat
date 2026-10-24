@@ -10,6 +10,7 @@ import type {
   GenerationMaintenanceCensus,
   MaintenanceOwnerSample,
 } from './maintenanceCensus';
+import type { StorageProviders } from '../storage/providerObservation';
 import type { MaintenanceIdentity } from './identity';
 import {
   MAINTENANCE_COUNTERS as counters,
@@ -17,6 +18,10 @@ import {
   aggregateMaintenanceOwners,
   composeMaintenanceCensus,
 } from './maintenanceCensus';
+import {
+  observeStorageProviders,
+  UNAVAILABLE_STORAGE_PROVIDERS,
+} from '../storage/providerObservation';
 import { createMaintenanceIdentity } from './identity';
 
 export type { MaintenanceIdentity } from './identity';
@@ -43,6 +48,7 @@ export interface MaintenanceDependencies {
   /** Existing owner keys; [] explicitly declares no qualified File-domain coverage. */
   fileDomainOwners: readonly string[];
   unqualifiedOwners?: readonly string[];
+  readStorageProviders(): StorageProviders;
   startupReady(): boolean;
   probeDatabase(): Promise<boolean>;
   probeSharedState(): Promise<boolean>;
@@ -52,6 +58,7 @@ export interface WorkloadMaintenanceDependencies {
   identity: MaintenanceIdentity;
   workOwners: Readonly<Record<string, ApplicationWorkPort>>;
   fileDomainOwners: readonly string[];
+  readStorageProviders(): StorageProviders;
   startupReady(): boolean;
 }
 type LifecycleDependencies =
@@ -71,6 +78,7 @@ export interface MaintenanceStatus {
   census: GenerationMaintenanceCensus | null;
   blockingReasons: string[];
   fileDomain: FileDomainStatus;
+  storageProviders: StorageProviders;
 }
 export interface AppMaintenance {
   identity: MaintenanceIdentity;
@@ -185,6 +193,8 @@ export function createWorkloadMaintenance(deps: WorkloadMaintenanceDependencies)
 
 /** One private lifecycle/HTTP/authentication owner; provider records remain with actual owners. */
 function createMaintenanceController(deps: LifecycleDependencies): AppMaintenance {
+  if (typeof deps.readStorageProviders !== 'function')
+    throw new Error('Storage provider observation owner is required');
   const token = deps.env.LIBRECHAT_MAINTENANCE_TOKEN;
   const controlEnabled = token !== undefined;
   const port = Number(deps.env.LIBRECHAT_MAINTENANCE_PORT ?? '3091');
@@ -301,6 +311,7 @@ function createMaintenanceController(deps: LifecycleDependencies): AppMaintenanc
     const sampledRevision = revision;
     const sampledRequest = requestId;
     const closed = sampledRequest !== null;
+    const providersBefore = observeStorageProviders(() => deps.readStorageProviders());
     const [generation, samples] = await Promise.all([
       deps.kind === 'application'
         ? observe(() => deps.generation.getGenerationAdmissionCensus())
@@ -316,7 +327,13 @@ function createMaintenanceController(deps: LifecycleDependencies): AppMaintenanc
           }),
       sampleOwners(sampledRequest),
     ]);
-    const current = sampledRevision === revision && sampledRequest === requestId && !uncertain;
+    const providersAfter = observeStorageProviders(() => deps.readStorageProviders());
+    const sameProviders =
+      providersBefore !== undefined &&
+      providersAfter !== undefined &&
+      JSON.stringify(providersBefore) === JSON.stringify(providersAfter);
+    const current =
+      sampledRevision === revision && sampledRequest === requestId && !uncertain && sameProviders;
     const census = composeMaintenanceCensus(
       generation,
       aggregateMaintenanceOwners(
@@ -350,6 +367,8 @@ function createMaintenanceController(deps: LifecycleDependencies): AppMaintenanc
         ...(!known ? ['census incomplete or admission uncertain'] : []),
       ],
       fileDomain: { known: fileCensus !== null, census: fileCensus },
+      storageProviders:
+        sameProviders && providersAfter ? providersAfter : UNAVAILABLE_STORAGE_PROVIDERS,
     };
   }
   function operation(action: 'begin' | 'cancel', body: unknown): number {

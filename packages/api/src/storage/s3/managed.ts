@@ -1,4 +1,5 @@
 import { Readable } from 'node:stream';
+import { randomUUID } from 'node:crypto';
 import { finished } from 'node:stream/promises';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { isUploadOriginalIntegrity, isUploadStorageReceipt } from 'librechat-data-provider';
@@ -11,11 +12,38 @@ import {
 } from '@aws-sdk/client-s3';
 import type { UploadOriginalIntegrity, UploadStorageReceipt } from 'librechat-data-provider';
 import type { S3Client } from '@aws-sdk/client-s3';
+import type {
+  ManagedS3Provider,
+  ManagedS3CommandCapture,
+  UploadBackendCapture,
+} from '../providerObservation';
 import type { StoragePort } from '../../uploads/contract';
 import { verifyOriginalIntegrity } from '../../uploads/storage/integrity';
+import { observeStorageProviders } from '../providerObservation';
 import { createManagedDeletionAdapter } from './managedDeletion';
 import { uploadAttemptId } from '../../uploads/processing/paths';
+import { getManagedS3ClientCapture } from './managedClient';
 import { buildS3Key as getS3Key, parseS3Key } from './keys';
+
+const captures = new WeakMap<
+  StoragePort,
+  { client: S3Client; commands: ManagedS3CommandCapture }
+>();
+/** Undefined backend means missing web custody; null is the explicit standalone HK composition. */
+export function getManagedS3Provider(
+  storage: StoragePort,
+  backend: UploadBackendCapture | null | undefined,
+): ManagedS3Provider {
+  const captured = captures.get(storage);
+  const client = captured && getManagedS3ClientCapture(captured.client);
+  if (!captured || !client || backend === undefined) return Object.freeze({ state: 'unavailable' });
+  return (
+    observeStorageProviders(() => ({
+      ordinaryS3: { state: 'not-owned' },
+      managedS3: { state: 'captured', client, commands: captured.commands, backend },
+    }))?.managedS3 ?? Object.freeze({ state: 'unavailable' })
+  );
+}
 
 const MAX_BYTES = 30 * 1024 * 1024;
 const ignoreStreamError = () => {
@@ -143,7 +171,7 @@ export function createManagedS3Storage(options: {
       deadlineAtMs: input.deadlineAtMs,
     };
   };
-  return {
+  const storage: StoragePort = {
     describeDeletion: (input) => {
       if (input.request.generation !== String(input.generation))
         throw new Error('Managed deletion generation mismatch');
@@ -331,4 +359,9 @@ export function createManagedS3Storage(options: {
       }
     },
   };
+  captures.set(storage, {
+    client,
+    commands: Object.freeze({ instanceId: randomUUID(), bucket: Bucket }),
+  });
+  return storage;
 }

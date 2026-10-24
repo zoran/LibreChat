@@ -2,6 +2,7 @@
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import type { AppMaintenance } from '../../app/maintenance';
+import { NOT_OWNED_STORAGE_PROVIDERS } from '../../storage/providerObservation';
 import { createWorkloadMaintenance } from '../../app/maintenance';
 import { createMaintenanceIdentity } from '../../app/identity';
 import { startSecurityService } from './service';
@@ -78,6 +79,7 @@ async function main() {
       identity,
       workOwners: { scanner: service.maintenance },
       fileDomainOwners: ['scanner'],
+      readStorageProviders: () => NOT_OWNED_STORAGE_PROVIDERS,
       startupReady: () => !closing,
     });
     await maintenance.listen();

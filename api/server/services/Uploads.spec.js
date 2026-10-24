@@ -96,9 +96,17 @@ describe('Upload startup admission at the actual composition', () => {
       start: jest.fn(),
       close: jest.fn(async () => ({ complete: true })),
     };
+    const platform = {
+      resources: {},
+      snapshots: {},
+      hardGuards() {},
+      readStorageBackend: jest.fn(() => undefined),
+    };
     const api = new Proxy(
       {
         createUploadWorkers: () => workers,
+        createManagedS3Storage: jest.fn(() => ({})),
+        getManagedS3Provider: jest.fn(() => ({ state: 'unavailable' })),
         createUploadHttpRouter: jest.fn(() => ({})),
         UploadManagementError,
         composeManagedFileMaintenance: () => maintenance,
@@ -162,7 +170,7 @@ describe('Upload startup admission at the actual composition', () => {
         createUploadTicketIssuer: () => ({}),
       },
       './UploadPlatform': {
-        createUploadPlatform: async () => ({ resources: {}, snapshots: {}, hardGuards() {} }),
+        createUploadPlatform: async () => platform,
       },
     };
     const module = { exports: {} };
@@ -185,6 +193,7 @@ describe('Upload startup admission at the actual composition', () => {
       api,
       files,
       workers,
+      platform,
       intake,
       settleIntake: () => finishIntake(intake),
       identity: {
@@ -197,6 +206,7 @@ describe('Upload startup admission at the actual composition', () => {
 
   it('keeps an uninitialized owner unknown and proves disabled absence only through acquisition', async () => {
     const f = fixture(false);
+    expect(f.uploadMaintenance.readStorageProvider()).toEqual({ state: 'uninitialized' });
     expect(f.uploadMaintenance.pauseAdmissions('startup')).toBe(true);
     expect(await f.uploadMaintenance.getMaintenanceCensus('startup')).toMatchObject({
       admissionClosed: true,
@@ -204,6 +214,8 @@ describe('Upload startup admission at the actual composition', () => {
     });
     expect(f.uploadMaintenance.resumeAdmissions('startup')).toBe(false);
     await f.initializeUploads({});
+    expect(f.uploadMaintenance.readStorageProvider()).toEqual({ state: 'disabled' });
+    expect(f.api.getManagedS3Provider).not.toHaveBeenCalled();
     expect(await f.uploadMaintenance.getMaintenanceCensus('startup')).toMatchObject({
       admissionClosed: true,
       complete: true,
@@ -211,6 +223,26 @@ describe('Upload startup admission at the actual composition', () => {
     expect(f.files.mkdir).not.toHaveBeenCalled();
     expect(f.api.startIntakeControlService).not.toHaveBeenCalled();
     expect(f.uploadMaintenance.resumeAdmissions('startup')).toBe(true);
+  });
+
+  it('keeps partial acquisition and closing unqualified without adopting a missing web backend', async () => {
+    const f = fixture();
+    const opening = f.initializeUploads({ identity: f.identity });
+    expect(f.uploadMaintenance.readStorageProvider()).toEqual({ state: 'unavailable' });
+    expect(f.api.getManagedS3Provider).not.toHaveBeenCalled();
+    const runtime = await opening;
+    expect(f.uploadMaintenance.readStorageProvider()).toEqual({ state: 'unavailable' });
+    expect(f.api.getManagedS3Provider).toHaveBeenLastCalledWith(
+      f.api.createManagedS3Storage.mock.results[0].value,
+      undefined,
+    );
+    expect(f.platform.readStorageBackend).toHaveBeenCalledTimes(1);
+    const reads = f.api.getManagedS3Provider.mock.calls.length;
+    const closing = runtime.close(new AbortController().signal);
+    expect(f.uploadMaintenance.readStorageProvider()).toEqual({ state: 'unavailable' });
+    expect(f.api.getManagedS3Provider).toHaveBeenCalledTimes(reads);
+    await closing;
+    expect(f.uploadMaintenance.readStorageProvider()).toEqual({ state: 'unavailable' });
   });
 
   it('preserves original startup failure through rejected composition cleanup', async () => {
@@ -223,6 +255,7 @@ describe('Upload startup admission at the actual composition', () => {
     );
     expect(f.workers.close).toHaveBeenCalledTimes(1);
     expect(f.api.startIntakeControlService).not.toHaveBeenCalled();
+    expect(f.uploadMaintenance.readStorageProvider()).toEqual({ state: 'unavailable' });
     expect(await f.uploadMaintenance.getMaintenanceCensus('startup')).toMatchObject({
       complete: false,
     });
@@ -640,11 +673,12 @@ describe('Cortex upload adapter trust boundaries', () => {
       AWS_SECRET_ACCESS_KEY: 'fixture-secret',
     };
     Object.assign(process.env, valid);
+    const client = { fixture: true, destroy: jest.fn() };
     const createClient = jest
       .spyOn(require('@aws-sdk/client-s3'), 'S3Client')
-      .mockImplementation(() => ({ fixture: true }));
+      .mockImplementation(() => client);
     try {
-      expect(managedStorageClient()).toEqual({ fixture: true });
+      expect(managedStorageClient()).toBe(client);
       expect(createClient).toHaveBeenCalledWith({
         region: valid.AWS_REGION,
         endpoint: 'https://object-s3.example.test:8333/',

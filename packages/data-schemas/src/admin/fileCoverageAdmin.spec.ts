@@ -9,9 +9,16 @@ import type {
   FileCoverageAction,
   FileCoverageRun,
   FileCoverageResult,
+  FileHistoryMongoInput,
+  FileHistoryStorageRequest,
 } from 'librechat-data-provider';
+import {
+  createFileHistoryStorageFixture,
+  assertFileHistoryResult,
+} from '../methods/__fixtures__/fileHistoryStorage';
 import { inspectFileHousekeepingInventory } from '../methods/fileHousekeepingCoverage';
 import { fileCoverageDigest } from '../methods/fileHousekeepingCoverageContract';
+import { initialFileRetentionActivity } from '../methods/fileActivityTransition';
 import { createHousekeepingStore } from '../methods/housekeepingStore';
 import { createUploadStore } from '../methods/uploadManagementStore';
 import { runFileCoverageAdmin } from './fileCoverageAdmin';
@@ -38,6 +45,7 @@ describe('fixed File coverage admin', () => {
   let mongo: MongoMemoryReplSet;
   let store: ReturnType<typeof createUploadStore>;
   let run: FileCoverageRun;
+  let history: ReturnType<typeof createFileHistoryStorageFixture>;
   let originalEnv: NodeJS.ProcessEnv;
   const file = createFileModel(mongoose);
   const jobs = createHousekeepingStore(mongoose);
@@ -56,6 +64,7 @@ describe('fixed File coverage admin', () => {
       store.Counter.deleteMany({}),
       jobs.model.deleteMany({}),
       file.deleteMany({}),
+      store.Operation.deleteMany({}),
     ]);
     await store.initialize();
     const counter = await store.Counter.findById('global').lean();
@@ -79,9 +88,10 @@ describe('fixed File coverage admin', () => {
         mongoReplicaSet: 'testset',
         mongoDatabase: 'test',
         writerCohortSha256: 'e'.repeat(64),
-        oldTimerDrainSha256: 'f'.repeat(64),
+        oldApplicationCessationSha256: 'f'.repeat(64),
       },
     };
+    history = createFileHistoryStorageFixture(() => run);
   });
   afterEach(() => jest.restoreAllMocks());
   afterAll(async () => {
@@ -89,6 +99,30 @@ describe('fixed File coverage admin', () => {
     await mongo?.stop();
     process.env = originalEnv;
   });
+
+  async function historyResponse(frame: Frame, action: FileCoverageAction) {
+    expect(Object.keys(frame).sort()).toEqual(
+      ['kind', 'seq', 'method', 'runSha256', 'actionSha256', 'payload'].sort(),
+    );
+    expect(frame.runSha256).toBe(fileCoverageDigest(run));
+    expect(frame.actionSha256).toBe(fileCoverageDigest(action));
+    expect(frame.seq).toBeLessThanOrEqual(64);
+    const signal = new AbortController().signal;
+    let payload: unknown;
+    if (frame.method === 'bind') {
+      expect(frame.payload).toEqual({ runSha256: fileCoverageDigest(run) });
+      payload = await history.port.bind(fileCoverageDigest(run), signal);
+    } else if (frame.method === 'ingest')
+      payload = await history.port.ingest(frame.payload as FileHistoryMongoInput, signal);
+    else if (frame.method === 'page')
+      payload = await history.port.page(frame.payload as FileHistoryStorageRequest, signal);
+    else throw new Error('Unexpected fixture history method');
+    const response =
+      JSON.stringify({ kind: 'history-result', seq: frame.seq, method: frame.method, payload }) +
+      '\n';
+    expect(Buffer.byteLength(response)).toBeLessThanOrEqual(66560);
+    return response;
+  }
 
   function invoke(
     action: FileCoverageAction,
@@ -110,6 +144,12 @@ describe('fixed File coverage admin', () => {
               input.write(JSON.stringify({ kind: 'current', seq: frame.seq }) + '\n');
           })();
         }
+        if (frame.kind === 'history')
+          void historyResponse(frame, action)
+            .then((response) => {
+              if (!input.destroyed && !input.writableEnded) input.write(response);
+            })
+            .catch((error: Error) => input.destroy(error));
         done();
       },
     });
@@ -125,11 +165,33 @@ describe('fixed File coverage admin', () => {
       phase: 'closed',
     });
     expect(invocation.frames[invocation.frames.length - 1]).toMatchObject({ kind: 'result' });
-    return invocation.frames[invocation.frames.length - 1]!.result!;
+    const result = invocation.frames[invocation.frames.length - 1]!.result!;
+    assertFileHistoryResult(result);
+    return result;
   }
   async function ready() {
+    const user = new mongoose.Types.ObjectId(),
+      deadline = new Date(Date.now() + 86_400_000);
+    const retained = {
+      user,
+      tenantId: 'tenant-a',
+      file_id: 'retained-admin-file',
+      filename: 'file',
+      filepath: `https://fixture.invalid/retained-test-files/t/tenant-a/files/${user}/admin`,
+      source: 's3',
+      storageKey: `t/tenant-a/files/${user}/admin`,
+      type: 'text/plain',
+      bytes: 1,
+      expiredAt: deadline,
+      retentionRevision: 0,
+      retainedDerivativeBytes: 0,
+      retainedDerivativeReservations: [],
+      retentionActivity: initialFileRetentionActivity(deadline, new Date(0), 'complete'),
+    };
+    history.registerFile(retained);
+    await file.create(retained);
     let result = await action({ action: 'begin', run });
-    for (let n = 0; n < 8 && result.outcome === 'progress' && result.lane !== 'ready'; n++)
+    for (let n = 0; n < 192 && result.outcome === 'progress' && result.lane !== 'ready'; n++)
       result = await action({ action: 'advance', run, expectedCheckpoint: result.checkpoint });
     expect(result).toMatchObject({ outcome: 'progress', lane: 'ready' });
     return result as Extract<FileCoverageResult, { outcome: 'progress' }>;
@@ -331,7 +393,18 @@ describe('fixed File coverage admin', () => {
       run,
       expectedCheckpoint: progress.checkpoint,
     });
-    expect(sealed).toMatchObject({ outcome: 'sealed' });
+    expect(sealed).toMatchObject({
+      outcome: 'sealed',
+      receipt: {
+        version: 1,
+        contract: { ...FILE_HOUSEKEEPING_COVERAGE_CONTRACT, version: 2 },
+        native: { oldApplicationCessationSha256: run.native.oldApplicationCessationSha256 },
+        history: {
+          counts: { file: 1, fileJob: 3, object: 1, indexRecord: 2, physicalReplica: 2 },
+          bytes: { fileOriginal: 1, fileDerivative: 0, physicalAllocated: 32768 },
+        },
+      },
+    });
     const observed = await action({
       action: 'inspect',
       version: 1,
@@ -351,7 +424,7 @@ describe('fixed File coverage admin', () => {
     );
   });
 
-  test.each(['pod', 'source', 'action', 'contract'])(
+  test.each(['pod', 'source', 'action', 'contract', 'legacy-native', 'extra-native'])(
     'rejects changed %s identity before opening Mongo',
     async (change) => {
       const opening = jest.spyOn(mongoose.Mongoose.prototype, 'connect');
@@ -367,7 +440,14 @@ describe('fixed File coverage admin', () => {
           action: 'begin',
           run: { ...run, originalDeadline: new Date(Date.now() + 20_000).toISOString() },
         };
-      if (change === 'contract') (value.run.contract as { version: number }).version = 2;
+      if (change === 'contract') (value.run.contract as { version: number }).version = 1;
+      if (change === 'legacy-native' || change === 'extra-native') {
+        const native = value.run.native as unknown as Record<string, unknown>;
+        native.oldTimerDrainSha256 = native.oldApplicationCessationSha256;
+        if (change === 'legacy-native') delete native.oldApplicationCessationSha256;
+      }
+      // Keep the opening and action identical: the current contract must reject the data itself.
+      if (['contract', 'legacy-native', 'extra-native'].includes(change)) run = value.run;
       try {
         const invocation = invoke(value);
         expect(await invocation.result).toBe(1);
@@ -575,7 +655,7 @@ describe('fixed File coverage admin', () => {
     for (const bytes of [
       Buffer.from([0xff, 10]),
       Buffer.from('null\n'),
-      Buffer.alloc(16_386, 120),
+      Buffer.alloc(66_561, 120),
     ]) {
       const input = new PassThrough(),
         output = new PassThrough();
@@ -614,6 +694,16 @@ describe('fixed File coverage admin', () => {
           frames.push(frame);
           if (frame.kind === 'assert')
             child.stdin.write(JSON.stringify({ kind: 'current', seq: frame.seq }) + '\n');
+          if (frame.kind === 'history')
+            void historyResponse(frame, { action: 'begin', run })
+              .then((response) => {
+                if (!child.stdin.destroyed && !child.stdin.writableEnded)
+                  child.stdin.write(response);
+              })
+              .catch((error: Error) => {
+                errors += error.message;
+                child.stdin.end();
+              });
         }
       });
       child.stderr.on('data', (bytes) => {

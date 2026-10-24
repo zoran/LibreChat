@@ -1,8 +1,17 @@
+import { randomUUID } from 'node:crypto';
 import { S3Client } from '@aws-sdk/client-s3';
 import { logger } from '@librechat/data-schemas';
+import type { S3ClientCapture } from '../storage/providerObservation';
+import { copyS3ClientCapture } from '../storage/providerObservation';
 import { isEnabled } from '~/utils/common';
 
 let s3: S3Client | null = null;
+let capture: S3ClientCapture | undefined;
+let acquisitionAttempted = false;
+/** Null means acquisition has not begun; failed or closed actual custody is unavailable. */
+export function getS3ClientCapture(): S3ClientCapture | null | undefined {
+  return s3 || acquisitionAttempted ? capture : null;
+}
 
 /**
  * Initializes and returns an instance of the AWS S3 client.
@@ -19,6 +28,7 @@ export const initializeS3 = (): S3Client | null => {
     return s3;
   }
 
+  acquisitionAttempted = true;
   const region = process.env.AWS_REGION;
   if (!region) {
     logger.error('[initializeS3] AWS_REGION is not set. Cannot initialize S3.');
@@ -56,5 +66,16 @@ export const initializeS3 = (): S3Client | null => {
     logger.info('[initializeS3] S3 initialized using default credentials (IRSA).');
   }
 
+  capture = copyS3ClientCapture({
+    instanceId: randomUUID(),
+    region,
+    endpoint: config.endpoint ?? null,
+    forcePathStyle: config.forcePathStyle === true,
+  });
+  const destroy = s3.destroy.bind(s3);
+  s3.destroy = () => {
+    capture = undefined;
+    destroy();
+  };
   return s3;
 };

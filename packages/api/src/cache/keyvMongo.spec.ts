@@ -1,3 +1,4 @@
+import { NOT_OWNED_STORAGE_PROVIDERS } from '../storage/providerObservation';
 /** Real Keyv/Auth/legacy consumers retain Mongo originals across pause and normalized failure. */
 import fs from 'node:fs';
 import vm from 'node:vm';
@@ -597,6 +598,7 @@ test('actual App partial cancellation cannot admit a new Auth root into the reta
   expect(await f.auth.getMaintenanceCensus(null)).toMatchObject({ complete: true });
   let generationClosed = false;
   const app = createAppMaintenance({
+    readStorageProviders: () => NOT_OWNED_STORAGE_PROVIDERS,
     env: {
       LIBRECHAT_MAINTENANCE_TOKEN: 'a'.repeat(32),
       POD_UID: '12345678-1234-1234-1234-123456789012',

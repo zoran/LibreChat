@@ -1650,3 +1650,59 @@ describe('S3 CRUD', () => {
     });
   });
 });
+
+describe('ordinary provider construction and command capture', () => {
+  it('keeps the module bucket distinct from later SDK configuration and preserves dynamic key region', async () => {
+    const previous = { ...process.env };
+    try {
+      await jest.isolateModulesAsync(async () => {
+        delete process.env.AWS_REGION;
+        delete process.env.AWS_ENDPOINT_URL;
+        process.env.AWS_BUCKET_NAME = 'captured-command-bucket';
+        process.env.AWS_ACCESS_KEY_ID = 'fixture-key';
+        process.env.AWS_SECRET_ACCESS_KEY = 'fixture-secret';
+        process.env.AWS_FORCE_PATH_STYLE = ' TrUe ';
+        const { getOrdinaryS3Provider, getS3Key } = await import('../crud');
+        const { initializeS3, getS3ClientCapture } = await import('~/cdn/s3');
+        expect(getOrdinaryS3Provider()).toEqual({ state: 'uninitialized' });
+        expect(getS3ClientCapture()).toBeNull();
+        process.env.AWS_REGION = 'eu-central-1';
+        process.env.AWS_BUCKET_NAME = 'later-client-bucket';
+        process.env.AWS_ENDPOINT_URL = 'https://later.example.test';
+        process.env.AWS_FORCE_PATH_STYLE = 'false';
+        const client = initializeS3()!;
+        try {
+          const captured = getOrdinaryS3Provider();
+          expect(captured).toMatchObject({
+            state: 'captured',
+            client: {
+              region: 'eu-central-1',
+              endpoint: 'https://later.example.test',
+              forcePathStyle: false,
+            },
+            commands: { bucket: 'captured-command-bucket', endpoint: null, forcePathStyle: true },
+          });
+          if (captured.state !== 'captured') throw new Error('Missing actual ordinary capture');
+          expect(captured.commands).not.toHaveProperty('region');
+          expect(Object.isFrozen(captured.commands)).toBe(true);
+          const input = {
+            basePath: 'files',
+            userId: 'user',
+            fileName: 'file',
+            includeRegionInPath: true,
+          };
+          expect(getS3Key(input)).toBe('r/eu-central-1/files/user/file');
+          process.env.AWS_REGION = 'us-west-2';
+          expect(getS3Key(input)).toBe('r/us-west-2/files/user/file');
+          expect(getOrdinaryS3Provider()).toEqual(captured);
+          client.destroy();
+          expect(getOrdinaryS3Provider()).toEqual({ state: 'unavailable' });
+        } finally {
+          client.destroy();
+        }
+      });
+    } finally {
+      process.env = previous;
+    }
+  });
+});

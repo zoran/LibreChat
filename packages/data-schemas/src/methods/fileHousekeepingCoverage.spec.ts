@@ -8,6 +8,7 @@ import type {
   FileCoverageRun,
   FileCoverageAction,
   FileCoverageResult,
+  FileCoveragePopulation,
 } from 'librechat-data-provider';
 import type { FileInventoryRequest } from 'librechat-data-provider';
 import type {
@@ -21,6 +22,10 @@ import {
   createFileHousekeepingCoverageMethods,
   inspectFileHousekeepingInventory,
 } from './fileHousekeepingCoverage';
+import {
+  createFileHistoryStorageFixture,
+  assertFileHistoryResult,
+} from './__fixtures__/fileHistoryStorage';
 import { createFileHousekeepingDiscoveryMethods } from './fileHousekeepingDiscovery';
 import { fileCoverageDigest } from './fileHousekeepingCoverageContract';
 import { initialFileRetentionActivity } from './fileActivityTransition';
@@ -48,6 +53,8 @@ describe('File coverage existing-owner census', () => {
   let request: FileCoverageRun;
   let guard: (hold: FileCoverageNativeHold) => Promise<void>;
   let held = false;
+  let history: ReturnType<typeof createFileHistoryStorageFixture>;
+  let retainedDeadline: Date;
   const signal = new AbortController().signal;
   const worker = {
     podUid: 'pod-a',
@@ -61,6 +68,7 @@ describe('File coverage existing-owner census', () => {
       const hold = {
         binding: request.native,
         source: request.source,
+        history: history.port,
         assertCurrent: async () => guard(hold),
       };
       try {
@@ -70,20 +78,26 @@ describe('File coverage existing-owner census', () => {
       }
     },
   };
-  function fixture(n: number, deadline = new Date(1000)) {
-    return {
+  function fixture(n: number, deadline = retainedDeadline) {
+    const value = {
       _id: new mongoose.Types.ObjectId(n.toString(16).padStart(24, '0')),
       user,
       tenantId: 'tenant-a',
       file_id: `file-${n}`,
       filename: 'file',
-      filepath: '/private/file',
+      filepath: `https://fixture.invalid/retained-test-files/t/tenant-a/files/${user}/file-${n}`,
+      source: 's3',
+      storageKey: `t/tenant-a/files/${user}/file-${n}`,
+      retainedDerivativeBytes: 0,
+      retainedDerivativeReservations: [],
       type: 'text/plain',
       bytes: 1,
       expiredAt: deadline,
       retentionRevision: 0,
       retentionActivity: initialFileRetentionActivity(deadline, new Date(0), 'complete'),
     };
+    history.registerFile(value);
+    return value;
   }
   async function transaction<T>(work: (session: mongoose.ClientSession) => Promise<T>) {
     const session = await mongoose.startSession();
@@ -93,22 +107,73 @@ describe('File coverage existing-owner census', () => {
       await session.endSession();
     }
   }
-  async function ready(): Promise<Extract<FileCoverageResult, { outcome: 'progress' }>> {
+  async function advanceUntil(lane = 'ready'): Promise<FileCoverageResult> {
     let result = await coverage.execute({ action: 'begin', run: request }, signal);
-    for (let n = 0; n < 20 && result.outcome === 'progress' && result.lane !== 'ready'; n++)
+    // One preparation/source row or one bounded storage page per call, under the same deadline.
+    assertFileHistoryResult(result);
+    for (let n = 0; n < 512 && result.outcome === 'progress' && result.lane !== lane; n++) {
       result = await coverage.execute(
         { action: 'advance', run: request, expectedCheckpoint: result.checkpoint },
         signal,
       );
+      assertFileHistoryResult(result);
+    }
+    return result;
+  }
+  async function ready(): Promise<Extract<FileCoverageResult, { outcome: 'progress' }>> {
+    const result = await advanceUntil();
     expect(result).toMatchObject({ outcome: 'progress', lane: 'ready' });
     return result as Extract<FileCoverageResult, { outcome: 'progress' }>;
   }
+  async function incomplete() {
+    const result = await advanceUntil();
+    expect(result).toMatchObject({ outcome: 'incomplete' });
+    const value = (await upload.Counter.findById('global').lean())!.value as {
+      migration: { population: FileCoveragePopulation };
+    };
+    return {
+      ...(result as Extract<FileCoverageResult, { outcome: 'incomplete' }>),
+      population: value.migration.population,
+    };
+  }
   async function seal() {
     const progress = await ready();
-    return coverage.execute(
+    const result = await coverage.execute(
       { action: 'verify-seal', run: request, expectedCheckpoint: progress.checkpoint },
       signal,
     );
+    assertFileHistoryResult(result);
+    return result;
+  }
+  function expectFreshRound(round: number, originalRun: string) {
+    expect(fileCoverageDigest(request)).toBe(originalRun);
+    const current = history.calls.filter((call) => call.round === round);
+    expect(
+      current
+        .filter((call) => call.method === 'ingest' && call.eof)
+        .map((call) => (call.scope?.kind === 'mongo' ? call.scope.collection : null)),
+    ).toEqual(['files', 'file-jobs', 'uploads']);
+    const families = [
+      'bucket-catalog',
+      'current-objects',
+      'versions',
+      'delete-markers',
+      'multipart-uploads',
+      'multipart-parts',
+      'filer-entries',
+      'manifest-edges',
+      'physical-catalog',
+      'volume-index',
+      'volume-data',
+      'physical-file',
+    ];
+    for (const lane of ['storage', 'join', 'verify-storage']) {
+      const visited = current.filter((call) => call.method === 'page' && call.lane === lane);
+      expect([...new Set(visited.filter((call) => call.eof).map((call) => call.stream))]).toEqual(
+        families,
+      );
+      expect(visited.some((call) => (call.entries ?? 0) > 0)).toBe(true);
+    }
   }
   beforeAll(async () => {
     mongo = await MongoMemoryReplSet.create({
@@ -158,9 +223,11 @@ describe('File coverage existing-owner census', () => {
         mongoReplicaSet: 'testset',
         mongoDatabase: 'test',
         writerCohortSha256: 'e'.repeat(64),
-        oldTimerDrainSha256: 'f'.repeat(64),
+        oldApplicationCessationSha256: 'f'.repeat(64),
       },
     };
+    history = createFileHistoryStorageFixture(() => request);
+    retainedDeadline = new Date(Date.now() + 86_400_000);
     coverage = createFileHousekeepingCoverageMethods(upload, nativeFixture);
   });
   afterAll(async () => {
@@ -177,6 +244,60 @@ describe('File coverage existing-owner census', () => {
       runSha256: fileCoverageDigest(request),
     };
   }
+
+  test.each(['historical-v1', 'relabeled-v1'] as const)(
+    'controlled cessation: %s receipts stay historical and cannot establish current coverage',
+    async (mode) => {
+      const sealed = await seal();
+      if (sealed.outcome !== 'sealed') throw new Error('fixture did not seal');
+      const { oldApplicationCessationSha256, ...native } = request.native;
+      const historicalRun = {
+        ...request,
+        contract: {
+          ...request.contract,
+          version: mode === 'historical-v1' ? 1 : 2,
+        },
+        native: { ...native, oldTimerDrainSha256: oldApplicationCessationSha256 },
+      };
+      const runSha256 = fileCoverageDigest(historicalRun);
+      const { receiptSha256: _hash, ...body } = {
+        ...sealed.receipt,
+        contract: historicalRun.contract,
+        native: historicalRun.native,
+        runSha256,
+      };
+      await upload.Counter.updateOne(
+        { _id: 'global' },
+        {
+          $set: {
+            'value.fileHousekeepingCoverage.runSha256': runSha256,
+            'value.fileHousekeepingCoverage.receipt': {
+              ...body,
+              receiptSha256: fileCoverageDigest(body),
+            },
+          },
+        },
+      );
+      const historical = await upload.Counter.findById('global').lean();
+      expect(await coverage.execute({ ...inspection(), runSha256 }, signal)).toMatchObject({
+        outcome: 'observed',
+        phase: 'sealed',
+        receipt: null,
+      });
+      const snapshot = await mongoose.startSession({ snapshot: true, causalConsistency: false });
+      try {
+        const discovery = createFileHousekeepingDiscoveryMethods(mongoose);
+        expect(await discovery.coverage('file.cleanup', signal, snapshot)).toEqual({
+          expected: null,
+          observed: 1,
+          recoveryHistory: 'unknown',
+        });
+      } finally {
+        await snapshot.endSession();
+      }
+      expect(await upload.Counter.findById('global').lean()).toEqual(historical);
+    },
+  );
 
   test('cutover inspect: actual catalog preserves TTL visibility and observes exact index absence without mutations', async () => {
     const sealed = await seal();
@@ -419,7 +540,8 @@ describe('File coverage existing-owner census', () => {
         outcome: 'refused',
         code: 'unclassified',
       });
-      const progress = await ready();
+      const progress = await incomplete();
+      expect(progress.history.blockers.unclassified).toBeGreaterThan(0);
       expect(progress.population).toMatchObject({
         filesSeen: rows.length,
         excludedFiles: 0,
@@ -430,7 +552,7 @@ describe('File coverage existing-owner census', () => {
           { action: 'verify-seal', run: request, expectedCheckpoint: progress.checkpoint },
           signal,
         ),
-      ).toEqual({ outcome: 'refused', code: 'unclassified' });
+      ).toEqual({ outcome: 'refused', code: 'checkpoint_conflict' });
       expect(await File.collection.find({}).sort({ _id: 1 }).toArray()).toEqual(rows);
       expect(commands).not.toContain('dropIndexes');
       expect(commands).not.toContain('collMod');
@@ -660,17 +782,20 @@ describe('File coverage existing-owner census', () => {
     const client = mongoose.connection.getClient(),
       start = client.startSession.bind(client);
     let originalSession: mongoose.ClientSession | undefined;
-    jest.spyOn(client, 'startSession').mockImplementationOnce((...args) => {
-      const session = start(...args);
-      originalSession = session;
-      const close = session.endSession.bind(session);
-      session.endSession = async (...options) => {
-        closing.release();
-        await releaseClose.promise;
-        await close(...options);
-      };
-      return session;
-    });
+    jest
+      .spyOn(client, 'startSession')
+      .mockImplementationOnce((...args) => start(...args))
+      .mockImplementationOnce((...args) => {
+        const session = start(...args);
+        originalSession = session;
+        const close = session.endSession.bind(session);
+        session.endSession = async (...options) => {
+          closing.release();
+          await releaseClose.promise;
+          await close(...options);
+        };
+        return session;
+      });
     const detached: FileCoverageNativeProducer = {
       async withCurrentQuiescence<T>(
         _action: FileCoverageAction,
@@ -680,6 +805,7 @@ describe('File coverage existing-owner census', () => {
         void callback({
           binding: request.native,
           source: request.source,
+          history: history.port,
           assertCurrent: async () => undefined,
         }).catch(() => undefined);
         await closing.promise;
@@ -743,7 +869,7 @@ describe('File coverage existing-owner census', () => {
         ?.retentionRevocationId,
     ).toBe(revocationId);
     expect((await upload.Counter.findById('global').lean())!.value).toMatchObject({
-      migration: { checkpoint: 0, cursor: null },
+      migration: { checkpoint: 0, preparingFiles: true, history: { active: { cursor: null } } },
       fileHousekeepingCoverage: { phase: 'preparing' },
     });
   });
@@ -802,21 +928,30 @@ describe('File coverage existing-owner census', () => {
     expect(await upload.Counter.findById('global').lean()).toEqual(before);
   });
 
-  it('censuses standalone Files in32-row indexed pages without an UploadOperation population', async () => {
+  it('censuses every standalone File in bounded indexed pages without an UploadOperation population', async () => {
     await File.insertMany(Array.from({ length: 33 }, (_, n) => fixture(n + 1)));
     expect(await upload.Operation.countDocuments()).toBe(0);
     const first = await coverage.execute({ action: 'begin', run: request }, signal);
-    expect(first).toMatchObject({ outcome: 'progress', checkpoint: 0 });
+    expect(first).toMatchObject({
+      outcome: 'progress',
+      checkpoint: 0,
+      history: { checkpoint: 0, lane: 'uploads', lastPage: null },
+    });
+    assertFileHistoryResult(first);
     const page = await coverage.execute(
       { action: 'advance', run: request, expectedCheckpoint: 0 },
       signal,
     );
     expect(page).toMatchObject({
       outcome: 'progress',
-      lane: 'files',
-      population: { filesSeen: 32, retainedFiles: 32 },
+      lane: 'uploads',
+      checkpoint: 1,
+      history: { checkpoint: 1, lastPage: { checkpointBefore: 0, checkpointAfter: 1 } },
+      population: { filesSeen: 0, retainedFiles: 0 },
     });
-    expect(await jobs.model.countDocuments()).toBe(96);
+    assertFileHistoryResult(page);
+    expect(await jobs.model.countDocuments()).toBe(3);
+    expect(history.calls.filter((call) => call.method === 'ingest')).toHaveLength(0);
     const result = await seal();
     expect(result).toMatchObject({
       outcome: 'sealed',
@@ -824,7 +959,79 @@ describe('File coverage existing-owner census', () => {
         population: { filesSeen: 33, fileJobsSeen: 99, unclassifiedFiles: 0, unclassifiedJobs: 0 },
       },
     });
+    expect(
+      history.calls.filter((call) => call.method === 'ingest' && call.entries === 1),
+    ).toHaveLength(132);
+    expect(
+      history.calls.filter((call) => call.method === 'ingest' && call.entries === 0),
+    ).toHaveLength(3);
+    for (const lane of ['storage', 'join', 'verify-storage'])
+      expect(
+        history.calls.some(
+          (call) => call.method === 'page' && call.lane === lane && call.entries! > 0,
+        ),
+      ).toBe(true);
+    expect(
+      (result as Extract<FileCoverageResult, { outcome: 'sealed' }>).receipt.history,
+    ).toMatchObject({
+      counts: { file: 33, fileJob: 99, object: 33, indexRecord: 66, physicalReplica: 2 },
+      bytes: { fileOriginal: 33, fileDerivative: 0, physicalAllocated: 32768 },
+    });
     expect(held).toBe(false);
+  });
+
+  it('cannot seal from a current provider hash without qualified historical provider authority', async () => {
+    history = createFileHistoryStorageFixture(() => request, { providerQualified: false });
+    await File.create(fixture(1));
+    const result = await incomplete();
+    expect(result.history.blockers.unsupportedSource).toBe(1);
+    expect(result.history.bytes.physicalAllocated).toBe(32768);
+    expect(history.calls.some((call) => call.method === 'page' && call.lane === 'join')).toBe(
+      false,
+    );
+    expect(
+      await coverage.execute(
+        { action: 'verify-seal', run: request, expectedCheckpoint: result.checkpoint },
+        signal,
+      ),
+    ).toEqual({
+      outcome: 'refused',
+      code: 'checkpoint_conflict',
+    });
+    expect((await upload.Counter.findById('global').lean())!.value).toHaveProperty(
+      'fileHousekeepingCoverage.phase',
+      'preparing',
+    );
+  });
+
+  it('keeps unrecognized format extents charged and incomplete through the actual Mongo owner', async () => {
+    history = createFileHistoryStorageFixture(() => request, { recognizedFormat: false });
+    await File.create(fixture(1));
+    const result = await incomplete();
+    expect(result.history).toMatchObject({
+      counts: { file: 1, fileJob: 3, physicalOverhead: 2 },
+      bytes: {
+        physicalLive: 48,
+        physicalOverhead: 48,
+        physicalFileBytes: 96,
+        physicalAllocated: 32768,
+      },
+    });
+    expect(result.history.blockers.unclassified).toBeGreaterThan(0);
+    expect(result.history.blockers.accountingMismatch).toBe(0);
+    expect(
+      await coverage.execute(
+        { action: 'verify-seal', run: request, expectedCheckpoint: result.checkpoint },
+        signal,
+      ),
+    ).toEqual({
+      outcome: 'refused',
+      code: 'checkpoint_conflict',
+    });
+    expect((await upload.Counter.findById('global').lean())!.value).toHaveProperty(
+      'fileHousekeepingCoverage.phase',
+      'preparing',
+    );
   });
 
   it('does not certify generic legacy policies, unknown retries, frozen Files or orphan obligations', async () => {
@@ -854,7 +1061,8 @@ describe('File coverage existing-owner census', () => {
       ),
     );
     const before = await File.collection.find({}).toArray();
-    const progress = await ready();
+    const progress = await incomplete();
+    expect(progress.history.blockers.unclassified).toBeGreaterThan(0);
     expect(progress.population).toMatchObject({
       filesSeen: 4,
       unclassifiedFiles: 4,
@@ -866,7 +1074,7 @@ describe('File coverage existing-owner census', () => {
         { action: 'verify-seal', run: request, expectedCheckpoint: progress.checkpoint },
         signal,
       ),
-    ).toEqual({ outcome: 'refused', code: 'unclassified' });
+    ).toEqual({ outcome: 'refused', code: 'checkpoint_conflict' });
     expect(await File.collection.find({}).toArray()).toEqual(before);
   });
 
@@ -883,13 +1091,14 @@ describe('File coverage existing-owner census', () => {
     await File.collection.insertOne(orphan);
     const before = await File.collection.findOne({ _id: orphan._id });
     expect(await upload.Operation.countDocuments()).toBe(0);
-    const progress = await ready();
+    const progress = await incomplete();
     expect(
       await coverage.execute(
         { action: 'verify-seal', run: request, expectedCheckpoint: progress.checkpoint },
         signal,
       ),
-    ).toEqual({ outcome: 'refused', code: 'unclassified' });
+    ).toEqual({ outcome: 'refused', code: 'checkpoint_conflict' });
+    expect(progress.history.blockers.unclassified).toBeGreaterThan(0);
     expect(progress.population).toMatchObject({
       filesSeen: 1,
       retainedFiles: 0,
@@ -932,7 +1141,7 @@ describe('File coverage existing-owner census', () => {
     expect((await jobs.model.findById(row!._id).lean())!.retryNotBefore).toEqual(later);
   });
 
-  // A complete census must reject runnable legacy schedules earlier than their retained authority.
+  // Source drift is observed during bounded verification, before the short sealed commit.
   it.each([
     ['queued', 'due'],
     ['waiting', 'due'],
@@ -943,34 +1152,103 @@ describe('File coverage existing-owner census', () => {
     async (state, bound) => {
       const floor = new Date(Date.now() + 3600000);
       await File.create({
-        ...fixture(1, bound === 'due' ? floor : new Date(1000)),
+        ...fixture(1, bound === 'due' ? floor : new Date(floor.getTime() - 1000)),
         ...(bound === 'retry' ? { deletionRetryAt: floor } : {}),
       });
-      const progress = await ready();
+      const originalRun = fileCoverageDigest(request);
+      const initial = await advanceUntil('verify-uploads');
+      expect(initial).toMatchObject({ outcome: 'progress', lane: 'verify-uploads' });
       const row = (await jobs.model.findOne({ handler: 'file.cleanup' }).lean())!;
       const collection = jobs.model
         .collection as unknown as mongoose.mongo.Collection<HousekeepingJobRecord>;
       await collection.updateOne({ _id: row._id }, { $set: { state, nextAttemptAt: new Date(0) } });
       const before = await jobs.model.find({}).sort({ _id: 1 }).lean();
-      const action = {
-        action: 'verify-seal' as const,
-        run: request,
-        expectedCheckpoint: progress.checkpoint,
-      };
-      expect(await coverage.execute(action, signal)).toEqual({
-        outcome: 'refused',
-        code: 'unclassified',
-      });
+      expect(await advanceUntil()).toEqual({ outcome: 'refused', code: 'source_changed' });
       expect(await jobs.model.find({}).sort({ _id: 1 }).lean()).toEqual(before);
+      const invalid = (await jobs.model.findById(row._id).lean())!;
       await collection.updateOne({ _id: row._id }, { $set: { nextAttemptAt: floor } });
-      expect(await coverage.execute(action, signal)).toMatchObject({ outcome: 'sealed' });
+      const restored = (await jobs.model.findById(row._id).lean())!;
+      history.settleJobRepair(invalid, restored);
+      const progress = await ready();
+      expect(progress.history.round).toBe(1);
+      expect(progress.history.lastPage).not.toBeNull();
+      expectFreshRound(1, originalRun);
+      expect(progress.checkpoint).toBeGreaterThan(
+        (initial as Extract<FileCoverageResult, { outcome: 'progress' }>).checkpoint,
+      );
+      expect(
+        await coverage.execute(
+          { action: 'verify-seal', run: request, expectedCheckpoint: progress.checkpoint },
+          signal,
+        ),
+      ).toMatchObject({ outcome: 'sealed' });
+      expect((await jobs.model.findById(row._id).lean())!.nextAttemptAt).toEqual(floor);
     },
   );
 
-  it('fences an unstarted claim but never reconstructs an attempted missing retry floor', async () => {
+  it('refuses post-ready source mutation after the actual hold is revoked and requires a fresh round', async () => {
     await File.create(fixture(1));
+    const originalRun = fileCoverageDigest(request);
+    const old = await ready();
+    const row = (await jobs.model.findOne({ handler: 'file.cleanup' }).lean())!;
+    const collection = jobs.model
+      .collection as unknown as mongoose.mongo.Collection<HousekeepingJobRecord>;
+    guard = async () => {
+      throw new Error('fixture original exclusive hold revoked');
+    };
+    await collection.updateOne({ _id: row._id }, { $set: { nextAttemptAt: new Date(0) } });
+    const before = await jobs.model.find({}).sort({ _id: 1 }).lean();
+    const stale = {
+      action: 'verify-seal' as const,
+      run: request,
+      expectedCheckpoint: old.checkpoint,
+    };
+    expect(await coverage.execute(stale, signal)).toEqual({
+      outcome: 'refused',
+      code: 'native_changed',
+    });
+    expect(await jobs.model.find({}).sort({ _id: 1 }).lean()).toEqual(before);
+    expect((await upload.Counter.findById('global').lean())!.value).toHaveProperty(
+      'fileHousekeepingCoverage.phase',
+      'preparing',
+    );
+    const invalid = (await jobs.model.findById(row._id).lean())!;
+    await collection.updateOne({ _id: row._id }, { $set: { nextAttemptAt: row.nextAttemptAt } });
+    const restored = (await jobs.model.findById(row._id).lean())!;
+    history.settleJobRepair(invalid, restored);
+    guard = async () => undefined;
+    expect(await coverage.execute(stale, signal)).toEqual({
+      outcome: 'refused',
+      code: 'native_changed',
+    });
+    expect(
+      await coverage.execute(
+        { action: 'advance', run: request, expectedCheckpoint: old.checkpoint },
+        signal,
+      ),
+    ).toMatchObject({ outcome: 'progress' });
+    const fresh = await ready();
+    expect(fresh.history.round).toBe(1);
+    expect(fresh.history.lastPage).not.toBeNull();
+    expectFreshRound(1, originalRun);
+    expect(fresh.checkpoint).toBeGreaterThan(old.checkpoint);
+    expect(
+      await coverage.execute(
+        { action: 'verify-seal', run: request, expectedCheckpoint: fresh.checkpoint },
+        signal,
+      ),
+    ).toMatchObject({ outcome: 'sealed' });
+  });
+
+  it('fences an unstarted claim but never reconstructs an attempted missing retry floor', async () => {
+    await File.create(fixture(1, new Date(1000)));
     await transaction((session) =>
-      projectFileHousekeeping(mongoose, null, fixture(1) as unknown as IMongoFile, session),
+      projectFileHousekeeping(
+        mongoose,
+        null,
+        fixture(1, new Date(1000)) as unknown as IMongoFile,
+        session,
+      ),
     );
     const claimed = (await jobs.claimNext('file.cleanup', worker))!;
     const row = (await jobs.model.findById(claimed.jobId).lean())!;
@@ -1006,9 +1284,14 @@ describe('File coverage existing-owner census', () => {
   });
 
   it('rejects retry import after concurrent claim/arming without replacing the original execution receipt', async () => {
-    await File.create(fixture(1));
+    await File.create(fixture(1, new Date(1000)));
     await transaction((session) =>
-      projectFileHousekeeping(mongoose, null, fixture(1) as unknown as IMongoFile, session),
+      projectFileHousekeeping(
+        mongoose,
+        null,
+        fixture(1, new Date(1000)) as unknown as IMongoFile,
+        session,
+      ),
     );
     const row = (await jobs.model.findOne({ handler: 'file.cleanup' }).lean())!;
     if (row.work.handler !== 'file.cleanup') throw new Error('fixture');

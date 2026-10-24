@@ -64,6 +64,7 @@ test('startup supplies existing owner ports and routes readiness through mainten
   const module = { exports: {} };
   const api = {
     createAppMaintenance: create,
+    getOrdinaryS3Provider: jest.fn(() => ({ state: 'uninitialized' })),
     fileDeletionWorkOwner: { maintenance: {} },
     codeEnvironmentLifecycleMaintenance: lifecycle,
     cacheConfig: { SHARED_STATE: { mode: 'sentinel' }, USE_REDIS: true },
@@ -79,6 +80,7 @@ test('startup supplies existing owner ports and routes readiness through mainten
   );
   module.exports.createWebMaintenance({
     browserMaintenance: {},
+    uploadMaintenance: { readStorageProvider: () => ({ state: 'disabled' }) },
     historyMaintenance: history,
     mongoCacheMaintenance: mongoCache,
     startupMigrationMaintenance: startupMigration,
@@ -89,6 +91,10 @@ test('startup supplies existing owner ports and routes readiness through mainten
   expect(create).toHaveBeenCalledTimes(1);
   const deps = create.mock.calls[0][0];
   expect(deps.startupAdmission).toBe('closed');
+  expect(deps.readStorageProviders()).toEqual({
+    ordinaryS3: { state: 'uninitialized' },
+    managedS3: { state: 'disabled' },
+  });
   expect(deps.workOwners.history).toBe(history);
   expect(deps.workOwners.codeLifecycle).toBe(lifecycle);
   expect(deps.workOwners.mongoCache).toBe(mongoCache.maintenance);

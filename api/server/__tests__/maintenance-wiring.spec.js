@@ -28,7 +28,10 @@ function maintenanceInputs(overrides = {}) {
     agentQueuedTurnMaintenance: facade(),
     skillSyncMaintenance: facade(),
     fileLibraryMaintenance: facade(),
-    uploadMaintenance: facade(),
+    uploadMaintenance: {
+      ...facade(),
+      readStorageProvider: jest.fn(() => ({ state: 'uninitialized' })),
+    },
     databaseBootstrap: facade(),
     legacyAuthMaintenance: facade(),
     historyMaintenance: facade(),
@@ -52,6 +55,7 @@ function loadMaintenance(overrides = {}) {
     fileDeletionWorkOwner: { ...facade(), maintenance: facade() },
     codeEnvironmentLifecycleMaintenance: facade(),
     createAppMaintenance: jest.fn(() => ({ identity: {} })),
+    getOrdinaryS3Provider: jest.fn(() => ({ state: 'uninitialized' })),
     initializeMaintenanceGeneration: jest.fn(),
     createStreamServices: () => ({}),
     isEnabled: () => false,
@@ -137,6 +141,12 @@ test('binds the declared File owners and configures Generation without an App ce
   const result = createWebMaintenance(input);
   expect(api.createAppMaintenance).toHaveBeenCalledTimes(1);
   const deps = api.createAppMaintenance.mock.calls[0][0];
+  expect(deps.readStorageProviders()).toEqual({
+    ordinaryS3: { state: 'uninitialized' },
+    managedS3: { state: 'uninitialized' },
+  });
+  expect(api.getOrdinaryS3Provider).toHaveBeenCalledTimes(1);
+  expect(input.uploadMaintenance.readStorageProvider).toHaveBeenCalledTimes(1);
   for (const method of ['pauseAdmissions', 'resumeAdmissions', 'getMaintenanceCensus']) {
     deps.workOwners.browser[method]('op');
     expect(input.browserMaintenance[method]).toHaveBeenCalledWith('op');

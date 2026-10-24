@@ -1,3 +1,6 @@
+import { createManagedS3Client, getManagedS3ClientCapture } from '../storage/s3/managedClient';
+import { createManagedS3Storage, getManagedS3Provider } from '../storage/s3/managed';
+import { NOT_OWNED_STORAGE_PROVIDERS } from '../storage/providerObservation';
 /** Actual listener/runtime/maintenance composition; controlled owner probes assert lifecycle only. */
 import http from 'node:http';
 import type { DiscoveryPage, HousekeepingRepository } from '@librechat/data-schemas';
@@ -31,6 +34,7 @@ function options(): HousekeepingApplicationDependencies & {
 } {
   return {
     env: { ...env },
+    readStorageProviders: () => NOT_OWNED_STORAGE_PROVIDERS,
     repository: {
       discover: jest.fn<
         ReturnType<HousekeepingRepository['discover']>,
@@ -133,6 +137,7 @@ it('holds before runtime admission and serves one authenticated unfiltered local
     requestId: app.startupHold.requestId,
     revision: 1,
     phase: 'drained',
+    storageProviders: NOT_OWNED_STORAGE_PROVIDERS,
   });
   for (const token of [undefined, 'wrong'])
     expect((await request(3080, '/metrics', token)).status).toBe(401);
@@ -379,14 +384,18 @@ it('keeps actual HTTP observation after SIGTERM reports unresolved resource cust
   }
 });
 
-it.each(['repository', 'fileNotice', 'fileCleanup', 'uploadCleanup', 'close'] as const)(
-  'rejects missing required %s without constructing a fallback owner',
-  (name) => {
-    expect(() =>
-      createHousekeepingApplication({ ...options(), [name]: undefined } as never),
-    ).toThrow('Incomplete Housekeeping owner ports');
-  },
-);
+it.each([
+  'repository',
+  'fileNotice',
+  'fileCleanup',
+  'uploadCleanup',
+  'close',
+  'readStorageProviders',
+] as const)('rejects missing required %s without constructing a fallback owner', (name) => {
+  expect(() => createHousekeepingApplication({ ...options(), [name]: undefined } as never)).toThrow(
+    'Incomplete Housekeeping owner ports',
+  );
+});
 it.each([
   { POD_UID: 'invalid' },
   { BUILD_COMMIT: 'bad' },
@@ -399,4 +408,52 @@ it.each([
   expect(() =>
     createHousekeepingApplication({ ...options(), env: { ...env, ...change } }),
   ).toThrow();
+});
+
+it('observes its independent managed client while the original startup hold remains closed', async () => {
+  const config = {
+    AWS_REGION: 'fixture',
+    AWS_BUCKET_NAME: 'cortex-managed-uploads',
+    AWS_ENDPOINT_URL: 'https://storage.example.test',
+    AWS_FORCE_PATH_STYLE: 'true',
+    AWS_ACCESS_KEY_ID: 'fixture-key',
+    AWS_SECRET_ACCESS_KEY: 'fixture-secret',
+  };
+  const webClient = createManagedS3Client(config);
+  const hkClient = createManagedS3Client(config);
+  const storage = createManagedS3Storage({ client: hkClient, bucket: config.AWS_BUCKET_NAME });
+  const deps = options();
+  deps.readStorageProviders = () => ({
+    ordinaryS3: { state: 'not-owned' },
+    managedS3: getManagedS3Provider(storage, null),
+  });
+  deps.close.mockImplementation(async () => {
+    hkClient.destroy();
+  });
+  const app = make(deps);
+  try {
+    await app.start();
+    const held = await app.maintenance.status();
+    expect(held).toMatchObject({
+      requestId: app.startupHold.requestId,
+      revision: 1,
+      phase: 'drained',
+      storageProviders: {
+        ordinaryS3: { state: 'not-owned' },
+        managedS3: { state: 'captured', backend: null },
+      },
+    });
+    if (held.storageProviders.managedS3.state !== 'captured') throw new Error('Missing HK capture');
+    expect(held.storageProviders.managedS3.client.instanceId).not.toBe(
+      getManagedS3ClientCapture(webClient)?.instanceId,
+    );
+    webClient.destroy();
+    expect((await app.maintenance.status()).storageProviders).toEqual(held.storageProviders);
+    expect(app.runtime.observe().admitting).toBe(false);
+    expect(deps.repository.discover).not.toHaveBeenCalled();
+  } finally {
+    await app.drain();
+    webClient.destroy();
+    hkClient.destroy();
+  }
 });

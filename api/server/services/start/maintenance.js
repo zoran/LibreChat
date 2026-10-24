@@ -1,6 +1,7 @@
 /** Web maintenance composition within startup; existing domain owners retain their work. */
 const {
   createAppMaintenance,
+  getOrdinaryS3Provider,
   initializeMaintenanceGeneration,
   probeMaintenanceRedis,
   probeMaintenanceDatabase,
@@ -141,6 +142,10 @@ function createWebMaintenance({
 }) {
   const maintenance = createAppMaintenance({
     startupAdmission: 'closed',
+    readStorageProviders: () => ({
+      ordinaryS3: getOrdinaryS3Provider(),
+      managedS3: uploadMaintenance.readStorageProvider(),
+    }),
     workOwners: {
       browser: {
         pauseAdmissions: (id) => browserMaintenance.pauseAdmissions(id),

@@ -134,6 +134,10 @@ describe('File library HTTP and native Mongo composition', () => {
     await db.models.File.collection.insertOne(original);
     libraryOwner = createFileLibraryMaintenance();
     maintenance = createAppMaintenance({
+      readStorageProviders: () => ({
+        ordinaryS3: { state: 'not-owned' },
+        managedS3: { state: 'not-owned' },
+      }),
       env: {},
       requiredSharedState: false,
       startupReady: () => true,

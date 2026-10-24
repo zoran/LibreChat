@@ -19,6 +19,7 @@ import type {
 } from 'librechat-data-provider';
 import type { Readable, Writable } from 'node:stream';
 import type { FileCoverageNativeProducer } from '../methods/fileHousekeepingCoverage';
+import type { FileHistoryNativePort } from '../methods/fileHousekeepingHistory';
 import {
   isFileCoverageAction,
   isFileInventoryRequest,
@@ -30,11 +31,12 @@ import {
   createFileHousekeepingCoverageMethods,
   inspectFileHousekeepingInventory,
 } from '../methods/fileHousekeepingCoverage';
+import { boundedHistoryData } from '../methods/fileHousekeepingHistoryContract';
 import { createUploadStore } from '../methods/uploadManagementStore';
 import { createFileModel } from '../models/file';
 
-const LIMIT = 16_384;
-const TOTAL = 262_144;
+const LIMIT = 66_560;
+const TOTAL = 1_048_576;
 const PROCESS_MS = 10_000;
 type CoverageOpening = {
   kind: 'open';
@@ -97,7 +99,7 @@ class Channel {
       this.bytes = Buffer.concat([this.bytes, chunk]);
       let newline: number;
       while ((newline = this.bytes.indexOf(10)) !== -1) {
-        requireValue(newline > 0 && newline <= LIMIT && this.waiting && !this.failure);
+        requireValue(newline > 0 && newline + 1 <= LIMIT && this.waiting && !this.failure);
         const value: unknown = JSON.parse(
           new TextDecoder('utf-8', { fatal: true }).decode(this.bytes.subarray(0, newline)),
         );
@@ -106,7 +108,7 @@ class Channel {
         this.waiting = undefined;
         waiting.resolve(value);
       }
-      requireValue(this.bytes.length <= LIMIT);
+      requireValue(this.bytes.length < LIMIT);
     } catch {
       this.failed();
     }
@@ -120,7 +122,8 @@ class Channel {
   async send(value: unknown): Promise<void> {
     requireValue(!this.failure && !this.abort.signal.aborted);
     const bytes = Buffer.from(JSON.stringify(value) + '\n');
-    requireValue(bytes.length <= LIMIT);
+    this.total += bytes.length;
+    requireValue(bytes.length <= LIMIT && this.total <= TOTAL);
     await new Promise<void>((resolve, reject) => {
       let completed = false;
       let writeError: Error | null | undefined;
@@ -363,12 +366,43 @@ export async function runFileCoverageAdmin(
         const owner = mongoose as unknown as typeof import('mongoose');
         createFileModel(owner);
         const store = createUploadStore(owner, {});
+        const historyCall = async (
+          method: 'bind' | 'ingest' | 'page',
+          payload: unknown,
+          signal: AbortSignal,
+        ): Promise<unknown> => {
+          requireValue(
+            ['begin', 'advance', 'verify-seal'].includes(action.action) &&
+              boundedHistoryData(payload),
+          );
+          await assertCurrent!('owner', signal);
+          requireValue(seq < 64 && !signal.aborted);
+          const waiting = channel.receive();
+          void waiting.catch(ignore);
+          await channel.send({ kind: 'history', seq: ++seq, method, ...correlation, payload });
+          const reply = await waiting;
+          requireValue(
+            shape(reply, ['kind', 'seq', 'method', 'payload']) &&
+              reply.kind === 'history-result' &&
+              reply.seq === seq &&
+              reply.method === method &&
+              boundedHistoryData(reply.payload),
+          );
+          await assertCurrent!('owner', signal);
+          return reply.payload;
+        };
+        const history: FileHistoryNativePort = {
+          bind: (runSha256, signal) => historyCall('bind', { runSha256 }, signal),
+          ingest: (payload, signal) => historyCall('ingest', payload, signal),
+          page: (payload, signal) => historyCall('page', payload, signal),
+        };
         const producer: FileCoverageNativeProducer = {
           async withCurrentQuiescence(_action, signal, callback) {
             try {
               await assertCurrent!('before-action', signal);
               return await callback(
                 Object.freeze({
+                  history,
                   binding: Object.freeze({ ...run.native }),
                   source: Object.freeze({ ...run.source }),
                   assertCurrent: (currentSignal: AbortSignal) =>

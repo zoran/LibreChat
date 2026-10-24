@@ -1,4 +1,7 @@
+import { randomUUID } from 'node:crypto';
+import type { OrdinaryS3Provider } from '../providerObservation';
 import type { S3KeyOptions } from './keys';
+import { observeStorageProviders } from '../providerObservation';
 import { buildS3Key, parseS3Key } from './keys';
 export { parseS3Key } from './keys';
 export type { S3KeyOptions, S3KeyParts } from './keys';
@@ -47,7 +50,7 @@ import {
 import { DEFAULT_BASE_PATH as defaultBasePath } from '~/storage/constants';
 import { sanitizeContentDispositionFilename } from '~/storage/validation';
 import { getSafeErrorMetadata } from '~/utils/errors';
-import { initializeS3 } from '~/cdn/s3';
+import { initializeS3, getS3ClientCapture } from '~/cdn/s3';
 import { deleteRagFile } from '~/files';
 import { s3Config } from './s3Config';
 
@@ -58,6 +61,28 @@ const {
   S3_URL_EXPIRY_SECONDS: s3UrlExpirySeconds,
   S3_REFRESH_EXPIRY_MS: s3RefreshExpiryMs,
 } = s3Config;
+const commandInstanceId = randomUUID();
+/** Reads the actual module command values without constructing or resolving an SDK client. */
+export function getOrdinaryS3Provider(): OrdinaryS3Provider {
+  const client = getS3ClientCapture();
+  if (client === null) return Object.freeze({ state: 'uninitialized' });
+  if (!client) return Object.freeze({ state: 'unavailable' });
+  return (
+    observeStorageProviders(() => ({
+      ordinaryS3: {
+        state: 'captured',
+        client,
+        commands: {
+          instanceId: commandInstanceId,
+          bucket: bucketName,
+          endpoint: endpoint ?? null,
+          forcePathStyle,
+        },
+      },
+      managedS3: { state: 'not-owned' },
+    }))?.ordinaryS3 ?? Object.freeze({ state: 'unavailable' })
+  );
+}
 
 const MULTIPART_UPLOAD_PART_SIZE = 5 * 1024 * 1024;
 const getDefaultStorageRegion = (): string | null =>

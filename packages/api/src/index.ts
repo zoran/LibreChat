@@ -182,4 +182,10 @@ export type {
   HousekeepingApplicationDependencies,
 } from './housekeeping/application';
 
-export { createManagedS3Client } from './storage/s3/managedClient';
+export { createManagedS3Client, getManagedS3ClientCapture } from './storage/s3/managedClient';
+export { getManagedS3Provider } from './storage/s3/managed';
+export type {
+  StorageProviders,
+  OrdinaryS3Provider,
+  ManagedS3Provider,
+} from './storage/providerObservation';

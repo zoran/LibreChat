@@ -1295,6 +1295,8 @@ describe('persistent Project context', () => {
   it.each(['another Project', 'native usage'] as const)(
     'does not restore a losing hold after the same file succeeds in %s',
     async (promotion) => {
+      // Finish model/index initialization before deliberately holding a transaction open.
+      await Promise.all([ChatProject.init(), File.init()]);
       const first = await methods.createChatProject(owner, { name: 'Losing project' });
       const second = await methods.createChatProject(owner, { name: 'Successful project' });
       const shared = await createReference('concurrent-shared', {
@@ -1339,12 +1341,17 @@ describe('persistent Project context', () => {
         (error: unknown) => error,
       );
       try {
-        await admissionReached;
-        if (promotion === 'another Project') {
-          expect(
-            await methods.addChatProjectFile(owner, second._id!.toString(), shared.file_id),
-          ).toMatchObject({ file_ids: [shared.file_id] });
-        } else {
+        await Promise.race([
+          admissionReached,
+          result.then((error) => {
+            throw error ?? new Error('Attachment settled before reaching its admission gate');
+          }),
+        ]);
+        // Native usage consumes a permanent File; Project attachment owns hold promotion.
+        expect(
+          await methods.addChatProjectFile(owner, second._id!.toString(), shared.file_id),
+        ).toMatchObject({ file_ids: [shared.file_id] });
+        if (promotion === 'native usage') {
           expect(
             await createFileMethods(mongoose).updateFileUsage({
               file_id: shared.file_id,

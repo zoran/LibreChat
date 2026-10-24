@@ -8,8 +8,9 @@ import {
   HeadObjectCommand,
   ListObjectVersionsCommand,
 } from '@aws-sdk/client-s3';
+import { createManagedS3Client, getManagedS3ClientCapture } from '../managedClient';
 import { createManagedS3Storage, managedOriginalKey } from '../managed';
-import { createManagedS3Client } from '../managedClient';
+import { getManagedS3Provider } from '../managed';
 
 jest.mock('~/files', () => ({ deleteRagFile: jest.fn() }));
 jest.mock('@librechat/data-schemas', () => ({
@@ -466,5 +467,64 @@ describe('managed client owned construction', () => {
     expect(() => createManagedS3Client({ ...env, ...override })).toThrow(
       'Managed storage configuration unavailable',
     );
+  });
+  it('binds observations to actual clients and command adapters, with immutable values and no foreign adoption', () => {
+    const input = { ...env };
+    const first = createManagedS3Client(input);
+    const second = createManagedS3Client(input);
+    const foreign = new S3Client({ region: env.AWS_REGION });
+    try {
+      const storage = createManagedS3Storage({ client: first, bucket: env.AWS_BUCKET_NAME });
+      const replacement = createManagedS3Storage({ client: first, bucket: env.AWS_BUCKET_NAME });
+      const original = getManagedS3Provider(storage, null);
+      const replaced = getManagedS3Provider(replacement, null);
+      if (original.state !== 'captured' || replaced.state !== 'captured')
+        throw new Error('Missing actual capture');
+      expect(original.client.instanceId).toBe(replaced.client.instanceId);
+      expect(original.commands.instanceId).not.toBe(replaced.commands.instanceId);
+      expect(getManagedS3ClientCapture(first)?.instanceId).not.toBe(
+        getManagedS3ClientCapture(second)?.instanceId,
+      );
+      expect(original.backend).toBeNull();
+      expect(Object.isFrozen(original.commands)).toBe(true);
+      input.AWS_BUCKET_NAME = 'different';
+      input.AWS_REGION = 'different';
+      input.AWS_ENDPOINT_URL = 'https://different.example.test';
+      expect(getManagedS3Provider(storage, null)).toEqual(original);
+      expect(JSON.stringify(original)).not.toMatch(/test-only-key|test-only-secret|credentials/i);
+      expect(getManagedS3Provider(storage, undefined)).toEqual({ state: 'unavailable' });
+      expect(getManagedS3ClientCapture(foreign)).toBeUndefined();
+      expect(
+        getManagedS3Provider(
+          createManagedS3Storage({ client: foreign, bucket: env.AWS_BUCKET_NAME }),
+          null,
+        ),
+      ).toEqual({ state: 'unavailable' });
+      first.destroy();
+      expect(getManagedS3Provider(storage, null)).toEqual({ state: 'unavailable' });
+      expect(getManagedS3Provider(replacement, null)).toEqual({ state: 'unavailable' });
+      expect(getManagedS3ClientCapture(second)).toBeDefined();
+    } finally {
+      first.destroy();
+      second.destroy();
+      foreign.destroy();
+    }
+  });
+
+  it('invalidates managed custody before the actual handler destroy and keeps a failed teardown unavailable', () => {
+    const client = createManagedS3Client(env);
+    const handler = client.config.requestHandler;
+    const failure = new Error('fixture teardown failed');
+    const destroy = jest.spyOn(handler, 'destroy').mockImplementation(() => {
+      expect(getManagedS3ClientCapture(client)).toBeUndefined();
+      throw failure;
+    });
+    try {
+      expect(() => client.destroy()).toThrow(failure);
+      expect(getManagedS3ClientCapture(client)).toBeUndefined();
+    } finally {
+      destroy.mockRestore();
+      client.destroy();
+    }
   });
 });

@@ -6,6 +6,7 @@ import type { CreateGenerationJobOptions } from '../GenerationJobManager';
 import type { SerializableJobData } from '../interfaces/IJobStore';
 import { buildPendingAction, buildToolApprovalPayload } from '~/agents/hitl/policy';
 import { InMemoryEventTransport } from '../implementations/InMemoryEventTransport';
+import { NOT_OWNED_STORAGE_PROVIDERS } from '../../storage/providerObservation';
 import { RedisEventTransport } from '../implementations/RedisEventTransport';
 import { InMemoryJobStore } from '../implementations/InMemoryJobStore';
 import { GenerationJobManagerClass } from '../GenerationJobManager';
@@ -1080,6 +1081,7 @@ describe('generation and application work census composition', () => {
       complete,
     }));
     const app = createAppMaintenance({
+      readStorageProviders: () => NOT_OWNED_STORAGE_PROVIDERS,
       env: {},
       requiredSharedState: false,
       startupReady: () => true,

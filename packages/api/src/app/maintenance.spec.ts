@@ -2,13 +2,17 @@ import { Server } from 'node:http';
 import { Readable } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { StorageProviders } from '../storage/providerObservation';
 import type { GenerationMaintenanceCensus } from './maintenance';
 import {
   createAppMaintenance,
   probeMaintenanceRedis,
   initializeMaintenanceGeneration,
 } from './maintenance';
+import { createManagedS3Storage, getManagedS3Provider } from '../storage/s3/managed';
 import { createCodeEnvironmentLifecycleMaintenance } from '../code/lifecycle';
+import { NOT_OWNED_STORAGE_PROVIDERS } from '../storage/providerObservation';
+import { createManagedS3Client } from '../storage/s3/managedClient';
 import { createFileDeletionWorkOwner } from '../files/deletion';
 import { createAuthMaintenance } from '../auth/maintenance';
 import { isLeader } from '../cluster';
@@ -52,6 +56,7 @@ function fixture(
     generation: owner,
     workOwners,
     fileDomainOwners,
+    readStorageProviders: () => NOT_OWNED_STORAGE_PROVIDERS,
     unqualifiedOwners,
     startupReady: () => true,
     probeDatabase: jest.fn(async () => true),
@@ -1331,5 +1336,124 @@ describe('actual Permission/cache/retry App composition', () => {
       await f.cache.mongoCacheMaintenance.drain();
       jest.useRealTimers();
     }
+  });
+});
+
+describe('captured storage providers within the original census', () => {
+  const env = {
+    AWS_REGION: 'test-region',
+    AWS_BUCKET_NAME: 'cortex-managed-uploads',
+    AWS_ENDPOINT_URL: 'https://storage.example.test',
+    AWS_FORCE_PATH_STYLE: 'true',
+    AWS_ACCESS_KEY_ID: 'fixture-key',
+    AWS_SECRET_ACCESS_KEY: 'fixture-secret',
+  };
+  it.each(['client', 'commands'] as const)(
+    'rejects an equal-valued actual %s replacement across the census await',
+    async (replacement) => {
+      const first = createManagedS3Client(env);
+      const second = createManagedS3Client(env);
+      let storage = createManagedS3Storage({ client: first, bucket: env.AWS_BUCKET_NAME });
+      const f = fixture();
+      const readStorageProviders = (): StorageProviders => ({
+        ordinaryS3: { state: 'not-owned' },
+        managedS3: getManagedS3Provider(storage, null),
+      });
+      const app = createAppMaintenance({ ...f.deps, readStorageProviders });
+      try {
+        expect(
+          app.operation('begin', {
+            identity: app.identity,
+            requestId: 'provider',
+            expectedRevision: 0,
+          }),
+        ).toBe(200);
+        const before = await app.status();
+        expect(before.known).toBe(true);
+        let finish!: (value: GenerationMaintenanceCensus) => void;
+        const sample = await f.owner.getGenerationAdmissionCensus();
+        let entered!: () => void;
+        const observing = new Promise<void>((resolve) => {
+          entered = resolve;
+        });
+        f.owner.getGenerationAdmissionCensus.mockImplementationOnce(
+          () =>
+            new Promise<GenerationMaintenanceCensus>((resolve) => {
+              finish = resolve;
+              entered();
+            }),
+        );
+        const original = app.status();
+        await observing;
+        storage = createManagedS3Storage({
+          client: replacement === 'client' ? second : first,
+          bucket: env.AWS_BUCKET_NAME,
+        });
+        finish(sample);
+        const interrupted = await original;
+        expect(interrupted).toMatchObject({
+          known: false,
+          census: null,
+          fileDomain: { known: false, census: null },
+        });
+        expect(interrupted.storageProviders).toEqual({
+          ordinaryS3: { state: 'unavailable' },
+          managedS3: { state: 'unavailable' },
+        });
+        const next = await app.status();
+        expect(next.known).toBe(true);
+        expect(next.identity).toBe(before.identity);
+        expect(next.revision).toBe(before.revision);
+        expect(next.storageProviders).not.toEqual(before.storageProviders);
+        expect(JSON.stringify(next)).not.toContain('fixture-secret');
+      } finally {
+        first.destroy();
+        second.destroy();
+      }
+    },
+  );
+
+  it('requires an explicit synchronous observation owner for every composition', () => {
+    const f = fixture();
+    expect(() =>
+      createAppMaintenance({ ...f.deps, readStorageProviders: undefined } as never),
+    ).toThrow('Storage provider observation owner is required');
+  });
+
+  it.each([
+    undefined,
+    { ordinaryS3: { state: 'not-owned' } },
+    { ...NOT_OWNED_STORAGE_PROVIDERS, credentials: 'fixture-secret' },
+    {
+      ordinaryS3: { state: 'disabled', reason: 'fixture-secret' },
+      managedS3: { state: 'not-owned' },
+    },
+    { ordinaryS3: { state: 'invented' }, managedS3: { state: 'not-owned' } },
+  ])('refuses malformed observations without retaining census authority %#', async (value) => {
+    const f = fixture();
+    const app = createAppMaintenance({ ...f.deps, readStorageProviders: () => value as never });
+    const status = await app.status();
+    expect(status).toMatchObject({ known: false, census: null, fileDomain: { known: false } });
+    expect(status.storageProviders).toEqual({
+      ordinaryS3: { state: 'unavailable' },
+      managedS3: { state: 'unavailable' },
+    });
+    expect(JSON.stringify(status)).not.toContain('fixture-secret');
+  });
+
+  it('does not expose a failing owner error or retain the first snapshot after a changed state', async () => {
+    const f = fixture();
+    let read = 0;
+    const app = createAppMaintenance({
+      ...f.deps,
+      readStorageProviders: () => {
+        if (++read === 1) return NOT_OWNED_STORAGE_PROVIDERS;
+        throw new Error('fixture-secret');
+      },
+    });
+    const status = await app.status();
+    expect(status.known).toBe(false);
+    expect(read).toBe(2);
+    expect(JSON.stringify(status)).not.toContain('fixture-secret');
   });
 });

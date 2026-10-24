@@ -5,6 +5,7 @@ import type { AppConfig } from '@librechat/data-schemas';
 import type { LCAvailableTools } from '../types';
 import type { CatalogStoreDeps } from './store';
 import { notifyMCPToolsChanged, setMCPToolsChangedHandler } from '../toolsChanged';
+import { NOT_OWNED_STORAGE_PROVIDERS } from '../../storage/providerObservation';
 import { createAppMaintenance } from '../../app/maintenance';
 import { createAppConfigService } from '../../app/service';
 import { createMCPCatalogStore } from './store';
@@ -336,6 +337,7 @@ describe('MCP catalog original custody', () => {
     let app!: ReturnType<typeof createAppMaintenance>;
     const prepare = f.store.trackPublication(async () => {
       app = createAppMaintenance({
+        readStorageProviders: () => NOT_OWNED_STORAGE_PROVIDERS,
         env: {
           LIBRECHAT_MAINTENANCE_TOKEN: 'a'.repeat(32),
           POD_UID: '12345678-1234-1234-1234-123456789012',

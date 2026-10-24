@@ -514,6 +514,7 @@ describe('web startup original custody', () => {
       {
         ...shutdown,
         cacheConfig: {},
+        getOrdinaryS3Provider: jest.fn(() => ({ state: 'uninitialized' })),
         createAppMaintenance: jest.fn(() => {
           catalog.maintenance.pauseAdmissions('startup_fixture');
           return maintenance;
@@ -599,7 +600,9 @@ describe('web startup original custody', () => {
         runMCPToolPublication: catalog.trackPublication,
       },
       './services/start/migration': migrationModule.exports,
-      './services/Uploads': { uploadMaintenance: {} },
+      './services/Uploads': {
+        uploadMaintenance: { readStorageProvider: () => ({ state: 'uninitialized' }) },
+      },
       './services/Files/LibraryMaintenance': {
         fileLibraryMaintenance: createFileLibraryMaintenance(),
       },
@@ -903,6 +906,10 @@ describe('web startup original custody', () => {
       await tick();
       expect(state.maintenance.listen).not.toHaveBeenCalled();
       const selected = state.api.createAppMaintenance.mock.calls[0][0];
+      expect(selected.readStorageProviders()).toEqual({
+        ordinaryS3: { state: 'uninitialized' },
+        managedS3: { state: 'uninitialized' },
+      });
       expect(selected.workOwners.databaseBootstrap).toBe(state.database.modelBootstrap.maintenance);
       expect(typeof selected.workOwners.history.getMaintenanceCensus).toBe('function');
       expect(selected.workOwners.auth).toBe(state.auth.legacyAuthMaintenance);

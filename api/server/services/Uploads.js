@@ -18,6 +18,7 @@ const {
   createHttpUploadSecurityPort,
   createUnixDocumentPort,
   createManagedS3Storage,
+  getManagedS3Provider,
   createUploadMetrics,
   createManagedS3Client,
   validateEmailCodeBearer,
@@ -41,6 +42,11 @@ let admissionsClosedBy;
 let initialization = 'unstarted';
 /** The actual composition inherits closure before acquiring its first dispatching service. */
 const uploadMaintenance = Object.freeze({
+  readStorageProvider() {
+    if (current) return current.readStorageProvider();
+    if (initialization === 'disabled') return { state: 'disabled' };
+    return { state: initialization === 'unstarted' ? 'uninitialized' : 'unavailable' };
+  },
   pauseAdmissions(requestId) {
     if (!requestId || (admissionsClosedBy && admissionsClosedBy !== requestId)) return false;
     admissionsClosedBy = requestId;
@@ -598,6 +604,10 @@ async function initializeUploads({
   current = {
     ...composition,
     maintenance,
+    readStorageProvider: () =>
+      initialization !== 'ready'
+        ? { state: 'unavailable' }
+        : getManagedS3Provider(storage, platform.readStorageBackend()),
     start() {
       if (intakePausedBy || closing)
         return Promise.reject(new Error('Upload startup admission is closed'));
@@ -633,6 +643,7 @@ async function initializeUploads({
     },
     close(signal) {
       if (closing) return closing;
+      initialization = 'closing';
       const paused = maintenance.pauseAdmissions(intakePausedBy ?? 'shutdown');
       closingPending = true;
       // A late listener remains this owner's original: stop dispatch, join it, then close it.
