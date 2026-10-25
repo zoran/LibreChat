@@ -1,4 +1,5 @@
 import { JSDOM } from 'jsdom';
+import { MAIL_MOBILE_STYLES } from './mailPresentation';
 import { emailCodeMessage } from './emailCodeMessage';
 import { emailCodeLink } from './emailCodeLink';
 
@@ -62,8 +63,19 @@ describe('email-code message presentation', () => {
     expect(document.body.textContent).not.toMatch(/Browser|\b(?:Sie|Ihr|Ihre|Ihnen)\b/);
     expect(new URL(anchor.href).search).toBe('');
     expect(
-      document.querySelectorAll('script, form, iframe, img, link, style, input, object'),
+      document.querySelectorAll('script, form, iframe, img, link, input, object'),
     ).toHaveLength(0);
+    const styles = document.querySelectorAll('style');
+    expect(styles).toHaveLength(1);
+    expect(styles[0].parentElement).toBe(document.head);
+    expect(styles[0].textContent).toBe(MAIL_MOBILE_STYLES);
+    expect(styles[0].textContent).not.toMatch(/url\s*\(|@import|https?:/i);
+    expect(document.documentElement.getAttribute('style')).toContain('text-size-adjust:100%');
+    expect(document.body.getAttribute('style')).toContain('text-size-adjust:100%');
+    expect(document.querySelector('.mail-heading')).toBe(document.querySelector('h1'));
+    expect(document.querySelector('.mail-code')).toBe(code);
+    expect(code.style.fontSize).toBe('28px');
+    expect(document.querySelector('h1')!.style.fontSize).toBe('26px');
     expect(document.querySelectorAll('a')).toHaveLength(1);
   });
 
@@ -87,7 +99,8 @@ describe('email-code message presentation', () => {
   });
 
   it('escapes configured titles and attributes without creating markup or resource loads', () => {
-    const title = '<img src="https://evil.test/pixel"> & \'Portal\'';
+    const title =
+      '<img src="https://evil.test/pixel"> & \'Portal\' <style>@import "https://evil.test/css";</style>';
     const supportText = 'Fragen an <img src="https://evil.test/help"> & "Support".';
     const message = emailCodeMessage({ ...input, appTitle: title, supportText });
     const document = new JSDOM(message.html).window.document;
@@ -98,6 +111,8 @@ describe('email-code message presentation', () => {
     expect(message.text).toContain(title);
     expect(document.body.textContent).toContain(supportText);
     expect(message.text).toContain(supportText);
+    expect(document.querySelectorAll('style')).toHaveLength(1);
+    expect(document.querySelector('style')!.textContent).toBe(MAIL_MOBILE_STYLES);
     expect(document.querySelectorAll('script,iframe,img,link,object')).toHaveLength(0);
   });
 

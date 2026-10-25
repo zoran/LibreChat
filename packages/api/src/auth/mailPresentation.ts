@@ -1,5 +1,8 @@
 /** Shared presentation only: callers supply renderer-owned, escaped content and footer fragments. */
 export const MAIL_FONT_FAMILY = 'Arial,Helvetica,sans-serif';
+// Fixed renderer-owned CSS; configured mail content never contributes selectors or rules.
+export const MAIL_MOBILE_STYLES =
+  '@media only screen and (max-width:480px){.mail-heading,.mail-code{font-size:22px!important;}}';
 
 export function escapeMailHtml(value: string): string {
   return value.replace(
@@ -29,8 +32,8 @@ export function mailPresentation(input: {
     ? `<img src="cid:application-logo@local" width="300" alt="${escapeMailHtml(input.appTitle)}" style="display:block;width:300px;max-width:100%;height:auto;border:0;margin:0 auto;">`
     : '';
   return `<!doctype html>
-<html lang="${input.language}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeMailHtml(input.subject)}</title></head>
-<body style="margin:0;padding:0;background:#F2F3F5;color:#202124;font-family:${fontFamily};line-height:1.6;">
+<html lang="${input.language}" style="-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;text-size-adjust:100%;"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>${escapeMailHtml(input.subject)}</title><style>${MAIL_MOBILE_STYLES}</style></head>
+<body style="margin:0;padding:0;background:#F2F3F5;color:#202124;font-family:${fontFamily};line-height:1.6;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;text-size-adjust:100%;">
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;background:#F2F3F5;font-family:${fontFamily};"><tr><td align="center" style="padding:24px 12px;font-family:${fontFamily};">
 <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="width:100%;max-width:600px;table-layout:fixed;background:#FFFFFF;border:1px solid #D9DDE2;border-radius:16px;font-family:${fontFamily};">
 <tr><td align="center" style="padding:24px;background:#202124;border-top:4px solid ${accent};border-radius:16px 16px 0 0;color:#FFFFFF;font-family:${fontFamily};font-size:20px;font-weight:bold;text-align:center;overflow-wrap:anywhere;word-break:break-word;">${logo || escapeMailHtml(input.appTitle)}</td></tr>

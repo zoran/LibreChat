@@ -41,9 +41,9 @@ export function emailCodeMessage(input: {
   if (!link) return { subject, text };
   const fontFamily = MAIL_FONT_FAMILY;
   const { highlight: codeBackground } = mailPalette(input.embeddedLogo);
-  const content = `<h1 style="margin:0 0 16px;font-family:${fontFamily};font-size:26px;line-height:1.3;color:#202124;">${heading}</h1>
+  const content = `<h1 class="mail-heading" style="margin:0 0 16px;font-family:${fontFamily};font-size:26px;line-height:1.3;color:#202124;">${heading}</h1>
 <p style="margin:0 0 16px;font-family:${fontFamily};font-size:16px;">${instruction}</p>
-<p style="display:inline-block;margin:0;max-width:100%;box-sizing:border-box;padding:12px 16px;border:1px solid #D9DDE2;border-radius:8px;background:${codeBackground};color:#202124;font-family:${fontFamily};font-size:28px;font-weight:bold;line-height:1.5;letter-spacing:2px;user-select:all;overflow-wrap:anywhere;word-break:break-all;">${escape(code)}</p>
+<p class="mail-code" style="display:inline-block;margin:0;max-width:100%;box-sizing:border-box;padding:12px 16px;border:1px solid #D9DDE2;border-radius:8px;background:${codeBackground};color:#202124;font-family:${fontFamily};font-size:28px;font-weight:bold;line-height:1.5;letter-spacing:2px;user-select:all;overflow-wrap:anywhere;word-break:break-all;">${escape(code)}</p>
 <p style="margin:12px 0 24px;font-family:${fontFamily};font-size:16px;color:#4A4F57;">${validity}</p>
 <p style="margin:0 0 8px;font-family:${fontFamily};font-size:14px;color:#4A4F57;">${alternative}</p>
 <a style="font-family:${fontFamily};font-size:14px;line-height:1.5;color:#4A4F57;text-decoration:underline;overflow-wrap:anywhere;word-break:break-all;" href="${escape(link)}">${escape(link)}</a>`;
