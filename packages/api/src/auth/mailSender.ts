@@ -17,6 +17,8 @@ import { emailCodeMessage } from './emailCodeMessage';
 export interface EmailCodeMailConfig extends MailConfig {
   qualification?: EmailCodeQualificationMailbox;
   clientUrl?: string;
+  /** Optional deployment language; unconfigured upstream keeps request negotiation. */
+  fixedLocale?: 'de' | 'en';
 }
 // Existing public names retain one implementation and migrate their runtime consumer together.
 export type {
@@ -40,6 +42,15 @@ function snapshotMailConfig(value: unknown): EmailCodeMailConfig {
   try {
     const shared = snapshotSharedConfig(value);
     const input = value as EmailCodeMailConfig;
+    let fixedLocale: 'de' | 'en' | undefined;
+    const suppliedLocale = (value as Record<string, unknown>).fixedLocale;
+    if (suppliedLocale !== undefined && suppliedLocale !== '') {
+      if (typeof suppliedLocale !== 'string' || suppliedLocale.length > 35)
+        return invalidMailConfig();
+      const language = new Intl.Locale(suppliedLocale).language;
+      if (language !== 'de' && language !== 'en') return invalidMailConfig();
+      fixedLocale = language;
+    }
     let qualification: EmailCodeQualificationMailbox | undefined;
     if (input.qualification !== undefined) {
       const row = input.qualification;
@@ -57,6 +68,7 @@ function snapshotMailConfig(value: unknown): EmailCodeMailConfig {
     }
     return Object.freeze({
       ...shared,
+      ...(fixedLocale ? { fixedLocale } : {}),
       ...(qualification ? { qualification } : {}),
       ...(input.clientUrl === undefined ? {} : { clientUrl: mailClientUrl(input.clientUrl) }),
     });
@@ -97,6 +109,8 @@ export function getEmailCodeMailConfig(
     ca,
     servername: env.EMAIL_CODE_SMTP_TLS_SERVERNAME,
     from: env.EMAIL_CODE_SMTP_FROM,
+    fromName: env.EMAIL_FROM_NAME || env.MAIL_FROM_NAME,
+    fixedLocale: env.MAIL_FIXED_LOCALE,
     appTitle: env.APP_TITLE == null || env.APP_TITLE === '' ? 'LibreChat' : env.APP_TITLE,
     allowedDomains,
     qualification: qualificationMailbox(env),
@@ -135,7 +149,7 @@ export function createBoundedEmailCodeSender(
         content: emailCodeMessage({
           appTitle: config.appTitle,
           code: input.code,
-          locale: input.locale,
+          locale: config.fixedLocale ?? input.locale,
           link,
           embeddedLogo: Boolean(config.logoPng && link),
           supportText: config.supportText,

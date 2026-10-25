@@ -73,6 +73,22 @@ function fixture(bytes = Buffer.from('Subject: Notice\r\n\r\nText\r\n'), manual 
   return { sender, deps, stream, sockets, options, callbacks, sent, composed, closed };
 }
 describe('one bounded SMTP submission', () => {
+  it.each([
+    'Sender\r\nBcc: injected@example.test',
+    'Sender\nInjected',
+    'Sender\u2028Injected',
+    'Sender\u0000Injected',
+    '   ',
+    'x'.repeat(121),
+  ])('rejects unsafe visible sender names before MIME or transport: %j', (fromName) => {
+    const f = fixture();
+    expect(() => createBoundedMailSubmission({ ...config, fromName }, f.deps)).toThrow(
+      'Invalid SMTP configuration',
+    );
+    expect(f.options).toHaveLength(0);
+    expect(f.composed).toHaveLength(0);
+  });
+
   beforeEach(() => jest.useFakeTimers());
   afterEach(() => jest.useRealTimers());
   it('submits the exact admitted bytes with strict TLS and one recipient after authorization', async () => {
@@ -109,6 +125,7 @@ describe('one bounded SMTP submission', () => {
       disableFileAccess: true,
       disableUrlAccess: true,
     });
+    expect(f.composed[0].from).toEqual({ name: config.appTitle, address: config.from });
     expect(f.composed[0].messageId).toMatch(/^<[0-9a-f]{64}@submission\.local>$/);
     f.callbacks[0](null, {
       accepted: [input.recipient],

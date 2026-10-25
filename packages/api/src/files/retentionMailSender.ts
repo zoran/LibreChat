@@ -40,7 +40,7 @@ function snapshotConfig(value: RetentionMailConfig): RetentionMailConfig {
   }
 }
 
-/** No EMAIL_CODE_* / EMAIL_* fallback; explicit activation requires the complete dedicated config. */
+/** Dedicated retention transport/auth is mandatory; shared public identity never supplies credentials. */
 export function getRetentionMailConfig(
   env: Record<string, string | undefined>,
   allowedDomains: readonly string[],
@@ -57,6 +57,7 @@ export function getRetentionMailConfig(
       ca: env.RETENTION_SMTP_CA!,
       servername: env.RETENTION_SMTP_TLS_SERVERNAME!,
       from: env.RETENTION_SMTP_FROM!,
+      fromName: env.EMAIL_FROM_NAME || env.MAIL_FROM_NAME,
       appTitle: env.APP_TITLE == null || env.APP_TITLE === '' ? 'LibreChat' : env.APP_TITLE,
       allowedDomains,
       supportText: env.RETENTION_MAIL_SUPPORT_TEXT,

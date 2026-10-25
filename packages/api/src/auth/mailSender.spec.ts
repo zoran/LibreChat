@@ -93,6 +93,66 @@ function fixture(settings: EmailCodeMailConfig = config) {
 }
 
 describe('bounded approved SMTP submission', () => {
+  it('uses the deployment sender and German language even for an English browser request', async () => {
+    const settings = getEmailCodeMailConfig(
+      environment({
+        EMAIL_FROM_NAME: 'Example Organization',
+        MAIL_FIXED_LOCALE: 'de-DE',
+        DOMAIN_CLIENT: 'https://portal.example.test',
+      }),
+      config.allowedDomains,
+    )!;
+    const f = fixture(settings);
+    const pending = f.sender.sendCode({
+      ...input,
+      locale: 'en',
+      attemptId: Buffer.alloc(32, 7).toString('base64url'),
+    });
+    f.sockets[0].emit('connect');
+    f.callbacks[0](null, { accepted: [input.email], rejected: [], response: '250 queued' });
+    await expect(pending).resolves.toBeUndefined();
+    expect(f.messages[0]).toMatchObject({
+      from: { name: 'Example Organization', address: config.from },
+      subject: 'Dein Anmeldecode für Example Portal',
+    });
+    expect((f.messages[0] as EmailCodeMailMessage).text).toContain(
+      'Gib diesen Code auf der Anmeldeseite ein:',
+    );
+    expect((f.messages[0] as EmailCodeMailMessage).text).not.toContain('Your sign-in code');
+    expect((f.messages[0] as EmailCodeMailMessage).html).toContain('lang="de"');
+    expect((f.messages[0] as EmailCodeMailMessage).html).toContain(
+      'Gib diesen Code auf der Anmeldeseite ein:',
+    );
+  });
+
+  it('preserves upstream sender precedence and unconfigured language behavior', () => {
+    expect(
+      getEmailCodeMailConfig(
+        environment({ EMAIL_FROM_NAME: 'Upstream Name', MAIL_FROM_NAME: 'Deployment Name' }),
+        config.allowedDomains,
+      ),
+    ).toMatchObject({ fromName: 'Upstream Name' });
+    expect(
+      getEmailCodeMailConfig(
+        environment({ EMAIL_FROM_NAME: '', MAIL_FROM_NAME: 'Deployment Name' }),
+        config.allowedDomains,
+      ),
+    ).toMatchObject({ fromName: 'Deployment Name' });
+    const defaults = getEmailCodeMailConfig(environment(), config.allowedDomains)!;
+    expect(defaults.fromName).toBeUndefined();
+    expect(defaults.fixedLocale).toBeUndefined();
+    expect(defaults.appTitle).toBe(config.appTitle);
+  });
+
+  it.each(['fr-FR', 'not a locale', 'de-DE\r\nBcc: injected@example.test', 'x'.repeat(36)])(
+    'rejects an invalid or unsupported fixed mail language before transport: %j',
+    (locale) => {
+      expect(() =>
+        getEmailCodeMailConfig(environment({ MAIL_FIXED_LOCALE: locale }), config.allowedDomains),
+      ).toThrow('Invalid email-code SMTP configuration');
+    },
+  );
+
   beforeEach(() => {
     jest.useFakeTimers();
   });

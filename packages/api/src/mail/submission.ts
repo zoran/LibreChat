@@ -22,6 +22,8 @@ export interface MailConfig {
   servername: string;
   from: string;
   appTitle: string;
+  /** Optional visible From identity; subjects and body retain appTitle. */
+  fromName?: string;
   allowedDomains: readonly string[];
   supportText?: string;
   logoPng?: Buffer;
@@ -167,6 +169,7 @@ export function snapshotMailConfig(value: unknown): MailConfig {
   const ca = input.ca;
   const from = input.from;
   const title = input.appTitle;
+  const fromName = input.fromName == null || input.fromName === '' ? title : input.fromName;
   if (
     typeof username !== 'string' ||
     username.length < 1 ||
@@ -187,7 +190,12 @@ export function snapshotMailConfig(value: unknown): MailConfig {
     title.length > 120 ||
     !title.trim() ||
     // eslint-disable-next-line no-control-regex -- Reject control characters and line separators in the mail subject title.
-    /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(title)
+    /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(title) ||
+    typeof fromName !== 'string' ||
+    fromName.length > 120 ||
+    !fromName.trim() ||
+    // eslint-disable-next-line no-control-regex -- Visible sender names must remain safe header text.
+    /[\x00-\x1f\x7f-\x9f\u2028\u2029]/.test(fromName)
   )
     return invalidMailConfig();
   const mailbox = from.split('@');
@@ -242,6 +250,7 @@ export function snapshotMailConfig(value: unknown): MailConfig {
     servername,
     from,
     appTitle: title.trim(),
+    ...(input.fromName == null || input.fromName === '' ? {} : { fromName: fromName.trim() }),
     allowedDomains: Object.freeze(allowedDomains),
     ...(supportText === undefined ? {} : { supportText }),
     ...(logo === undefined ? {} : { logoPng: Buffer.from(logo as Buffer) }),
@@ -288,7 +297,7 @@ export function createBoundedMailSubmission(inputConfig: MailConfig, deps: MailD
         return Promise.resolve({ state: 'notAccepted', reason: 'notAuthorized' });
       if (signal?.aborted) return Promise.resolve({ state: 'notAccepted', reason: 'unavailable' });
       const message: MailMessage = {
-        from: { name: config.appTitle, address: config.from },
+        from: { name: config.fromName ?? config.appTitle, address: config.from },
         to: { address: recipient },
         envelope: { from: config.from, to: [recipient] },
         messageId: `<${createHash('sha256').update(submissionId).digest('hex')}@submission.local>`,

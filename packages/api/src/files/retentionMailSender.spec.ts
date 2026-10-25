@@ -91,6 +91,18 @@ function fixture(settings = config) {
   };
 }
 describe('dedicated retention purpose adapter', () => {
+  it('uses the common visible sender without changing retention title or German content', async () => {
+    const f = fixture({ ...config, fromName: 'Example Organization' });
+    const pending = f.sender.sendReminder(input);
+    f.socket.emit('connect');
+    f.complete(null, { accepted: [input.recipient], response: '250 queued' });
+    await expect(pending).resolves.toEqual({ state: 'accepted', relayIndex: 0 });
+    expect(f.message?.from).toEqual({ name: 'Example Organization', address: config.from });
+    expect(f.message?.subject).toContain(config.appTitle);
+    expect(f.message?.subject).not.toContain('Example Organization');
+    expect(f.message?.text).toContain('Sicherheitsgründen');
+  });
+
   it.each([7, 1] as const)(
     'renders the frozen German %i-day snapshot and fixed envelope',
     async (offsetDays) => {
@@ -194,6 +206,12 @@ describe('dedicated retention purpose adapter', () => {
       ...config,
       clientUrl: 'https://portal.example.test/',
     });
+    expect(
+      getRetentionMailConfig(
+        { ...env, EMAIL_FROM_NAME: 'Example Organization' },
+        config.allowedDomains,
+      ),
+    ).toMatchObject({ fromName: 'Example Organization' });
     expect(() =>
       getRetentionMailConfig({ ...env, RETENTION_SMTP_PASSWORD: undefined }, config.allowedDomains),
     ).toThrow();
