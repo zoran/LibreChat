@@ -9,6 +9,7 @@ import type {
   EmailCodeSMTPOptions,
 } from './mailSender';
 import { createBoundedEmailCodeSender, getEmailCodeMailConfig } from './mailSender';
+import { emailCodeDomainPolicy } from './emailRecipientPolicy';
 
 const config: EmailCodeMailConfig = {
   hosts: ['192.0.2.10', 'smtp-backup.example.test'],
@@ -93,6 +94,24 @@ function fixture(settings: EmailCodeMailConfig = config) {
 }
 
 describe('bounded approved SMTP submission', () => {
+  it('sends only to the server-side union of public and hidden login domains', async () => {
+    const policy = emailCodeDomainPolicy({
+      EMAIL_CODE_ALLOWED_DOMAINS: 'example.test',
+      EMAIL_CODE_HIDDEN_ALLOWED_DOMAINS: 'private.example.test',
+    });
+    const settings = getEmailCodeMailConfig(environment(), policy.domains)!;
+    const f = fixture(settings);
+    const email = 'person@private.example.test';
+    const pending = f.sender.sendCode({ ...input, email });
+    f.sockets[0].emit('connect');
+    f.callbacks[0](null, { accepted: [email], rejected: [], response: '250 queued' });
+    await expect(pending).resolves.toBeUndefined();
+    await expect(
+      f.sender.sendCode({ ...input, email: 'person@sub.private.example.test' }),
+    ).rejects.toThrow();
+    expect(policy.publicDomains).toEqual(['example.test']);
+  });
+
   it('uses the deployment sender and German language even for an English browser request', async () => {
     const settings = getEmailCodeMailConfig(
       environment({

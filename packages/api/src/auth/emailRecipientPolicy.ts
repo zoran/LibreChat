@@ -1,3 +1,22 @@
+/** Server-only accepted domains; only publicDomains may enter the public auth DTO. */
+export function emailCodeDomainPolicy(env: Record<string, string | undefined>): {
+  publicDomains: string[];
+  domains: string[];
+  configured: boolean;
+} {
+  const parse = (value: string | undefined) =>
+    (value ?? '')
+      .split(',')
+      .map((domain) => domain.trim().toLowerCase())
+      .filter(Boolean);
+  const publicDomains = parse(env.EMAIL_CODE_ALLOWED_DOMAINS);
+  const domains = [...new Set([...publicDomains, ...parse(env.EMAIL_CODE_HIDDEN_ALLOWED_DOMAINS)])];
+  const configured =
+    publicDomains.length > 0 &&
+    domains.every((domain) => /^[a-z0-9]+(?:[.-][a-z0-9]+)*\.[a-z]{2,63}$/.test(domain));
+  return { publicDomains, domains, configured };
+}
+
 /** Trusted deployment policy shared by authentication and its existing SMTP sender. */
 export interface EmailCodeQualificationMailbox {
   readonly email: string;

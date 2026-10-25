@@ -1,4 +1,5 @@
 import type { ConfiguredAdministratorPolicy } from '@librechat/data-schemas';
+import { emailCodeDomainPolicy, recipientAllowed } from './emailRecipientPolicy';
 import { emailCodeAddressSchema } from './emailCodeAddress';
 
 /** Server-only control-plane configuration; never part of the public auth DTO or JWT. */
@@ -18,8 +19,10 @@ export function getConfiguredAdministratorPolicy(
     throw invalid();
   const revision = Number(revisionText);
   const tenantId = env.EMAIL_CODE_TENANT_ID ?? '';
+  const domainPolicy = emailCodeDomainPolicy(env);
   if (
     !Number.isSafeInteger(revision) ||
+    !domainPolicy.configured ||
     tenantId === '__SYSTEM__' ||
     !/^[a-zA-Z0-9_.-]{1,128}$/.test(tenantId)
   )
@@ -37,7 +40,8 @@ export function getConfiguredAdministratorPolicy(
     if (
       !address.success ||
       address.data !== value ||
-      !/^[a-z0-9][a-z0-9._+-]*@bwi\.de$/.test(address.data) ||
+      !/^[a-z0-9][a-z0-9._+-]*@[a-z0-9]+(?:[.-][a-z0-9]+)*\.[a-z]{2,63}$/.test(address.data) ||
+      !recipientAllowed(address.data, domainPolicy.domains, undefined) ||
       Buffer.byteLength(address.data, 'utf8') > 254 ||
       emails.includes(address.data)
     )

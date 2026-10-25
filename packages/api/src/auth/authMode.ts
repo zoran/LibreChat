@@ -3,7 +3,11 @@ import { createHmac, timingSafeEqual } from 'node:crypto';
 import type { AuthMode, EmailCodeConfig } from 'librechat-data-provider';
 import type { Request, Response } from 'express';
 import { getEmailCodeMailConfig } from './mailSender';
-import { qualificationMailbox, type EmailCodeQualificationMailbox } from './emailRecipientPolicy';
+import {
+  emailCodeDomainPolicy,
+  qualificationMailbox,
+  type EmailCodeQualificationMailbox,
+} from './emailRecipientPolicy';
 
 export const AUTH_SELECTION_COOKIE = '__Host-librechat-auth-selection';
 export const EMAIL_ATTEMPT_COOKIE = '__Host-librechat-email-attempt';
@@ -32,28 +36,26 @@ export function guestUploadTransitionEnabled(): boolean {
 export function getEmailCodeSettings(): {
   tenantId: string;
   domains: string[];
+  publicDomains: string[];
   secret: string;
   policyVersion: number;
   configured: boolean;
   qualification: EmailCodeQualificationMailbox | undefined;
 } {
   const tenantId = process.env.EMAIL_CODE_TENANT_ID ?? '';
-  const domains = (process.env.EMAIL_CODE_ALLOWED_DOMAINS ?? '')
-    .split(',')
-    .map((domain) => domain.trim().toLowerCase())
-    .filter(Boolean);
+  const domainPolicy = emailCodeDomainPolicy(process.env);
+  const { domains, publicDomains } = domainPolicy;
   const qualification = qualificationMailbox(process.env);
   const secret = process.env.EMAIL_CODE_HMAC_KEY ?? '';
   const policyVersion = Number(process.env.EMAIL_CODE_POLICY_VERSION ?? '1');
   const configured =
     tenantId !== '__SYSTEM__' &&
     /^[a-zA-Z0-9_.-]{1,128}$/.test(tenantId) &&
-    domains.length > 0 &&
-    domains.every((domain) => /^[a-z0-9]+(?:[.-][a-z0-9]+)*\.[a-z]{2,63}$/.test(domain)) &&
+    domainPolicy.configured &&
     Buffer.byteLength(secret) >= 32 &&
     Number.isSafeInteger(policyVersion) &&
     policyVersion > 0;
-  return { tenantId, domains, secret, policyVersion, configured, qualification };
+  return { tenantId, domains, publicDomains, secret, policyVersion, configured, qualification };
 }
 
 export function getEmailCodeConfig(senderConfigured?: boolean): EmailCodeConfig {
@@ -69,7 +71,7 @@ export function getEmailCodeConfig(senderConfigured?: boolean): EmailCodeConfig 
       settings.configured &&
       process.env.EMAIL_CODE_ENABLED === 'true' &&
       senderAvailable,
-    emailCodeDomains: settings.domains,
+    emailCodeDomains: settings.publicDomains,
   };
 }
 

@@ -5,6 +5,7 @@ const valid = () => ({
   PLATFORM_ADMIN_EMAILS_JSON: '["zoran.kikic@bwi.de","dennis.maier@bwi.de"]',
   PLATFORM_ADMIN_POLICY_REVISION: '1',
   EMAIL_CODE_TENANT_ID: 'cortex-bwi',
+  EMAIL_CODE_ALLOWED_DOMAINS: 'bwi.de',
 });
 
 describe('server-only configured administrator policy', () => {
@@ -20,6 +21,33 @@ describe('server-only configured administrator policy', () => {
     });
     expect(Object.isFrozen(policy)).toBe(true);
     expect(Object.isFrozen(policy.emails)).toBe(true);
+  });
+  it('admits only explicitly listed canonical addresses from configured public or hidden domains', () => {
+    const env = {
+      ...valid(),
+      EMAIL_CODE_HIDDEN_ALLOWED_DOMAINS: 'private.example.test',
+      PLATFORM_ADMIN_EMAILS_JSON: '["operator@private.example.test","zoran.kikic@bwi.de"]',
+      PLATFORM_ADMIN_POLICY_REVISION: '2',
+    };
+    expect(getConfiguredAdministratorPolicy(env)?.emails).toEqual([
+      'operator@private.example.test',
+      'zoran.kikic@bwi.de',
+    ]);
+    expect(() =>
+      getConfiguredAdministratorPolicy({ ...env, EMAIL_CODE_HIDDEN_ALLOWED_DOMAINS: '' }),
+    ).toThrow();
+    expect(() =>
+      getConfiguredAdministratorPolicy({
+        ...env,
+        PLATFORM_ADMIN_EMAILS_JSON: '["operator@sub.private.example.test"]',
+      }),
+    ).toThrow();
+    expect(() =>
+      getConfiguredAdministratorPolicy({
+        ...env,
+        EMAIL_CODE_HIDDEN_ALLOWED_DOMAINS: '*.example.test',
+      }),
+    ).toThrow();
   });
   it('distinguishes absent configuration from explicit removal', () => {
     expect(getConfiguredAdministratorPolicy({})).toBeUndefined();

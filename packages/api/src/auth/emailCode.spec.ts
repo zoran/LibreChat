@@ -33,6 +33,7 @@ import { fixture, cookies, parseCookies } from './emailCode.helper';
 describe('email-code authentication composition', () => {
   const original = { ...process.env };
   beforeEach(() => {
+    delete process.env.EMAIL_CODE_HIDDEN_ALLOWED_DOMAINS;
     delete process.env.EMAIL_CODE_QUALIFICATION_MAILBOX;
     delete process.env.EMAIL_CODE_QUALIFICATION_NOT_AFTER;
     process.env.AUTH_MODE = 'transition';
@@ -61,6 +62,41 @@ describe('email-code authentication composition', () => {
     const payload = jwt.verify(response.body.token, process.env.JWT_SECRET!) as jwt.JwtPayload;
     return { ...f, response, payload, token: parseCookies(cookies(response)).refreshToken };
   }
+
+  it('authenticates a permanently allowed hidden domain without advertising it or admitting suffixes', async () => {
+    process.env.EMAIL_CODE_HIDDEN_ALLOWED_DOMAINS = 'private.example.test';
+    const f = fixture();
+    const pending = await request(f.app)
+      .post('/request')
+      .send({ email: 'person@private.example.test' });
+    expect(pending.status).toBe(202);
+    const publicConfig = getEmailCodeConfig(true);
+    expect(publicConfig.emailCodeDomains).toEqual([
+      'employees.example.test',
+      'partners.example.test',
+    ]);
+    expect(JSON.stringify(publicConfig)).not.toContain('private.example.test');
+    const verified = await request(f.app)
+      .post('/verify')
+      .set('Cookie', cookies(pending))
+      .send({ attemptId: pending.body.attemptId, code: f.code() });
+    expect(verified.status).toBe(200);
+    expect((await request(f.app).post('/refresh').set('Cookie', cookies(verified))).status).toBe(
+      200,
+    );
+    expect(
+      (
+        await request(f.app)
+          .post('/request')
+          .send({ email: 'person@private.example.test.attacker.test' })
+      ).status,
+    ).not.toBe(202);
+    process.env.EMAIL_CODE_HIDDEN_ALLOWED_DOMAINS = '*.private.example.test';
+    expect(getEmailCodeConfig(true).emailCodeEnabled).toBe(false);
+    expect(
+      (await request(f.app).post('/refresh').set('Cookie', cookies(verified))).status,
+    ).not.toBe(200);
+  });
 
   describe('finite exact qualification mailbox', () => {
     const email = 'qualification@outside.example.test';
