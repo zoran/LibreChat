@@ -138,7 +138,7 @@ export function createBoundedEmailCodeSender(
         throw new SubmissionUnavailable();
       const email = input.email;
       const link = config.clientUrl
-        ? emailCodeLink(config.clientUrl, input.attemptId, input.code)
+        ? emailCodeLink(config.clientUrl, input.attemptId, input.code, input.linkProof)
         : undefined;
       const qualifiedOnly = !config.allowedDomains.includes(
         email.slice(email.lastIndexOf('@') + 1),

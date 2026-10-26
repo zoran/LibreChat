@@ -7,6 +7,7 @@ export interface EmailCodeSender {
     email: string;
     code: string;
     attemptId?: string;
+    linkProof?: string;
     expiresInMinutes: number;
     locale: 'de' | 'en';
   }): Promise<void>;

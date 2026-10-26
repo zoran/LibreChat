@@ -11,10 +11,13 @@ export function emailCodeLink(
   clientUrl: string,
   attemptId: string | undefined,
   code: string,
+  linkProof?: string,
 ): string {
   if (!attemptId || !/^[A-Za-z0-9_-]{43}$/.test(attemptId) || !/^\d{8}$/.test(code))
     throw new Error('Invalid email-code link');
+  if (linkProof !== undefined && !/^[a-f0-9]{64}$/.test(linkProof))
+    throw new Error('Invalid email-code link');
   const url = new URL('login/email-code', mailClientUrl(clientUrl));
-  url.hash = `attemptId=${attemptId}&code=${code}`;
+  url.hash = `attemptId=${attemptId}&code=${code}${linkProof ? `&proof=${linkProof}` : ''}`;
   return url.href;
 }

@@ -13,7 +13,12 @@ let mockStartup: {
   error: unknown;
 };
 const mockRequest = jest.fn();
-const mockLink = { attemptId: 'a'.repeat(43), code: '01234567', activated: true };
+const mockLink = {
+  attemptId: 'a'.repeat(43),
+  code: '01234567',
+  linkProof: 'b'.repeat(64),
+  activated: true,
+};
 const configuredLogo = '/assets/cortex-wordmark-dark.svg?v=fixture';
 jest.mock('~/hooks/AuthContext', () => ({ useAuthContext: () => mockAuth }));
 jest.mock('~/hooks/Auth/useAuthMode', () => ({
@@ -105,18 +110,19 @@ it('auto-completes a confirmed anonymous click once while branding is still load
   expect(mockRequest).toHaveBeenCalledWith('email-code/verify', {
     attemptId: mockLink.attemptId,
     code: mockLink.code,
+    linkProof: mockLink.linkProof,
   });
 });
 it.each(['email_code', 'local', 'openid'])(
-  'confirms every authenticated non-guest (%s) before POST',
+  'automatically uses a real email click with an existing %s session',
   async (provider) => {
     mockAuth.authResolution.status = 'resolved';
     mockAuth.isAuthenticated = true;
     mockAuth.user = { provider };
     render(view());
-    expect(mockRequest).not.toHaveBeenCalled();
-    fireEvent.click(continueButton());
-    await waitFor(() => expect(mockRequest).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(mockAuth.completeAuthentication).toHaveBeenCalledTimes(1));
+    expect(mockRequest).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole('button', { name: 'com_auth_email_link_continue' })).toBeNull();
   },
 );
 it('prefetch requires confirmation and stale completion cannot switch identity', async () => {
@@ -161,4 +167,18 @@ it('offers recovery without redeeming an absent link even when startup configura
   expect(recoveryLink()).toHaveAttribute('href', '/login');
   expect(mockRequest).not.toHaveBeenCalled();
   expect(mockAuth.completeAuthentication).not.toHaveBeenCalled();
+});
+
+it('preserves an existing login and offers the current app after failed link verification', async () => {
+  mockAuth.authResolution.status = 'resolved';
+  mockAuth.isAuthenticated = true;
+  mockAuth.user = { provider: 'email_code', id: 'current-user' };
+  mockRequest.mockRejectedValueOnce(new Error('expired link'));
+  render(view());
+  await waitFor(() => expect(landingAlert()).toHaveTextContent('com_auth_email_link_invalid'));
+  expect(screen.getByRole('link', { name: 'com_ui_continue' })).toHaveAttribute('href', '/c/new');
+  expect(mockAuth.isAuthenticated).toBe(true);
+  expect(mockAuth.user.id).toBe('current-user');
+  expect(mockAuth.completeAuthentication).not.toHaveBeenCalled();
+  expect(screen.queryByText('com_auth_email_link_browser')).toBeNull();
 });

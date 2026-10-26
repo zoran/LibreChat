@@ -152,3 +152,20 @@ describe('email-code message presentation', () => {
     expect(plain.text).not.toMatch(/Browser|Alternativ/);
   });
 });
+
+describe('mailbox link credential transport', () => {
+  it('keeps the independently redeemable proof exclusively in the fragment', () => {
+    const proof = 'b'.repeat(64);
+    const url = new URL(
+      emailCodeLink('https://portal.example.test/', 'a'.repeat(43), '01234567', proof),
+    );
+    expect(url.search).toBe('');
+    expect(url.hash).toBe(`#attemptId=${'a'.repeat(43)}&code=01234567&proof=${proof}`);
+    const message = emailCodeMessage({ ...input, link: url.href });
+    expect(message.text).toContain(url.href);
+    expect(new JSDOM(message.html).window.document.querySelector('a')!.href).toBe(url.href);
+    expect(() =>
+      emailCodeLink('https://portal.example.test/', 'a'.repeat(43), '01234567', 'bad'),
+    ).toThrow();
+  });
+});

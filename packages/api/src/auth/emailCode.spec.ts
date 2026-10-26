@@ -490,6 +490,130 @@ describe('email-code authentication composition', () => {
     },
   );
 
+  it.each(['existing', 'stale', 'absent'])(
+    'redeems a fresh mailbox link from a different browser with an %s session',
+    async (session) => {
+      const f = session === 'existing' ? await authenticated() : fixture();
+      const pending = await request(f.app)
+        .post('/request')
+        .send({ email: 'person@employees.example.test' });
+      const sent = f.sender.sendCode.mock.calls.at(-1)![0];
+      expect(sent.linkProof).toMatch(/^[a-f0-9]{64}$/);
+      expect(pending.body.linkProof).toBeUndefined();
+      const verify = request(f.app).post('/verify');
+      if (session === 'existing' && 'response' in f) verify.set('Cookie', cookies(f.response));
+      if (session === 'stale') verify.set('Cookie', 'refreshToken=expired-session');
+      const result = await verify.send({
+        attemptId: pending.body.attemptId,
+        code: sent.code,
+        linkProof: sent.linkProof,
+      });
+      expect(result.status).toBe(200);
+      expect(result.body.user.email).toBe(sent.email);
+      expect(parseCookies(cookies(result)).refreshToken).toBeTruthy();
+      expect(f.repository.redeemEmailCode).toHaveBeenLastCalledWith(
+        expect.objectContaining({ nonceHash: f.challenges.get(pending.body.attemptId)!.nonceHash }),
+      );
+      const replay = await request(f.app).post('/verify').set('Cookie', cookies(result)).send({
+        attemptId: pending.body.attemptId,
+        code: sent.code,
+        linkProof: sent.linkProof,
+      });
+      expect(replay.status).toBe(400);
+      expect(replay.headers['set-cookie']).toBeUndefined();
+    },
+  );
+
+  it('rejects another MAC purpose and preserves the current login after failed link proof', async () => {
+    const f = await authenticated();
+    const pending = await request(f.app)
+      .post('/request')
+      .send({ email: 'person@employees.example.test' });
+    const challenge = f.challenges.get(pending.body.attemptId)!;
+    const failed = await request(f.app).post('/verify').set('Cookie', cookies(f.response)).send({
+      attemptId: challenge._id,
+      code: f.code(),
+      linkProof: challenge.verifier,
+    });
+    expect(failed.status).toBe(400);
+    expect(failed.headers['set-cookie']).toBeUndefined();
+    expect(challenge.consumedAt).toBeUndefined();
+    const refreshed = await request(f.app).post('/refresh').set('Cookie', cookies(f.response));
+    expect(refreshed.status).toBe(200);
+  });
+
+  it('rejects an expired link without publishing credentials', async () => {
+    const f = fixture();
+    const pending = await request(f.app)
+      .post('/request')
+      .send({ email: 'person@employees.example.test' });
+    const sent = f.sender.sendCode.mock.calls[0][0];
+    f.challenges.get(pending.body.attemptId)!.expiresAt = new Date(0);
+    const result = await request(f.app).post('/verify').send({
+      attemptId: pending.body.attemptId,
+      code: sent.code,
+      linkProof: sent.linkProof,
+    });
+    expect(result.status).toBe(400);
+    expect(result.headers['set-cookie']).toBeUndefined();
+  });
+
+  it('binds a link to its code, recipient and current resend generation', async () => {
+    const f = fixture();
+    const pending = await request(f.app)
+      .post('/request')
+      .send({ email: 'person@employees.example.test' });
+    const first = f.sender.sendCode.mock.calls[0][0];
+    const wrongCode = first.code === '00000000' ? '11111111' : '00000000';
+    expect(
+      (
+        await request(f.app).post('/verify').send({
+          attemptId: pending.body.attemptId,
+          code: wrongCode,
+          linkProof: first.linkProof,
+        })
+      ).status,
+    ).toBe(400);
+    const challenge = f.challenges.get(pending.body.attemptId)!;
+    challenge.email = 'another@employees.example.test';
+    expect(
+      (
+        await request(f.app).post('/verify').send({
+          attemptId: pending.body.attemptId,
+          code: first.code,
+          linkProof: first.linkProof,
+        })
+      ).status,
+    ).toBe(400);
+    challenge.email = first.email;
+    challenge.resendAt = new Date(0);
+    const resend = await request(f.app).post('/request').set('Cookie', cookies(pending)).send({
+      email: first.email,
+      attemptId: pending.body.attemptId,
+    });
+    expect(resend.status).toBe(202);
+    const next = f.sender.sendCode.mock.calls.at(-1)![0];
+    expect(next.linkProof).not.toBe(first.linkProof);
+    expect(
+      (
+        await request(f.app).post('/verify').send({
+          attemptId: pending.body.attemptId,
+          code: first.code,
+          linkProof: first.linkProof,
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await request(f.app).post('/verify').send({
+          attemptId: pending.body.attemptId,
+          code: next.code,
+          linkProof: next.linkProof,
+        })
+      ).status,
+    ).toBe(200);
+  });
+
   it('denies suffix domains, client tenant grants and a code without its browser binding', async () => {
     const f = fixture();
     expect(

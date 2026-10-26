@@ -126,6 +126,7 @@ describe('bounded approved SMTP submission', () => {
       ...input,
       locale: 'en',
       attemptId: Buffer.alloc(32, 7).toString('base64url'),
+      linkProof: 'b'.repeat(64),
     });
     f.sockets[0].emit('connect');
     f.callbacks[0](null, { accepted: [input.email], rejected: [], response: '250 queued' });
@@ -138,6 +139,7 @@ describe('bounded approved SMTP submission', () => {
       'Gib diesen Code auf der Anmeldeseite ein:',
     );
     expect((f.messages[0] as EmailCodeMailMessage).text).not.toContain('Your sign-in code');
+    expect((f.messages[0] as EmailCodeMailMessage).text).toContain(`&proof=${'b'.repeat(64)}`);
     expect((f.messages[0] as EmailCodeMailMessage).html).toContain('lang="de"');
     expect((f.messages[0] as EmailCodeMailMessage).html).toContain(
       'Gib diesen Code auf der Anmeldeseite ein:',

@@ -10,7 +10,7 @@ import { useGetStartupConfig } from '~/data-provider';
 import { useAuthContext } from '~/hooks/AuthContext';
 import useLocalize from '~/hooks/useLocalize';
 
-/** Share the branded auth shell while retaining this link's explicit account-switch confirmation. */
+/** Redeem real email clicks automatically, preserving the current session until verification succeeds. */
 export default function EmailCodeLanding() {
   const localize = useLocalize();
   const { data: startupConfig, isFetching, error: startupConfigError } = useGetStartupConfig();
@@ -19,7 +19,6 @@ export default function EmailCodeLanding() {
   current.current = auth;
   const attempted = useRef(false);
   const [state, setState] = useState<'idle' | 'working' | 'invalid'>('idle');
-  const needsConfirmation = auth.isAuthenticated && auth.user?.provider !== 'browser';
   const redeem = useCallback(async () => {
     const context = current.current;
     const generation = context.authResolution.generation;
@@ -36,6 +35,7 @@ export default function EmailCodeLanding() {
       const response = await emailCodeRequest<TLoginResponse>('email-code/verify', {
         attemptId: emailCodeLink.attemptId,
         code: emailCodeLink.code,
+        ...(emailCodeLink.linkProof ? { linkProof: emailCodeLink.linkProof } : {}),
       });
       if (
         !current.current.isAuthGenerationCurrent(generation) ||
@@ -49,9 +49,8 @@ export default function EmailCodeLanding() {
     }
   }, []);
   useEffect(() => {
-    if (emailCodeLink?.activated && auth.authResolution.status === 'resolved' && !needsConfirmation)
-      void redeem();
-  }, [auth.authResolution, needsConfirmation, redeem]);
+    if (emailCodeLink?.activated && auth.authResolution.status === 'resolved') void redeem();
+  }, [auth.authResolution, redeem]);
   const unavailable = auth.authResolution.status === 'unavailable';
   const invalid = !emailCodeLink || state === 'invalid';
   let content: ReactNode;
@@ -75,9 +74,7 @@ export default function EmailCodeLanding() {
     content = (
       <>
         <p className="text-text-secondary text-sm leading-6">
-          {localize(
-            needsConfirmation ? 'com_auth_email_link_switch' : 'com_auth_email_link_confirm',
-          )}
+          {localize('com_auth_email_link_confirm')}
         </p>
         <Button className="w-full" onClick={() => void redeem()}>
           {localize('com_auth_email_link_continue')}
@@ -98,11 +95,15 @@ export default function EmailCodeLanding() {
         {content}
         {(invalid || unavailable) && (
           <div className="space-y-4">
-            <p className="text-text-secondary text-sm leading-6">
-              {localize('com_auth_email_link_browser')}
-            </p>
+            {!auth.isAuthenticated && !emailCodeLink?.linkProof && (
+              <p className="text-text-secondary text-sm leading-6">
+                {localize('com_auth_email_link_browser')}
+              </p>
+            )}
             <Button asChild variant="outline" className="w-full">
-              <Link to="/login">{localize('com_auth_email_link_new')}</Link>
+              <Link to={auth.isAuthenticated ? '/c/new' : '/login'}>
+                {localize(auth.isAuthenticated ? 'com_ui_continue' : 'com_auth_email_link_new')}
+              </Link>
             </Button>
           </div>
         )}

@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import jwt from 'jsonwebtoken';
 import { readUploadIntakeGrant } from 'librechat-data-provider';
-import { createHash, createHmac, randomBytes, randomInt } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomInt, timingSafeEqual } from 'node:crypto';
 import type {
   EmailCodeIdentity,
   EmailCodeChallenge,
@@ -32,7 +32,14 @@ const requestSchema = z
   })
   .strict();
 const verifySchema = z
-  .object({ attemptId: z.string().regex(OPAQUE), code: z.string().regex(/^\d{8}$/) })
+  .object({
+    attemptId: z.string().regex(OPAQUE),
+    code: z.string().regex(/^\d{8}$/),
+    linkProof: z
+      .string()
+      .regex(/^[a-f0-9]{64}$/)
+      .optional(),
+  })
   .strict();
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 const mac = (purpose: string, ...values: unknown[]) =>
@@ -43,6 +50,12 @@ const verifier = (
   c: Pick<EmailCodeChallenge, '_id' | 'tenantId' | 'email' | 'nonceHash' | 'generation'>,
   code: string,
 ) => mac('email-code:v1', c.tenantId, c.email, c._id, c.nonceHash, c.generation, code);
+// A mailbox link is independently redeemable; the short manual code remains browser-bound.
+// A separate MAC purpose prevents the stored code verifier from becoming a link credential.
+const linkVerifier = (
+  c: Pick<EmailCodeChallenge, '_id' | 'tenantId' | 'email' | 'nonceHash' | 'generation'>,
+  code: string,
+) => mac('email-code-link:v1', c.tenantId, c.email, c._id, c.nonceHash, c.generation, code);
 
 interface GrantClaims extends jwt.JwtPayload {
   id: string;
@@ -387,6 +400,7 @@ export function createEmailCodeAuth(deps: EmailCodeDependencies): {
           email,
           code,
           attemptId: challenge._id,
+          linkProof: linkVerifier(challenge, code),
           expiresInMinutes: 10,
           locale: req.acceptsLanguages('de', 'en') === 'en' ? 'en' : 'de',
         }),
@@ -410,18 +424,29 @@ export function createEmailCodeAuth(deps: EmailCodeDependencies): {
     const parsed = verifySchema.safeParse(req.body);
     if (!parsed.success) fail('EMAIL_CODE_INVALID');
     const nonce = req.cookies?.[EMAIL_ATTEMPT_COOKIE];
-    if (typeof nonce !== 'string' || !OPAQUE.test(nonce)) fail('EMAIL_CODE_INVALID');
+    const browserBound = typeof nonce === 'string' && OPAQUE.test(nonce);
+    if (!parsed.data.linkProof && !browserBound) fail('EMAIL_CODE_INVALID');
     const settings = getEmailCodeSettings();
     const challenge = await repo.getEmailCodeChallenge(parsed.data.attemptId, settings.tenantId);
     if (!challenge) fail('EMAIL_CODE_INVALID');
     if (!recipientEligible(challenge.email)) fail('EMAIL_CODE_INVALID');
+    if (
+      parsed.data.linkProof &&
+      !timingSafeEqual(
+        Buffer.from(parsed.data.linkProof, 'hex'),
+        Buffer.from(linkVerifier(challenge, parsed.data.code), 'hex'),
+      )
+    )
+      fail('EMAIL_CODE_INVALID');
+    // Only an authenticated link may supply the challenge's binding to the existing atomic owner.
+    const nonceHash = parsed.data.linkProof ? challenge.nonceHash : hash(nonce);
     const refreshNonce = randomBytes(32).toString('base64url');
     const balance = await deps.getBalance?.();
     const identity = await deps.write(() =>
       repo.redeemEmailCode({
         attemptId: challenge._id,
         tenantId: settings.tenantId,
-        nonceHash: hash(nonce),
+        nonceHash,
         generation: challenge.generation,
         verifier: verifier(challenge, parsed.data.code),
         refreshTokenHash: hash(refreshNonce),

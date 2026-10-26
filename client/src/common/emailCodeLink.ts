@@ -1,4 +1,9 @@
-type EmailCodeLink = { attemptId: string; code: string; activated: boolean };
+type EmailCodeLink = {
+  attemptId: string;
+  code: string;
+  linkProof?: string;
+  activated: boolean;
+};
 declare global {
   interface Window {
     __emailCodeLink?: EmailCodeLink | null;

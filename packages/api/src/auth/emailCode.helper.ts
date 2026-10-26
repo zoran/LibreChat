@@ -6,6 +6,7 @@ import type {
   EmailCodeRepository,
 } from '@librechat/data-schemas';
 import type request from 'supertest';
+import type { EmailCodeSender } from './emailCode.types';
 import { createEmailCodeAuth } from './emailCode';
 
 export const parseCookies: (value: string) => Record<string, string> =
@@ -104,7 +105,7 @@ export function fixture(sendFails = false) {
     touchEmailCodeSession: jest.fn(async () => undefined),
   };
   const sender = {
-    sendCode: jest.fn(async ({ code }: { code: string }) => {
+    sendCode: jest.fn(async ({ code }: Parameters<EmailCodeSender['sendCode']>[0]) => {
       sentCode = code;
       if (sendFails) throw new Error('private transport detail must not escape');
     }),
