@@ -10,6 +10,7 @@ import {
   HeadObjectCommand,
   ListObjectVersionsCommand,
 } from '@aws-sdk/client-s3';
+import type { ManagedUploadWriteBinding, ManagedUploadWriteInput } from '@librechat/data-schemas';
 import type { UploadOriginalIntegrity, UploadStorageReceipt } from 'librechat-data-provider';
 import type { S3Client } from '@aws-sdk/client-s3';
 import type {
@@ -18,6 +19,7 @@ import type {
   UploadBackendCapture,
 } from '../providerObservation';
 import type { StoragePort } from '../../uploads/contract';
+import { observeManagedOriginal, snapshotManagedWrite } from './managedUpload';
 import { verifyOriginalIntegrity } from '../../uploads/storage/integrity';
 import { observeStorageProviders } from '../providerObservation';
 import { createManagedDeletionAdapter } from './managedDeletion';
@@ -185,16 +187,73 @@ export function createManagedS3Storage(options: {
       }),
     beginDeletion: (input) => deletion.begin(deletionInput(input)),
     observeDeletion: (input) => deletion.observe(deletionInput(input)),
+    async observeOriginal({ binding: supplied, integrity: suppliedIntegrity, signal }) {
+      const binding = snapshotManagedWrite(supplied);
+      const integrity = identitySnapshot(suppliedIntegrity, binding.bytes);
+      if (
+        binding.bucket !== Bucket ||
+        !validKey(binding.key) ||
+        binding.wholeSHA256 !== integrity.sha256
+      )
+        throw new Error('Managed original observation binding mismatch');
+      const receipt = {
+        source: 's3' as const,
+        filepath: await (options.urlForKey?.(binding.key) ??
+          getSignedUrl(client, new GetObjectCommand({ Bucket, Key: binding.key }), {
+            expiresIn: 120,
+          })),
+        storageKey: binding.key,
+        bytes: binding.bytes,
+      };
+      const result = await observeManagedOriginal(client, { binding, signal });
+      if (result.state !== 'published') return { ...receipt, outcome: 'unknown' as const };
+      const durable = { ...receipt, outcome: 'durable' as const, integrity, etag: result.etag };
+      return isUploadStorageReceipt(durable)
+        ? durable
+        : { ...receipt, outcome: 'unknown' as const };
+    },
     async put(input) {
       const Key = managedOriginalKey(input.lease);
       const { operationId, generation } = input.lease;
-      const { bytes, mediaType, signal } = input;
+      const { bytes, mediaType } = input;
+      let signal = input.signal;
       const integrity = identitySnapshot(input.integrity, bytes);
       const started = performance.now();
       const receipt = { source: 's3', filepath: Key, storageKey: Key, bytes };
       if (!Number.isSafeInteger(bytes) || bytes < 1 || bytes > MAX_BYTES) {
         throw new Error('Invalid managed object size');
       }
+      const proposal: ManagedUploadWriteInput = {
+        bucket: Bucket,
+        key: Key,
+        operationId,
+        generation: String(generation),
+        bytes,
+        wholeSHA256: integrity.sha256,
+        mediaType,
+      };
+      if (typeof input.bindWrite !== 'function')
+        throw new Error('Missing managed write binding owner');
+      const binding: ManagedUploadWriteBinding = { ...(await input.bindWrite(proposal)) };
+      const bindingKeys = ['version', ...Object.keys(proposal), 'originalDeadline'].sort();
+      if (
+        !binding ||
+        Object.getPrototypeOf(binding) !== Object.prototype ||
+        Object.keys(binding).sort().join(',') !== bindingKeys.join(',') ||
+        binding.version !== 1 ||
+        Object.entries(proposal).some(
+          ([key, value]) => binding[key as keyof ManagedUploadWriteBinding] !== value,
+        ) ||
+        !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(binding.originalDeadline) ||
+        !Number.isFinite(Date.parse(binding.originalDeadline)) ||
+        new Date(binding.originalDeadline).toISOString() !== binding.originalDeadline ||
+        Date.parse(binding.originalDeadline) <= Date.now()
+      )
+        throw new Error('Invalid or expired managed write binding');
+      signal = AbortSignal.any([
+        signal,
+        AbortSignal.timeout(Math.max(1, Date.parse(binding.originalDeadline) - Date.now())),
+      ]);
       const source =
         input.body instanceof Readable
           ? input.body
@@ -213,6 +272,8 @@ export function createManagedS3Storage(options: {
         if (signal.aborted) return { ...receipt, outcome: 'absent' };
         if (!isUploadStorageReceipt({ ...receipt, outcome: 'absent' }))
           throw new Error('Invalid managed original locator');
+        if (Date.parse(binding.originalDeadline) <= Date.now())
+          throw new Error('Managed write deadline expired before dispatch');
         let complete = false;
         body = Readable.from(
           (async function* () {
@@ -222,6 +283,12 @@ export function createManagedS3Storage(options: {
           { objectMode: false, highWaterMark: 64 * 1024 },
         );
         body.on('error', ignoreStreamError);
+        const reconcile = async () => {
+          if (!complete || input.signal.aborted) return;
+          return storage
+            .observeOriginal({ binding, integrity, signal: input.signal })
+            .catch(() => undefined);
+        };
         try {
           const result = await client.send(
             new PutObjectCommand({
@@ -231,7 +298,13 @@ export function createManagedS3Storage(options: {
               ContentLength: bytes,
               ContentType: mediaType,
               IfNoneMatch: '*',
-              Metadata: { operation: operationId, generation: String(generation) },
+              Metadata: {
+                operation: operationId,
+                generation: String(generation),
+                'cortex-upload-bytes': String(binding.bytes),
+                'cortex-upload-sha256': binding.wholeSHA256,
+                'cortex-upload-deadline': binding.originalDeadline,
+              },
             }),
             { abortSignal: signal },
           );
@@ -243,12 +316,22 @@ export function createManagedS3Storage(options: {
             ...(result.VersionId !== undefined ? { versionId: result.VersionId } : {}),
           };
           if (!complete || signal.aborted || !isUploadStorageReceipt(durable)) {
+            const recovered = await reconcile();
+            if (recovered?.outcome === 'durable') {
+              observe('put', 'durable', started);
+              return recovered;
+            }
             observe('put', 'unknown', started);
             return { ...receipt, outcome: 'unknown' };
           }
           observe('put', 'durable', started);
           return durable;
         } catch {
+          const recovered = await reconcile();
+          if (recovered?.outcome === 'durable') {
+            observe('put', 'durable', started);
+            return recovered;
+          }
           // An abort, integrity failure or missing acknowledgement after dispatch can follow
           // a partial or completed remote write. The existing cleanup owner retains capacity.
           observe('put', 'unknown', started);

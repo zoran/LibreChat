@@ -660,6 +660,9 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         };
       });
       const storage: StoragePort = {
+        async observeOriginal() {
+          throw new Error('Unexpected original status in scanner admission');
+        },
         put,
         describeDeletion() {
           throw new Error('Unexpected housekeeping deletion in scanner admission');

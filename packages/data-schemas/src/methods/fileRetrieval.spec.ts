@@ -6,7 +6,7 @@ import { runInNewContext } from 'node:vm';
 import { canonicalManagedJson } from 'librechat-data-provider';
 import type { GenerationJobManagerClass as GenerationManager } from '@librechat/api' with { 'resolution-mode': 'require' };
 import type { ManagedRetrievalState } from 'librechat-data-provider';
-import { createUploadActivationMethods } from './uploadManagementStore';
+import { createUploadActivationMethods } from './uploadManagementActivation';
 import { createFileRetentionMethods } from './fileRetention';
 const {
   createFileDeletionWorkOwner,

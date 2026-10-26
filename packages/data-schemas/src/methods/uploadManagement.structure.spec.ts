@@ -9,11 +9,8 @@ import {
   copyFrozenUploadFiles,
   completeAcceptedUploadFileCleanup,
 } from './uploadManagement.structure.fixture';
-import {
-  createUploadStore,
-  createUploadActivationMethods,
-  hasValidUploadPublicationTime,
-} from './uploadManagementStore';
+import { createUploadStore, hasValidUploadPublicationTime } from './uploadManagementStore';
+import { createUploadActivationMethods } from './uploadManagementActivation';
 import { captureManagedRetrievalInventoryEvidence } from './fileRetrieval';
 import { projectFileHousekeeping } from './fileHousekeepingProjection';
 import { validFileRetentionActivity } from './fileActivityTransition';

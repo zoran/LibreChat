@@ -199,3 +199,9 @@ export type { FileCleanupClaimMethods } from './methods/fileCleanupClaim';
 export { createUploadFileCleanupOwner } from './methods/uploadFileCleanup';
 export { createFileRetentionMethods } from './methods/fileRetention';
 export { createMessageMethods } from './methods/message';
+
+export type {
+  ManagedUploadWriteInput,
+  ManagedUploadWriteBinding,
+  ManagedUploadWriteBinder,
+} from './methods/uploadManagementWriteTypes';

@@ -493,15 +493,16 @@ describe('email-code authentication composition', () => {
   it.each(['existing', 'stale', 'absent'])(
     'redeems a fresh mailbox link from a different browser with an %s session',
     async (session) => {
-      const f = session === 'existing' ? await authenticated() : fixture();
+      const existing = session === 'existing' ? await authenticated() : undefined;
+      const f = existing ?? fixture();
       const pending = await request(f.app)
         .post('/request')
         .send({ email: 'person@employees.example.test' });
-      const sent = f.sender.sendCode.mock.calls.at(-1)![0];
+      const sent = f.sender.sendCode.mock.calls[f.sender.sendCode.mock.calls.length - 1]![0];
       expect(sent.linkProof).toMatch(/^[a-f0-9]{64}$/);
       expect(pending.body.linkProof).toBeUndefined();
       const verify = request(f.app).post('/verify');
-      if (session === 'existing' && 'response' in f) verify.set('Cookie', cookies(f.response));
+      if (existing) verify.set('Cookie', cookies(existing.response));
       if (session === 'stale') verify.set('Cookie', 'refreshToken=expired-session');
       const result = await verify.send({
         attemptId: pending.body.attemptId,
@@ -592,7 +593,7 @@ describe('email-code authentication composition', () => {
       attemptId: pending.body.attemptId,
     });
     expect(resend.status).toBe(202);
-    const next = f.sender.sendCode.mock.calls.at(-1)![0];
+    const next = f.sender.sendCode.mock.calls[f.sender.sendCode.mock.calls.length - 1]![0];
     expect(next.linkProof).not.toBe(first.linkProof);
     expect(
       (

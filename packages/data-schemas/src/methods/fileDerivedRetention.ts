@@ -26,8 +26,8 @@ import {
   loadFileSourceMetadata,
   managedFileScope,
 } from './fileSourceAuthority';
+import { mirrorFileActivityDeadline } from './uploadManagementRetention';
 import { projectFileHousekeeping } from './fileHousekeepingProjection';
-import { mirrorFileActivityDeadline } from './uploadManagementStore';
 import { touchActiveUserPrincipal } from './userPrincipal';
 
 function unavailable(): never {

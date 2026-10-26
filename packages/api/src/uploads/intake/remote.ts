@@ -318,6 +318,35 @@ export function createRemoteIntakeBodyHandler(
             operationId,
           ),
         cancel: async () => operation(await call({ action: 'cancel' }, true), operationId),
+        bindOriginalWrite: async (lease, input, integrity, approval) => {
+          if (
+            !prepared ||
+            !isDeepStrictEqual(prepared.integrity, integrity) ||
+            !isDeepStrictEqual(prepared.approval, approval)
+          )
+            fail('security_uninspectable');
+          const reply = data(
+            await call({ action: 'bind-original-write', lease: readLease(lease), input }),
+            [
+              'version',
+              'bucket',
+              'key',
+              'operationId',
+              'generation',
+              'bytes',
+              'wholeSHA256',
+              'mediaType',
+              'originalDeadline',
+            ],
+          );
+          if (
+            reply.version !== 1 ||
+            Object.entries(input).some(([key, value]) => reply[key] !== value) ||
+            !iso(reply.originalDeadline)
+          )
+            fail('storage_uncertain');
+          return { version: 1, ...input, originalDeadline: reply.originalDeadline };
+        },
         bindSecurityExecution: async (lease, execution) => {
           await call({ action: 'bind-security', lease: readLease(lease), execution });
         },

@@ -1,3 +1,4 @@
+import type { ManagedUploadWriteBinder } from '@librechat/data-schemas';
 /** Upload domain ports. Adapters own credentials, storage engines, processes and transports. */
 import type {
   StorageDeletionBinding,
@@ -72,6 +73,12 @@ export type StorageDeletionInput = {
   deadlineAtMs: number;
 };
 export interface StoragePort {
+  /** Private read-only status from the persisted write binding; never HEAD/absence proof. */
+  observeOriginal(input: {
+    binding: import('@librechat/data-schemas').ManagedUploadWriteBinding;
+    integrity: UploadOriginalIntegrity;
+    signal: AbortSignal;
+  }): Promise<UploadStorageReceipt>;
   /** Pure configured binding; persist before any deletion request. */
   describeDeletion(
     input: Omit<StorageDeletionInput, 'signal' | 'deadlineAtMs' | 'binding'>,
@@ -82,6 +89,8 @@ export interface StoragePort {
   beginDeletion(input: StorageDeletionInput): Promise<StorageDeletionResult>;
   observeDeletion(input: StorageDeletionInput): Promise<StorageDeletionResult>;
   put(input: {
+    /** Server-only fenced persistence; required before the storage adapter dispatches. */
+    bindWrite: ManagedUploadWriteBinder;
     lease: UploadLease;
     filename: string;
     mediaType: string;
@@ -196,6 +205,7 @@ export type UploadAttemptPort = {
   ): void;
 };
 export interface UploadRepository {
+  bindOriginalWrite: UploadManagementRepository['bindOriginalWrite'];
   prepareCleanupStorage: UploadManagementRepository['prepareCleanupStorage'];
   recordCleanupStorage: UploadManagementRepository['recordCleanupStorage'];
   prepareHousekeepingCleanup: UploadManagementRepository['prepareHousekeepingCleanup'];

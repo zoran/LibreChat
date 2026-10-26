@@ -1,4 +1,5 @@
 import type { UploadCleanupReceiptMethods } from './uploadCleanupReceipts';
+import type { UploadWriteMethods } from './uploadManagementWriteTypes';
 /** Public repository contract and private ports shared by the cohesive upload lifecycle owners. */
 import type {
   UploadPrincipal,
@@ -35,7 +36,7 @@ import type {
   StepOutcome,
 } from '../types/housekeeping';
 import type { FileReadRepository } from '~/types/fileActivity';
-import type { UploadActivationMethods } from './uploadManagementStore';
+import type { UploadActivationMethods } from './uploadManagementActivation';
 import type { UploadAdmissionMethods } from './uploadManagementAdmission';
 import type { UploadControlMethods } from './uploadManagementControl';
 import type { UploadIntakeMethods } from './uploadManagementIntake';
@@ -71,7 +72,8 @@ export type UploadActorCleanupProof = Pick<
   'operationId' | 'generation' | 'writerStopped' | 'localCopiesAbsent' | 'securitySettlement'
 > & { localWriterStopped?: boolean };
 /** Upload repository contract and explicit internal composition ports. */
-export type UploadManagementRepository = UploadCleanupReceiptMethods &
+export type UploadManagementRepository = UploadWriteMethods &
+  UploadCleanupReceiptMethods &
   UploadControlMethods &
   UploadMigrationMethods &
   UploadAdmissionMethods &

@@ -20,6 +20,7 @@ import type {
   StorageDeletionTerminalReceipt,
   StorageDeletionConsumptionResult,
 } from 'librechat-data-provider';
+import type { ManagedUploadWriteBinding } from './uploadManagementWriteTypes';
 import type { FileUploadCleanupAcknowledgment } from '../types/fileCleanup';
 
 export const WAIT_MS = 600_000;
@@ -68,6 +69,8 @@ export type StoredUpload = {
   leaseExpiresAt?: number;
   attemptGeneration?: number;
   original?: UploadStorageReceipt;
+  /** Private immutable dispatch identity; never projected into UploadOperation. */
+  writeBinding?: ManagedUploadWriteBinding;
   /** Trusted scanner receipt, private to the original transfer rather than processing attempts. */
   securityApproval?: UploadSecurityApproval;
   securityExecution?: UploadSecurityExecution;

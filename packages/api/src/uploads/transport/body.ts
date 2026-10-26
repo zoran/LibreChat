@@ -61,6 +61,7 @@ export type RawUploadBodyDependencies = {
     | 'fail'
     | 'cancel'
     | 'confirmCleanup'
+    | 'bindOriginalWrite'
     | 'bindSecurityExecution'
     | 'settleSecurityExecution'
   >;
@@ -490,6 +491,8 @@ export function createRawUploadBodyHandler(deps: RawUploadBodyDependencies): Req
       let receipt;
       try {
         receipt = await deps.storage.put({
+          bindWrite: (input) =>
+            deps.management.bindOriginalWrite(lease!, input, integrity, securityApproval!),
           securityApproval,
           lease,
           filename: metadata.filename,

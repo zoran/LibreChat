@@ -25,6 +25,7 @@ import type {
   UploadSecuritySettlement,
   UploadAcceptedMetadata,
 } from 'librechat-data-provider';
+import type { ManagedUploadWriteInput } from '@librechat/data-schemas';
 import type { UploadRepository, IdentityPort, ResourcePort, TelemetryPort } from './contract';
 import { UploadManagementError, isUploadManagementError } from './errors';
 
@@ -91,6 +92,12 @@ export interface UploadManagement {
   retryProcessing(principal: UploadPrincipal, id: string): Promise<UploadOperation>;
   claimProcessing(worker: UploadWorker): Promise<UploadLease | null>;
   renew(lease: UploadLease): Promise<UploadLease>;
+  bindOriginalWrite(
+    lease: UploadLease,
+    input: ManagedUploadWriteInput,
+    integrity: Parameters<UploadRepository['bindOriginalWrite']>[2],
+    approval: UploadSecurityApproval,
+  ): ReturnType<UploadRepository['bindOriginalWrite']>;
   bindSecurityExecution(lease: UploadLease, execution: UploadSecurityExecution): Promise<void>;
   settleSecurityExecution(lease: UploadLease, settlement: UploadSecuritySettlement): Promise<void>;
   claimWorkBytes(
@@ -325,6 +332,8 @@ export function createUploadManagement(deps: UploadManagementDependencies): Uplo
     },
     claimWorkBytes: (lease: UploadLease, requestedBytes: number) =>
       repository.claimWorkBytes({ lease, requestedBytes, now: now() }),
+    bindOriginalWrite: (lease, input, integrity, approval) =>
+      repository.bindOriginalWrite(lease, input, integrity, approval, now()),
     bindSecurityExecution: (lease, execution) =>
       repository.bindSecurityExecution(lease, execution, now()),
     settleSecurityExecution: (lease, settlement) =>

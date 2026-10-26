@@ -295,6 +295,9 @@ describe('private Intake and App-promotion transaction fences', () => {
             }) as never,
         },
         storage: {
+          async observeOriginal() {
+            throw new Error('Unexpected original status in writer fixture');
+          },
           put: async (value) => {
             for await (const chunk of value.body)
               expect(Buffer.from(chunk).toString()).toBe('document');

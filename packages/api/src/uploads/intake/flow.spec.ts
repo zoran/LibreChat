@@ -374,7 +374,12 @@ describe('isolated Intake through native authority, scanner and App promotion', 
       identityRepository: identity,
       management,
       resources: appResources,
-      storage: { put: ordinaryPut },
+      storage: {
+        put: ordinaryPut,
+        observeOriginal: async () => {
+          throw new Error('Unexpected original status in direct promotion');
+        },
+      },
       attempts: journal.attempts,
       worker: appWorker,
     });

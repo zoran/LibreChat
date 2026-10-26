@@ -60,6 +60,9 @@ describe('sole File owner managed cleanup adapter', () => {
       recordCleanupStorage: jest.fn(),
     };
     const storage = {
+      observeOriginal: jest.fn(async () => {
+        throw new Error('Unexpected original status in cleanup');
+      }),
       describeDeletion: jest.fn(() => {
         throw new Error('Unexpected storage deletion binding');
       }),

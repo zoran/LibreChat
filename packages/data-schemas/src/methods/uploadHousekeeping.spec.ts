@@ -24,13 +24,12 @@ import {
   retireUploadHousekeeping,
 } from './uploadHousekeepingProjection';
 import {
-  WAIT_MS,
-  createUploadStore,
   mirrorFileActivityDeadline,
   mirrorFileRetentionMigration,
-} from './uploadManagementStore';
+} from './uploadManagementRetention';
 import { validateUploadCleanupCustody, assertUploadCleanupCapacity } from './uploadCleanupReceipts';
 import { createUploadManagementRepository } from './uploadManagement';
+import { WAIT_MS, createUploadStore } from './uploadManagementStore';
 import { createHousekeepingStore } from './housekeepingStore';
 import { createModels } from '../models';
 

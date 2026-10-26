@@ -8,6 +8,7 @@ import {
   HeadObjectCommand,
   ListObjectVersionsCommand,
 } from '@aws-sdk/client-s3';
+import type { HttpRequest } from '@smithy/types';
 import { createManagedS3Client, getManagedS3ClientCapture } from '../managedClient';
 import { createManagedS3Storage, managedOriginalKey } from '../managed';
 import { getManagedS3Provider } from '../managed';
@@ -27,6 +28,7 @@ const lease = {
   instanceId: 'instance',
   expiresAt: '2099-01-01T00:00:00Z',
 };
+const originalDeadline = new Date(Date.now() + 300000).toISOString();
 const expectedKey = 't/tenant/managed-uploads/user/operation.2__original';
 const signal = () => new AbortController().signal;
 const BLOCK = 262144;
@@ -55,6 +57,7 @@ describe('managed S3 adapter preserves lifecycle and uncertainty', () => {
     return { storage, observations, serviceObservations };
   }
   const put = (body = 'hello') => ({
+    bindWrite: jest.fn(async (input) => ({ version: 1 as const, ...input, originalDeadline })),
     lease,
     filename: '../../display.txt',
     mediaType: 'text/plain',
@@ -64,6 +67,110 @@ describe('managed S3 adapter preserves lifecycle and uncertainty', () => {
     signal: signal(),
   });
 
+  it('signs every managed write metadata field through the actual SDK without network', async () => {
+    const headers: Record<string, string>[] = [];
+    const client = new S3Client({
+      region: 'us-east-1',
+      endpoint: 'https://fixture.invalid',
+      forcePathStyle: true,
+      maxAttempts: 1,
+      requestChecksumCalculation: 'WHEN_REQUIRED',
+      credentials: { accessKeyId: 'fixture-access', secretAccessKey: 'fixture-secret' },
+      requestHandler: {
+        handle: async (request: {
+          headers: Record<string, string>;
+          body: AsyncIterable<Uint8Array>;
+        }) => {
+          headers.push(request.headers);
+          for await (const _ of request.body) {
+            /* actual SDK stream, inert transport */
+          }
+          return {
+            response: {
+              statusCode: 200,
+              headers: { etag: 'fixture-etag' },
+              body: Readable.from([]),
+            },
+          };
+        },
+      },
+    });
+    const storage = createManagedS3Storage({
+      client,
+      bucket: 'isolated',
+      urlForKey: async () => '/fixture',
+    });
+    await expect(storage.put(put())).resolves.toMatchObject({ outcome: 'durable' });
+    expect(headers).toHaveLength(1);
+    const signed = headers[0].authorization.match(/SignedHeaders=([^,]+)/)?.[1].split(';');
+    for (const name of [
+      'operation',
+      'generation',
+      'cortex-upload-bytes',
+      'cortex-upload-sha256',
+      'cortex-upload-deadline',
+    ])
+      expect(signed).toContain(`x-amz-meta-${name}`);
+    expect(headers[0]['x-amz-meta-cortex-upload-deadline']).toBe(originalDeadline);
+    expect(headers[0]['if-none-match']).toBe('*');
+    expect(signed).toContain('content-type');
+    expect(signed).toContain('if-none-match');
+    client.destroy();
+  });
+  it('awaits the existing fenced binding owner before any SDK dispatch', async () => {
+    const send = jest.fn(async (command) => {
+      for await (const _ of command.input.Body) {
+        /* consume */
+      }
+      return {};
+    });
+    const input = put();
+    let complete!: (value: unknown) => void;
+    input.bindWrite = jest.fn(
+      () =>
+        new Promise((resolve) => {
+          complete = resolve;
+        }),
+    ) as unknown as typeof input.bindWrite;
+    const pending = fixture(send).storage.put(input);
+    await Promise.resolve();
+    expect(send).not.toHaveBeenCalled();
+    expect(input.bindWrite).toHaveBeenCalledWith({
+      bucket: 'isolated',
+      key: expectedKey,
+      operationId: 'operation',
+      generation: '2',
+      bytes: 5,
+      wholeSHA256: sha(Buffer.from('hello')),
+      mediaType: 'text/plain',
+    });
+    complete({ version: 1, ...input.bindWrite.mock.calls[0][0], originalDeadline });
+    await expect(pending).resolves.toMatchObject({ outcome: 'durable' });
+  });
+  it.each(['missing-owner', 'expired', 'changed-key', 'changed-sha', 'noncanonical-deadline'])(
+    'never dispatches an invalid persisted write binding: %s',
+    async (kind) => {
+      const send = jest.fn();
+      const input = put();
+      if (kind === 'missing-owner') input.bindWrite = undefined as never;
+      else
+        input.bindWrite = jest.fn(async (proposal) => ({
+          version: 1,
+          ...proposal,
+          ...(kind === 'changed-key' ? { key: 'foreign' } : {}),
+          ...(kind === 'changed-sha' ? { wholeSHA256: 'f'.repeat(64) } : {}),
+          originalDeadline:
+            (
+              {
+                expired: '2000-01-01T00:00:00.000Z',
+                'noncanonical-deadline': '2099-01-01T00:05:00Z',
+              } as Record<string, string>
+            )[kind] ?? '2099-01-01T00:05:00.000Z',
+        })) as typeof input.bindWrite;
+      await expect(fixture(send).storage.put(input)).rejects.toThrow();
+      expect(send).not.toHaveBeenCalled();
+    },
+  );
   it('uses existing tenant/user canonical key with a server-only basename', () => {
     expect(managedOriginalKey(lease)).toBe(expectedKey);
     expect(() => managedOriginalKey({ ...lease, userId: '../escape' })).toThrow();
@@ -103,6 +210,13 @@ describe('managed S3 adapter preserves lifecycle and uncertainty', () => {
       expect(command.input.Key).toBe(expectedKey);
       expect(command.input.ContentLength).toBe(5);
       expect(command.input.IfNoneMatch).toBe('*');
+      expect(command.input.Metadata).toEqual({
+        operation: 'operation',
+        generation: '2',
+        'cortex-upload-bytes': '5',
+        'cortex-upload-sha256': sha(Buffer.from('hello')),
+        'cortex-upload-deadline': originalDeadline,
+      });
       for await (const _ of command.input.Body) {
         /* consume actual streaming input */
       }
@@ -526,5 +640,174 @@ describe('managed client owned construction', () => {
       destroy.mockRestore();
       client.destroy();
     }
+  });
+});
+
+describe('managed original bound status through actual AWS SDK', () => {
+  const binding = (expired = true) => ({
+    version: 1 as const,
+    bucket: 'isolated',
+    key: expectedKey,
+    operationId: 'operation',
+    generation: '2',
+    bytes: 5,
+    wholeSHA256: sha(Buffer.from('hello')),
+    mediaType: 'text/plain',
+    originalDeadline: new Date(Date.now() + (expired ? -60000 : 300000)).toISOString(),
+  });
+  const status = (b: ReturnType<typeof binding>, state = 'published') => ({
+    protocol: 1,
+    bucket: b.bucket,
+    key: b.key,
+    generation: b.generation,
+    uploadRequestId: b.operationId,
+    declaredBytes: String(b.bytes),
+    contentSHA256: b.wholeSHA256,
+    mediaType: b.mediaType,
+    originalDeadline: b.originalDeadline,
+    state,
+    ...(state === 'published'
+      ? {
+          metadataSHA256: 'a'.repeat(64),
+          inventoryRevision: '2',
+          inventorySHA256: 'b'.repeat(64),
+          etag: 'c'.repeat(32),
+        }
+      : {}),
+  });
+  const canonical = (v: object) => JSON.stringify(v, Object.keys(v).sort());
+  type InertReply = {
+    response: { statusCode: number; headers: Record<string, string>; body: Readable };
+  };
+  function fixture(handle: (request: HttpRequest) => Promise<InertReply>) {
+    const client = new S3Client({
+      region: 'us-east-1',
+      endpoint: 'https://fixture.invalid',
+      forcePathStyle: true,
+      maxAttempts: 1,
+      requestChecksumCalculation: 'WHEN_REQUIRED',
+      credentials: { accessKeyId: 'fixture-access', secretAccessKey: 'fixture-secret' },
+      requestHandler: { handle },
+    });
+    return {
+      client,
+      storage: createManagedS3Storage({
+        client,
+        bucket: 'isolated',
+        urlForKey: async () => '/fixture',
+      }),
+    };
+  }
+  it('reads the expired immutable binding with exact signed GET fields and no new PUT/HEAD', async () => {
+    const b = binding();
+    const requests: HttpRequest[] = [];
+    const f = fixture(async (request) => {
+      requests.push(request);
+      return {
+        response: {
+          statusCode: 200,
+          headers: { 'content-type': 'application/json' },
+          body: Readable.from([canonical(status(b))]),
+        },
+      };
+    });
+    await expect(
+      f.storage.observeOriginal({
+        binding: b,
+        integrity: manifest(Buffer.from('hello')),
+        signal: signal(),
+      }),
+    ).resolves.toMatchObject({ outcome: 'durable', etag: '"' + 'c'.repeat(32) + '"' });
+    expect(requests).toHaveLength(1);
+    expect(requests[0].method).toBe('GET');
+    expect(requests[0].query).toEqual({ 'cortex-upload': '1' });
+    expect(requests[0].body).toBeUndefined();
+    const signed =
+      requests[0].headers.authorization.match(/SignedHeaders=([^,]+)/)?.[1].split(';') ?? [];
+    for (const field of [
+      'content-type',
+      'x-amz-meta-operation',
+      'x-amz-meta-generation',
+      'x-amz-meta-cortex-upload-bytes',
+      'x-amz-meta-cortex-upload-sha256',
+      'x-amz-meta-cortex-upload-deadline',
+    ])
+      expect(signed).toContain(field);
+    expect(requests[0].headers['x-amz-meta-cortex-upload-deadline']).toBe(b.originalDeadline);
+    f.client.destroy();
+  });
+  it.each([
+    'unknown',
+    'open',
+    'sealed',
+    '404',
+    'mismatch',
+    'extra',
+    'no-proof',
+    'oversize',
+  ] as const)('preserves custody for %s status', async (mode) => {
+    const b = binding();
+    const value: Record<string, unknown> = status(
+      b,
+      ['unknown', 'open', 'sealed'].includes(mode) ? mode : 'published',
+    );
+    if (mode === 'mismatch') value.contentSHA256 = 'f'.repeat(64);
+    if (mode === 'extra') value.surprise = true;
+    if (mode === 'no-proof') delete value.metadataSHA256;
+    const responseBody = Readable.from([
+      mode === 'oversize' ? 'x'.repeat(16385) : canonical(value),
+    ]);
+    const f = fixture(async () => ({
+      response: {
+        statusCode: mode === '404' ? 404 : 200,
+        headers: { 'content-type': 'application/json' },
+        body: responseBody,
+      },
+    }));
+    await expect(
+      f.storage.observeOriginal({
+        binding: b,
+        integrity: manifest(Buffer.from('hello')),
+        signal: signal(),
+      }),
+    ).resolves.toMatchObject({ outcome: 'unknown' });
+    expect(responseBody.destroyed).toBe(true);
+    f.client.destroy();
+  });
+  it('resolves a lost PUT acknowledgement through the same bound status without a second PUT', async () => {
+    const b = binding(false);
+    const methods: string[] = [];
+    const f = fixture(async (request) => {
+      methods.push(request.method);
+      if (request.method === 'PUT') {
+        for await (const _ of request.body) {
+          /* Consume verified bytes before the deliberately lost acknowledgement. */
+        }
+        throw new Error('lost acknowledgement');
+      }
+      return {
+        response: {
+          statusCode: 200,
+          headers: { 'content-type': 'application/json' },
+          body: Readable.from([canonical(status(b))]),
+        },
+      };
+    });
+    const bindWrite = jest.fn(async () => b);
+    await expect(
+      f.storage.put({
+        bindWrite,
+        lease,
+        filename: 'display.txt',
+        mediaType: 'text/plain',
+        bytes: 5,
+        integrity: manifest(Buffer.from('hello')),
+        body: Readable.from([Buffer.from('hello')]),
+        signal: signal(),
+      }),
+    ).resolves.toMatchObject({ outcome: 'durable' });
+    expect(methods).toEqual(['PUT', 'GET']);
+    expect(bindWrite).toHaveBeenCalledTimes(1);
+    f.client.destroy();
   });
 });

@@ -42,10 +42,8 @@ import { createFileCleanupClaimMethods } from '../../src/methods/fileCleanupClai
 import { createFileCleanupProgressMethods } from '../../src/methods/fileCleanupProgress';
 import { createHousekeepingStore } from '../../src/methods/housekeepingStore';
 import { createUploadFileCleanupOwner } from '../../src/methods/uploadFileCleanup';
-import {
-  createUploadStore,
-  createUploadActivationMethods,
-} from '../../src/methods/uploadManagementStore';
+import { createUploadStore } from '../../src/methods/uploadManagementStore';
+import { createUploadActivationMethods } from '../../src/methods/uploadManagementActivation';
 import { captureManagedRetrievalInventoryEvidence } from '../../src/methods/fileRetrieval';
 import fixture from '../../../data-provider/src/__fixtures__/managed-retrieval-v1.json';
 

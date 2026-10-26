@@ -155,6 +155,22 @@ function fixture(observeSecurityDispatch?: IntakeControlOptions['observeSecurity
       return copy(record);
     }),
     getPromotion: jest.fn(async () => copy(record)),
+    bindOriginalWrite: jest.fn(async (_lease, input) => ({
+      version: 1 as const,
+      ...input,
+      originalDeadline: new Date(now + 300000).toISOString(),
+    })),
+    readOriginalWrite: jest.fn(async () => ({
+      version: 1 as const,
+      bucket: 'cortex-managed-uploads',
+      key: receipt.storageKey,
+      operationId,
+      generation: '1',
+      bytes: 5,
+      wholeSHA256: integrity.sha256,
+      mediaType: 'text/plain',
+      originalDeadline: new Date(now - 1000).toISOString(),
+    })),
     beginPromotion: jest.fn(async () => {
       if (!record || record.state !== 'prepared') throw new UploadManagementError('not_ready');
       record = { ...record, state: 'writing', writerStopped: false };
@@ -184,6 +200,7 @@ function fixture(observeSecurityDispatch?: IntakeControlOptions['observeSecurity
   };
   const resources = { assertSafe: jest.fn(async () => undefined) };
   const storage = {
+    observeOriginal: jest.fn(async () => ({ ...copy(receipt), outcome: 'unknown' as const })),
     put: jest.fn(async (input: Parameters<IntakeControlOptions['storage']['put']>[0]) => {
       for await (const chunk of input.body) expect(Buffer.from(chunk)).toEqual(body);
       return copy(receipt);
@@ -227,6 +244,80 @@ function fixture(observeSecurityDispatch?: IntakeControlOptions['observeSecurity
 }
 
 describe('application intake control', () => {
+  it('forwards private write binding to the existing fenced owner with stored security facts', async () => {
+    const f = fixture();
+    await f.prepare();
+    const input = {
+      bucket: 'cortex-managed-uploads',
+      key: receipt.storageKey,
+      operationId,
+      generation: '1',
+      bytes: 5,
+      wholeSHA256: integrity.sha256,
+      mediaType: 'text/plain',
+    };
+    await expect(f.command({ action: 'bind-original-write', lease, input })).resolves.toMatchObject(
+      { version: 1, ...input },
+    );
+    expect(f.repository.bindOriginalWrite).toHaveBeenCalledWith(
+      lease,
+      input,
+      integrity,
+      approval,
+      now,
+    );
+    const calls = jest.mocked(f.repository.bindOriginalWrite).mock.calls.length;
+    await expect(
+      f.command({ action: 'bind-original-write', lease: { ...lease, generation: 2 }, input }),
+    ).rejects.toMatchObject({ code: 'lease_lost' });
+    expect(f.repository.bindOriginalWrite).toHaveBeenCalledTimes(calls);
+  });
+
+  it.each(['unknown', 'durable'] as const)(
+    'reconciles persisted promotion through bound native status: %s',
+    async (outcome) => {
+      const f = fixture();
+      await f.prepare();
+      f.storage.put.mockImplementationOnce(async (input) => {
+        await input.bindWrite({
+          bucket: 'cortex-managed-uploads',
+          key: receipt.storageKey,
+          operationId,
+          generation: '1',
+          bytes: 5,
+          wholeSHA256: integrity.sha256,
+          mediaType: 'text/plain',
+        });
+        for await (const _ of input.body) {
+          /* Consume the verified fixture before returning its unknown acknowledgement. */
+        }
+        return { ...receipt, outcome: 'unknown' };
+      });
+      const promotion = await f.handlers.promote(context, promotionId, 5, signal());
+      await promotion.consume(stream());
+      await promotion.close();
+      f.storage.observeOriginal.mockResolvedValueOnce({ ...copy(receipt), outcome } as never);
+      const settled = await f.command({ action: 'get-promotion' });
+      expect(settled).toMatchObject(
+        outcome === 'durable'
+          ? { state: 'settled', writerStopped: true, receipt: { outcome: 'durable' } }
+          : { state: 'writing', writerStopped: false },
+      );
+      expect(f.repository.readOriginalWrite).toHaveBeenCalledWith(principal, operationId);
+      expect(f.storage.observeOriginal).toHaveBeenCalledWith(
+        expect.objectContaining({
+          binding: expect.objectContaining({
+            originalDeadline: new Date(now - 1000).toISOString(),
+          }),
+          integrity,
+        }),
+      );
+      expect(f.storage.put).toHaveBeenCalledTimes(1);
+      expect(f.repository.bindOriginalWrite).toHaveBeenCalledTimes(1);
+      expect(f.repository.renew).toHaveBeenCalledTimes(1);
+    },
+  );
+
   const original = { ...process.env };
   beforeAll(() => {
     process.env.AUTH_MODE = 'email_code';

@@ -27,10 +27,11 @@ import {
   projectDerivedFileDeadline,
 } from './fileDerivedRetention';
 import { projectFileHousekeeping, fileHousekeepingObligations } from './fileHousekeepingProjection';
-import { mirrorFileRetentionMigration, reject } from './uploadManagementStore';
+import { mirrorFileRetentionMigration } from './uploadManagementRetention';
 import { validFileRetentionActivity } from './fileActivityTransition';
 import { importFileRetryFloor } from './housekeepingProjection';
 import { createHousekeepingStore } from './housekeepingStore';
+import { reject } from './uploadManagementStore';
 function unavailable(): never {
   throw new FileSourceUnavailableError();
 }

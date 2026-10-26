@@ -14,9 +14,9 @@ import type {
 } from '~/types/fileActivity';
 import type { createUploadStore } from './uploadManagementStore';
 import { createFileActivityStore, FileReadError, refuse, sha256 } from './fileActivityStore';
+import { mirrorFileActivityDeadline } from './uploadManagementRetention';
 import { advanceFileRetentionActivity } from './fileActivityTransition';
 import { projectFileHousekeeping } from './fileHousekeepingProjection';
-import { mirrorFileActivityDeadline } from './uploadManagementStore';
 import { refreshDerivedFileDeadlines } from './fileDerivedRetention';
 
 const hash = (value: unknown): value is string =>

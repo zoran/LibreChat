@@ -1,3 +1,4 @@
+import { reconcilePromotionOriginal } from './promotionOriginal';
 /** App-owned capability control and approved-only promotion; existing owners retain all state. */
 import { createHash } from 'node:crypto';
 import {
@@ -41,6 +42,7 @@ export type IntakeControlOptions = {
     | 'readIntake'
     | 'claim'
     | 'renew'
+    | 'bindOriginalWrite'
     | 'preparePromotion'
     | 'beginPromotion'
     | 'settlePromotion'
@@ -48,6 +50,8 @@ export type IntakeControlOptions = {
     | 'sealIntakeRecovery'
     | 'confirmIntakeRecovery'
     | 'readActorCleanupRecovery'
+    | 'bindOriginalWrite'
+    | 'readOriginalWrite'
   >;
   identityRepository: Pick<EmailCodeRepository, 'readEmailCodeIdentity'>;
   management: Pick<
@@ -63,7 +67,7 @@ export type IntakeControlOptions = {
     | 'confirmCleanup'
   >;
   resources: ResourcePort;
-  storage: Pick<StoragePort, 'put'>;
+  storage: Pick<StoragePort, 'put' | 'observeOriginal'>;
   attempts: UploadAttemptPort;
   worker: UploadWorker;
   now?: () => number;
@@ -279,6 +283,7 @@ export function createIntakeControlHandlers(options: IntakeControlOptions): Inta
       'claim-bytes': ['lease', 'requestedBytes'],
       'complete-bytes': ['lease', 'generation'],
       'prepare-promotion': ['input'],
+      'bind-original-write': ['lease', 'input'],
       'get-promotion': [],
       accept: ['lease', 'promotionId'],
       'confirm-cleanup': ['proof'],
@@ -404,8 +409,30 @@ export function createIntakeControlHandlers(options: IntakeControlOptions): Inta
         bound(prepared.lease, ctx, auth);
         return repository.preparePromotion(prepared, now());
       }
-      case 'get-promotion':
-        return promotion(ctx, auth);
+      case 'bind-original-write': {
+        const record = await promotion(ctx, auth);
+        if (!held || !record || !['prepared', 'writing'].includes(record.state)) fail('not_ready');
+        const input = fields(command.input, [
+          'bucket',
+          'key',
+          'operationId',
+          'generation',
+          'bytes',
+          'wholeSHA256',
+          'mediaType',
+        ]);
+        return repository.bindOriginalWrite(
+          held,
+          input as import('@librechat/data-schemas').ManagedUploadWriteInput,
+          record.integrity,
+          record.approval,
+          now(),
+        );
+      }
+      case 'get-promotion': {
+        const record = await promotion(ctx, auth);
+        return reconcilePromotionOriginal({ record, repository, options, ctx, auth, signal, now });
+      }
       case 'accept': {
         if (typeof command.promotionId !== 'string' || !UUID.test(command.promotionId)) fail();
         const record = await promotion(ctx, auth);
@@ -612,6 +639,14 @@ export function createIntakeControlHandlers(options: IntakeControlOptions): Inta
             putStarted = true;
             outcome = 'unknown';
             const result = await options.storage.put({
+              bindWrite: (input) =>
+                repository.bindOriginalWrite(
+                  renewed,
+                  input,
+                  record.integrity,
+                  record.approval,
+                  now(),
+                ),
               lease: renewed,
               filename: record.metadata.filename,
               mediaType: record.approval.subject.mediaType,

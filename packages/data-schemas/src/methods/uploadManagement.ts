@@ -1,3 +1,4 @@
+import { createUploadWriteMethods } from './uploadManagementWrite';
 /** Compose the existing upload store, reservation and lifecycle owners; retain one repository. */
 import {
   UPLOAD_MAX_FILE_BYTES,
@@ -29,9 +30,9 @@ import {
   project,
   assertLease,
   reject,
-  createUploadActivationMethods,
   RESOURCE_MAX,
 } from './uploadManagementStore';
+import { createUploadActivationMethods } from './uploadManagementActivation';
 import {
   createUploadIntakeMethods,
   hasStoppedUploadPromotion,
@@ -367,6 +368,7 @@ export function createUploadManagementRepository(
     recordOriginalPublication: options.recordOriginalPublication,
   };
   return {
+    ...createUploadWriteMethods(context),
     ...createUploadProcessingMethods(context),
     ...createUploadCleanupMethods(context),
     ...createUploadHousekeepingMethods(context, jobs, projectHousekeeping),
