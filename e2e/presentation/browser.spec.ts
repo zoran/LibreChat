@@ -696,7 +696,7 @@ for (const theme of ['light', 'dark'] as const) {
   });
 }
 
-test('branded mail route preserves signed-in account confirmation (controlled verification boundary)', async ({
+test('branded mail route automatically rejects an invalid link and preserves the signed-in session (controlled verification boundary)', async ({
   page,
   context,
   baseURL,
@@ -706,31 +706,57 @@ test('branded mail route preserves signed-in account confirmation (controlled ve
   await prepareEnglish(context, baseURL, isMobile);
   await configureBranding(page, { theme: 'dark' });
   await signInFixture(page);
+  // This existing fixture uses a legacy fragment and a controlled invalid response, not a fresh
+  // cryptographic link. It proves automatic admission and recovery without replacing the session.
   const requests: Array<{ attemptId: string; code: string }> = [];
+  const verification = responseGate();
   await page.route('**/api/auth/email-code/verify', async (route) => {
     requests.push(route.request().postDataJSON());
+    await verification.ready;
     await route.fulfill({ status: 400, json: { code: 'EMAIL_CODE_INVALID' } });
   });
-  await clickRenderedMailLink(page, baseURL);
-  await expect(
-    page.getByText(
-      'Du bist bereits angemeldet. Möchtest du die Anmeldung aus dieser E-Mail verwenden?',
-      {
-        exact: true,
-      },
-    ),
-  ).toBeVisible();
-  await expectThemedLogo(page.getByRole('img', { name: appTitle, exact: true }), 'dark');
-  const confirm = page.getByRole('main').getByRole('button', { name: 'Anmelden', exact: true });
-  await expect(confirm).toBeEnabled();
-  expect(requests).toHaveLength(0);
-  await expectNoOverflow(page);
-  await page.screenshot({ path: testInfo.outputPath('presentation-mail-confirmation.png') });
-  await confirm.click();
-  await expect(page.getByRole('main').getByRole('alert')).toHaveText(
-    'Dieser Link ist nicht mehr gültig. Fordere einen neuen Code an.',
-  );
-  expect(requests).toEqual([{ attemptId: mailAttemptId, code: mailCode }]);
+  try {
+    await clickRenderedMailLink(page, baseURL);
+    await expect.poll(() => requests.length).toBe(1);
+    expect(requests).toEqual([{ attemptId: mailAttemptId, code: mailCode }]);
+    await expect(page.getByRole('main').getByRole('status')).toHaveText('Anmeldung wird geprüft …');
+    await expect(
+      page.getByText(
+        'Du bist bereits angemeldet. Möchtest du die Anmeldung aus dieser E-Mail verwenden?',
+        { exact: true },
+      ),
+    ).toHaveCount(0);
+    await expect(
+      page.getByRole('main').getByRole('button', { name: 'Anmelden', exact: true }),
+    ).toHaveCount(0);
+    await expectThemedLogo(page.getByRole('img', { name: appTitle, exact: true }), 'dark');
+    expect(new URL(page.url()).hash).toBe('');
+    expect(new URL(page.url()).search).toBe('');
+    await expectNoOverflow(page);
+    await page.screenshot({
+      path: testInfo.outputPath('presentation-mail-automatic-verification.png'),
+    });
+
+    verification.release();
+    const alert = page.getByRole('main').getByRole('alert');
+    await expect(alert).toHaveText(
+      'Dieser Link ist nicht mehr gültig. Fordere einen neuen Code an.',
+    );
+    await expectReadableAuthText(alert);
+    const recovery = page.getByRole('link', { name: 'Fortfahren', exact: true });
+    await expect(recovery).toHaveAttribute('href', '/c/new');
+    await expectNoOverflow(page);
+    await page.screenshot({
+      path: testInfo.outputPath('presentation-mail-existing-session-recovery.png'),
+    });
+    await recovery.click();
+    await expect(page).toHaveURL(/\/c\/new$/);
+    await expect(page.getByTestId('composer-surface')).toBeVisible();
+    await expectGerman(page);
+    expect(requests).toHaveLength(1);
+  } finally {
+    verification.release();
+  }
 });
 
 for (const centered of [true, false]) {
