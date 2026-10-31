@@ -131,9 +131,6 @@ describe('actual native physical history contract', () => {
     // Actual one-Store/two-root Go serialization, normalized by the shipped Python owners.
     // This local corpus supplies no original-A/cohort, provider, full-census or seal authority.
     const raw = readFileSync(join(__dirname, '__fixtures__/file-history-native-normalized.json'));
-    expect(createHash('sha256').update(raw).digest('hex')).toBe(
-      '00cab9d94e1f8f9e82a64088d89fde64106c422bc5c47531f365271a40270c8b',
-    );
     const corpus = JSON.parse(raw.toString('utf8')) as {
       corpusSha256: string;
       branches: {
@@ -146,6 +143,10 @@ describe('actual native physical history contract', () => {
         continuations: number;
       }[];
     };
+    // Pin the normalized compact payload independently of source-file formatting.
+    expect(createHash('sha256').update(JSON.stringify(corpus)).digest('hex')).toBe(
+      '00cab9d94e1f8f9e82a64088d89fde64106c422bc5c47531f365271a40270c8b',
+    );
     expect(corpus.corpusSha256).toBe(
       '1d0a24966488bea029a62fa250e964df0e3fad4387b8f237d21b7dddedba3ba5',
     );

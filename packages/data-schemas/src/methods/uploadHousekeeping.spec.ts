@@ -3,8 +3,7 @@ import mongoose from 'mongoose';
 import { createHash } from 'crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import {
-  UPLOAD_REPLAY_MS,
-  UPLOAD_RECORD_BYTES,
+  UPLOAD_AV_RECORD_BYTES,
   canonicalStorageDeletionReceipt,
   isStorageDeletionBinding,
   isStorageDeletionResult,
@@ -16,7 +15,6 @@ import type {
 } from 'librechat-data-provider';
 import type { StoredUpload, CounterRow } from './uploadManagementStore';
 import type { HousekeepingJobRecord } from '../models/housekeepingJob';
-import type { HousekeepingStore } from './housekeepingStore';
 import {
   createUploadHousekeepingProjection,
   uploadHousekeepingDue,
@@ -24,175 +22,20 @@ import {
   retireUploadHousekeeping,
 } from './uploadHousekeepingProjection';
 import {
+  row,
+  registerUploadSchedulingProjectionCases,
+} from '../../specs/fixtures/uploadHousekeeping.projection.fixture';
+import {
   mirrorFileActivityDeadline,
   mirrorFileRetentionMigration,
 } from './uploadManagementRetention';
 import { validateUploadCleanupCustody, assertUploadCleanupCapacity } from './uploadCleanupReceipts';
 import { createUploadManagementRepository } from './uploadManagement';
-import { WAIT_MS, createUploadStore } from './uploadManagementStore';
 import { createHousekeepingStore } from './housekeepingStore';
+import { createUploadStore } from './uploadManagementStore';
 import { createModels } from '../models';
 
-const row = (): StoredUpload => ({
-  _id: 'operation',
-  tenantId: null,
-  userId: '111111111111111111111111',
-  scope: { kind: 'personal' },
-  idempotencyKey: '11111111-1111-4111-8111-111111111111',
-  fingerprint: 'fixture',
-  mediaType: 'text/plain',
-  declaredBytes: 8,
-  state: 'waiting',
-  revision: 0,
-  createdAt: 1_700_000_000_000,
-  cleanupPending: false,
-  generation: 0,
-  originalBytes: 8,
-  textBytes: 0,
-  recordBytes: UPLOAD_RECORD_BYTES,
-  queueCharged: true,
-  pendingBytes: 8,
-  stagingHeld: false,
-  writerStopped: true,
-});
-function job(operation: StoredUpload): HousekeepingJobRecord {
-  const dueAt = uploadHousekeepingDue(operation);
-  return {
-    _id: 'a'.repeat(64),
-    version: 1,
-    identityHash: 'a'.repeat(64),
-    handler: 'upload.cleanup',
-    work: uploadHousekeepingWork(operation),
-    subjectId: operation._id,
-    generation: operation.generation,
-    dueAt,
-    nextAttemptAt: dueAt,
-    state: 'queued',
-    fence: 0,
-    progressRevision: 0,
-    attempts: 0,
-    recoveries: 0,
-    lastRecoveryAt: null,
-    claim: null,
-    execution: { id: 'execution', phase: 'awaiting_owner_transition', receiptRef: null },
-    lastCode: 'scheduled',
-    createdAt: new Date(),
-    updatedAt: new Date(),
-    terminalAt: null,
-  };
-}
-
-describe('Upload scheduling projection port boundary', () => {
-  // Only the session boundary is simulated here; real transaction assertions are below.
-  const session = { inTransaction: () => true } as mongoose.ClientSession;
-  const ports = () => ({
-    observeWork: jest.fn<
-      ReturnType<HousekeepingStore['observeWork']>,
-      Parameters<HousekeepingStore['observeWork']>
-    >(),
-    project: jest
-      .fn<ReturnType<HousekeepingStore['project']>, Parameters<HousekeepingStore['project']>>()
-      .mockResolvedValue('a'.repeat(64)),
-    refreshDue: jest
-      .fn<
-        ReturnType<HousekeepingStore['refreshDue']>,
-        Parameters<HousekeepingStore['refreshDue']>
-      >()
-      .mockResolvedValue('unchanged'),
-    invalidate: jest
-      .fn<
-        ReturnType<HousekeepingStore['invalidate']>,
-        Parameters<HousekeepingStore['invalidate']>
-      >()
-      .mockResolvedValue(false),
-  });
-  it('projects generation zero and the waiting deadline in the supplied transaction', async () => {
-    const owner = ports();
-    owner.observeWork.mockResolvedValue(null);
-    const operation = row();
-    await expect(createUploadHousekeepingProjection(owner)(null, operation, session)).resolves.toBe(
-      true,
-    );
-    expect(owner.project).toHaveBeenCalledWith(
-      uploadHousekeepingWork(operation),
-      new Date(operation.createdAt + WAIT_MS),
-      session,
-    );
-  });
-  it('never turns accepted File expiry or extension into an Upload expiry job', () => {
-    const operation = {
-      ...row(),
-      state: 'ready' as const,
-      acceptedAt: row().createdAt,
-      expiresAt: row().createdAt + 1,
-      fileId: 'operation',
-    };
-    expect(uploadHousekeepingDue(operation).getTime()).toBe(operation.createdAt + UPLOAD_REPLAY_MS);
-    expect(
-      uploadHousekeepingDue({ ...operation, expiresAt: operation.expiresAt + 7 * 86400000 }),
-    ).toEqual(uploadHousekeepingDue(operation));
-  });
-  it('keeps pending cleanup scheduling stable across repeated observations', () => {
-    const operation = { ...row(), state: 'failed' as const, cleanupPending: true };
-    expect(uploadHousekeepingDue(operation)).toEqual(new Date(operation.createdAt));
-  });
-  it('reports an updated current projection so callers stop using the fenced claim', async () => {
-    const owner = ports();
-    const operation = row();
-    const current = job(operation);
-    owner.observeWork.mockResolvedValue(current);
-    owner.refreshDue.mockResolvedValue('updated');
-    await expect(createUploadHousekeepingProjection(owner)(null, operation, session)).resolves.toBe(
-      true,
-    );
-    expect(owner.refreshDue).toHaveBeenCalledWith(
-      uploadHousekeepingWork(operation),
-      { jobId: current._id, executionId: current.execution.id, progressRevision: 0 },
-      current.dueAt,
-      session,
-    );
-  });
-  it('preserves a started predecessor while projecting the new generation', async () => {
-    const owner = ports();
-    const previous = row();
-    const next = { ...previous, generation: 1 };
-    const old = { ...job(previous), state: 'unknown' as const };
-    old.execution.phase = 'removing_unaccepted_original';
-    owner.observeWork.mockResolvedValueOnce(old).mockResolvedValueOnce(null);
-    await expect(createUploadHousekeepingProjection(owner)(previous, next, session)).resolves.toBe(
-      true,
-    );
-    expect(owner.invalidate).toHaveBeenCalledWith(old._id, 0, session);
-    expect(owner.project).toHaveBeenCalledWith(
-      uploadHousekeepingWork(next),
-      uploadHousekeepingDue(next),
-      session,
-    );
-    expect(old.state).toBe('unknown');
-    expect(old.execution.phase).toBe('removing_unaccepted_original');
-  });
-  it('leaves preserved/unknown current work intact without regenerating execution identity', async () => {
-    const owner = ports();
-    const operation = row();
-    owner.observeWork.mockResolvedValue(job(operation));
-    owner.refreshDue.mockResolvedValue('preserved');
-    await expect(createUploadHousekeepingProjection(owner)(null, operation, session)).resolves.toBe(
-      false,
-    );
-    expect(owner.project).not.toHaveBeenCalled();
-    expect(owner.invalidate).not.toHaveBeenCalled();
-  });
-  it('fails a stale projection CAS without an internal generic retry', async () => {
-    const owner = ports();
-    const operation = row();
-    owner.observeWork.mockResolvedValue(job(operation));
-    owner.refreshDue.mockResolvedValue('stale');
-    await expect(
-      createUploadHousekeepingProjection(owner)(null, operation, session),
-    ).rejects.toThrow('UPLOAD_HOUSEKEEPING_CAS_LOST');
-    expect(owner.refreshDue).toHaveBeenCalledTimes(1);
-  });
-});
+registerUploadSchedulingProjectionCases(describe, it);
 
 describe('Upload Housekeeping composed Mongo transactions', () => {
   let mongo: MongoMemoryReplSet;
@@ -368,14 +211,14 @@ describe('Upload Housekeeping composed Mongo transactions', () => {
       originalBytes: 0,
       textBytes: 0,
       cleanupPending: true,
-      recordBytes: UPLOAD_RECORD_BYTES,
+      recordBytes: UPLOAD_AV_RECORD_BYTES,
       cleanupCustody: { receipt, receiptSHA256: hash, consumerCommitId: prepared.consumerCommitId },
     });
     const accounting = await db.model<CounterRow>('UploadCounter').findById('global').lean();
     expect(accounting?.value).toMatchObject({
       originalBytes: 0,
       objectBytes: 0,
-      recordBytes: UPLOAD_RECORD_BYTES,
+      recordBytes: UPLOAD_AV_RECORD_BYTES,
       bundles: 1,
     });
     expect(
@@ -397,7 +240,7 @@ describe('Upload Housekeeping composed Mongo transactions', () => {
     });
     const after = (await currentRow())!;
     expect(after.cleanupPending).toBe(false);
-    expect(after.recordBytes).toBe(UPLOAD_RECORD_BYTES);
+    expect(after.recordBytes).toBe(UPLOAD_AV_RECORD_BYTES);
     expect(after.cleanupCustody?.retiredAt).toEqual(expect.any(Number));
     expect(() => validateUploadCleanupCustody(after)).not.toThrow();
     expect(await db.models.UploadCounter.findById('global').lean()).toEqual(accounting);
@@ -501,6 +344,7 @@ describe('Upload Housekeeping composed Mongo transactions', () => {
     const authority = await attempted();
     const binding = await bound(authority);
     const source = (await currentRow())!;
+    expect(source.recordBytes).toBe(UPLOAD_AV_RECORD_BYTES);
     // Independent protocol-maximal custody, sized as one BSON document rather than summed parts.
     const token = 'a'.repeat(128);
     const digest = 'a'.repeat(64);
@@ -553,9 +397,9 @@ describe('Upload Housekeeping composed Mongo transactions', () => {
       },
     };
     const size = mongoose.mongo.BSON.calculateObjectSize;
-    const room = UPLOAD_RECORD_BYTES - size(future);
+    const room = source.recordBytes - size(future);
     expect(room).toBeGreaterThan(18000);
-    expect(size({ ...future, filename: 'x'.repeat(room) })).toBe(UPLOAD_RECORD_BYTES);
+    expect(size({ ...future, filename: 'x'.repeat(room) })).toBe(source.recordBytes);
     expect(() =>
       assertUploadCleanupCapacity({ ...source, filename: 'x'.repeat(room) }, size),
     ).not.toThrow();
@@ -570,11 +414,12 @@ describe('Upload Housekeeping composed Mongo transactions', () => {
   it('checks the post-increment BSON row and rolls back an int32-boundary overflow without custody', async () => {
     await reserve('operation');
     const source = { ...(await currentRow())!, revision: 2147483647, filename: '' };
+    expect(source.recordBytes).toBe(UPLOAD_AV_RECORD_BYTES);
     delete source.cleanupCustody;
     const size = mongoose.mongo.BSON.calculateObjectSize;
-    source.filename = 'x'.repeat(UPLOAD_RECORD_BYTES - 3 - size(source));
-    expect(size(source)).toBe(UPLOAD_RECORD_BYTES - 3);
-    expect(size({ ...source, revision: source.revision + 1 })).toBe(UPLOAD_RECORD_BYTES + 1);
+    source.filename = 'x'.repeat(source.recordBytes - 3 - size(source));
+    expect(size(source)).toBe(source.recordBytes - 3);
+    expect(size({ ...source, revision: source.revision + 1 })).toBe(source.recordBytes + 1);
     await db.connection
       .db!.collection<StoredUpload>(db.models.UploadOperation.collection.name)
       .replaceOne({ _id: source._id }, source);
@@ -595,7 +440,7 @@ describe('Upload Housekeeping composed Mongo transactions', () => {
     await store.transaction(async (session) => store.save(source, session));
     const persisted = (await currentRow())!;
     expect(persisted.revision).toBe(2147483648);
-    expect(size(persisted)).toBe(UPLOAD_RECORD_BYTES);
+    expect(size(persisted)).toBe(source.recordBytes);
   });
 
   it('projects reserve/save changes atomically and retains the original execution on refresh', async () => {

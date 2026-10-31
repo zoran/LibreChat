@@ -2,7 +2,11 @@
 import mongoose from 'mongoose';
 import { randomUUID } from 'node:crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
-import type { UploadPrincipal, UploadSecurityApproval } from 'librechat-data-provider';
+import type { UploadPrincipal } from 'librechat-data-provider';
+import {
+  uploadSecurityFixture,
+  bindUploadOriginalFixture,
+} from '../../specs/fixtures/uploadManagement.security.fixture';
 import fixture from '../../../data-provider/src/__fixtures__/managed-retrieval-v1.json';
 import { createUploadManagementRepository } from '../../src/methods/uploadManagement';
 import { createModels } from '../../src/models';
@@ -70,20 +74,6 @@ export async function acceptedRetrievalPublication(
       now,
     });
     if (!lease) throw new Error('Actual retrieval fixture transfer was not admitted');
-    const execution = {
-      version: 2 as const,
-      custody: { kind: 'none' as const },
-      attemptId: `${fileId}.${lease.generation}`,
-      instanceId: randomUUID(),
-      executionId: randomUUID(),
-      expiresAt: new Date(now + 60_000).toISOString(),
-    };
-    await repository.bindSecurityExecution(lease, execution, now);
-    await repository.settleSecurityExecution(
-      lease,
-      { execution, writerStopped: true, transientDataRemoved: true },
-      now,
-    );
     const receipt = {
       outcome: 'durable' as const,
       bytes,
@@ -98,18 +88,30 @@ export async function acceptedRetrievalPublication(
         chunkSha256: [sha256],
       },
     };
-    const approval: UploadSecurityApproval = {
-      ...fixture.revisionInput.approval,
-      version: 1,
-      decision: 'approved',
-      subject: {
-        ...fixture.revisionInput.approval.subject,
-        userId: principal.userId,
-        transferGeneration: lease.generation,
+    // This inert external-engine tuple exercises current validators, not physical AV acceptance.
+    const security = uploadSecurityFixture(
+      {
+        ...fixture.revisionInput.approval,
+        decision: 'approved',
+        subject: {
+          ...fixture.revisionInput.approval.subject,
+          userId: principal.userId,
+          transferGeneration: lease.generation,
+        },
+        checkedAt: new Date(now).toISOString(),
+        coverage: { ...fixture.revisionInput.approval.coverage, complete: true },
       },
-      checkedAt: new Date(now).toISOString(),
-      coverage: { ...fixture.revisionInput.approval.coverage, complete: true },
-    };
+      {
+        attemptId: `${fileId}.${lease.generation}`,
+        instanceId: randomUUID(),
+        executionId: randomUUID(),
+        expiresAt: new Date(now + 60_000).toISOString(),
+      },
+    );
+    const { approval, execution, settlement } = security;
+    await repository.bindSecurityExecution(lease, execution, now);
+    await repository.settleSecurityExecution(lease, settlement, now);
+    await bindUploadOriginalFixture(repository, lease, receipt, approval, now);
     const worker = { hostId: 'fixture-host', instanceId: 'fixture-app' };
     const promotionId = randomUUID();
     await repository.preparePromotion(

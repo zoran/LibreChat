@@ -260,8 +260,7 @@ describe('role-only ACL writes', () => {
         ],
         grantedBy,
       });
-    // A real concurrent write invalidates the transaction; only an explicit fresh call may retry it.
-    await expect(update()).rejects.toMatchObject({ code: 112 });
+    // Native owned transaction retry rolls back the stale attempt within this one original call.
     const result = await update();
     // The failed original rolled back; the retry sees no prior grant, so no revocation may be invented.
     expect(result.insightsChanges).toEqual([]);

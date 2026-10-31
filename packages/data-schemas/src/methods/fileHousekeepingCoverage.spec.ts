@@ -1009,7 +1009,8 @@ describe('File coverage existing-owner census', () => {
     await File.create(fixture(1));
     const result = await incomplete();
     expect(result.history).toMatchObject({
-      counts: { file: 1, fileJob: 3, physicalOverhead: 2 },
+      // Two replicas each contribute a data superblock and an index-format extent.
+      counts: { file: 1, fileJob: 3, physicalOverhead: 4 },
       bytes: {
         physicalLive: 48,
         physicalOverhead: 48,

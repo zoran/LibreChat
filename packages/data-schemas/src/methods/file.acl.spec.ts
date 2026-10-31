@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
 import { v4 as uuidv4 } from 'uuid';
-import { MongoMemoryServer } from 'mongodb-memory-server';
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import {
   ResourceType,
   AccessRoleIds,
@@ -9,6 +9,8 @@ import {
 } from 'librechat-data-provider';
 import type { AccessRole as TAccessRole, AclEntry as TAclEntry } from '..';
 import type { Types } from 'mongoose';
+import type { FileRetentionAdmission } from '~/types/file';
+import { createHousekeepingStore } from './housekeepingStore';
 import { createAclEntryMethods } from './aclEntry';
 import { createModels } from '../models';
 import { createMethods } from './index';
@@ -34,10 +36,17 @@ let methods: ReturnType<typeof createMethods>;
 let aclMethods: ReturnType<typeof createAclEntryMethods>;
 
 describe('File Access Control', () => {
-  let mongoServer: MongoMemoryServer;
+  let mongoServer: MongoMemoryReplSet;
+  let jobs: ReturnType<typeof createHousekeepingStore>;
+  let retention: FileRetentionAdmission;
+  const stopOwnedMongo = async () => {
+    if (mongoServer && !(await mongoServer.stop()))
+      throw new Error('Owned File ACL MongoDB did not stop; original retained');
+  };
 
   beforeAll(async () => {
-    mongoServer = await MongoMemoryServer.create();
+    mongoServer = new MongoMemoryReplSet({ replSet: { count: 1 } });
+    await mongoServer.start();
     const mongoUri = mongoServer.getUri();
     await mongoose.connect(mongoUri);
 
@@ -48,6 +57,16 @@ describe('File Access Control', () => {
     AccessRole = mongoose.models.AccessRole;
     User = mongoose.models.User;
 
+    jobs = createHousekeepingStore(mongoose);
+    await Promise.all([
+      File.init(),
+      Agent.init(),
+      AclEntry.init(),
+      AccessRole.init(),
+      User.init(),
+      jobs.initialize(),
+    ]);
+
     methods = createMethods(mongoose);
     aclMethods = createAclEntryMethods(mongoose);
 
@@ -56,15 +75,24 @@ describe('File Access Control', () => {
   });
 
   afterAll(async () => {
-    const collections = mongoose.connection.collections;
-    for (const key in collections) {
-      await collections[key].deleteMany({});
+    try {
+      const collections = mongoose.connection.collections;
+      for (const key in collections) {
+        await collections[key].deleteMany({});
+      }
+    } finally {
+      try {
+        await mongoose.disconnect();
+      } finally {
+        await stopOwnedMongo();
+      }
     }
-    await mongoose.disconnect();
-    await mongoServer.stop();
   });
 
   beforeEach(async () => {
+    const acceptedAt = new Date();
+    retention = { acceptedAt, expiredAt: new Date(acceptedAt.getTime() + 7 * 86_400_000) };
+    await jobs.model.deleteMany({});
     await File.deleteMany({});
     await Agent.deleteMany({});
     await AclEntry.deleteMany({});
@@ -95,12 +123,18 @@ describe('File Access Control', () => {
 
       // Create files
       for (const fileId of fileIds) {
-        await methods.createFile({
-          user: authorId,
-          file_id: fileId,
-          filename: `file-${fileId}.txt`,
-          filepath: `/uploads/${fileId}`,
-        });
+        await methods.createFile(
+          {
+            user: authorId,
+            file_id: fileId,
+            filename: `file-${fileId}.txt`,
+            filepath: `/uploads/${fileId}`,
+            bytes: 0,
+            type: 'text/plain',
+          },
+          false,
+          { retention },
+        );
       }
 
       // Create agent with only first two files attached
@@ -357,23 +391,31 @@ describe('File Access Control', () => {
       const fileId1 = `file_${uuidv4()}`;
       const fileId2 = `file_${uuidv4()}`;
 
-      await methods.createFile({
-        file_id: fileId1,
-        user: userId,
-        filename: 'file1.txt',
-        filepath: '/uploads/file1.txt',
-        type: 'text/plain',
-        bytes: 100,
-      });
+      await methods.createFile(
+        {
+          file_id: fileId1,
+          user: userId,
+          filename: 'file1.txt',
+          filepath: '/uploads/file1.txt',
+          type: 'text/plain',
+          bytes: 100,
+        },
+        false,
+        { retention },
+      );
 
-      await methods.createFile({
-        file_id: fileId2,
-        user: new mongoose.Types.ObjectId(),
-        filename: 'file2.txt',
-        filepath: '/uploads/file2.txt',
-        type: 'text/plain',
-        bytes: 200,
-      });
+      await methods.createFile(
+        {
+          file_id: fileId2,
+          user: new mongoose.Types.ObjectId(),
+          filename: 'file2.txt',
+          filepath: '/uploads/file2.txt',
+          type: 'text/plain',
+          bytes: 200,
+        },
+        false,
+        { retention },
+      );
 
       const files = await methods.getFiles({ file_id: { $in: [fileId1, fileId2] } });
       expect(files).toHaveLength(2);
@@ -384,19 +426,31 @@ describe('File Access Control', () => {
       const fileId1 = `file_${uuidv4()}`;
       const fileId2 = `file_${uuidv4()}`;
 
-      await methods.createFile({
-        file_id: fileId1,
-        user: userId,
-        filename: 'file1.txt',
-        filepath: '/uploads/file1.txt',
-      });
+      await methods.createFile(
+        {
+          file_id: fileId1,
+          user: userId,
+          filename: 'file1.txt',
+          filepath: '/uploads/file1.txt',
+          bytes: 0,
+          type: 'text/plain',
+        },
+        false,
+        { retention },
+      );
 
-      await methods.createFile({
-        file_id: fileId2,
-        user: userId,
-        filename: 'file2.txt',
-        filepath: '/uploads/file2.txt',
-      });
+      await methods.createFile(
+        {
+          file_id: fileId2,
+          user: userId,
+          filename: 'file2.txt',
+          filepath: '/uploads/file2.txt',
+          bytes: 0,
+          type: 'text/plain',
+        },
+        false,
+        { retention },
+      );
 
       const files = await methods.getFiles({ user: userId });
       expect(files).toHaveLength(2);

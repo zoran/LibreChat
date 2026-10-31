@@ -19,12 +19,20 @@ const TENANT_ISOLATION_APPLIED = Symbol.for('librechat:tenantIsolation');
  * the signed OpenID marker cookie during unauthenticated refresh recovery, and
  * its methods apply explicit tenant filters. Adding an entry here must be a
  * deliberate, reviewed decision — that is the whole point of this guard.
+ * PlatformAdminPolicy is the global configured-administrator singleton: its tenantId
+ * identifies the configured identity tenant, while fixed-ID revision/digest CAS
+ * serializes policy changes across tenants. GenerationAdmission is connection-injected
+ * and scopes requests/preparations explicitly by tenant, principal and immutable
+ * admission fences; source writes also bind the actual Mongo client/database. Its
+ * read-only Pod-owner census deliberately includes all tenants for process drain.
  */
 const MANUAL_TENANT_SCOPING = new Set<string>([
   'SystemGrant',
   'SkillSyncStatus',
   'AuditLog',
   'RefreshTokenBridge',
+  'PlatformAdminPolicy',
+  'GenerationAdmission',
 ]);
 
 function isPluginApplied(schema: mongoose.Schema): boolean {

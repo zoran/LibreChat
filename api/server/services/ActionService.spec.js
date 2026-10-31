@@ -1,9 +1,11 @@
+const { randomUUID } = require('node:crypto');
 const dataSchemas = require('@librechat/data-schemas');
 const { logger } = dataSchemas;
 const { Constants, actionDelimiter, actionDomainSeparator } = require('librechat-data-provider');
 
 const mockEmitChunk = jest.fn();
 const mockFindToken = jest.fn();
+const mockRefreshAccessToken = jest.fn();
 const mockActionFlowManager = {
   createFlowWithHandler: jest.fn(),
   createFlow: jest.fn(),
@@ -23,6 +25,7 @@ jest.mock('@librechat/agents', () => ({
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
   validateActionOAuthMetadata: jest.fn().mockResolvedValue(undefined),
+  refreshAccessToken: (...args) => mockRefreshAccessToken(...args),
   GenerationJobManager: {
     emitChunk: (...args) => mockEmitChunk(...args),
   },
@@ -65,6 +68,7 @@ beforeEach(() => {
   getActions.mockReset();
   mockEmitChunk.mockReset();
   mockFindToken.mockReset();
+  mockRefreshAccessToken.mockReset();
   mockActionFlowManager.createFlowWithHandler.mockReset();
   mockActionFlowManager.createFlow.mockReset();
 });
@@ -559,15 +563,18 @@ describe('createActionTool OAuth abort identity', () => {
 
   it('does not request a fresh login when a stopped run detaches from a refresh', async () => {
     const { requestBuilder, preparedExecutor } = oauthToolFixture();
+    const refreshToken = randomUUID();
     /** No access token but a live refresh token: the branch that waits on the
      *  shared refresh flow rather than opening a login. */
     mockFindToken.mockImplementation(async ({ type }) =>
-      type === 'oauth_refresh' ? { token: 'encrypted-refresh-token' } : null,
+      type === 'oauth_refresh' ? { token: refreshToken } : null,
     );
-    jest.spyOn(dataSchemas, 'decryptV2').mockResolvedValue('refresh-token');
 
     /** The refresh never settles; the run stops while it is pending. */
-    mockActionFlowManager.createFlowWithHandler.mockImplementation(() => new Promise(() => {}));
+    mockRefreshAccessToken.mockImplementation(() => new Promise(() => {}));
+    mockActionFlowManager.createFlowWithHandler.mockImplementation((_flowId, type, handler) =>
+      type === 'oauth_refresh' ? handler() : new Promise(() => {}),
+    );
     mockActionFlowManager.createFlow.mockImplementation(() => new Promise(() => {}));
 
     const actionTool = await createActionTool({
@@ -586,6 +593,8 @@ describe('createActionTool OAuth abort identity', () => {
     await new Promise((resolve) => setImmediate(resolve));
     controller.abort();
     await expect(call).rejects.toThrow();
+    expect(mockRefreshAccessToken).toHaveBeenCalledTimes(1);
+    expect(mockRefreshAccessToken.mock.calls[0][0].refresh_token).toBe(refreshToken);
 
     const loginFlows = mockActionFlowManager.createFlowWithHandler.mock.calls.filter(
       ([, type]) => type === 'oauth_login',
@@ -596,36 +605,41 @@ describe('createActionTool OAuth abort identity', () => {
   });
 
   it('propagates the abort instead of reporting a failed API call', async () => {
-    const { requestBuilder } = oauthToolFixture();
-    mockFindToken.mockResolvedValue(null);
-    mockActionFlowManager.createFlowWithHandler.mockImplementation(
-      async (_flowId, _type, handler) => handler(),
-    );
-    mockActionFlowManager.createFlow.mockImplementation(() => new Promise(() => {}));
+    const errorLog = jest.spyOn(logger, 'error');
+    try {
+      const { requestBuilder } = oauthToolFixture();
+      mockFindToken.mockResolvedValue(null);
+      mockActionFlowManager.createFlowWithHandler.mockImplementation(
+        async (_flowId, _type, handler) => handler(),
+      );
+      mockActionFlowManager.createFlow.mockImplementation(() => new Promise(() => {}));
 
-    const actionTool = await createActionTool({
-      userId: 'action-user',
-      res: {},
-      action: oauthAction,
-      requestBuilder,
-      encrypted: {
-        oauth_client_id: 'encrypted-client-id',
-        oauth_client_secret: 'encrypted-client-secret',
-      },
-      streamId: 'action-oauth-stream',
-      jobCreatedAt: 1234,
-    });
+      const actionTool = await createActionTool({
+        userId: 'action-user',
+        res: {},
+        action: oauthAction,
+        requestBuilder,
+        encrypted: {
+          oauth_client_id: 'encrypted-client-id',
+          oauth_client_secret: 'encrypted-client-secret',
+        },
+        streamId: 'action-oauth-stream',
+        jobCreatedAt: 1234,
+      });
 
-    const controller = new AbortController();
-    const call = actionTool._call({}, callConfig(controller.signal));
-    await new Promise((resolve) => setImmediate(resolve));
-    controller.abort();
+      const controller = new AbortController();
+      const call = actionTool._call({}, callConfig(controller.signal));
+      await new Promise((resolve) => setImmediate(resolve));
+      controller.abort();
 
-    await expect(call).rejects.toBe(controller.signal.reason);
-    expect(logger.error).not.toHaveBeenCalledWith(
-      'Failed to authenticate OAuth tool',
-      expect.anything(),
-    );
+      await expect(call).rejects.toBe(controller.signal.reason);
+      expect(logger.error).not.toHaveBeenCalledWith(
+        'Failed to authenticate OAuth tool',
+        expect.anything(),
+      );
+    } finally {
+      errorLog.mockRestore();
+    }
   });
 });
 

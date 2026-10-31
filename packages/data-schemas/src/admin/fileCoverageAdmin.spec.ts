@@ -1,28 +1,14 @@
 /** Real Mongo owner and owned duplex-stream evidence; broker replies are explicitly fixtures. */
 import mongoose from 'mongoose';
 import { randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
 import { PassThrough, Writable } from 'node:stream';
-import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import { FILE_HOUSEKEEPING_COVERAGE_CONTRACT } from 'librechat-data-provider';
-import type {
-  FileCoverageAction,
-  FileCoverageRun,
-  FileCoverageResult,
-  FileHistoryMongoInput,
-  FileHistoryStorageRequest,
-} from 'librechat-data-provider';
-import {
-  createFileHistoryStorageFixture,
-  assertFileHistoryResult,
-} from '../methods/__fixtures__/fileHistoryStorage';
+import type { FileCoverageAction, FileCoverageRun } from 'librechat-data-provider';
+import type { Frame } from '../../specs/fixtures/fileCoverageAdmin.child.fixture';
+import { createFileCoverageAdminFixture } from '../../specs/fixtures/fileCoverageAdmin.child.fixture';
 import { inspectFileHousekeepingInventory } from '../methods/fileHousekeepingCoverage';
 import { fileCoverageDigest } from '../methods/fileHousekeepingCoverageContract';
-import { initialFileRetentionActivity } from '../methods/fileActivityTransition';
-import { createHousekeepingStore } from '../methods/housekeepingStore';
-import { createUploadStore } from '../methods/uploadManagementStore';
 import { runFileCoverageAdmin } from './fileCoverageAdmin';
-import { createFileModel } from '../models/file';
 
 const deferred = () => {
   let resolve!: () => void;
@@ -33,169 +19,17 @@ const deferred = () => {
 };
 const delay = (milliseconds: number) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const POD = '11111111-1111-4111-8111-111111111111';
-type Frame = {
-  kind: string;
-  seq: number;
-  phase?: string;
-  result?: FileCoverageResult;
-  [key: string]: unknown;
-};
 
 describe('fixed File coverage admin', () => {
-  let mongo: MongoMemoryReplSet;
-  let store: ReturnType<typeof createUploadStore>;
   let run: FileCoverageRun;
-  let history: ReturnType<typeof createFileHistoryStorageFixture>;
-  let originalEnv: NodeJS.ProcessEnv;
-  const file = createFileModel(mongoose);
-  const jobs = createHousekeepingStore(mongoose);
-  beforeAll(async () => {
-    originalEnv = { ...process.env };
-    mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
-    process.env.MONGO_URI = mongo.getUri();
-    process.env.POD_UID = POD;
-    process.env.BUILD_COMMIT = 'a'.repeat(40);
-    await mongoose.connect(mongo.getUri());
-    store = createUploadStore(mongoose, {});
-    await Promise.all([file.init(), store.initialize(), jobs.initialize()]);
-  });
+  const fixture = createFileCoverageAdminFixture(mongoose, () => run, POD);
+  const { file, store, invoke, action, ready } = fixture;
+  beforeAll(() => fixture.start());
   beforeEach(async () => {
-    await Promise.all([
-      store.Counter.deleteMany({}),
-      jobs.model.deleteMany({}),
-      file.deleteMany({}),
-      store.Operation.deleteMany({}),
-    ]);
-    await store.initialize();
-    const counter = await store.Counter.findById('global').lean();
-    run = {
-      version: 1,
-      requestId: randomUUID(),
-      storeId: (counter!.value as { storeId: string }).storeId,
-      generation: 1,
-      originalDeadline: new Date(Date.now() + 60_000).toISOString(),
-      contract: FILE_HOUSEKEEPING_COVERAGE_CONTRACT,
-      source: {
-        sourceRevision: 'a'.repeat(40),
-        imageDigest: `sha256:${'b'.repeat(64)}`,
-        manifestSha256: 'c'.repeat(64),
-      },
-      native: {
-        invocationId: 'fixture-invocation',
-        invocationGeneration: 1,
-        originalRequestSha256: 'd'.repeat(64),
-        namespaceUid: randomUUID(),
-        mongoReplicaSet: 'testset',
-        mongoDatabase: 'test',
-        writerCohortSha256: 'e'.repeat(64),
-        oldApplicationCessationSha256: 'f'.repeat(64),
-      },
-    };
-    history = createFileHistoryStorageFixture(() => run);
+    ({ run } = await fixture.reset());
   });
   afterEach(() => jest.restoreAllMocks());
-  afterAll(async () => {
-    await mongoose.disconnect();
-    await mongo?.stop();
-    process.env = originalEnv;
-  });
-
-  async function historyResponse(frame: Frame, action: FileCoverageAction) {
-    expect(Object.keys(frame).sort()).toEqual(
-      ['kind', 'seq', 'method', 'runSha256', 'actionSha256', 'payload'].sort(),
-    );
-    expect(frame.runSha256).toBe(fileCoverageDigest(run));
-    expect(frame.actionSha256).toBe(fileCoverageDigest(action));
-    expect(frame.seq).toBeLessThanOrEqual(64);
-    const signal = new AbortController().signal;
-    let payload: unknown;
-    if (frame.method === 'bind') {
-      expect(frame.payload).toEqual({ runSha256: fileCoverageDigest(run) });
-      payload = await history.port.bind(fileCoverageDigest(run), signal);
-    } else if (frame.method === 'ingest')
-      payload = await history.port.ingest(frame.payload as FileHistoryMongoInput, signal);
-    else if (frame.method === 'page')
-      payload = await history.port.page(frame.payload as FileHistoryStorageRequest, signal);
-    else throw new Error('Unexpected fixture history method');
-    const response =
-      JSON.stringify({ kind: 'history-result', seq: frame.seq, method: frame.method, payload }) +
-      '\n';
-    expect(Buffer.byteLength(response)).toBeLessThanOrEqual(66560);
-    return response;
-  }
-
-  function invoke(
-    action: FileCoverageAction,
-    onAssert?: (frame: Frame, input: PassThrough) => Promise<boolean | void>,
-  ) {
-    const input = new PassThrough();
-    const frames: Frame[] = [];
-    const output = new Writable({
-      write(bytes, _encoding, done) {
-        const frame = JSON.parse(bytes.toString()) as Frame;
-        frames.push(frame);
-        if (frame.kind === 'assert') {
-          void (async () => {
-            if (
-              (await onAssert?.(frame, input)) !== false &&
-              !input.destroyed &&
-              !input.writableEnded
-            )
-              input.write(JSON.stringify({ kind: 'current', seq: frame.seq }) + '\n');
-          })();
-        }
-        if (frame.kind === 'history')
-          void historyResponse(frame, action)
-            .then((response) => {
-              if (!input.destroyed && !input.writableEnded) input.write(response);
-            })
-            .catch((error: Error) => input.destroy(error));
-        done();
-      },
-    });
-    const result = runFileCoverageAdmin(input, output);
-    input.write(JSON.stringify({ kind: 'open', seq: 0, podUid: POD, run, action }) + '\n');
-    return { input, frames, result };
-  }
-  async function action(value: FileCoverageAction) {
-    const invocation = invoke(value);
-    expect(await invocation.result).toBe(0);
-    expect(invocation.frames[invocation.frames.length - 2]).toMatchObject({
-      kind: 'assert',
-      phase: 'closed',
-    });
-    expect(invocation.frames[invocation.frames.length - 1]).toMatchObject({ kind: 'result' });
-    const result = invocation.frames[invocation.frames.length - 1]!.result!;
-    assertFileHistoryResult(result);
-    return result;
-  }
-  async function ready() {
-    const user = new mongoose.Types.ObjectId(),
-      deadline = new Date(Date.now() + 86_400_000);
-    const retained = {
-      user,
-      tenantId: 'tenant-a',
-      file_id: 'retained-admin-file',
-      filename: 'file',
-      filepath: `https://fixture.invalid/retained-test-files/t/tenant-a/files/${user}/admin`,
-      source: 's3',
-      storageKey: `t/tenant-a/files/${user}/admin`,
-      type: 'text/plain',
-      bytes: 1,
-      expiredAt: deadline,
-      retentionRevision: 0,
-      retainedDerivativeBytes: 0,
-      retainedDerivativeReservations: [],
-      retentionActivity: initialFileRetentionActivity(deadline, new Date(0), 'complete'),
-    };
-    history.registerFile(retained);
-    await file.create(retained);
-    let result = await action({ action: 'begin', run });
-    for (let n = 0; n < 192 && result.outcome === 'progress' && result.lane !== 'ready'; n++)
-      result = await action({ action: 'advance', run, expectedCheckpoint: result.checkpoint });
-    expect(result).toMatchObject({ outcome: 'progress', lane: 'ready' });
-    return result as Extract<FileCoverageResult, { outcome: 'progress' }>;
-  }
+  afterAll(() => fixture.close());
 
   test.each([false, true])(
     'cutover inspect: expired original run stays read-only and joins original client close (rejection %s)',
@@ -672,71 +506,7 @@ describe('fixed File coverage admin', () => {
     'the fixed CJS entry executes the compiled %s admin in a real owned child',
     async (mode) => {
       if (mode === 'inventory') await store.Counter.deleteMany({});
-      const fixture = process.env.FILE_COVERAGE_ADMIN_FIXTURE_ROOT!;
-      expect(fixture).toBeTruthy();
-      const child = spawn(
-        process.execPath,
-        [fixture + '/candidate/config/file-housekeeping-coverage.js'],
-        {
-          env: { ...process.env, NODE_PATH: process.env.FILE_COVERAGE_ADMIN_MODULES },
-          stdio: ['pipe', 'pipe', 'pipe'],
-        },
-      );
-      const frames: Frame[] = [];
-      let pending = '',
-        errors = '';
-      child.stdout.on('data', (bytes) => {
-        pending += bytes.toString();
-        let split: number;
-        while ((split = pending.indexOf('\n')) >= 0) {
-          const frame = JSON.parse(pending.slice(0, split)) as Frame;
-          pending = pending.slice(split + 1);
-          frames.push(frame);
-          if (frame.kind === 'assert')
-            child.stdin.write(JSON.stringify({ kind: 'current', seq: frame.seq }) + '\n');
-          if (frame.kind === 'history')
-            void historyResponse(frame, { action: 'begin', run })
-              .then((response) => {
-                if (!child.stdin.destroyed && !child.stdin.writableEnded)
-                  child.stdin.write(response);
-              })
-              .catch((error: Error) => {
-                errors += error.message;
-                child.stdin.end();
-              });
-        }
-      });
-      child.stderr.on('data', (bytes) => {
-        errors += bytes.toString();
-      });
-      const opening =
-        mode === 'inventory'
-          ? {
-              kind: 'inventory',
-              seq: 0,
-              podUid: POD,
-              request: {
-                action: 'inventory',
-                version: 1,
-                requestId: randomUUID(),
-                source: run.source,
-                target: {
-                  namespaceUid: run.native.namespaceUid,
-                  mongoReplicaSet: 'testset',
-                  mongoDatabase: 'test',
-                },
-                originalDeadline: run.originalDeadline,
-                lookAheadMs: 30_000,
-              },
-            }
-          : { kind: 'open', seq: 0, podUid: POD, run, action: { action: 'begin', run } };
-      child.stdin.write(JSON.stringify(opening) + '\n');
-      // Fixture cancellation is a failed test, never native remote-settlement proof.
-      const timeout = setTimeout(() => child.kill('SIGTERM'), 5_000);
-      const code = await new Promise((resolve, reject) => {
-        child.once('close', resolve);
-        child.once('error', reject);
-      }).finally(() => clearTimeout(timeout));
+      const { child, frames, code, errors, pending } = await fixture.compiled(mode);
       expect({ code, errors, pending }).toEqual({ code: 0, errors: '', pending: '' });
       expect(frames[0]).toMatchObject({ kind: 'hello', pid: child.pid });
       expect(frames[frames.length - 1]).toMatchObject({
@@ -777,8 +547,8 @@ describe('fixed File coverage admin', () => {
           source: run.source,
           target: {
             namespaceUid: run.native.namespaceUid,
-            mongoReplicaSet: 'testset',
-            mongoDatabase: 'test',
+            mongoReplicaSet: run.native.mongoReplicaSet,
+            mongoDatabase: run.native.mongoDatabase,
           },
           originalDeadline: new Date(Date.now() + 60_000).toISOString(),
           lookAheadMs: 30_000,
@@ -809,8 +579,8 @@ describe('fixed File coverage admin', () => {
         source: { ...run.source },
         target: {
           namespaceUid: run.native.namespaceUid,
-          mongoReplicaSet: 'testset',
-          mongoDatabase: 'test',
+          mongoReplicaSet: run.native.mongoReplicaSet,
+          mongoDatabase: run.native.mongoDatabase,
         },
         originalDeadline: new Date(Date.now() + 60_000).toISOString(),
         lookAheadMs: 30_000,
@@ -874,8 +644,8 @@ describe('fixed File coverage admin', () => {
           source: run.source,
           target: {
             namespaceUid: run.native.namespaceUid,
-            mongoReplicaSet: 'testset',
-            mongoDatabase: 'test',
+            mongoReplicaSet: run.native.mongoReplicaSet,
+            mongoDatabase: run.native.mongoDatabase,
           },
           originalDeadline: run.originalDeadline,
           lookAheadMs: 30_000,

@@ -3,6 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import { FileContext, FileSources } from 'librechat-data-provider';
 import type { CodeFileCommitData, IMongoFile } from '~/types/file';
+import { FileSourceUnavailableError } from './fileRetention';
 import { createFileMethods } from './file';
 import fileSchema from '~/schema/file';
 
@@ -79,8 +80,7 @@ describe('Code output commits', () => {
     expect(stored?.createdAt).toBeInstanceOf(Date);
   });
 
-  it('updates foreground output unconditionally and preserves existing upsert TTL semantics', async () => {
-    const expiresAt = new Date(Date.now() + 3_600_000);
+  it('updates persisted non-temporary foreground output unconditionally', async () => {
     const data = fileData({
       metadata: { sourceDispatchedAt: 200 },
       text: 'old preview',
@@ -88,7 +88,9 @@ describe('Code output commits', () => {
       status: 'ready',
       previewRevision: 'old-revision',
     });
-    await File.create({ ...data, expiresAt });
+    const born = await File.create({ ...data, user: new mongoose.Types.ObjectId(data.user) });
+    expect(born.user).toEqual(new mongoose.Types.ObjectId(data.user));
+    expect(born.expiresAt).toBeUndefined();
 
     expect(
       await methods.commitCodeFile({
@@ -110,8 +112,29 @@ describe('Code output commits', () => {
       textFormat: null,
       status: null,
       previewRevision: null,
-      expiresAt,
+      bytes: data.bytes,
     });
+    expect(stored?.expiresAt).toBeUndefined();
+    expect(await File.countDocuments()).toBe(1);
+  });
+
+  it('refuses foreground replacement of a legacy temporary without changing its bytes or TTL', async () => {
+    const data = fileData({ metadata: { sourceDispatchedAt: 200 } });
+    const expiresAt = new Date(Date.now() + 3_600_000);
+    await File.create({ ...data, expiresAt });
+    const before = await File.findOne({ file_id: data.file_id }).lean();
+
+    await expect(
+      methods.commitCodeFile({
+        ...data,
+        filepath: '/uploads/replacement.csv',
+        bytes: 99,
+        metadata: { sourceDispatchedAt: 100 },
+      }),
+    ).rejects.toBeInstanceOf(FileSourceUnavailableError);
+
+    expect(await File.findOne({ file_id: data.file_id }).lean()).toEqual(before);
+    expect(before).toMatchObject({ bytes: data.bytes, expiresAt });
     expect(await File.countDocuments()).toBe(1);
   });
 
@@ -120,12 +143,14 @@ describe('Code output commits', () => {
     ['earlier', 100],
     ['equal', 200],
   ] as const)(
-    'commits over an %s dispatch stamp and removes the upload TTL',
+    'commits over an %s dispatch stamp on a persisted non-temporary output',
     async (_label, stamp) => {
       const data = fileData({
         metadata: stamp == null ? undefined : { sourceDispatchedAt: stamp },
       });
-      await File.create({ ...data, expiresAt: new Date(Date.now() + 3_600_000) });
+      const born = await File.create({ ...data, user: new mongoose.Types.ObjectId(data.user) });
+      expect(born.user).toEqual(new mongoose.Types.ObjectId(data.user));
+      expect(born.expiresAt).toBeUndefined();
 
       expect(
         await methods.commitCodeFile(
@@ -141,6 +166,7 @@ describe('Code output commits', () => {
       const stored = await File.findOne({ file_id: data.file_id }).lean();
       expect(stored).toMatchObject({
         filepath: '/uploads/background.csv',
+        bytes: data.bytes,
         metadata: { sourceDispatchedAt: 200 },
       });
       expect(stored?.expiresAt).toBeUndefined();

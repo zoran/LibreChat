@@ -341,4 +341,27 @@ describe('access role resolution under tenant isolation', () => {
       expect(byPermissions?.permBits).toBe(RoleBits.EDITOR);
     });
   });
+  it('forwards the exact optional session through global and bounded tenant role reads', async () => {
+    await seedGlobalRoles();
+    await shadowAgentOwnerAsEditor('tenant-a');
+    const session = await mongoose.startSession();
+    const find = jest.spyOn(mongoose.models.AccessRole.collection, 'find');
+    try {
+      await methods.findRolesByResourceType(ResourceType.AGENT, session);
+      expect(find.mock.calls[find.mock.calls.length - 1]?.[1]?.session).toBe(session);
+      const roles = await tenantStorage.run({ tenantId: 'tenant-a' }, () =>
+        methods.findRolesByResourceType(ResourceType.AGENT, session),
+      );
+      expect(find.mock.calls[find.mock.calls.length - 1]?.[0]).toEqual({
+        tenantId: { $in: ['tenant-a', null] },
+      });
+      expect(find.mock.calls[find.mock.calls.length - 1]?.[1]?.session).toBe(session);
+      expect(roles.find((role) => role.accessRoleId === AccessRoleIds.AGENT_OWNER)?.permBits).toBe(
+        RoleBits.EDITOR,
+      );
+    } finally {
+      find.mockRestore();
+      await session.endSession();
+    }
+  });
 });

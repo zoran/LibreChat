@@ -1,5 +1,5 @@
 import { AccessRoleIds, ResourceType, PermissionBits } from 'librechat-data-provider';
-import type { Model, Types, DeleteResult } from 'mongoose';
+import type { Model, Types, DeleteResult, ClientSession } from 'mongoose';
 import type { IAccessRole } from '~/types';
 import { getTenantId, runAsSystem, SYSTEM_TENANT_ID } from '~/config/tenantContext';
 import { RoleBits } from '~/common';
@@ -23,7 +23,10 @@ export function createAccessRoleMethods(mongoose: typeof import('mongoose')): {
     resourceType: string,
     permBits: PermissionBits | RoleBits,
   ) => Promise<IAccessRole | null>;
-  findRolesByResourceType: (resourceType: string) => Promise<IAccessRole[]>;
+  findRolesByResourceType: (
+    resourceType: string,
+    session?: ClientSession,
+  ) => Promise<IAccessRole[]>;
 } {
   /** True inside a tenant's own context; false with no context or a system one. */
   function inTenantScope(): boolean {
@@ -51,7 +54,7 @@ export function createAccessRoleMethods(mongoose: typeof import('mongoose')): {
    *
    * The unique index on `(accessRoleId, tenantId)` makes the substitution unambiguous.
    */
-  async function visibleTenantRoles(): Promise<IAccessRole[]> {
+  async function visibleTenantRoles(session?: ClientSession): Promise<IAccessRole[]> {
     const tenantId = getTenantId();
     const AccessRole = mongoose.models.AccessRole as Model<IAccessRole>;
 
@@ -59,6 +62,7 @@ export function createAccessRoleMethods(mongoose: typeof import('mongoose')): {
      * query inside it. MongoDB's null match includes absent tenantId fields. */
     const roles = await runAsSystem(async () =>
       AccessRole.find({ tenantId: { $in: [tenantId, null] } })
+        .session(session ?? null)
         .lean<IAccessRole[]>()
         .exec(),
     );
@@ -108,16 +112,22 @@ export function createAccessRoleMethods(mongoose: typeof import('mongoose')): {
    * @param resourceType - The type of resource ('agent', 'project', 'file')
    * @returns Array of role documents
    */
-  async function findRolesByResourceType(resourceType: string): Promise<IAccessRole[]> {
+  async function findRolesByResourceType(
+    resourceType: string,
+    session?: ClientSession,
+  ): Promise<IAccessRole[]> {
     const AccessRole = mongoose.models.AccessRole as Model<IAccessRole>;
     if (!inTenantScope()) {
-      return await AccessRole.find({ resourceType }).lean<IAccessRole[]>().exec();
+      return await AccessRole.find({ resourceType })
+        .session(session ?? null)
+        .lean<IAccessRole[]>()
+        .exec();
     }
     /** Filtered after the merge, so a tenant copy that moves an identifier to another
      * resource type withdraws the global row from this list instead of leaving it
      * visible — and callers such as `bulkUpdatePermissions`, which key this result by
      * `accessRoleId`, cannot grant bits the tenant has superseded. */
-    const roles = await visibleTenantRoles();
+    const roles = await visibleTenantRoles(session);
     return roles.filter((role) => role.resourceType === resourceType);
   }
 

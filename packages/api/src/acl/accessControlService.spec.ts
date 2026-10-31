@@ -101,6 +101,7 @@ describe('AccessControlService', () => {
           grantedBy: grantedById,
         });
       const results = await Promise.all([revoke(), revoke()]);
+      expect(results.map((result) => result.errors)).toEqual([[], []]);
 
       expect(results.flatMap((result) => result.insightsChanges)).toEqual([
         expect.objectContaining({ action: 'removed' }),

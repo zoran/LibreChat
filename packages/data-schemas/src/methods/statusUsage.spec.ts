@@ -1,5 +1,7 @@
 import mongoose from 'mongoose';
-import { mkdtemp, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import type { EmailCodeGrant } from '~/types/emailCode';
 import { STATUS_USAGE_STORAGE_LIMITS as L } from '../types/statusUsage';
@@ -7,9 +9,15 @@ import { createStatusUsageMethods } from './statusUsage';
 
 describe('bounded durable application usage', () => {
   let mongo: MongoMemoryReplSet;
+  let dbPath: string | undefined;
   let port: ReturnType<typeof createStatusUsageMethods>;
   let now: number;
   let grant: EmailCodeGrant;
+  const stopOwnedMongo = async () => {
+    if (mongo && !(await mongo.stop()))
+      throw new Error('Owned status-usage MongoDB did not stop; dbPath retained');
+    if (dbPath) await rm(dbPath, { recursive: true, force: true });
+  };
   const commandEvidence: Record<string, unknown>[] = [];
   const faultEvidence: Record<string, unknown>[] = [];
   const ownedTransactionSessions = new Map<string, object>();
@@ -68,11 +76,12 @@ describe('bounded durable application usage', () => {
     return { value, error, elapsedMs, commands, server };
   };
   beforeAll(async () => {
-    const dbPath = await mkdtemp(process.env.TMPDIR + '/status-usage-db-');
-    mongo = await MongoMemoryReplSet.create({
+    dbPath = await mkdtemp(join(tmpdir(), 'status-usage-db-'));
+    mongo = new MongoMemoryReplSet({
       replSet: { count: 1, ip: '127.0.0.1' },
       instanceOpts: [{ dbPath, args: ['--setParameter', 'enableTestCommands=1'] }],
     });
+    await mongo.start();
     await mongoose.connect(mongo.getUri(), {
       monitorCommands: true,
       appName: 'status-usage-fault-qualification',
@@ -154,18 +163,25 @@ describe('bounded durable application usage', () => {
     });
   });
   afterAll(async () => {
-    if (process.env.STATUS_USAGE_FAULT_EVIDENCE)
-      await writeFile(
-        process.env.STATUS_USAGE_FAULT_EVIDENCE,
-        JSON.stringify(
-          { driver: 'mongodb 6.20.0', mongoose: '8.24.1', cases: faultEvidence },
-          null,
-          2,
-        ) + '\n',
-      );
-    await mongoose.disconnect();
-    await mongo?.stop();
+    try {
+      if (process.env.STATUS_USAGE_FAULT_EVIDENCE)
+        await writeFile(
+          process.env.STATUS_USAGE_FAULT_EVIDENCE,
+          JSON.stringify(
+            { driver: 'mongodb 6.20.0', mongoose: '8.24.1', cases: faultEvidence },
+            null,
+            2,
+          ) + '\n',
+        );
+    } finally {
+      try {
+        await mongoose.disconnect();
+      } finally {
+        await stopOwnedMongo();
+      }
+    }
   });
+
   afterEach(async () => {
     await clearFault();
     // Test-only teardown: a timed-out abort can leave the isolated server transaction open.
@@ -516,6 +532,7 @@ describe('bounded durable application usage', () => {
       ),
     ).toBe(true);
   });
+  //18s operation contract +2s receipt census +2s owned-session cleanup reserve.
   it('fault: exhausted work and failed abort consume separate bounded budgets without returning a value', async () => {
     await fail(['find', 'abortTransaction'], 9000, 'alwaysOn');
     const result = await observeFault('combined work and abort timeout', () =>
@@ -535,7 +552,7 @@ describe('bounded durable application usage', () => {
     ).toBe(true);
     expect(result.server.openTransactions).toBeGreaterThan(0);
     expect(result.server.receipts).toBe(0);
-  });
+  }, 22_000);
 });
 
 describe('durable usage constructor validation', () => {

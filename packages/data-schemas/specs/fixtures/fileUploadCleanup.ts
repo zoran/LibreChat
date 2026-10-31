@@ -263,8 +263,8 @@ export async function prepareNonemptyFileCleanup(input: {
         return actualCall('derivative.messages', async () => {
           const context = tenantStorage.getStore();
           trace('derivative.messages', 'tenant-context', {
-            canonicalModule: require.resolve('../../../config/tenantContext'),
-            policyModule: require.resolve('../../../tenant/policy'),
+            canonicalModule: require.resolve('../../src/config/tenantContext'),
+            policyModule: require.resolve('../../src/tenant/policy'),
             publicIdentityMatches: publicTenantStorage === tenantStorage,
             context,
             policyScope: currentTenantScope(),

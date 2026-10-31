@@ -48,9 +48,9 @@ it('publishes the trusted private revision through the existing transactional Fi
     expect(update.$set!.managedRetrieval!.revision).toEqual({
       ...fixture.revision,
       owner: { tenantId: accepted.principal.tenantId, userId: accepted.principal.userId },
-      approvalSha256: 'f947f800ab57366e8934f3c0b6e80938575fe21967126f1dbae2c70d325e93ec',
+      approvalSha256: '9dab1e0744e388e97d414013a8828ffe457355254df8dc5bfac223f10a8fbdc5',
       sourceRevision: 'e9f0f339a5dbace84b84c19358d3bbe05c6364ace843b6984f5c29ceaaf079f4',
-      representationRevision: '760cca069ebb80ca39e6385596be3fb02a8b9d784e2c3f54a2fee9181b56e986',
+      representationRevision: 'fb6a58cd06ebaae5d2114c2f701cc88e01580b1317441d91fe064ea6d2dd2ece',
     });
     expect(update.$set!.managedRetrieval!.inventory).toBe('unknown');
     expect(options?.session).toBe(session);

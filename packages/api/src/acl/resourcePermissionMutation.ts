@@ -1,5 +1,6 @@
 /** Private ACL bulk mutation and compensation owner; sessions stay bound to their entry identity. */
 import { Types } from 'mongoose';
+import { performance } from 'node:perf_hooks';
 import { getTransactionSupport, logger, runAfterTransaction } from '@librechat/data-schemas';
 import {
   PermissionBits,
@@ -35,6 +36,8 @@ function withMutation<T>(
     track<R>(start: () => Promise<R> | R, session?: ClientSession): Promise<R>;
     write<R>(start: () => Promise<R> | R, session?: ClientSession): Promise<R>;
     acquire<R>(start: () => Promise<R>): Promise<R>;
+    retain<R>(start: () => Promise<R> | R): Promise<R>;
+    unit<R>(start: () => Promise<R>): Promise<R>;
     cleanup<R>(start: () => Promise<R>, write?: boolean): Promise<R>;
   }) => Promise<T>,
 ): Promise<T> {
@@ -85,10 +88,31 @@ function withMutation<T>(
       track: (start, session) => effect(start, false, session),
       write: (start, session) => effect(start, true, session),
       acquire: (start) => effect(start, false, undefined, 'acquire'),
+      retain: (start) => (observer ? observer.track(start) : Promise.resolve().then(start)),
+      unit: (start) => (observer ? observer.write(start) : start()),
       cleanup: (start, write = false) => effect(start, write, undefined, 'cleanup'),
     });
   };
   return observer ? observer.track(run) : run();
+}
+
+/** Driver-compatible terminal fence; native errors/labels remain untouched as its cause. */
+class AclTransactionBoundary extends Error {
+  readonly cause: unknown;
+  constructor(message: string, cause?: unknown) {
+    super(message);
+    this.cause = cause;
+  }
+
+  hasErrorLabel(_label: string): false {
+    return false;
+  }
+}
+function hasNativeLabel(error: unknown, label: string): boolean {
+  return (
+    typeof (error as { hasErrorLabel?: unknown } | null)?.hasErrorLabel === 'function' &&
+    (error as { hasErrorLabel(label: string): boolean }).hasErrorLabel(label)
+  );
 }
 
 export function bulkUpdateResourcePermissions(
@@ -114,57 +138,57 @@ export function bulkUpdateResourcePermissions(
     observer?: AuthContinuationObserver;
   },
 ): Promise<BulkPermissionUpdateResult> {
+  // A NEW local dispatch/replay ceiling; pending originals are still joined after expiry.
+  const dispatchDeadline = session ? undefined : performance.now() + 120_000;
+  const invalidateOwned = session
+    ? undefined
+    : dbMethods.invalidatePromptGroupAccessContext.bind(dbMethods);
   return withMutation(mongoose, observer, async (binding) => {
-    const supportsTransactions = await binding.track(() =>
-      getTransactionSupport(mongoose, null, observer),
-    );
-    // This owner has no proved clean-negative classifier. A failed original cannot authorize writes.
-    if (!supportsTransactions) throw new Error('Transaction original remains unconfirmed');
-    let localSession = session;
-    let shouldEndSession = false;
-    let startAttempted = false;
-    let failed = false;
-    let failure: unknown;
-    let results!: BulkPermissionUpdateResult;
-
-    try {
-      if (!Array.isArray(updatedPrincipals)) {
-        throw new Error('updatedPrincipals must be an array');
+    let terminalFailure: AclTransactionBoundary | undefined;
+    const boundary = (message: string, cause?: unknown) =>
+      (terminalFailure ??= new AclTransactionBoundary(message, cause));
+    const guard = (owned?: ClientSession, terminalCause?: unknown) => {
+      try {
+        binding.assertCurrent(owned);
+        if (dispatchDeadline !== undefined && owned?.hasEnded)
+          throw new Error('ACL owned session ended');
+      } catch (cause) {
+        throw boundary(
+          'ACL original connection or session identity changed',
+          terminalCause ?? cause,
+        );
       }
-      if (!Array.isArray(revokedPrincipals)) {
-        throw new Error('revokedPrincipals must be an array');
-      }
-      if (!resourceId || !Types.ObjectId.isValid(resourceId)) {
-        throw new Error(`Invalid resource ID: ${resourceId}`);
-      }
-
-      if (!localSession && supportsTransactions) {
-        localSession = await binding.acquire(() => binding.connection.startSession());
-        shouldEndSession = true;
-        binding.assertCurrent(localSession);
-        startAttempted = true;
-        await binding.write(() => localSession!.startTransaction(), localSession);
-      }
-      binding.assertCurrent(localSession);
-      // The external transaction owner has not qualified its eventual disposition.
-      if (session) observer?.markUncertain();
+      if (dispatchDeadline !== undefined && performance.now() >= dispatchDeadline)
+        throw boundary('ACL owned transaction dispatch budget exhausted', terminalCause);
+    };
+    const body = async (
+      localSession: ClientSession,
+      owned: boolean,
+    ): Promise<BulkPermissionUpdateResult> => {
+      const tracked = async <R>(
+        start: () => Promise<R> | R,
+        _session?: ClientSession,
+      ): Promise<R> => {
+        guard(localSession);
+        const value = await binding.retain(start);
+        guard(localSession);
+        return value;
+      };
+      const effects = owned ? { track: tracked, write: tracked } : binding;
       const sessionOptions = localSession ? { session: localSession } : {};
-      const [roleOutcome, entriesOutcome] = await Promise.allSettled([
-        binding.track(() => dbMethods.findRolesByResourceType(resourceType), localSession),
+      // A session cannot run parallel queries; first failure prevents the second dispatch.
+      const roles = await effects.track(
+        () => dbMethods.findRolesByResourceType(resourceType, localSession),
+        localSession,
+      );
+      const currentEntries =
         resourceType === ResourceType.AGENT
-          ? binding.track(
-              () => dbMethods.findEntriesByResource(resourceType, resourceId, localSession),
-              localSession,
+          ? await effects.track(() =>
+              dbMethods.findEntriesByResource(resourceType, resourceId, localSession),
             )
-          : Promise.resolve([]),
-      ]);
-      // Join every launched lookup before cleanup, even if the first original failed.
-      if (roleOutcome.status === 'rejected') throw roleOutcome.reason;
-      if (entriesOutcome.status === 'rejected') throw entriesOutcome.reason;
-      const roles = roleOutcome.value;
-      const currentEntries = entriesOutcome.value;
+          : [];
       const rolesMap = new Map(roles.map((role) => [role.accessRoleId, role]));
-      results = {
+      const results: BulkPermissionUpdateResult = {
         granted: [],
         updated: [],
         revoked: [],
@@ -224,6 +248,18 @@ export function bulkUpdateResourcePermissions(
           currentEntriesByPrincipal.set(key, entry);
         }
       }
+
+      const principalView = (principal: BulkPrincipal) => ({
+        type: principal.type,
+        id: principal.id,
+        name: principal.name,
+        email: principal.email,
+        source: principal.source,
+        avatar: principal.avatar,
+        description: principal.description,
+        idOnTheSource: principal.idOnTheSource,
+        memberCount: principal.memberCount,
+      });
 
       for (const principal of effectiveUpdatedPrincipals) {
         try {
@@ -311,16 +347,8 @@ export function bulkUpdateResourcePermissions(
             });
           }
           results.granted.push({
-            type: principal.type,
-            id: principal.id,
-            name: principal.name,
-            email: principal.email,
-            source: principal.source,
-            avatar: principal.avatar,
-            description: principal.description,
-            idOnTheSource: principal.idOnTheSource,
+            ...principalView(principal),
             accessRoleId: principal.accessRoleId,
-            memberCount: principal.memberCount,
             memberIds: principal.memberIds,
             ...(resourceType === ResourceType.AGENT ? { viewInsights: wantsInsights } : {}),
           });
@@ -352,7 +380,7 @@ export function bulkUpdateResourcePermissions(
       }
 
       if (roleBitsWrites.length > 0) {
-        await binding.write(
+        await effects.write(
           () =>
             dbMethods.replaceRoleBits(roleBitsWrites, {
               ...sessionOptions,
@@ -363,7 +391,7 @@ export function bulkUpdateResourcePermissions(
       }
 
       if (bulkWrites.length > 0) {
-        const bulkWriteResult = await binding.write(
+        const bulkWriteResult = await effects.write(
           () => dbMethods.bulkWriteAclEntries(bulkWrites, sessionOptions),
           localSession,
         );
@@ -375,6 +403,7 @@ export function bulkUpdateResourcePermissions(
       }
 
       for (const principal of revokedPrincipals) {
+        let query: Record<string, unknown>;
         try {
           if (
             principal?.type !== PrincipalType.PUBLIC &&
@@ -383,7 +412,7 @@ export function bulkUpdateResourcePermissions(
           ) {
             continue;
           }
-          const query: Record<string, unknown> = {
+          query = {
             principalType: principal.type,
             resourceType,
             resourceId,
@@ -391,95 +420,191 @@ export function bulkUpdateResourcePermissions(
           if (principal.type !== PrincipalType.PUBLIC) {
             query.principalId = queryPrincipalId(principal);
           }
-          const deleteResult = await binding.write(
-            () => dbMethods.deleteAclEntries(query, sessionOptions),
-            localSession,
-          );
-          const existingEntry = currentEntriesByPrincipal.get(
-            `${principal.type}:${principal.type === PrincipalType.PUBLIC ? 'null' : principal.id}`,
-          );
-          results.revoked.push({
-            type: principal.type,
-            id: principal.id,
-            name: principal.name,
-            email: principal.email,
-            source: principal.source,
-            avatar: principal.avatar,
-            description: principal.description,
-            idOnTheSource: principal.idOnTheSource,
-            memberCount: principal.memberCount,
-          });
-          if (
-            resourceType === ResourceType.AGENT &&
-            deleteResult.deletedCount > 0 &&
-            existingEntry &&
-            (existingEntry.permBits & PermissionBits.VIEW_INSIGHTS) === PermissionBits.VIEW_INSIGHTS
-          ) {
-            results.insightsChanges.push({
-              action: 'removed',
-              previousEntry: existingEntry,
-              writtenEntry: null,
-              principal: { type: principal.type, id: principal.id, name: principal.name },
-            });
-          }
         } catch (error) {
           results.errors.push({
             principal,
             error: error instanceof Error ? error.message : String(error),
           });
+          continue;
+        }
+        const deleteResult = await effects.write(
+          () => dbMethods.deleteAclEntries(query, sessionOptions),
+          localSession,
+        );
+        const existingEntry = currentEntriesByPrincipal.get(
+          `${principal.type}:${principal.type === PrincipalType.PUBLIC ? 'null' : principal.id}`,
+        );
+        results.revoked.push({
+          ...principalView(principal),
+        });
+        if (
+          resourceType === ResourceType.AGENT &&
+          deleteResult.deletedCount > 0 &&
+          existingEntry &&
+          (existingEntry.permBits & PermissionBits.VIEW_INSIGHTS) === PermissionBits.VIEW_INSIGHTS
+        ) {
+          results.insightsChanges.push({
+            action: 'removed',
+            previousEntry: existingEntry,
+            writtenEntry: null,
+            principal: { type: principal.type, id: principal.id, name: principal.name },
+          });
         }
       }
 
-      if (shouldEndSession && supportsTransactions) {
-        await binding.write(() => localSession!.commitTransaction(), localSession);
-      }
-      if (resourceType === ResourceType.PROMPTGROUP) {
-        await runAfterTransaction(
-          localSession,
-          () =>
-            binding.write(
-              () => dbMethods.invalidatePromptGroupAccessContext(observer),
-              localSession,
-            ),
-          observer,
-        );
-      }
-    } catch (error) {
-      failed = true;
-      failure = error;
-      if (shouldEndSession && startAttempted) {
-        try {
-          await binding.cleanup(() => localSession!.abortTransaction(), true);
-        } catch (transactionError) {
-          logger.error(
-            '[AccessControlService.bulkUpdateResourcePermissions] Error aborting transaction:',
-            transactionError,
-          );
-        }
-      }
-      logger.error(
-        `[AccessControlService.bulkUpdateResourcePermissions] Error: ${error instanceof Error ? error.message : String(error)}`,
+      return results;
+    };
+    const run = async (): Promise<BulkPermissionUpdateResult> => {
+      guard();
+      const supportsTransactions = await binding.track(() =>
+        getTransactionSupport(mongoose, null, observer),
       );
-    } finally {
-      if (shouldEndSession && localSession) {
-        try {
-          await binding.cleanup(() => localSession!.endSession());
-          binding.assertCurrent(localSession);
-        } catch (endError) {
-          if (!failed) {
-            failed = true;
-            failure = endError;
-          } else {
-            logger.error(
-              '[AccessControlService.bulkUpdateResourcePermissions] Error ending session:',
-              endError,
-            );
+      guard();
+      if (!supportsTransactions) throw new Error('Transaction original remains unconfirmed');
+      if (!Array.isArray(updatedPrincipals)) throw new Error('updatedPrincipals must be an array');
+      if (!Array.isArray(revokedPrincipals)) throw new Error('revokedPrincipals must be an array');
+      if (!resourceId || !Types.ObjectId.isValid(resourceId))
+        throw new Error(`Invalid resource ID: ${resourceId}`);
+      if (session) {
+        binding.assertCurrent(session);
+        observer?.markUncertain();
+        const result = await body(session, false);
+        if (resourceType === ResourceType.PROMPTGROUP)
+          await runAfterTransaction(
+            session,
+            () =>
+              binding.write(() => dbMethods.invalidatePromptGroupAccessContext(observer), session),
+            observer,
+          );
+        return result;
+      }
+      let owned: ClientSession | undefined;
+      let committed = false;
+      let startAttempted = false;
+      let failure: unknown;
+      let lastNativeError: unknown;
+      let failed = false;
+      const recordFailure = (error: unknown, message = '[ACL] Native transaction failed') => {
+        if (!failed) {
+          failed = true;
+          failure = error;
+        } else logger.error(message, error);
+      };
+      let result!: BulkPermissionUpdateResult;
+      let restore = () => {};
+      let abortOriginal: (() => Promise<void>) | undefined;
+      let endOriginal: (() => Promise<void>) | undefined;
+      try {
+        guard();
+        owned = await binding.acquire(() => binding.connection.startSession());
+        abortOriginal = owned.abortTransaction.bind(owned);
+        endOriginal = owned.endSession.bind(owned);
+        guard(owned);
+        const originalStart = owned.startTransaction;
+        const originalCommit = owned.commitTransaction;
+        const nativeWithTransaction: ClientSession['withTransaction'] =
+          owned.withTransaction.bind(owned);
+        const startDescriptor = Object.getOwnPropertyDescriptor(owned, 'startTransaction');
+        const commitDescriptor = Object.getOwnPropertyDescriptor(owned, 'commitTransaction');
+        let starts = 0;
+        let callbacks = 0;
+        const freshBody = (error: unknown) =>
+          hasNativeLabel(error, 'TransientTransactionError') &&
+          !hasNativeLabel(error, 'UnknownTransactionCommitResult');
+        const start: ClientSession['startTransaction'] = (...args) => {
+          guard(owned, lastNativeError);
+          if (starts >= 3 || hasNativeLabel(lastNativeError, 'UnknownTransactionCommitResult'))
+            throw boundary('ACL owned transaction replay forbidden', lastNativeError);
+          lastNativeError = undefined;
+          starts++;
+          startAttempted = true;
+          const value = originalStart.apply(owned, args);
+          guard(owned);
+          return value;
+        };
+        const commit: ClientSession['commitTransaction'] = async (...args) => {
+          guard(owned, lastNativeError);
+          try {
+            const value = await binding.retain(() => originalCommit.apply(owned, args));
+            committed = true; // Durable success precedes a possible late identity/deadline fence.
+            guard(owned);
+            return value;
+          } catch (error) {
+            lastNativeError = error;
+            if (!committed && starts >= 3 && freshBody(error))
+              throw boundary('ACL owned transaction attempts exhausted', error);
+            throw error;
           }
+        };
+        owned.startTransaction = start;
+        owned.commitTransaction = commit;
+        restore = () => {
+          for (const [key, wrapper, descriptor] of [
+            ['startTransaction', start, startDescriptor],
+            ['commitTransaction', commit, commitDescriptor],
+          ] as const)
+            if (owned![key] === wrapper) {
+              if (descriptor) Object.defineProperty(owned, key, descriptor);
+              else Reflect.deleteProperty(owned!, key);
+            }
+        };
+        const inherited = owned.timeoutMS;
+        const remaining = Math.floor(dispatchDeadline! - performance.now());
+        if (remaining <= 0) throw boundary('ACL owned transaction dispatch budget exhausted');
+        const timeoutMS =
+          typeof inherited === 'number' && inherited > 0
+            ? Math.min(inherited, remaining)
+            : remaining;
+        guard(owned);
+        result = await binding.retain(() =>
+          nativeWithTransaction(
+            async () => {
+              guard(owned);
+              if (++callbacks > 3)
+                throw boundary('ACL owned transaction attempts exhausted', lastNativeError);
+              try {
+                return await body(owned!, true);
+              } catch (error) {
+                lastNativeError = error;
+                if (callbacks >= 3 && freshBody(error))
+                  throw boundary('ACL owned transaction attempts exhausted', error);
+                throw error;
+              }
+            },
+            { timeoutMS },
+          ),
+        );
+        if (!committed) throw boundary('ACL owned transaction commit remains unconfirmed');
+      } catch (error) {
+        recordFailure(terminalFailure ?? lastNativeError ?? error);
+        if (failure !== error) logger.error('[ACL] Native terminal cleanup failed', error);
+        if (owned && startAttempted && !committed)
+          try {
+            await binding.cleanup(abortOriginal!, true);
+          } catch (cleanupError) {
+            recordFailure(cleanupError, '[ACL] Original abort failed');
+          }
+      } finally {
+        if (owned) {
+          if (committed && resourceType === ResourceType.PROMPTGROUP)
+            try {
+              await binding.cleanup(() => invalidateOwned!(observer), true);
+            } catch (error) {
+              recordFailure(error, '[ACL] Committed cache afterwork failed');
+            }
+          try {
+            await binding.cleanup(endOriginal!);
+            binding.assertCurrent();
+          } catch (error) {
+            recordFailure(error, '[ACL] Original end failed');
+          }
+          restore();
         }
       }
-    }
-    if (failed) throw failure;
-    return results;
+      if (failed) throw failure;
+      return result;
+    };
+    return session ? run() : binding.unit(run);
   });
 }
 
