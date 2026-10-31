@@ -1,5 +1,5 @@
 import type { FunctionTool, ToolResources } from './tools';
-import type { AssistantsEndpoint } from 'src/schemas';
+import type { AssistantsEndpoint } from '../schemas';
 
 export type Metadata = {
   avatar?: string;

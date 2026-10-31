@@ -6,13 +6,13 @@ import type {
   AgentToolOptions,
   ToolApprovalGrantBinding,
 } from './tools';
-import type { TAttachment, TPlugin, AgentProvider, MemoryScope, SkillsScope } from 'src/schemas';
+import type { TAttachment, TPlugin, AgentProvider, MemoryScope, SkillsScope } from '../schemas';
 import type { TTokenUsageEvent, TContextUsageEvent, TPendingSteer } from './runs';
 import type { StatefulCodeEnvironment } from '../stateful-code';
 import type { SummaryContentPart } from './content';
 import type { TFile } from './files';
 import { StepTypes, ContentTypes, ToolCallTypes } from './runs';
-import { ArtifactModes } from 'src/artifacts';
+import { ArtifactModes } from '../artifacts';
 import { EToolResources } from './tools';
 export {
   STATEFUL_CODE_ENVIRONMENTS,
