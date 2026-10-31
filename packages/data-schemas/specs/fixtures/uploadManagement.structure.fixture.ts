@@ -10,21 +10,21 @@ import type {
   UploadPrincipal,
   UploadCleanupProof,
 } from 'librechat-data-provider';
-import type { FileCleanupProgressResult } from '../types/fileCleanup';
-import type { IMongoFile } from '../types/file';
+import type { FileCleanupProgressResult } from '../../src/types/fileCleanup';
+import type { IMongoFile } from '../../src/types/file';
 import {
   uploadSecurityFixture,
   bindUploadOriginalFixture,
   uploadSecuritySettlementFixture,
 } from './uploadManagement.security.fixture';
-import { createFileCleanupLifecycleMethods } from './fileCleanupLifecycle';
-import { createFileCleanupProgressMethods } from './fileCleanupProgress';
-import { createUploadManagementRepository } from './uploadManagement';
-import { managedFileRetrievalDeletionSettled } from './fileRetrieval';
-import { createUploadFileCleanupOwner } from './uploadFileCleanup';
-import { createHousekeepingStore } from './housekeepingStore';
-import { createFileRetentionMethods } from './fileRetention';
-import { createMessageMethods } from './message';
+import { createFileCleanupLifecycleMethods } from '../../src/methods/fileCleanupLifecycle';
+import { createFileCleanupProgressMethods } from '../../src/methods/fileCleanupProgress';
+import { createUploadManagementRepository } from '../../src/methods/uploadManagement';
+import { managedFileRetrievalDeletionSettled } from '../../src/methods/fileRetrieval';
+import { createUploadFileCleanupOwner } from '../../src/methods/uploadFileCleanup';
+import { createHousekeepingStore } from '../../src/methods/housekeepingStore';
+import { createFileRetentionMethods } from '../../src/methods/fileRetention';
+import { createMessageMethods } from '../../src/methods/message';
 import { createModels } from '~/models';
 
 /** Copy the File owner's frozen database rows before importing its accepted Upload rows. */

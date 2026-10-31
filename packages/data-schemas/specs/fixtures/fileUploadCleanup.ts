@@ -4,19 +4,23 @@ import mongoose from 'mongoose';
 import { createHash, randomUUID } from 'node:crypto';
 import { canonicalManagedJson } from 'librechat-data-provider';
 import { tenantStorage as publicTenantStorage } from '@librechat/data-schemas';
-import type { StoredUpload, CounterRow, GlobalState } from '../../uploadManagementStore';
-import type { createFileCleanupProgressMethods } from '../../fileCleanupProgress';
-import type { FileCleanupProgressResult } from '../../../types/fileCleanup';
-import type { createUploadFileCleanupOwner } from '../../uploadFileCleanup';
-import type { createHousekeepingStore } from '../../housekeepingStore';
-import type { createFileRetentionMethods } from '../../fileRetention';
-import type { JobClaim } from '../../../types/housekeeping';
-import type { IMongoFile } from '../../../types/file';
-import { createFileCleanupLifecycleMethods } from '../../fileCleanupLifecycle';
-import { tenantStorage, getTenantId } from '../../../config/tenantContext';
-import { managedFileRetrievalDeletionSettled } from '../../fileRetrieval';
-import { currentTenantScope } from '../../../tenant/policy';
-import { createMessageMethods } from '../../message';
+import type {
+  StoredUpload,
+  CounterRow,
+  GlobalState,
+} from '../../src/methods/uploadManagementStore';
+import type { createFileCleanupProgressMethods } from '../../src/methods/fileCleanupProgress';
+import type { FileCleanupProgressResult } from '../../src/types/fileCleanup';
+import type { createUploadFileCleanupOwner } from '../../src/methods/uploadFileCleanup';
+import type { createHousekeepingStore } from '../../src/methods/housekeepingStore';
+import type { createFileRetentionMethods } from '../../src/methods/fileRetention';
+import type { JobClaim } from '../../src/types/housekeeping';
+import type { IMongoFile } from '../../src/types/file';
+import { createFileCleanupLifecycleMethods } from '../../src/methods/fileCleanupLifecycle';
+import { tenantStorage, getTenantId } from '../../src/config/tenantContext';
+import { managedFileRetrievalDeletionSettled } from '../../src/methods/fileRetrieval';
+import { currentTenantScope } from '../../src/tenant/policy';
+import { createMessageMethods } from '../../src/methods/message';
 const observed = (result: FileCleanupProgressResult) => {
   if (result.state !== 'progress') throw Error(JSON.stringify(result));
   return result;
@@ -75,14 +79,10 @@ export async function prepareNonemptyFileCleanup(input: {
     }
   }
   const { InMemoryJobStore } = require('@librechat/api');
-  const {
-    createSourceReplayIntent,
-  } = require('../../../../../api/src/stream/internal/sourceBudget');
-  const { createGenerationCleanupPort } = require('../../../../../api/src/stream/sourceCleanup');
-  const {
-    purgeCheckpointRows,
-  } = require('../../../../../api/src/agents/checkpoints/source-retention');
-  const { checkpointOwnerNamespacePrefix } = require('../../../../../api/src/stream/checkpoints');
+  const { createSourceReplayIntent } = require('../../../api/src/stream/internal/sourceBudget');
+  const { createGenerationCleanupPort } = require('../../../api/src/stream/sourceCleanup');
+  const { purgeCheckpointRows } = require('../../../api/src/agents/checkpoints/source-retention');
+  const { checkpointOwnerNamespacePrefix } = require('../../../api/src/stream/checkpoints');
   const source = new InMemoryJobStore();
   const job = await source.createJob('retained-generation', user.userId, undefined, user.tenantId, {
     providerExecutionId: 'provider-fixture',

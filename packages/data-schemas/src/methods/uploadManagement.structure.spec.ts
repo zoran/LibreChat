@@ -8,9 +8,9 @@ import {
   useUploadStructureFixture,
   copyFrozenUploadFiles,
   completeAcceptedUploadFileCleanup,
-} from './uploadManagement.structure.fixture';
+} from '../../specs/fixtures/uploadManagement.structure.fixture';
+import { uploadSecuritySettlementFixture } from '../../specs/fixtures/uploadManagement.security.fixture';
 import { createUploadStore, hasValidUploadPublicationTime } from './uploadManagementStore';
-import { uploadSecuritySettlementFixture } from './uploadManagement.security.fixture';
 import { createUploadActivationMethods } from './uploadManagementActivation';
 import { captureManagedRetrievalInventoryEvidence } from './fileRetrieval';
 import { projectFileHousekeeping } from './fileHousekeepingProjection';

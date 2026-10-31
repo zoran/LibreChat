@@ -12,7 +12,7 @@ import {
   uploadSecurityFixture,
   bindUploadOriginalFixture,
   uploadSecuritySettlementFixture,
-} from './uploadManagement.security.fixture';
+} from '../../specs/fixtures/uploadManagement.security.fixture';
 import { createCheckpointSourceMethods, snapshotCheckpointSourceBinding } from './checkpointSource';
 import { createFileRetentionMethods, resizeRetainedDerivatives } from './fileRetention';
 import { createUploadManagementRepository } from './uploadManagement';

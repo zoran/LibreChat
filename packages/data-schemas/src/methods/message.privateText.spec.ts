@@ -11,8 +11,8 @@ import {
   uploadSecurityFixture,
   bindUploadOriginalFixture,
   uploadSecuritySettlementFixture,
-} from './uploadManagement.security.fixture';
-import { completeAcceptedUploadFileCleanup } from './uploadManagement.structure.fixture';
+} from '../../specs/fixtures/uploadManagement.security.fixture';
+import { completeAcceptedUploadFileCleanup } from '../../specs/fixtures/uploadManagement.structure.fixture';
 import { createUploadStore, RESOURCE_MAX } from './uploadManagementStore';
 import { createMessageMethods, CLIENT_MESSAGE_SELECT } from './message';
 import { initialFileRetentionActivity } from './fileActivityTransition';

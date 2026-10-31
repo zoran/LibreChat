@@ -12,11 +12,11 @@ import {
   uploadSecurityFixture,
   bindUploadOriginalFixture,
   uploadSecuritySettlementFixture,
-} from './uploadManagement.security.fixture';
+} from '../../specs/fixtures/uploadManagement.security.fixture';
 import {
   prepareNonemptyFileCleanup,
   proveLiteralActorClosure,
-} from './__tests__/helpers/fileUploadCleanup';
+} from '../../specs/fixtures/fileUploadCleanup';
 import {
   createUploadFileCleanupOwner,
   validateUploadFileCleanupMigration,

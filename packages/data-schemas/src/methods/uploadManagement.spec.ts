@@ -17,7 +17,7 @@ import {
   copyFrozenUploadFiles,
   completeUnacceptedUploadCleanup,
   completeAcceptedUploadFileCleanup,
-} from './uploadManagement.structure.fixture';
+} from '../../specs/fixtures/uploadManagement.structure.fixture';
 import retrievalFixture from '../../../data-provider/src/__fixtures__/managed-retrieval-v1.json';
 import { createFileRetentionMethods, FileSourceUnavailableError } from './fileRetention';
 import { createFileRetrievalOperationOwner } from './fileRetrievalOperation';

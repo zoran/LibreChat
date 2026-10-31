@@ -14,7 +14,7 @@ import {
   uploadSecurityFixture,
   uploadSecuritySettlementFixture,
   bindUploadOriginalFixture,
-} from './uploadManagement.security.fixture';
+} from '../../specs/fixtures/uploadManagement.security.fixture';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createModels } from '~/models';
 

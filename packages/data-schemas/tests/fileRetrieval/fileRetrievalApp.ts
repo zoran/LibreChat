@@ -34,7 +34,7 @@ interface ManagedFileDeletionPorts {
   removeAgentResourceFilesFromAllAgents: (input: { file_ids: string[] }) => Promise<unknown>;
 }
 import { acceptedRetrievalPublication } from './fileRetrievalPublication';
-import { prepareNonemptyFileCleanup } from '../../src/methods/__tests__/helpers/fileUploadCleanup';
+import { prepareNonemptyFileCleanup } from '../../specs/fixtures/fileUploadCleanup';
 import { createMethods } from '../../src/methods/index';
 import { createFileRetentionMethods } from '../../src/methods/fileRetention';
 import { createFileCleanupLifecycleMethods } from '../../src/methods/fileCleanupLifecycle';

@@ -12,7 +12,7 @@ import {
   uploadSecurityFixture,
   bindUploadOriginalFixture,
   uploadSecuritySettlementFixture,
-} from './uploadManagement.security.fixture';
+} from '../../specs/fixtures/uploadManagement.security.fixture';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createDocumentWorkspaceMethods } from './documentWorkspace';
 import { createHousekeepingStore } from './housekeepingStore';

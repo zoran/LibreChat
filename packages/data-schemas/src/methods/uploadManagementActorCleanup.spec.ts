@@ -4,8 +4,8 @@ import { tmpdir } from 'node:os';
 import { readUploadPromotionRecord } from 'librechat-data-provider';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import type { StoredUpload } from './uploadManagementStore';
+import { useUploadStructureFixture } from '../../specs/fixtures/uploadManagement.structure.fixture';
 import { createUploadActorSettlement } from '../../../api/src/uploads/actorSettlement';
-import { useUploadStructureFixture } from './uploadManagement.structure.fixture';
 import { createUploadAttemptJournal } from '../../../api/src/uploads/attempts';
 import { createUploadManagementRepository } from './uploadManagement';
 

@@ -8,8 +8,8 @@ import {
   uploadSecurityFixture,
   uploadSecuritySettlementFixture,
   bindUploadOriginalFixture,
-} from './uploadManagement.security.fixture';
-import { completeAcceptedUploadFileCleanup } from './uploadManagement.structure.fixture';
+} from '../../specs/fixtures/uploadManagement.security.fixture';
+import { completeAcceptedUploadFileCleanup } from '../../specs/fixtures/uploadManagement.structure.fixture';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createModels } from '~/models';
 

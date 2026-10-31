@@ -16,7 +16,7 @@ import type {
   UploadOriginalWriteBinding,
   ManagedUploadWriteBinding,
 } from 'librechat-data-provider';
-import type { UploadManagementRepository } from './uploadManagementTypes';
+import type { UploadManagementRepository } from '../../src/methods/uploadManagementTypes';
 import { antivirusFixture } from '../../../data-provider/src/__fixtures__/upload-antivirus';
 
 /** Preserve the caller's actual subject, coverage, scanner and clock; no scan or native AV proof is performed. */

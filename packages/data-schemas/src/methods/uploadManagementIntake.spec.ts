@@ -1,6 +1,9 @@
 /** Actual Mongo transactions and File models; scanner/storage acknowledgements are explicit fixtures. */
 import mongoose from 'mongoose';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import { canonicalStorageDeletionReceipt } from 'librechat-data-provider';
 import type {
@@ -17,7 +20,7 @@ import {
   uploadSecurityFixture,
   uploadSecuritySettlementFixture,
   bindUploadOriginalFixture,
-} from './uploadManagement.security.fixture';
+} from '../../specs/fixtures/uploadManagement.security.fixture';
 import { createUploadActorSettlement } from '../../../api/src/uploads/actorSettlement';
 import { createIntakeControlHandlers } from '../../../api/src/uploads/intake/control';
 import { createUploadAttemptJournal } from '../../../api/src/uploads/attempts';
@@ -240,6 +243,9 @@ describe('private Intake and App-promotion transaction fences', () => {
   }
 
   it('joins actual control unknown PUT, original Intake recovery, actor settlement and committed owner receipt', async () => {
+    const stagingParent = process.env.UPLOAD_TEST_TMPDIR ?? tmpdir();
+    await mkdir(stagingParent, { recursive: true, mode: 0o700 });
+    const stagingRoot = await mkdtemp(join(stagingParent, 'intake-owner-'));
     const env = { ...process.env };
     Object.assign(process.env, {
       AUTH_MODE: 'email_code',
@@ -250,6 +256,7 @@ describe('private Intake and App-promotion transaction fences', () => {
     });
     const appJournal = createUploadAttemptJournal(appWorker);
     const intakeJournal = createUploadAttemptJournal(intakeWorker);
+    const failures: unknown[] = [];
     try {
       const lease = await transfer();
       await first.preparePromotion(input(lease), now);
@@ -376,7 +383,7 @@ describe('private Intake and App-promotion transaction fences', () => {
         repository: first,
         worker: appWorker,
         attempts: appJournal.attempts,
-        stagingRoot: process.env.UPLOAD_TEST_TMPDIR!,
+        stagingRoot,
         documents: { cancel: async () => ({ writerStopped: false }) } as never,
         now: () => now,
       });
@@ -484,9 +491,24 @@ describe('private Intake and App-promotion transaction fences', () => {
       });
       expect(await appJournal.close()).toEqual({ complete: true });
       expect(await intakeJournal.close()).toEqual({ complete: true });
+    } catch (error) {
+      failures.push(error);
     } finally {
+      const joined = await Promise.allSettled([
+        appJournal.close(AbortSignal.timeout(3000)),
+        intakeJournal.close(AbortSignal.timeout(3000)),
+      ]);
+      for (const result of joined) {
+        if (result.status === 'rejected') failures.push(result.reason);
+        else if (!result.value.complete)
+          failures.push(new Error('Intake fixture journal not joined'));
+      }
       process.env = env;
+      await rm(stagingRoot, { recursive: true, force: true }).catch((error) =>
+        failures.push(error),
+      );
     }
+    if (failures.length) throw failures[0];
   });
 
   it('stores only a private hash/grant, rotates waiting tickets, and snapshots the supplied grant', async () => {

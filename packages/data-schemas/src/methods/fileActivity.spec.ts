@@ -12,7 +12,7 @@ import {
   uploadSecurityFixture,
   uploadSecuritySettlementFixture,
   bindUploadOriginalFixture,
-} from './uploadManagement.security.fixture';
+} from '../../specs/fixtures/uploadManagement.security.fixture';
 import { initialFileRetentionActivity } from './fileActivityTransition';
 import { createUploadManagementRepository } from './uploadManagement';
 import { projectFileActivitySnapshot } from './fileActivitySnapshot';

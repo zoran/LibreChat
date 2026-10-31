@@ -25,7 +25,7 @@ import {
   uploadSecurityFixture,
   uploadSecuritySettlementFixture,
   bindUploadOriginalFixture,
-} from './uploadManagement.security.fixture';
+} from '../../specs/fixtures/uploadManagement.security.fixture';
 import { createFileRetentionMethods, FileSourceUnavailableError } from './fileRetention';
 import { createUploadManagementRepository } from './uploadManagement';
 import { loadManagedFileSource } from './fileSourceAuthority';

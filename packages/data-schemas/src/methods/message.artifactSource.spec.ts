@@ -13,7 +13,7 @@ import {
   uploadSecurityFixture,
   bindUploadOriginalFixture,
   uploadSecuritySettlementFixture,
-} from './uploadManagement.security.fixture';
+} from '../../specs/fixtures/uploadManagement.security.fixture';
 import { createUploadManagementRepository } from './uploadManagement';
 import { tenantStorage, runAsSystem } from '~/config/tenantContext';
 import { createFileRetentionMethods } from './fileRetention';

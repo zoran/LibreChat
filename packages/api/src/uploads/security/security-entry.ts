@@ -1,15 +1,11 @@
 /** Standalone intake process: no application bootstrap, database or ordinary storage credentials. */
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
-import type { AppMaintenance } from '../../app/maintenance';
+import type { startSecurityService } from './service';
 import { createAntivirusRuntime, readAntivirusConfiguration } from './antivirus-runtime';
-import { NOT_OWNED_STORAGE_PROVIDERS } from '../../storage/providerObservation';
-import { createWorkloadMaintenance } from '../../app/maintenance';
-import { createMaintenanceIdentity } from '../../app/identity';
-import { startSecurityService } from './service';
+import { startSecurityProcess } from './security-process';
 
 async function main() {
-  const identity = createMaintenanceIdentity(process.env, true);
   const port = Number(process.env.UPLOAD_SECURITY_PORT ?? '8443');
   if (!Number.isInteger(port) || port < 1 || port > 65535)
     throw new Error('Security configuration unavailable');
@@ -73,52 +69,19 @@ async function main() {
       sourceRevision: process.env.BUILD_COMMIT ?? '',
     }),
   );
-  const service = await startSecurityService({
-    antivirus,
-    instanceId: identity.incarnation,
-    port,
-    policySha256: process.env.UPLOAD_SECURITY_POLICY_SHA256 ?? '',
-    policyBytes,
-    peers: JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(peerBytes)),
-    tls: { ca, cert, key },
-    threadPath: path.join(__dirname, 'worker-thread.cjs'),
-    pdf,
+  await startSecurityProcess({
+    env: process.env,
+    serviceOptions: {
+      antivirus,
+      port,
+      policySha256: process.env.UPLOAD_SECURITY_POLICY_SHA256 ?? '',
+      policyBytes,
+      peers: JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(peerBytes)),
+      tls: { ca, cert, key },
+      threadPath: path.join(__dirname, 'worker-thread.cjs'),
+      pdf,
+    },
   });
-  let closing = false;
-  let maintenance: AppMaintenance | undefined;
-  try {
-    maintenance = createWorkloadMaintenance({
-      env: process.env,
-      identity,
-      workOwners: { scanner: service.maintenance },
-      fileDomainOwners: ['scanner'],
-      readStorageProviders: () => NOT_OWNED_STORAGE_PROVIDERS,
-      // Availability proves startup selftests+retirement, not a currently loaded/live AV original.
-      startupReady: () => !closing && service.available(),
-    });
-    await maintenance.listen();
-  } catch (error) {
-    await service.close(AbortSignal.timeout(30_000));
-    await maintenance?.close();
-    throw error;
-  }
-  const close = () => {
-    if (closing) return;
-    closing = true;
-    void service
-      .close(AbortSignal.timeout(30_000))
-      .finally(() => maintenance!.close())
-      .then(
-        (result) => {
-          process.exitCode = result.complete ? 0 : 1;
-        },
-        () => {
-          process.exitCode = 1;
-        },
-      );
-  };
-  process.once('SIGTERM', close);
-  process.once('SIGINT', close);
 }
 
 void main().catch(() => {

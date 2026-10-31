@@ -1,4 +1,4 @@
-/** Actual built processes, mTLS and scanner threads; this does not prove Kubernetes isolation. */
+/** Actual shared process lifecycle/mTLS/threads with inert external AV; no physical AV or Kubernetes proof. */
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { request } from 'node:https';
@@ -8,6 +8,7 @@ import { request as httpRequest } from 'node:http';
 import { createHash, randomUUID, X509Certificate } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
+import { antivirusReceiptFixture } from './antivirus-fixture.helper';
 import { createSecurityTlsFixture } from './tls-fixture.helper';
 import { createHttpUploadSecurityPort } from './transport';
 
@@ -41,7 +42,12 @@ const body = async function* () {
   yield text;
 };
 type ExitResult = { code: number | null; signal: NodeJS.Signals | null };
-type OwnedChild = { ready(): Promise<void>; stop(): Promise<ExitResult> };
+type OwnedChild = {
+  ready(): Promise<void>;
+  exited(): Promise<ExitResult>;
+  output(): string;
+  stop(): Promise<ExitResult>;
+};
 
 async function bounded<T>(promise: Promise<T>, milliseconds = 5000): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -94,6 +100,8 @@ describe('built standalone scanner entry', () => {
     const directory = mkdtempSync(join(tmpdir(), 'scanner-entry-'));
     const entry = join(__dirname, '../../../dist/uploads/security/security-entry.cjs');
     const thread = join(__dirname, '../../../dist/uploads/security/worker-thread.cjs');
+    const processEntry = join(__dirname, '../../../dist/uploads/security/security-process.cjs');
+    const trustedFixtureEntry = join(directory, 'trusted-security-fixture.cjs');
     const children: OwnedChild[] = [];
     const failures: unknown[] = [];
     const pem = (name: string) => readFileSync(join(fixture.directory, name));
@@ -142,12 +150,14 @@ describe('built standalone scanner entry', () => {
       );
     }
 
-    function launch(): OwnedChild {
+    function launch(executable = trustedFixtureEntry): OwnedChild {
       const artifacts = {
-        entrySha256: hash(readFileSync(entry)),
+        entrySha256: hash(readFileSync(executable)),
+        productionEntrySha256: hash(readFileSync(entry)),
+        processSha256: hash(readFileSync(processEntry)),
         threadSha256: hash(readFileSync(thread)),
       };
-      const child = spawn(process.execPath, [entry], {
+      const child = spawn(process.execPath, [executable], {
         env: environment,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
@@ -168,7 +178,7 @@ describe('built standalone scanner entry', () => {
       const provenance = {
         identity,
         parentPid: process.pid,
-        entry,
+        entry: executable,
         ...artifacts,
         podUid: environment.POD_UID,
         buildCommit: environment.BUILD_COMMIT,
@@ -211,6 +221,12 @@ describe('built standalone scanner entry', () => {
           }
           throw new Error(`Scanner did not become ready: ${output}`);
         },
+        async exited() {
+          const result = await bounded(closed);
+          writeFileSync(provenanceFile, JSON.stringify({ ...provenance, closed: result }));
+          return result;
+        },
+        output: () => output,
         async stop() {
           send('SIGTERM');
           let result;
@@ -234,6 +250,7 @@ describe('built standalone scanner entry', () => {
       // Read the real build before spawning; this suite never substitutes a source-level entry.
       readFileSync(entry);
       readFileSync(thread);
+      readFileSync(processEntry);
       const port = await availablePort();
       do {
         maintenancePort = await availablePort();
@@ -263,6 +280,35 @@ describe('built standalone scanner entry', () => {
         UPLOAD_SECURITY_POLICY_SHA256: policySha256,
         UPLOAD_SECURITY_PEERS_FILE: peersFile,
       };
+      // Only the external AV boundary is inert; the child executes the real built shared lifecycle.
+      writeFileSync(
+        trustedFixtureEntry,
+        `require(${JSON.stringify(require.resolve('ts-node'))}).register({
+          skipProject: true, transpileOnly: true,
+          compilerOptions: { module: 'CommonJS', moduleResolution: 'Node', target: 'ES2022', esModuleInterop: true }
+        });
+        const { readFileSync } = require('node:fs');
+        const { createInertAntivirusFixture } = require(${JSON.stringify(join(__dirname, 'antivirus-fixture.helper.ts'))});
+        const { startSecurityProcess } = require(${JSON.stringify(processEntry)});
+        const material = name => readFileSync(process.env[name]);
+        startSecurityProcess({
+          env: process.env,
+          serviceOptions: {
+            antivirus: createInertAntivirusFixture().runtime,
+            port: Number(process.env.UPLOAD_SECURITY_PORT),
+            policySha256: process.env.UPLOAD_SECURITY_POLICY_SHA256,
+            policyBytes: material('UPLOAD_SECURITY_POLICY_FILE'),
+            peers: JSON.parse(material('UPLOAD_SECURITY_PEERS_FILE').toString('utf8')),
+            tls: { ca: material('UPLOAD_SECURITY_TLS_CA_FILE'), cert: material('UPLOAD_SECURITY_TLS_CERT_FILE'), key: material('UPLOAD_SECURITY_TLS_KEY_FILE') },
+            threadPath: ${JSON.stringify(thread)}
+          }
+        }).catch(() => { console.error('trusted_security_fixture_start_failed'); process.exitCode = 1; });`,
+      );
+      // The production executable remains unconditional and fails closed without Root AV assets.
+      const missingRootAv = launch(entry);
+      expect(await missingRootAv.exited()).toEqual({ code: 1, signal: null });
+      expect(missingRootAv.output()).toContain('upload_security_start_failed');
+      await expect(maintenance('GET', '/readyz')).rejects.toThrow();
       const client = createHttpUploadSecurityPort({
         endpoint,
         allowedHosts: ['127.0.0.1'],
@@ -333,6 +379,7 @@ describe('built standalone scanner entry', () => {
       });
       expect(await client.cancel({ execution: old, signal: signal() })).toEqual({
         execution: old,
+        antivirusReceipt: antivirusReceiptFixture(old),
         writerStopped: true,
         transientDataRemoved: true,
       });
@@ -395,6 +442,7 @@ describe('built standalone scanner entry', () => {
       expect((await maintenance('POST', '/begin', begin)).status).toBe(400);
       expect(await client.cancel({ execution: old, signal: signal() })).toEqual({
         execution: old,
+        antivirusReceipt: null,
         writerStopped: false,
         transientDataRemoved: false,
       });
@@ -409,6 +457,7 @@ describe('built standalone scanner entry', () => {
       });
       expect(await client.cancel({ execution: current, signal: signal() })).toEqual({
         execution: current,
+        antivirusReceipt: antivirusReceiptFixture(current),
         writerStopped: true,
         transientDataRemoved: true,
       });
@@ -421,6 +470,7 @@ describe('built standalone scanner entry', () => {
       // Keep only the nonsensitive child provenance under the caller's owned TMPDIR.
       rmSync(join(directory, 'policy.json'), { force: true });
       rmSync(join(directory, 'peers.json'), { force: true });
+      rmSync(trustedFixtureEntry, { force: true });
       for (const result of cleanup) {
         if (result.status === 'rejected') failures.push(result.reason);
       }

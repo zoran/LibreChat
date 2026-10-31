@@ -6,7 +6,7 @@ import {
   uploadSecuritySettlementFixture,
   uploadSecurityFixture,
   originalWriteBindingFixture,
-} from './uploadManagement.security.fixture';
+} from '../../specs/fixtures/uploadManagement.security.fixture';
 import { createStatusUsageCurrentMethods } from './statusUsageCurrent';
 
 const at = 1792454400000;

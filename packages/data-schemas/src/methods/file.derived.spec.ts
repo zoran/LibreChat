@@ -23,7 +23,7 @@ import {
   originalWriteBindingFixture,
   bindUploadOriginalFixture,
   uploadSecuritySettlementFixture,
-} from './uploadManagement.security.fixture';
+} from '../../specs/fixtures/uploadManagement.security.fixture';
 import {
   createFileRetentionMethods,
   FileSourceCapacityError,

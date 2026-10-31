@@ -3,7 +3,7 @@ import mongoose from 'mongoose';
 import { readUploadDerivedOrigin } from 'librechat-data-provider';
 import type { UploadPrincipal } from 'librechat-data-provider';
 import type { UploadPublicationPort } from './uploadManagementTypes';
-import { useUploadStructureFixture } from './uploadManagement.structure.fixture';
+import { useUploadStructureFixture } from '../../specs/fixtures/uploadManagement.structure.fixture';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createStatusUsageMethods } from './statusUsage';
 describe('original-bound managed status publication', () => {

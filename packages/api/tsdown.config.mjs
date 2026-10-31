@@ -24,6 +24,7 @@ export default defineConfig({
     './src/uploads/security/antivirus-policy.ts',
     './src/uploads/security/antivirus-process.ts',
     './src/uploads/security/security-entry.ts',
+    './src/uploads/security/security-process.ts',
     './src/uploads/intake/intake-entry.ts',
   ],
   format: ['cjs'],
