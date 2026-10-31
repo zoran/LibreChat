@@ -67,6 +67,19 @@ function sessionFor(client) {
   let active = false;
   return Object.assign(new EventEmitter(), {
     client,
+    hasEnded: false,
+    timeoutMS: undefined,
+    withTransaction: jest.fn(async function (callback) {
+      this.startTransaction();
+      try {
+        const result = await callback(this);
+        await this.commitTransaction();
+        return result;
+      } catch (error) {
+        if (this.inTransaction()) await this.abortTransaction();
+        throw error;
+      }
+    }),
     startTransaction: jest.fn(() => {
       active = true;
     }),
@@ -78,6 +91,7 @@ function sessionFor(client) {
       active = false;
     }),
     endSession: jest.fn(async function () {
+      this.hasEnded = true;
       active = false;
       this.emit('ended');
     }),
@@ -577,6 +591,7 @@ test.each(['settled', 'unknown'])(
     const favorites = outcome === 'settled' ? f.hold('User.updateMany') : undefined;
     const probe = sessionFor(f.client);
     const mutation = sessionFor(f.client);
+    const mutationCommit = mutation.commitTransaction;
     f.connection.startSession.mockReset().mockResolvedValueOnce(probe).mockResolvedValue(mutation);
     const gates = [deferred(), deferred(), deferred(), deferred()];
     f.pending.push(...gates);
@@ -614,10 +629,10 @@ test.each(['settled', 'unknown'])(
       expect(f.connection.startSession).toHaveBeenCalledTimes(1);
       expect(await owner.getMaintenanceCensus('raw-hold')).toMatchObject({
         queuedContinuations: 1,
-        pendingWrites: 0,
+        pendingWrites: 1,
       });
       gates[1].resolve();
-      await until(() => mutation.commitTransaction.mock.calls.length === 1);
+      await until(() => mutationCommit.mock.calls.length === 1);
       expect(f.connection.startSession).toHaveBeenCalledTimes(2);
       const deletion = f.trace.find((row) => row.key === 'AclEntry.deleteMany');
       expect(deletion.receiver).toBe(f.models.AclEntry);
@@ -633,9 +648,9 @@ test.each(['settled', 'unknown'])(
       expect(original.res.statusCode).toBeUndefined();
       expect(await owner.getMaintenanceCensus('raw-hold')).toMatchObject({
         queuedContinuations: 1,
-        pendingWrites: 0,
+        pendingWrites: 1,
       });
-      expect(mutation.commitTransaction.mock.contexts[0]).toBe(mutation);
+      expect(mutationCommit.mock.contexts[0]).toBe(mutation);
       expect(mutation.endSession.mock.contexts[0]).toBe(mutation);
       if (outcome === 'unknown') gates[3].reject(new Error('session cleanup unknown'));
       else gates[3].resolve();

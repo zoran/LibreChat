@@ -3,6 +3,7 @@ import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import type { startSecurityService } from './service';
 import { createAntivirusRuntime, readAntivirusConfiguration } from './antivirus-runtime';
+import { antivirusStartupFailure } from './antivirus-process-events';
 import { startSecurityProcess } from './security-process';
 
 async function main() {
@@ -84,7 +85,9 @@ async function main() {
   });
 }
 
-void main().catch(() => {
+void main().catch((error) => {
   console.error('upload_security_start_failed');
+  const original = antivirusStartupFailure(error);
+  if (original) console.error('upload_security_av_original_failed ' + original);
   process.exitCode = 1;
 });

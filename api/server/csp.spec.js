@@ -18,6 +18,31 @@ const FIXTURE_INDEX_HTML =
   '<script defer src="/assets/app.js"></script>' +
   '</head><body><div id="root"></div></body></html>';
 
+/** Emit only the closed redacted fixture observation; never replace its original failure. */
+function reportFixtureFailure(fixture) {
+  try {
+    const diagnostic = fixture?.diagnostics
+      ? JSON.parse(fixture.diagnostics())
+      : { unavailable: true };
+    let output = JSON.stringify({ applicationFixtureDiagnostic: { suite: 'csp', ...diagnostic } });
+    if (Buffer.byteLength(output) > 8192) {
+      output = JSON.stringify({
+        applicationFixtureDiagnostic: {
+          suite: 'csp',
+          original: diagnostic.original,
+          released: diagnostic.released,
+          ready: diagnostic.ready,
+          close: diagnostic.close,
+          outputBoundExceeded: true,
+        },
+      });
+    }
+    process.stderr.write(output + '\n');
+  } catch {
+    // Observation and output failures cannot replace the original assertion or child error.
+  }
+}
+
 describe('Content Security Policy', () => {
   jest.setTimeout(30_000);
 
@@ -46,7 +71,7 @@ describe('Content Security Policy', () => {
     try {
       if (fixture) assert.deepEqual(await fixture.stop(), { code: 0, signal: null });
     } catch (error) {
-      error.message += `\nCSP child diagnostics: ${fixture?.diagnostics()}`;
+      reportFixtureFailure(fixture);
       throw error;
     } finally {
       if (!fixture || fixture.joined) {
@@ -316,10 +341,14 @@ async function createAppFixture(directory, mongoUri, environment = {}) {
       events:
         text
           .match(
-            /Failed to start server|Post-listen initialization failed|Received startup_failure|Received SIGTERM|Server readiness checks passing|Graceful shutdown complete|Graceful shutdown exceeded/g,
+            /Failed to start server|Post-listen initialization failed|Received startup_failure|Received SIGTERM|Server readiness checks passing|Graceful shutdown complete|Graceful shutdown exceeded|Pre-drain custody unresolved|Error closing HTTP server|There was an uncaught error|Shutdown task failed/g,
           )
           ?.slice(0, 8) || [],
     };
+    if (/Shutdown task "[^"\r\n]{1,160}" failed:/.test(text))
+      entry.events.push('shutdown-task-failed');
+    if (/Running pre-drain shutdown task:/.test(text)) entry.events.push('pre-drain-task');
+    if (/Running post-drain shutdown task:/.test(text)) entry.events.push('post-drain-task');
     if (entry.codes.length || entry.frames.length || entry.events.length) {
       if (entry.codes.length || entry.events.some((event) => /failed|failure/i.test(event)))
         firstError[stream] ??= entry;
@@ -442,7 +471,7 @@ async function createAppFixture(directory, mongoUri, environment = {}) {
               released = true;
             }
           }
-          if (released && (await request(app).get('/health').timeout(500)).status === 200) {
+          if (released && (await request(app).get('/readyz').timeout(500)).status === 200) {
             lifecycle.ready = true;
             return;
           }

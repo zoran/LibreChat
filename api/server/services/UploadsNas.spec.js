@@ -3,20 +3,19 @@ const { mkdtemp, writeFile, rm } = require('node:fs/promises');
 const { realpathSync } = require('node:fs');
 const { performance } = require('node:perf_hooks');
 const path = require('node:path');
-let mockNasGraph;
 jest.mock(
   '@librechat/api',
   () => {
     const producer = jest.requireActual('../../../packages/api/src/uploads/composition/storage');
     const router = jest.requireActual('../../../packages/api/src/storage/uploads');
-    mockNasGraph = {
+    const graph = {
       producer,
       router,
       storage: jest.requireActual('../../../packages/api/src/storage/nas/storage'),
       barrel: jest.requireActual('../../../packages/api/src/storage/nas'),
       client: jest.requireActual('../../../packages/api/src/storage/nas/client'),
     };
-    return { ...producer, ...router };
+    return { ...producer, ...router, __nasFixtureGraph: graph };
   },
   { virtual: true },
 );
@@ -45,30 +44,38 @@ const repository = {};
 /** Observe the failing fixture graph without replacing its adapter or any capture result. */
 function createNasDiagnostic() {
   const started = performance.now();
-  const graph = mockNasGraph;
+  let entry;
+  try {
+    entry = require('@librechat/api');
+  } catch {
+    // The original composition still owns module failure; observation is optional.
+  }
+  const graph = entry?.__nasFixtureGraph;
   const restores = [];
   const events = [];
   let adapter,
     returned,
     client,
-    assertionFailed = false,
+    failureObserved = false,
     creates = 0,
     destroys = 0;
   let factorySpyInstalled = false,
     destroySpyInstalled = false;
-  const actualCreate = graph.client.createNasS3Client;
+  const actualCreate = graph?.client?.createNasS3Client;
   const identities = {
-    producer: createNormalNasStorage === graph.producer.createNormalUploadStorage,
-    router: require('@librechat/api').composeUploadStorage === graph.router.composeUploadStorage,
-    ordinaryReader: getNasS3StorageCapture === graph.storage.getNasS3StorageCapture,
-    barrelReader: graph.barrel.getNasS3StorageCapture === graph.storage.getNasS3StorageCapture,
-    producerMock: jest.isMockFunction(graph.producer.createNormalUploadStorage),
-    storageFactoryMock: jest.isMockFunction(graph.storage.createNasS3Storage),
+    graphCaptured: graph !== undefined,
+    normalEntry: entry?.createNormalUploadStorage === createNormalNasStorage,
+    producer: createNormalNasStorage === graph?.producer?.createNormalUploadStorage,
+    router: require('@librechat/api').composeUploadStorage === graph?.router?.composeUploadStorage,
+    ordinaryReader: getNasS3StorageCapture === graph?.storage?.getNasS3StorageCapture,
+    barrelReader: graph?.barrel?.getNasS3StorageCapture === graph?.storage?.getNasS3StorageCapture,
+    producerMock: jest.isMockFunction(graph?.producer?.createNormalUploadStorage),
+    storageFactoryMock: jest.isMockFunction(graph?.storage?.createNasS3Storage),
     ordinaryReaderMock: jest.isMockFunction(getNasS3StorageCapture),
-    actualReaderMock: jest.isMockFunction(graph.storage.getNasS3StorageCapture),
-    barrelReaderMock: jest.isMockFunction(graph.barrel.getNasS3StorageCapture),
+    actualReaderMock: jest.isMockFunction(graph?.storage?.getNasS3StorageCapture),
+    barrelReaderMock: jest.isMockFunction(graph?.barrel?.getNasS3StorageCapture),
     clientFactoryMock: jest.isMockFunction(actualCreate),
-    clientReaderMock: jest.isMockFunction(graph.client.getNasS3ClientCapture),
+    clientReaderMock: jest.isMockFunction(graph?.client?.getNasS3ClientCapture),
   };
   const checkout = path.resolve(__dirname, '../../..');
   const publicPath = (value) => {
@@ -116,12 +123,13 @@ function createNasDiagnostic() {
       returnedAlias: returned !== undefined && returned.nasStorage === adapter,
       cleanupAlias: returned !== undefined && returned.nasCleanup === adapter,
       ordinary: capture(getNasS3StorageCapture, adapter),
-      actual: capture(graph.storage.getNasS3StorageCapture, adapter),
-      barrel: capture(graph.barrel.getNasS3StorageCapture, adapter),
-      client: capture(graph.client.getNasS3ClientCapture, client),
+      actual: capture(graph?.storage?.getNasS3StorageCapture, adapter),
+      barrel: capture(graph?.barrel?.getNasS3StorageCapture, adapter),
+      client: capture(graph?.client?.getNasS3ClientCapture, client),
     });
   };
   try {
+    if (typeof actualCreate !== 'function') throw new Error('Fixture graph was not captured');
     const createSpy = jest.spyOn(graph.client, 'createNasS3Client').mockImplementation(function (
       ...args
     ) {
@@ -162,13 +170,19 @@ function createNasDiagnostic() {
       note('composition-returned');
     },
     note,
-    failed(error) {
-      assertionFailed = Boolean(error?.matcherResult);
+    failed() {
+      failureObserved = true;
     },
     finish() {
       note('after-cleanup');
-      for (const restore of restores.reverse()) restore();
-      if (!assertionFailed) return;
+      for (const restore of restores.reverse()) {
+        try {
+          restore();
+        } catch {
+          // Diagnostics cannot replace the original test failure.
+        }
+      }
+      if (!failureObserved) return;
       const output = JSON.stringify({
         nasFixtureDiagnostic: {
           identities,
@@ -180,11 +194,15 @@ function createNasDiagnostic() {
           events,
         },
       });
-      process.stderr.write(
-        Buffer.byteLength(output) <= 8192
-          ? output + '\n'
-          : '{"nasFixtureDiagnostic":{"outputBoundExceeded":true}}\n',
-      );
+      try {
+        process.stderr.write(
+          Buffer.byteLength(output) <= 8192
+            ? output + '\n'
+            : '{"nasFixtureDiagnostic":{"outputBoundExceeded":true}}\n',
+        );
+      } catch {
+        // Observation cannot replace the original test failure.
+      }
     },
   };
 }

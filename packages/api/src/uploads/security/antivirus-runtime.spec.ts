@@ -76,6 +76,7 @@ type Original = {
     signatureManifestSha256: string;
   };
   activate: jest.Mock;
+  failure: jest.Mock;
   socket: jest.Mock;
   retire: jest.Mock;
 };
@@ -85,6 +86,11 @@ let originals: Original[],
   badIdentity: boolean,
   badVersion: boolean,
   malicious: boolean;
+let activation: (() => Promise<boolean>) | undefined;
+let processFailure: Error | null;
+let duringVersion: (() => void) | undefined;
+let afterVersion: (() => void) | undefined;
+let duringRetirement: (() => void) | undefined;
 beforeEach(() => {
   originals = [];
   active = [];
@@ -92,6 +98,11 @@ beforeEach(() => {
   badIdentity = false;
   badVersion = false;
   malicious = false;
+  activation = undefined;
+  processFailure = null;
+  duringVersion = undefined;
+  afterVersion = undefined;
+  duringRetirement = undefined;
   jest.clearAllMocks();
   (createAntivirusProcessOwner as jest.Mock).mockReturnValue({
     async start() {
@@ -105,17 +116,20 @@ beforeEach(() => {
           configurationSha256: '1'.repeat(64),
           signatureManifestSha256: 'd'.repeat(64),
         },
-        activate: jest.fn(() => {
+        activate: jest.fn(async () => {
           if (active[index]) return false;
+          if (activation && !(await activation())) return false;
           active[index] = true;
           return true;
         }),
+        failure: jest.fn(() => processFailure),
         socket: jest.fn(() =>
           active[index]
             ? { path: `/av/${index}/clamd.sock`, device: 7, inode: 8 + index, uid: 1000 }
             : null,
         ),
         retire: jest.fn(async () => {
+          duringRetirement?.();
           if (retireKnown) active[index] = false;
           return { originalProcessJoined: retireKnown, ownedTransientDataRemoved: retireKnown };
         }),
@@ -170,6 +184,7 @@ beforeEach(() => {
       const bytes = Buffer.from(data);
       let response = 'stream: OK\0';
       if (bytes.equals(Buffer.from('zVERSION\0'))) {
+        duringVersion?.();
         response = badVersion ? 'ClamAV 9.9.9/123/date\0' : 'ClamAV 1.4.6/123/date\0';
       } else if (bytes.includes(Buffer.from('EICAR-STANDARD')) || malicious) {
         response = 'stream: Test.Signature FOUND\0';
@@ -179,6 +194,7 @@ beforeEach(() => {
         socket.emit('data', Buffer.from(response));
         socket.emit('end');
         socket.emit('close');
+        if (bytes.equals(Buffer.from('zVERSION\0'))) afterVersion?.();
       });
     };
     queueMicrotask(() => socket.emit('connect'));
@@ -187,6 +203,86 @@ beforeEach(() => {
 });
 
 describe('actual AV runtime with inert external ports', () => {
+  it.each(['during-version', 'after-version'])(
+    'retains original death %s before retirement changes its observed state',
+    async (phase) => {
+      const originalCause = new Error('Fixed inert original exited 78');
+      const laterRetirement = new Error('Fixed inert owner retirement SIGTERM');
+      const die = () => {
+        processFailure = originalCause;
+        active[0] = false;
+      };
+      if (phase === 'during-version') duringVersion = die;
+      else afterVersion = die;
+      duringRetirement = () => {
+        processFailure = laterRetirement;
+      };
+      const runtime = createAntivirusRuntime(configuration());
+      await expect(runtime.initialise(AbortSignal.timeout(2000))).rejects.toBe(originalCause);
+      expect(runtime.available()).toBe(false);
+      expect(originals).toHaveLength(1);
+      expect(originals[0].retire).toHaveBeenCalledTimes(1);
+      expect(active[0]).toBe(false);
+    },
+  );
+  it('keeps a generic VERSION refusal when only later owned retirement observes a signal', async () => {
+    badVersion = true;
+    const laterRetirement = new Error('Fixed inert owner retirement SIGTERM');
+    duringRetirement = () => {
+      processFailure = laterRetirement;
+    };
+    const runtime = createAntivirusRuntime(configuration());
+    const result = runtime.initialise(AbortSignal.timeout(2000));
+    await expect(result).rejects.toThrow('Antivirus unavailable');
+    await expect(result).rejects.not.toBe(laterRetirement);
+    expect(runtime.available()).toBe(false);
+    expect(originals).toHaveLength(1);
+    expect(originals[0].retire).toHaveBeenCalledTimes(1);
+  });
+  it('awaits actual permit dispatch before VERSION or startup scans', async () => {
+    let dispatch: ((value: boolean) => void) | undefined;
+    activation = () =>
+      new Promise<boolean>((resolve) => {
+        dispatch = resolve;
+      });
+    const runtime = createAntivirusRuntime(configuration());
+    const initialising = runtime.initialise(AbortSignal.timeout(2000));
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(runtime.available()).toBe(false);
+    expect(createConnection).not.toHaveBeenCalled();
+    expect(originals[0].retire).not.toHaveBeenCalled();
+    if (!dispatch) throw new Error('Permit dispatch not pending');
+    dispatch(true);
+    await initialising;
+    expect(runtime.available()).toBe(true);
+    expect(originals[0].activate).toHaveBeenCalledTimes(1);
+    expect(originals[0].retire).toHaveBeenCalledTimes(1);
+  });
+  it.each(['refused', 'rejected', 'cancelled'])(
+    'keeps startup unavailable and joins the original when permit is %s',
+    async (fault) => {
+      const cause = new Error('Fixed inert permit failure');
+      const controller = new AbortController();
+      activation = async () => {
+        if (fault === 'rejected') throw cause;
+        if (fault === 'cancelled') {
+          controller.abort();
+          return true;
+        }
+        processFailure = cause;
+        return false;
+      };
+      const runtime = createAntivirusRuntime(configuration());
+      const result = runtime.initialise(controller.signal);
+      if (fault === 'cancelled') await expect(result).rejects.toThrow();
+      else await expect(result).rejects.toBe(cause);
+      expect(runtime.available()).toBe(false);
+      expect(createConnection).not.toHaveBeenCalled();
+      expect(originals).toHaveLength(1);
+      expect(originals[0].activate).toHaveBeenCalledTimes(1);
+      expect(originals[0].retire).toHaveBeenCalledTimes(1);
+    },
+  );
   it('retires startup verification, binds a fresh original and refuses user bytes before its activation', async () => {
     const runtime = createAntivirusRuntime(configuration());
     await runtime.initialise(AbortSignal.timeout(2000));

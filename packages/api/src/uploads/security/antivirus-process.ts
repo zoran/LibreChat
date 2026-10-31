@@ -20,6 +20,7 @@ import {
   rmdirSync,
 } from 'node:fs';
 import type { Stats } from 'node:fs';
+import { createAntivirusProcessEvents } from './antivirus-process-events';
 import { createAntivirusProcessPolicy } from './antivirus-policy';
 /** One immutable image asset; caller JSON never chooses a process or read scope. */
 export type AntivirusAsset = Readonly<{ path: string; sha256: string }>;
@@ -235,7 +236,9 @@ export type AntivirusOriginal = Readonly<{
   }>;
   socket(): Readonly<{ path: string; device: number; inode: number; uid: number }> | null;
   /** Existing repository owner calls this ONCE only after durable original-custody binding. */
-  activate(): boolean;
+  activate(): Promise<boolean>;
+  /** Closed same-original terminal facts only; no caller or child output enters this error. */
+  failure(): Error | null;
   retire(): Promise<
     Readonly<{ originalProcessJoined: boolean; ownedTransientDataRemoved: boolean }>
   >;
@@ -365,6 +368,7 @@ export function createAntivirusProcessOwner(
       let birth: ReturnType<typeof spawn> | undefined;
       let birthClosed = false;
       let birthJoined: Promise<void> | undefined;
+      let lifecycle: ReturnType<typeof createAntivirusProcessEvents> | undefined;
       try {
         for (const a of [
           p.program,
@@ -467,25 +471,17 @@ export function createAntivirusProcessOwner(
           detached: false,
           stdio: ['ignore', 'pipe', 'pipe', 'pipe', filterFd],
         });
+        const events = createAntivirusProcessEvents(child, originalDeadlineAtMs, monoEnd);
+        lifecycle = events;
         birth = child;
         currentBirth = child;
         currentClosed = false;
-        let exited = false,
-          closed = false;
-        const joined = new Promise<void>((resolve) =>
-          child.once('close', () => {
-            closed = true;
-            birthClosed = true;
-            currentClosed = true;
-            resolve();
-          }),
-        );
+        const joined = events.joined.then(() => {
+          birthClosed = true;
+          currentClosed = true;
+        });
         birthJoined = joined;
         currentJoined = joined;
-        child.once('exit', () => {
-          exited = true;
-        });
-        child.on('error', () => {});
         for (const stream of [child.stdout, child.stderr])
           stream?.on('data', (b: Buffer) => b.fill(0));
         const pending: {
@@ -512,7 +508,7 @@ export function createAntivirusProcessOwner(
             stopping = true;
             if (pending.timer) clearTimeout(pending.timer);
             child.stdio[3]?.destroy();
-            if (!exited && same()) child.kill('SIGTERM');
+            if (!events.state().exited && same()) child.kill('SIGTERM');
             await Promise.race([
               joined,
               new Promise((r) =>
@@ -525,7 +521,7 @@ export function createAntivirusProcessOwner(
                 ),
               ),
             ]);
-            if (!closed && !exited && same()) child.kill('SIGKILL');
+            if (!events.state().closed && !events.state().exited && same()) child.kill('SIGKILL');
             await Promise.race([
               joined,
               new Promise((r) =>
@@ -540,6 +536,7 @@ export function createAntivirusProcessOwner(
             ]);
           },
           state() {
+            const { exited, closed } = events.state();
             return { exited: exited || (!child.pid && closed), closed };
           },
           cleanup() {
@@ -581,31 +578,25 @@ export function createAntivirusProcessOwner(
             ),
           ),
         );
-        let activated = false;
         return Object.freeze({
           custody,
           retire: reconcile,
+          failure: events.failure,
           activate() {
             if (
-              activated ||
               stopping ||
-              closed ||
-              exited ||
               performance.now() >= monoEnd - 10000 ||
               Date.now() >= originalDeadlineAtMs - 10000
             )
-              return false;
-            const permit = child.stdio[3];
-            if (!permit || !('write' in permit) || permit.destroyed) return false;
-            activated = true;
-            permit.end('G');
-            return true;
+              return Promise.resolve(false);
+            return events.activate();
           },
           socket() {
             if (
               stopping ||
-              closed ||
-              exited ||
+              events.failure() ||
+              events.state().closed ||
+              events.state().exited ||
               performance.now() >= monoEnd - 10000 ||
               Date.now() >= originalDeadlineAtMs - 10000
             )
@@ -627,6 +618,8 @@ export function createAntivirusProcessOwner(
           } catch {
             busy = true;
           }
+          const failure = lifecycle?.failure();
+          if (failure) throw failure;
           return null;
         }
         if (birth) {

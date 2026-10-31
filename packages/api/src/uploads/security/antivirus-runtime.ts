@@ -251,7 +251,7 @@ export function createAntivirusRuntime(
     starting = false,
     initialising: Promise<void> | undefined;
   async function loaded(original: AntivirusOriginal, deadline: number, signal: AbortSignal) {
-    if (!original.activate()) throw failure();
+    if (signal.aborted || !(await original.activate())) throw original.failure() ?? failure();
     const mono = performance.now() + Math.max(0, deadline - Date.now() - 10_000);
     while (
       !closed &&
@@ -260,6 +260,8 @@ export function createAntivirusRuntime(
       performance.now() < mono &&
       fresh(generation, signatureMaxAgeMs)
     ) {
+      const processFailure = original.failure();
+      if (processFailure) throw processFailure;
       if (original.socket()) {
         const observed = await version(original, profile, deadline - 10_000, signal);
         if (
@@ -267,9 +269,10 @@ export function createAntivirusRuntime(
           observed.version !== generation.engineVersion ||
           observed.daily !== generation.dailyDatabaseVersion
         )
-          throw failure();
+          throw original.failure() ?? failure();
         const socket = original.socket();
-        if (!socket || !sameOriginal(original, profile, socket)) throw failure();
+        if (!socket || !sameOriginal(original, profile, socket))
+          throw original.failure() ?? failure();
         return {
           socket,
           observedAt: new Date().toISOString(),
@@ -295,6 +298,9 @@ export function createAntivirusRuntime(
     let original: AntivirusOriginal | null;
     try {
       original = await owner.start(deadline);
+    } catch (error) {
+      unknownBirth = true;
+      throw error;
     } finally {
       starting = false;
     }
@@ -323,7 +329,7 @@ export function createAntivirusRuntime(
       initialising = (async () => {
         const deadline = Date.now() + 60_000;
         const original = await start(deadline);
-        let startupFailed = false;
+        let startupFailure: unknown;
         try {
           const observation = await loaded(original, deadline, signal);
           const adapter = createClamdAdapter({
@@ -353,21 +359,21 @@ export function createAntivirusRuntime(
               fixture.bytes.fill(0);
             }
           }
-        } catch {
-          startupFailed = true;
+        } catch (error) {
+          startupFailure = error;
         } finally {
           try {
             const stopped = await original.retire();
             if (!stopped.originalProcessJoined || !stopped.ownedTransientDataRemoved) {
               unknownBirth = true;
-              startupFailed = true;
+              startupFailure ??= failure();
             }
           } catch {
             unknownBirth = true;
-            startupFailed = true;
+            startupFailure ??= failure();
           }
         }
-        if (startupFailed) throw failure();
+        if (startupFailure) throw startupFailure;
         qualified = true;
       })().finally(() => {
         initialising = undefined;

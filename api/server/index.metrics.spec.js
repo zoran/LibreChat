@@ -7,6 +7,33 @@ const { MongoMemoryServer } = require('mongodb-memory-server');
 const FIXTURE_INDEX_HTML =
   '<!DOCTYPE html><html><head><title>LibreChat</title></head><body><div id="root"></div></body></html>';
 
+/** Emit only the closed redacted fixture observation; never replace its original failure. */
+function reportFixtureFailure(fixture) {
+  try {
+    const diagnostic = fixture?.diagnostics
+      ? JSON.parse(fixture.diagnostics())
+      : { unavailable: true };
+    let output = JSON.stringify({
+      applicationFixtureDiagnostic: { suite: 'metrics', ...diagnostic },
+    });
+    if (Buffer.byteLength(output) > 8192) {
+      output = JSON.stringify({
+        applicationFixtureDiagnostic: {
+          suite: 'metrics',
+          original: diagnostic.original,
+          released: diagnostic.released,
+          ready: diagnostic.ready,
+          close: diagnostic.close,
+          outputBoundExceeded: true,
+        },
+      });
+    }
+    process.stderr.write(output + '\n');
+  } catch {
+    // Observation and output failures cannot replace the original assertion or child error.
+  }
+}
+
 describe('Server metrics route', () => {
   jest.setTimeout(30_000);
 
@@ -31,6 +58,9 @@ describe('Server metrics route', () => {
   afterAll(async () => {
     try {
       if (fixture) assert.deepEqual(await fixture.stop(), { code: 0, signal: null });
+    } catch (error) {
+      reportFixtureFailure(fixture);
+      throw error;
     } finally {
       if (!fixture || fixture.joined) {
         await mongoServer?.stop();
@@ -239,11 +269,50 @@ async function createAppFixture(directory, mongoUri, environment = {}) {
     childError = error;
   });
   const commands = new Map();
+  const observed = { stdout: [], stderr: [] };
+  const firstError = {};
+  const lifecycle = { ready: false, close: null };
+  const capture = (stream, data) => {
+    const text = String(data);
+    const entry = {
+      codes: [
+        ...new Set(
+          text.match(
+            /\b(?:ENOENT|EACCES|EADDRINUSE|ECONNREFUSED|ERR_[A-Z_]{1,48}|TypeError|RangeError|SyntaxError|ReferenceError|ValidationError|MongoServerError|MongoNetworkError)\b/g,
+          ) || [],
+        ),
+      ].slice(0, 8),
+      frames: [
+        ...new Set(
+          text.match(/(?:api|packages)\/[A-Za-z0-9_./-]{1,180}\.[cm]?[jt]s(?::\d+(?::\d+)?)?/g) ||
+            [],
+        ),
+      ].slice(0, 4),
+      events:
+        text
+          .match(
+            /Failed to start server|Post-listen initialization failed|Received startup_failure|Received SIGTERM|Server readiness checks passing|Graceful shutdown complete|Graceful shutdown exceeded|Pre-drain custody unresolved|Error closing HTTP server|There was an uncaught error|Shutdown task failed/g,
+          )
+          ?.slice(0, 8) || [],
+    };
+    if (/Shutdown task "[^"\r\n]{1,160}" failed:/.test(text))
+      entry.events.push('shutdown-task-failed');
+    if (/Running pre-drain shutdown task:/.test(text)) entry.events.push('pre-drain-task');
+    if (/Running post-drain shutdown task:/.test(text)) entry.events.push('post-drain-task');
+    if (entry.codes.length || entry.frames.length || entry.events.length) {
+      if (entry.codes.length || entry.events.some((event) => /failed|failure/i.test(event)))
+        firstError[stream] ??= entry;
+      observed[stream].push(entry);
+      if (observed[stream].length > 6) observed[stream].splice(1, 1);
+    }
+  };
   let output = '';
   child.stdout.on('data', (data) => {
+    capture('stdout', data);
     output = (output + data).slice(-16384);
   });
   child.stderr.on('data', (data) => {
+    capture('stderr', data);
     output = (output + data).slice(-16384);
   });
   const identity = (pid) => ({
@@ -276,6 +345,7 @@ async function createAppFixture(directory, mongoUri, environment = {}) {
         pending.reject(new Error(`Application exited before command acknowledgement: ${output}`));
       commands.clear();
       const result = { code, signal };
+      lifecycle.close = result;
       fs.writeFileSync(provenanceFile, JSON.stringify({ ...provenance, closed: result }));
       resolve(result);
     });
@@ -296,6 +366,7 @@ async function createAppFixture(directory, mongoUri, environment = {}) {
   const app = `http://127.0.0.1:${port}`;
   return {
     app,
+    diagnostics: () => JSON.stringify({ original, released, ...lifecycle, firstError, observed }),
     get joined() {
       return joined;
     },
@@ -350,7 +421,10 @@ async function createAppFixture(directory, mongoUri, environment = {}) {
               released = true;
             }
           }
-          if (released && (await request(app).get('/health').timeout(500)).status === 200) return;
+          if (released && (await request(app).get('/readyz').timeout(500)).status === 200) {
+            lifecycle.ready = true;
+            return;
+          }
         } catch (error) {
           if (error.message === 'Actual startup release was not acknowledged') throw error;
         }
