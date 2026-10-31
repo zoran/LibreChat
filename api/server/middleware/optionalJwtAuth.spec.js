@@ -9,6 +9,7 @@ jest.mock('passport', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   continueAfterOptionalAuth: jest.requireActual('@librechat/api').continueAfterOptionalAuth,
   isEnabled: jest.fn(() => false),
   clearCloudFrontCookies: (...args) => mockClearCloudFrontCookies(...args),

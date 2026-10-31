@@ -15,6 +15,10 @@ const { createHash, randomUUID } = require('node:crypto');
 // The isolated qualification runner selects the checkout; normal execution uses this file's root.
 const workspace = process.env.CORTEX_HTTP_WORKSPACE || path.resolve(__dirname, '../../../..');
 const fromWorkspace = createRequire(path.join(workspace, 'package.json'));
+// Synthetic contract follows the selected checkout; this does not attest native AV.
+const { antivirusFixture } = fromWorkspace(
+  './packages/data-provider/src/__fixtures__/upload-antivirus.ts',
+);
 Object.assign(process.env, {
   NODE_ENV: 'test',
   LOG_TO_FILE: 'false',
@@ -285,8 +289,21 @@ test(
           now: at,
         });
         assert.ok(lease);
+        const antivirus = antivirusFixture(
+          {
+            tenantId: p.tenantId,
+            userId: p.userId,
+            operationId: fileId,
+            transferGeneration: lease.generation,
+            mediaType: 'text/plain',
+            bytes: payload.length,
+            sha256: integrity.sha256,
+          },
+          at,
+        );
         const execution = {
-          version: 2,
+          version: 3,
+          antivirus: antivirus.custody,
           custody: { kind: 'none' },
           attemptId: `${fileId}.${lease.generation}`,
           instanceId: '11111111-1111-4111-8111-111111111111',
@@ -296,7 +313,12 @@ test(
         await repository.bindSecurityExecution(lease, execution, at);
         await repository.settleSecurityExecution(
           lease,
-          { execution, writerStopped: true, transientDataRemoved: true },
+          {
+            execution,
+            writerStopped: true,
+            transientDataRemoved: true,
+            antivirusReceipt: antivirus.receipt,
+          },
           at,
         );
         receipt = {
@@ -310,7 +332,8 @@ test(
           etag: 'fixture-etag',
         };
         const approval = {
-          version: 1,
+          version: 2,
+          antivirus: antivirus.approval,
           decision: 'approved',
           policySha256: policy,
           subject: {
@@ -326,6 +349,21 @@ test(
           checkedAt: new Date(at).toISOString(),
           coverage: { complete: true, pages: 1, parts: 1 },
         };
+        await repository.bindOriginalWrite(
+          lease,
+          {
+            bucket: 'isolated',
+            key: receipt.storageKey,
+            operationId: fileId,
+            generation: String(lease.generation),
+            bytes: receipt.bytes,
+            wholeSHA256: integrity.sha256,
+            mediaType: 'text/plain',
+          },
+          integrity,
+          approval,
+          at,
+        );
         await repository.accept(p, lease, receipt, approval, { filename: 'private-note.txt' }, at);
         const gone = (value) => ({
           operationId: value.operationId,

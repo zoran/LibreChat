@@ -39,9 +39,18 @@ describe('SteeringLifecycle via GenerationJobManager.steering (in-memory)', () =
     manager.initialize();
   });
 
-  afterEach(async () => {
+  const ownedProviderJoins: Array<() => Promise<boolean>> = [];
+  async function beginOwnedProvider(streamId: string, epoch: number, segment: string) {
+    const started = await manager.beginProviderExecution(streamId, epoch, segment);
+    if (started)
+      ownedProviderJoins.push(() => manager.settleGenerationExecution(streamId, epoch, segment));
+    return started;
+  }
+  async function settleOwnedManagerAfterTest() {
+    for (const settle of ownedProviderJoins.splice(0)) expect(await settle()).toBe(true);
     await manager.destroy();
-  });
+  }
+  afterEach(settleOwnedManagerAfterTest);
 
   let steerCounter = 0;
   function buildSteer(text: string, userId = 'user-1'): SteerQueueItem {
@@ -1117,9 +1126,9 @@ describe('SteeringLifecycle via GenerationJobManager.steering (in-memory)', () =
             { path: '/content/2/tool_call/output', field: 'decision_response' },
           ],
         });
-        await expect(
-          manager.beginProviderExecution(streamId, job.createdAt, `exec-${streamId}`),
-        ).resolves.toBe(true);
+        await expect(beginOwnedProvider(streamId, job.createdAt, `exec-${streamId}`)).resolves.toBe(
+          true,
+        );
         const persisted: unknown[] = [];
 
         const result = await manager.abortJob(streamId, {
@@ -1154,9 +1163,9 @@ describe('SteeringLifecycle via GenerationJobManager.steering (in-memory)', () =
       test('publishes the pre-claim provenance while the provider has started without applying the decision', async () => {
         const streamId = 'steer-abort-started-unapplied-provenance';
         const { job } = await claimResume(streamId);
-        await expect(
-          manager.beginProviderExecution(streamId, job.createdAt, `exec-${streamId}`),
-        ).resolves.toBe(true);
+        await expect(beginOwnedProvider(streamId, job.createdAt, `exec-${streamId}`)).resolves.toBe(
+          true,
+        );
 
         const result = await manager.abortJob(streamId);
 
@@ -1169,9 +1178,9 @@ describe('SteeringLifecycle via GenerationJobManager.steering (in-memory)', () =
       test('publishes and persists the claimed provenance once the resumed tool completed', async () => {
         const streamId = 'steer-abort-applied-provenance';
         const { job, content } = await claimResume(streamId);
-        await expect(
-          manager.beginProviderExecution(streamId, job.createdAt, `exec-${streamId}`),
-        ).resolves.toBe(true);
+        await expect(beginOwnedProvider(streamId, job.createdAt, `exec-${streamId}`)).resolves.toBe(
+          true,
+        );
         content[1] = {
           type: 'tool_call',
           tool_call: { id: 'call-1', args: '{"q":"user"}', output: 'User response' },

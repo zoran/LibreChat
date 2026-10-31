@@ -4,6 +4,11 @@ import { createHash } from 'crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import type { UploadLease, UploadPrincipal, UploadSecurityApproval } from 'librechat-data-provider';
 import type { StoredUpload } from './uploadManagementStore';
+import {
+  uploadSecurityFixture,
+  uploadSecuritySettlementFixture,
+  bindUploadOriginalFixture,
+} from './uploadManagement.security.fixture';
 import { completeAcceptedUploadFileCleanup } from './uploadManagement.structure.fixture';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createModels } from '~/models';
@@ -45,23 +50,23 @@ describe('durable upload security approval', () => {
       chunkSha256: ['b'.repeat(64)],
     },
   });
-  const approval = (lease: UploadLease): UploadSecurityApproval => ({
-    version: 1,
-    decision: 'approved',
-    policySha256: policy,
-    subject: {
-      tenantId: lease.tenantId,
-      userId: lease.userId,
-      operationId: lease.operationId,
-      transferGeneration: lease.generation,
-      mediaType: 'text/plain',
-      bytes: 8,
-      sha256: receipt(lease).integrity.sha256,
-    },
-    scannerVersion: 'trusted-fixture-v1',
-    checkedAt: new Date(now).toISOString(),
-    coverage: { complete: true, pages: 1, parts: 1 },
-  });
+  const approval = (lease: UploadLease): UploadSecurityApproval =>
+    uploadSecurityFixture({
+      decision: 'approved',
+      policySha256: policy,
+      subject: {
+        tenantId: lease.tenantId,
+        userId: lease.userId,
+        operationId: lease.operationId,
+        transferGeneration: lease.generation,
+        mediaType: 'text/plain',
+        bytes: 8,
+        sha256: receipt(lease).integrity.sha256,
+      },
+      scannerVersion: 'trusted-fixture-v1',
+      checkedAt: new Date(now).toISOString(),
+      coverage: { complete: true, pages: 1, parts: 1 },
+    }).approval;
   const documentResult = (text: string, bytes = 8) => ({
     text,
     writerStopped: true as const,
@@ -92,20 +97,23 @@ describe('durable upload security approval', () => {
     textAndHistoryRemoved: false,
   });
   async function completeScanner(lease: UploadLease, at: number) {
-    const execution = {
-      version: 2 as const,
+    const execution = uploadSecurityFixture(approval(lease), {
       custody: { kind: 'none' as const },
       attemptId: `${lease.operationId}.${lease.generation}`,
       instanceId: '11111111-1111-4111-8111-111111111111',
       executionId: '22222222-2222-4222-8222-222222222222',
       expiresAt: new Date(at + 60_000).toISOString(),
-    };
+    }).execution;
     await first.bindSecurityExecution(lease, execution, at);
     await second.settleSecurityExecution(
       lease,
-      { execution, writerStopped: true, transientDataRemoved: true },
+      uploadSecuritySettlementFixture(execution, {
+        writerStopped: true,
+        transientDataRemoved: true,
+      }),
       at,
     );
+    await bindUploadOriginalFixture(first, lease, receipt(lease), approval(lease), at);
   }
 
   beforeAll(async () => {

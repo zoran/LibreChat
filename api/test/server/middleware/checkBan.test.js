@@ -1,12 +1,20 @@
 const mockBanCacheGet = jest.fn().mockResolvedValue(undefined);
 const mockBanCacheSet = jest.fn().mockResolvedValue(undefined);
 
-jest.mock('keyv', () => ({
-  Keyv: jest.fn().mockImplementation(() => ({
-    get: mockBanCacheGet,
-    set: mockBanCacheSet,
-  })),
-}));
+jest.mock('keyv', () => {
+  const actual = jest.requireActual('keyv');
+  return {
+    ...actual,
+    // Policy-only I/O doubles live on a genuine facade bound to the real cache adapter.
+    Keyv: class extends actual.Keyv {
+      constructor(...args) {
+        super(...args);
+        this.get = mockBanCacheGet;
+        this.set = mockBanCacheSet;
+      }
+    },
+  };
+});
 
 const mockBanLogsGet = jest.fn().mockResolvedValue(undefined);
 const mockBanLogsDelete = jest.fn().mockResolvedValue(true);
@@ -30,6 +38,7 @@ jest.mock('@librechat/data-schemas', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   isEnabled: (value) => {
     if (typeof value === 'boolean') {
       return value;
@@ -39,7 +48,6 @@ jest.mock('@librechat/api', () => ({
     }
     return false;
   },
-  keyvMongo: {},
   getBanIp: jest.requireActual('../../../../packages/api/src/middleware/ban').getBanIp,
   removePorts: jest.fn((req) => req.ip),
   redirectToAuthFailure: (res, { clientDomain, authFailedError }) =>

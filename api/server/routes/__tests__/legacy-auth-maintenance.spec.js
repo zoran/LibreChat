@@ -1,8 +1,6 @@
 /** Actual Passport-local -> middleware -> controller lifecycle, with deferred storage ports. */
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
-  ...jest.requireActual('../../../../packages/api/src/auth/maintenance.ts'),
-  ...jest.requireActual('../../../../packages/api/src/auth/sessionMaintenance.ts'),
   isEnabled: () => false,
   checkEmailConfig: () => false,
   comparePassword: jest.fn(async () => true),
@@ -103,6 +101,7 @@ test('admitted login retains strategy writes and session creation across pause a
 
 function passportFixture() {
   let instance, maintenance, install;
+  jest.resetModules();
   jest.isolateModules(() => {
     instance = new (jest.requireActual('passport').Passport)();
     const service = require('~/server/services/LegacyAuthMaintenance');

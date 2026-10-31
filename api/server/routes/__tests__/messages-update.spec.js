@@ -3,10 +3,12 @@ const request = require('supertest');
 const { ContentTypes, RetentionMode } = require('librechat-data-provider');
 
 jest.mock('@librechat/agents', () => ({
+  ...jest.requireActual('@librechat/agents'),
   sleep: jest.fn(),
 }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   prepareToolCallPreviews: jest.fn(() => (messages) => Promise.resolve(messages)),
   createToolCallPartHandler: jest.fn(() => (_req, res) => res.status(404).end()),
   rejectToolCallPreviewWrites: (_req, _res, next) => next(),
@@ -30,7 +32,7 @@ jest.mock('@librechat/api', () => ({
   CHILD_THREAD_READ_ONLY_ERROR: 'Child thread is view-only.',
   isSubagentThreadWriteBlocked: jest.fn().mockResolvedValue(false),
   requireFeedbackEnabled: (req, res, next) => next(),
-  applyForcedRetention: jest.fn(),
+  applyForcedRetention: jest.fn(jest.requireActual('@librechat/api').applyForcedRetention),
 }));
 
 jest.mock('@librechat/data-schemas', () => ({
@@ -90,11 +92,20 @@ describe('PUT /:conversationId/:messageId', () => {
   const messageId = 'message-1';
   const interfaceConfig = { retentionMode: RetentionMode.EPHEMERAL, temporaryChatRetention: 1 };
 
-  const expectRestamp = (ctx) =>
-    expect(applyForcedRetention).toHaveBeenCalledWith(
-      { stampForcedRetention },
-      { ctx: expect.objectContaining(ctx), conversationId, messageId },
+  const expectRestamp = (ctx) => {
+    const [models] = applyForcedRetention.mock.calls[0];
+    expect(Object.keys(models).sort()).toEqual(Object.keys(require('~/models')).sort());
+    expect(models.stampForcedRetention).not.toBe(stampForcedRetention);
+    expect(applyForcedRetention).toHaveBeenCalledWith(models, {
+      ctx: expect.objectContaining(ctx),
+      conversationId,
+      messageId,
+    });
+    expect(stampForcedRetention).toHaveBeenCalledWith(
+      { userId: ctx.userId, interfaceConfig: ctx.interfaceConfig },
+      { conversationId, messageIds: [messageId] },
     );
+  };
 
   beforeAll(() => {
     const messagesRouter = require('../messages');

@@ -1,8 +1,14 @@
 const mockRateLimit = jest.fn((options) => options);
 const mockLimiterCache = jest.fn((name) => ({ name }));
 
-jest.mock('express-rate-limit', () => mockRateLimit);
+jest.mock('express-rate-limit', () =>
+  Object.assign(mockRateLimit, jest.requireActual('express-rate-limit'), {
+    default: mockRateLimit,
+    rateLimit: mockRateLimit,
+  }),
+);
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   limiterCache: mockLimiterCache,
   removePorts: (req) => req.ip,
   /** The key policy lives in packages/api and is covered by its own tests; here it records

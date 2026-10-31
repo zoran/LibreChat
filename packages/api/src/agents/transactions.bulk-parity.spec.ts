@@ -3,7 +3,7 @@
  *
  * Each test uses the actual getMultiplier/getCacheMultiplier pricing functions
  * (the same ones the legacy createTransaction path uses) and runs the bulk path
- * against a real MongoMemoryServer instance.
+ * against a real MongoMemoryReplSet instance.
  *
  * The assertion pattern: compute the expected tokenValue/rate/rawAmount from the
  * pricing functions directly, then verify the DB state matches exactly. Since both
@@ -12,13 +12,12 @@
  * numerically identical.
  */
 import mongoose from 'mongoose';
-import { MongoMemoryServer } from 'mongodb-memory-server';
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import {
   tokenValues,
   CANCEL_RATE,
   createMethods,
-  balanceSchema,
-  transactionSchema,
+  createModels,
   premiumTokenValues,
 } from '@librechat/data-schemas';
 import type { PricingFns, TxMetadata } from './transactions';
@@ -56,7 +55,7 @@ jest.mock('@librechat/data-schemas', () => {
   };
 });
 
-let mongoServer: MongoMemoryServer;
+let mongoServer: MongoMemoryReplSet;
 let Transaction: mongoose.Model<unknown>;
 let Balance: mongoose.Model<unknown>;
 let dbMethods: ReturnType<typeof createMethods>;
@@ -65,10 +64,11 @@ let getMultiplier: ReturnType<typeof createMethods>['getMultiplier'];
 let getCacheMultiplier: ReturnType<typeof createMethods>['getCacheMultiplier'];
 
 beforeAll(async () => {
-  mongoServer = await MongoMemoryServer.create();
+  mongoServer = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
   await mongoose.connect(mongoServer.getUri());
-  Transaction = mongoose.models.Transaction || mongoose.model('Transaction', transactionSchema);
-  Balance = mongoose.models.Balance || mongoose.model('Balance', balanceSchema);
+  createModels(mongoose);
+  Transaction = mongoose.models.Transaction;
+  Balance = mongoose.models.Balance;
   dbMethods = createMethods(mongoose, { matchModelName, findMatchingPattern });
   getMultiplier = dbMethods.getMultiplier;
   getCacheMultiplier = dbMethods.getCacheMultiplier;

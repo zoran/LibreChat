@@ -29,9 +29,18 @@ describe('ApprovalLifecycle via GenerationJobManager.approvals (in-memory)', () 
     manager.initialize();
   });
 
-  afterEach(async () => {
+  const ownedProviderJoins: Array<() => Promise<boolean>> = [];
+  async function beginOwnedProvider(streamId: string, epoch: number, segment: string) {
+    const started = await manager.beginProviderExecution(streamId, epoch, segment);
+    if (started)
+      ownedProviderJoins.push(() => manager.settleGenerationExecution(streamId, epoch, segment));
+    return started;
+  }
+  async function settleOwnedManagerAfterTest() {
+    for (const settle of ownedProviderJoins.splice(0)) expect(await settle()).toBe(true);
     await manager.destroy();
-  });
+  }
+  afterEach(settleOwnedManagerAfterTest);
 
   function buildAction(streamId: string, overrides: Partial<Agents.PendingAction> = {}) {
     const payload = buildToolApprovalPayload([
@@ -758,14 +767,17 @@ describe('ApprovalLifecycle via GenerationJobManager.approvals (in-memory)', () 
       });
       const pausedProviderExecutionId = job.metadata.providerExecutionId!;
       const action = buildAction(streamId);
-      expect(
-        await manager.beginProviderExecution(streamId, job.createdAt, pausedProviderExecutionId),
-      ).toBe(true);
+      expect(await beginOwnedProvider(streamId, job.createdAt, pausedProviderExecutionId)).toBe(
+        true,
+      );
       await manager.approvals.pause(streamId, action, {
         expectedCreatedAt: job.createdAt,
         agentEventSuspension: { version: 1, suspensionId: 'suspension-1', attempt: 0 },
       });
 
+      expect(
+        await manager.settleGenerationExecution(streamId, job.createdAt, pausedProviderExecutionId),
+      ).toBe(true);
       expect(
         await manager.approvals.resolve(
           streamId,
@@ -780,9 +792,7 @@ describe('ApprovalLifecycle via GenerationJobManager.approvals (in-memory)', () 
       });
       expect((await manager.getJob(streamId))?.metadata.agentEventSuspension).toBeUndefined();
       expect((await manager.getJob(streamId))?.metadata.providerExecutionStartedId).toBeUndefined();
-      expect(await manager.beginProviderExecution(streamId, job.createdAt, 'provider-resume')).toBe(
-        true,
-      );
+      expect(await beginOwnedProvider(streamId, job.createdAt, 'provider-resume')).toBe(true);
       expect((await manager.getJob(streamId))?.metadata.providerExecutionStartedId).toBe(
         'provider-resume',
       );

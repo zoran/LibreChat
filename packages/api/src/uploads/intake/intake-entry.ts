@@ -46,15 +46,15 @@ async function main(): Promise<void> {
     tls: appTls,
     worker,
   });
-  const security = createHttpUploadSecurityPort({
+  const securityOptions = {
     endpoint: process.env.UPLOAD_SECURITY_ENDPOINT ?? '',
     allowedHosts: (process.env.UPLOAD_SECURITY_ALLOWED_HOSTS ?? '').split(',').filter(Boolean),
     policySha256: process.env.UPLOAD_SECURITY_POLICY_SHA256 ?? '',
     tls: securityTls,
-  });
+  };
   const service = await startIntakeService({
     channel,
-    security,
+    createSecurityPort: () => createHttpUploadSecurityPort(securityOptions),
     worker,
     stagingRoot: process.env.UPLOAD_INTAKE_ROOT ?? '/var/run/cortex-intake',
     localResources: { cgroupDirectory: '/sys/fs/cgroup', storage },

@@ -7,8 +7,7 @@ const mockValidatePasswordReset = jest.fn((req, res, next) => next());
 const mockResetPasswordController = jest.fn((req, res) => res.status(204).end());
 
 jest.mock('@librechat/api', () => ({
-  ...jest.requireActual('../../../packages/api/src/auth/maintenance.ts'),
-  ...jest.requireActual('../../../packages/api/src/auth/sessionMaintenance.ts'),
+  ...jest.requireActual('@librechat/api'),
   createBrowserAuth: () => {
     const pass = (_req, _res, next) => next();
     return { forget: pass, refresh: pass, bootstrap: pass, reset: pass };

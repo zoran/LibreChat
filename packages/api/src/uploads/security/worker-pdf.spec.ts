@@ -1,11 +1,12 @@
 /** worker-pdf.spec.ts owns original PDF scope/cancellation cases with real parser fixtures and inert AV. */
 import { join } from 'node:path';
-import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { performance } from 'node:perf_hooks';
+import { createHash, randomUUID } from 'node:crypto';
 import type { UploadSecurityExecution, UploadSecurityScopeReceipt } from 'librechat-data-provider';
 import type { SecurityPdfOcrProvider } from './pdf-ocr';
+import { antivirusReceiptFixture, createInertAntivirusFixture } from './antivirus-fixture.helper';
 import { createSecurityWorkerFixture } from './worker-fixture.helper';
-import { antivirusReceiptFixture } from './antivirus-fixture.helper';
 import { observeSecurityProcess } from './process-observer';
 import { createSecurityWorker } from './worker';
 const fixture = createSecurityWorkerFixture();
@@ -37,7 +38,7 @@ describe('original PDF scope through actual worker and built child', () => {
       text + `trailer\n<< /Size ${offsets.length} /Root 1 0 R >>\nstartxref\n${offset}\n%%EOF\n`,
     );
   }
-  function composition() {
+  function composition(options: { now?: () => number } = {}) {
     const bytes = document();
     const input = {
       ...subject(),
@@ -136,11 +137,17 @@ describe('original PDF scope through actual worker and built child', () => {
         },
       ),
     };
-    const instance = worker({ pdf: { provider, launcher } });
+    const antivirus = createInertAntivirusFixture({ now: options.now });
+    const instance = worker({
+      ...options,
+      antivirus: antivirus.runtime,
+      pdf: { provider, launcher },
+    });
     return {
       bytes,
       input,
       prepare,
+      antivirus,
       instance,
       provider,
       launcher,
@@ -153,6 +160,37 @@ describe('original PDF scope through actual worker and built child', () => {
         retire = true;
       },
     };
+  }
+  function holdPreparation(test: ReturnType<typeof composition>) {
+    const implementation = test.prepare.getMockImplementation()!;
+    let entered!: () => void, release!: () => void, retiring!: () => void;
+    let execution!: UploadSecurityExecution;
+    const ready = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const retirement = new Promise<void>((resolve) => {
+      retiring = resolve;
+    });
+    const prepareAv = test.antivirus.runtime.prepare;
+    jest.spyOn(test.antivirus.runtime, 'prepare').mockImplementation(async (...args) => {
+      const session = await prepareAv(...args);
+      const retire = session.retire;
+      jest.spyOn(session, 'retire').mockImplementation(() => {
+        retiring();
+        return retire();
+      });
+      return session;
+    });
+    test.prepare.mockImplementationOnce(async (input) => {
+      execution = await implementation(input);
+      entered();
+      await held;
+      return execution;
+    });
+    return { ready, release, retirement, execution: () => execution };
   }
   it('does no content work before prepare returns and joins actual parser/pages plus original provider before approval', async () => {
     const test = composition();
@@ -203,8 +241,118 @@ describe('original PDF scope through actual worker and built child', () => {
     });
     expect(test.calls).toHaveLength(2);
     expect(test.calls[0]).toEqual(test.calls[1]);
+    expect(test.antivirus.preparations()).toBe(1);
+    expect(test.antivirus.events).not.toContain('activate');
+    expect(test.antivirus.events).not.toContain('scan');
+    expect(test.launcher.run).not.toHaveBeenCalled();
     expect(await test.instance.cancel({ execution, signal: signal() })).toMatchObject({
       providerReceipt: { state: 'retired', dispatchedPages: [] },
+    });
+  });
+  it.each(['original process', 'profile'])(
+    'refuses a provider that changes the original AV %s without adopting or dispatching it',
+    async (field) => {
+      const test = composition();
+      const implementation = test.prepare.getMockImplementation()!;
+      test.prepare.mockImplementationOnce(async (input) => {
+        const original = await implementation(input);
+        if (original.version !== 3) throw new Error('Current tuple required');
+        return {
+          ...original,
+          antivirus: {
+            ...original.antivirus,
+            ...(field === 'profile'
+              ? { profileSha256: 'e'.repeat(64) }
+              : { original: { ...original.antivirus.original, id: randomUUID() } }),
+          },
+        };
+      });
+      await expect(
+        test.instance.prepare({ attemptId: 'upload.1', subject: test.input, signal: signal() }),
+      ).rejects.toThrow();
+      expect(test.launcher.run).not.toHaveBeenCalled();
+      expect(test.session.readPage).not.toHaveBeenCalled();
+      expect(test.antivirus.events).not.toContain('activate');
+      const execution = await test.instance.prepare({
+        attemptId: 'upload.1',
+        subject: test.input,
+        signal: signal(),
+      });
+      expect(test.calls[0]).toEqual(test.calls[1]);
+      expect(test.antivirus.preparations()).toBe(1);
+      expect(await test.instance.cancel({ execution, signal: signal() })).toMatchObject({
+        writerStopped: true,
+        providerReceipt: { state: 'retired' },
+      });
+    },
+  );
+  it.each(['wall', 'monotonic', 'abort'])(
+    'never restarts the original inert prepare after its %s stop',
+    async (stop) => {
+      let now = Date.now(),
+        mono = performance.now();
+      const monotonic = jest.spyOn(performance, 'now').mockImplementation(() => mono);
+      const test = composition({ now: () => now });
+      const gate = holdPreparation(test);
+      const caller = new AbortController();
+      const initial = test.instance
+        .prepare({ attemptId: 'upload.1', subject: test.input, signal: caller.signal })
+        .catch((error: unknown) => error);
+      await gate.ready;
+      try {
+        if (stop === 'wall') now += 30001;
+        else if (stop === 'monotonic') mono += 30001;
+        else {
+          caller.abort();
+          await gate.retirement;
+        }
+        await expect(
+          test.instance.prepare({ attemptId: 'upload.1', subject: test.input, signal: signal() }),
+        ).rejects.toThrow();
+        expect(test.calls).toHaveLength(1);
+        expect(test.antivirus.preparations()).toBe(1);
+        expect(test.launcher.run).not.toHaveBeenCalled();
+        expect(test.session.readPage).not.toHaveBeenCalled();
+      } finally {
+        gate.release();
+        monotonic.mockRestore();
+      }
+      expect(await initial).toBeInstanceOf(Error);
+      expect(
+        await test.instance.cancel({ execution: gate.execution(), signal: signal() }),
+      ).toMatchObject({ writerStopped: true, providerReceipt: { state: 'retired' } });
+      expect(await test.instance.close(signal())).toEqual({ complete: true });
+    },
+  );
+  it('refuses a foreign subject during unresolved prepare without replacing the original', async () => {
+    const test = composition();
+    const implementation = test.prepare.getMockImplementation()!;
+    test.prepare.mockImplementationOnce(async (input) => {
+      await implementation(input);
+      throw new Error('fixture-lost-ack');
+    });
+    await expect(
+      test.instance.prepare({ attemptId: 'upload.1', subject: test.input, signal: signal() }),
+    ).rejects.toThrow();
+    await expect(
+      test.instance.prepare({
+        attemptId: 'upload.1',
+        subject: { ...test.input, bytes: test.input.bytes + 1 },
+        signal: signal(),
+      }),
+    ).rejects.toThrow();
+    expect(test.calls).toHaveLength(1);
+    const execution = await test.instance.prepare({
+      attemptId: 'upload.1',
+      subject: test.input,
+      signal: signal(),
+    });
+    expect(test.calls[0]).toEqual(test.calls[1]);
+    expect(test.antivirus.preparations()).toBe(1);
+    expect(test.launcher.run).not.toHaveBeenCalled();
+    expect(await test.instance.cancel({ execution, signal: signal() })).toMatchObject({
+      writerStopped: true,
+      providerReceipt: { state: 'retired' },
     });
   });
   it('withholds a complete local parse while the original API retirement is unknown, then observes only that scope', async () => {

@@ -4,11 +4,11 @@ import type {
   AgentApiKeyCreateData,
   AgentApiKeyListItem,
   IAgentApiKey,
-} from '~/types';
+} from '../types';
 import type { AuthPersistenceObserver } from './authPersistence';
 import { observeAuthPersistence } from './authPersistence';
-import { hashToken, getRandomValues } from '~/crypto';
-import logger from '~/config/winston';
+import { hashToken, getRandomValues } from '../crypto';
+import logger from '../config/winston';
 
 const API_KEY_PREFIX = 'sk-';
 const API_KEY_LENGTH = 32;

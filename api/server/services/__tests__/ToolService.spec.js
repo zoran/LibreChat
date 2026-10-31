@@ -1,3 +1,8 @@
+/** Runtime fixture identities are shared by their producers and assertions. */
+const mockRandomUUID = require('node:crypto').randomUUID;
+const mockCredential1 = mockRandomUUID();
+const mockCredential2 = mockRandomUUID();
+
 const { createHash } = require('node:crypto');
 const { Constants: AgentConstants } = require('@librechat/agents');
 const {
@@ -609,8 +614,8 @@ describe('ToolService - Action Capability Gating', () => {
     });
 
     it.each([
-      ['bearer_header', 'Authorization: Bearer required-action-token', 'Bearer token'],
-      ['api_key_header', 'api-key: required-action-token', 'api-key header'],
+      ['bearer_header', 'Authorization: Bearer ' + mockCredential1, 'Bearer token'],
+      ['api_key_header', 'api-key: ' + mockCredential1, 'api-key header'],
     ])(
       'returns a stable required-action %s block output',
       async (starterPattern, privateOutput, detectorLabel) => {
@@ -642,7 +647,7 @@ describe('ToolService - Action Capability Gating', () => {
     );
 
     it('normalizes a required-action policy error without tool-output filtering', async () => {
-      const privateOutput = 'Authorization: Bearer generated-file-token';
+      const privateOutput = 'Authorization: Bearer ' + mockCredential2;
       const policyError = new ContentFilterError({
         detectorId: 'pii-pattern',
         ruleId: 'bearer_header',
@@ -3236,15 +3241,9 @@ describe('ToolService - Action Capability Gating', () => {
         codeWorkspaces: [{ environmentId: 'personal-machine', workspaceId: 'project-a' }],
       };
       mockGetEndpointsConfig.mockResolvedValue(createEndpointsConfig(capabilities));
-      mockResolveCodeExecutionContext.mockReturnValueOnce({
-        baseUrl: 'http://attached-code.test/v1',
-        codeSessionKey: 'execute_code:stateful:attached',
-        executionProfile: 'stateful',
-        statefulSessions: true,
-        environmentType: 'attached',
-        environmentId: 'personal-machine',
-        bridgeWorkerId: 'worker-abc',
-      });
+      req.config.endpoints[EModelEndpoint.agents].statefulCodeSessions = {
+        environments: [attachedEnvironment()],
+      };
       mockCreateLaneGitRecorder.mockClear();
 
       await loadToolsForExecution({
@@ -3255,6 +3254,7 @@ describe('ToolService - Action Capability Gating', () => {
           tools: [Tools.execute_code],
           stateful_code_sessions: true,
           stateful_code_environment: 'agent-user',
+          code_environment_id: 'personal-machine',
         },
         conversationId: 'resolved-convo',
         toolNames: [AgentConstants.BASH_TOOL],
@@ -3294,15 +3294,9 @@ describe('ToolService - Action Capability Gating', () => {
         codeWorkspaces: [{ environmentId: 'personal-machine', workspaceId: 'project-a' }],
       };
       mockGetEndpointsConfig.mockResolvedValue(createEndpointsConfig(capabilities));
-      mockResolveCodeExecutionContext.mockReturnValueOnce({
-        baseUrl: 'http://attached-code.test/v1',
-        codeSessionKey: 'execute_code:stateful:attached',
-        executionProfile: 'stateful',
-        statefulSessions: true,
-        environmentType: 'attached',
-        environmentId: 'personal-machine',
-        bridgeWorkerId: 'worker-abc',
-      });
+      req.config.endpoints[EModelEndpoint.agents].statefulCodeSessions = {
+        environments: [attachedEnvironment()],
+      };
       mockCreateLaneGitRecorder.mockClear();
 
       await loadToolsForExecution({
@@ -3313,6 +3307,7 @@ describe('ToolService - Action Capability Gating', () => {
           tools: [Tools.execute_code],
           stateful_code_sessions: true,
           stateful_code_environment: 'agent-user',
+          code_environment_id: 'personal-machine',
         },
         conversationId: 'resolved-convo',
         toolNames: [AgentConstants.BASH_TOOL],

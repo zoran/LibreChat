@@ -1,5 +1,6 @@
 import { JSDOM } from 'jsdom';
 import type { ExpiryMessageInput } from './expiryMessage';
+import { MAIL_MOBILE_STYLES } from '../auth/mailPresentation';
 import { expiryMessage } from './expiryMessage';
 
 const input: ExpiryMessageInput = {
@@ -185,15 +186,21 @@ describe('upload expiry mail presentation', () => {
 
   it('escapes hostile and long names without markup, clipping rules or extra links', () => {
     const filename =
-      '<img src="https://evil.test/pixel" onerror="x"> & \'Plan\' ' + '長'.repeat(600) + '\u202e\n';
+      '<img src="https://evil.test/pixel" onerror="x"><style>.attacker{background:url(https://evil.test/css)}</style> & \'Plan\' ' +
+      '長'.repeat(600) +
+      '\u202e\n';
     const message = expiryMessage({
       ...input,
-      appTitle: '<b>Portal</b>',
-      supportText: 'Hilfe <img src="https://evil.test/help"> & "Team"',
+      appTitle: '<b>Portal</b><style>.attacker{display:none}</style>',
+      supportText:
+        'Hilfe <img src="https://evil.test/help"><style>.attacker{color:red}</style> & "Team"',
       files: [{ ...input.files[0], filename }],
     });
     const doc = body(message.html);
-    expect(doc.querySelectorAll('script,iframe,form,object,link,style,input')).toHaveLength(0);
+    expect(doc.querySelectorAll('script,iframe,form,object,link,input')).toHaveLength(0);
+    expect(doc.querySelectorAll('style')).toHaveLength(1);
+    expect(doc.querySelectorAll('head > style')).toHaveLength(1);
+    expect(doc.querySelector('head > style')!.textContent).toBe(MAIL_MOBILE_STYLES);
     expect(doc.querySelectorAll('img')).toHaveLength(1);
     expect(doc.querySelector('img')!.getAttribute('src')).toBe('cid:application-logo@local');
     expect(doc.querySelector('h2')!.textContent).toContain('長'.repeat(600));

@@ -5,11 +5,16 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import {
   UPLOAD_MAX_FILE_BYTES,
   UPLOAD_MAX_TEXT_BYTES,
-  UPLOAD_RECORD_BYTES,
+  UPLOAD_AV_RECORD_BYTES,
   UPLOAD_RETENTION_MS,
 } from 'librechat-data-provider';
 import type { UploadLease, UploadPrincipal, UploadStorageReceipt } from 'librechat-data-provider';
 import type { StoredUpload } from './uploadManagementStore';
+import {
+  uploadSecurityFixture,
+  uploadSecuritySettlementFixture,
+  bindUploadOriginalFixture,
+} from './uploadManagement.security.fixture';
 import {
   completeAcceptedUploadFileCleanup,
   copyFrozenUploadFiles,
@@ -73,37 +78,46 @@ describe('durable managed original integrity', () => {
     originalAbsent: false,
     textAndHistoryRemoved: false,
   });
-  const approval = (lease: UploadLease, original = receipt(lease)) => ({
-    version: 1 as const,
-    decision: 'approved' as const,
-    policySha256: securityPolicySha256,
-    subject: {
-      tenantId: lease.tenantId,
-      userId: lease.userId,
-      operationId: lease.operationId,
-      transferGeneration: lease.generation,
-      mediaType: 'text/plain',
-      bytes: original.bytes,
-      sha256: original.integrity.sha256,
-    },
-    scannerVersion: 'fixture-v1',
-    checkedAt: new Date(now).toISOString(),
-    coverage: { complete: true as const, pages: 1, parts: 1 },
-  });
+  const approval = (lease: UploadLease, original = receipt(lease)) =>
+    uploadSecurityFixture({
+      decision: 'approved' as const,
+      policySha256: securityPolicySha256,
+      subject: {
+        tenantId: lease.tenantId,
+        userId: lease.userId,
+        operationId: lease.operationId,
+        transferGeneration: lease.generation,
+        mediaType: 'text/plain',
+        bytes: original.bytes,
+        sha256: original.integrity.sha256,
+      },
+      scannerVersion: 'fixture-v1',
+      checkedAt: new Date(now).toISOString(),
+      coverage: { complete: true as const, pages: 1, parts: 1 },
+    }).approval;
 
-  async function completeScanner(lease: UploadLease, at: number) {
-    const execution = {
-      version: 2 as const,
+  async function completeScanner(lease: UploadLease, at: number, bytes = 8) {
+    const execution = uploadSecurityFixture(approval(lease, receipt(lease, bytes)), {
       custody: { kind: 'none' as const },
       attemptId: `${lease.operationId}.${lease.generation}`,
       instanceId: '11111111-1111-4111-8111-111111111111',
       executionId: '22222222-2222-4222-8222-222222222222',
       expiresAt: new Date(at + 60_000).toISOString(),
-    };
+    }).execution;
     await first.bindSecurityExecution(lease, execution, at);
     await second.settleSecurityExecution(
       lease,
-      { execution, writerStopped: true, transientDataRemoved: true },
+      uploadSecuritySettlementFixture(execution, {
+        writerStopped: true,
+        transientDataRemoved: true,
+      }),
+      at,
+    );
+    await bindUploadOriginalFixture(
+      first,
+      lease,
+      receipt(lease, bytes),
+      approval(lease, receipt(lease, bytes)),
       at,
     );
   }
@@ -373,7 +387,7 @@ describe('durable managed original integrity', () => {
     await replacement.models.File.insertMany(
       await a.models.File.find({})
         .select(
-          '+securityApproval +retentionActivity +derivedRetention +derivedOrigin +retentionRevocationId',
+          '+securityApproval +originalWriteBinding +originalIntegrity +retentionActivity +derivedRetention +derivedOrigin +retentionRevocationId',
         )
         .lean(),
     );
@@ -465,7 +479,7 @@ describe('durable managed original integrity', () => {
     });
   });
 
-  it('keeps the maximum supported original manifest and bounded record inside its existing 32 KiB charge', async () => {
+  it('keeps the maximum supported original manifest and bounded record inside its existing AV charge', async () => {
     const id = 'a'.repeat(128);
     const owner = {
       ...user,
@@ -497,7 +511,7 @@ describe('durable managed original integrity', () => {
       etag: 'é'.repeat(512),
       versionId: 'é'.repeat(512),
     };
-    await completeScanner(lease, now);
+    await completeScanner(lease, now, UPLOAD_MAX_FILE_BYTES);
     await first.accept(owner, lease, original, approval(lease, original), { filename }, now);
     const row = (await b.models.UploadOperation.findById(id).lean<StoredUpload>())!;
     const largest: StoredUpload = {
@@ -523,9 +537,9 @@ describe('durable managed original integrity', () => {
       textRemoved: false,
     };
     expect(original.integrity.chunkSha256).toHaveLength(120);
-    expect(row.recordBytes).toBe(UPLOAD_RECORD_BYTES);
+    expect(row.recordBytes).toBe(UPLOAD_AV_RECORD_BYTES);
     expect(mongoose.mongo.BSON.calculateObjectSize(largest)).toBeLessThanOrEqual(
-      UPLOAD_RECORD_BYTES,
+      UPLOAD_AV_RECORD_BYTES,
     );
   });
 });

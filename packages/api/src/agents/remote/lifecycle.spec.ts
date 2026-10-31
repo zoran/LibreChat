@@ -43,14 +43,19 @@ function enrollmentParams(runId: string, conversationId = 'conversation-1') {
 
 describe('Agent execution enrollment', () => {
   let manager: GenerationJobManagerClass;
+  let expectedShutdownRefusal = false;
 
   beforeEach(() => {
     manager = createManager();
+    expectedShutdownRefusal = false;
   });
 
-  afterEach(async () => {
-    await manager.destroy();
-  });
+  async function settleOwnedManagerAfterTest() {
+    if (expectedShutdownRefusal) {
+      await expect(manager.destroy()).rejects.toThrow('generation_shutdown_unconfirmed');
+    } else await manager.destroy();
+  }
+  afterEach(settleOwnedManagerAfterTest);
 
   it('registers a cleanup-blocking run before provider execution', async () => {
     const enrollment = await enrollAgentExecution(enrollmentParams('chatcmpl-1'), { manager });
@@ -193,6 +198,7 @@ describe('Agent execution enrollment', () => {
   });
 
   it('does not mistake terminal retry for successful trailing persistence', async () => {
+    expectedShutdownRefusal = true;
     const enrollment = await enrollAgentExecution(enrollmentParams('trailing-rejected'), {
       manager,
     });
@@ -204,8 +210,12 @@ describe('Agent execution enrollment', () => {
     await expect(manager.getJobStore().getJob('trailing-rejected')).resolves.toMatchObject({
       providerDrained: false,
     });
+    await expect(manager.getCleanupBlockingJobIdsForUser('user-1')).resolves.toEqual([
+      'trailing-rejected',
+    ]);
   });
   it('does not mark the provider drained while terminalization remains unavailable', async () => {
+    expectedShutdownRefusal = true;
     const enrollment = await enrollAgentExecution(enrollmentParams('chatcmpl-terminal-outage'), {
       manager,
     });
@@ -226,7 +236,8 @@ describe('Agent execution enrollment', () => {
     ]);
   });
 
-  it('abandons the shutdown tracker when terminalization gives up, without recording a drain', async () => {
+  it('retains uncertain original custody when terminalization gives up, without recording a drain', async () => {
+    expectedShutdownRefusal = true;
     const enrollment = await enrollAgentExecution(enrollmentParams('chatcmpl-terminal-abandon'), {
       manager,
     });
@@ -240,14 +251,20 @@ describe('Agent execution enrollment', () => {
 
     await expect(enrollment.settle()).rejects.toThrow('terminal store still unavailable');
 
-    /** No marker on purpose — a successor must still see the truth — but the shutdown
-     *  tracker has no other release path, so it is abandoned explicitly. */
+    /** Failed persistence keeps the exact original uncertain and cleanup-blocking;
+     * no drained marker or successful shutdown may be manufactured. */
     expect(drained).not.toHaveBeenCalled();
     expect(abandon).toHaveBeenCalledWith(
       'chatcmpl-terminal-abandon',
       expect.any(Number),
       expect.any(String),
     );
+    await expect(manager.getJobStore().getJob('chatcmpl-terminal-abandon')).resolves.toMatchObject({
+      providerDrained: false,
+    });
+    await expect(manager.getCleanupBlockingJobIdsForUser('user-1')).resolves.toEqual([
+      'chatcmpl-terminal-abandon',
+    ]);
   });
 
   it('lets destructive cleanup abort the canonical signal and wait for trailing writes', async () => {

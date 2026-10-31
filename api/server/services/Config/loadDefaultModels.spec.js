@@ -7,7 +7,11 @@ jest.mock('@librechat/api', () => ({
   getOpenAIModels: jest.fn(),
   mergeHeaders: jest.fn(),
 }));
-jest.mock('./app');
+// Auto-mock metadata uses an isolated registry without the initialized model graph.
+jest.mock('./app', () => ({
+  ...jest.requireActual('./app'),
+  getAppConfig: jest.fn(),
+}));
 jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
   logger: { error: jest.fn() },

@@ -1,3 +1,7 @@
+// Explicit synthetic AV contract only; no native scan/readiness evidence.
+const {
+  antivirusFixture,
+} = require('../../../../../packages/data-provider/src/__fixtures__/upload-antivirus.ts');
 /** Real HTTP consumer, initializer, input owner, native admission, saver and SDK. */
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
@@ -339,8 +343,21 @@ beforeEach(async () => {
     worker,
     now,
   });
+  const antivirus = antivirusFixture(
+    {
+      tenantId: principal.tenantId,
+      userId: principal.userId,
+      operationId: fileId,
+      transferGeneration: transfer.generation,
+      mediaType: 'text/plain',
+      bytes: bytes.length,
+      sha256,
+    },
+    now,
+  );
   const execution = {
-    version: 2,
+    version: 3,
+    antivirus: antivirus.custody,
     custody: { kind: 'none' },
     attemptId: `${fileId}.${transfer.generation}`,
     instanceId: randomUUID(),
@@ -354,45 +371,57 @@ beforeEach(async () => {
       execution,
       writerStopped: true,
       transientDataRemoved: true,
+      antivirusReceipt: antivirus.receipt,
     },
     now,
   );
-  await uploads.accept(
-    principal,
+  const receipt = {
+    outcome: 'durable',
+    bytes: bytes.length,
+    source: 's3',
+    filepath: `/api/files/managed/${fileId}`,
+    storageKey: `t/${owner.tenantId}/managed-uploads/${owner.userId}/${fileId}.${transfer.generation}__original`,
+    integrity: {
+      version: 1,
+      algorithm: 'sha256',
+      sha256,
+      chunkBytes: 262144,
+      chunkSha256: [sha256],
+    },
+  };
+  const approval = {
+    version: 2,
+    antivirus: antivirus.approval,
+    decision: 'approved',
+    policySha256: policy,
+    subject: {
+      ...owner,
+      operationId: fileId,
+      transferGeneration: transfer.generation,
+      mediaType: 'text/plain',
+      bytes: bytes.length,
+      sha256,
+    },
+    scannerVersion: 'explicit-synthetic/v1',
+    checkedAt: new Date(now).toISOString(),
+    coverage: { complete: true, pages: 1, parts: 1 },
+  };
+  await uploads.bindOriginalWrite(
     transfer,
     {
-      outcome: 'durable',
-      bytes: bytes.length,
-      source: 's3',
-      filepath: `/api/files/managed/${fileId}`,
-      storageKey: `t/${owner.tenantId}/managed-uploads/${owner.userId}/${fileId}.${transfer.generation}__original`,
-      integrity: {
-        version: 1,
-        algorithm: 'sha256',
-        sha256,
-        chunkBytes: 262144,
-        chunkSha256: [sha256],
-      },
+      bucket: 'isolated',
+      key: receipt.storageKey,
+      operationId: fileId,
+      generation: String(transfer.generation),
+      bytes: receipt.bytes,
+      wholeSHA256: receipt.integrity.sha256,
+      mediaType: 'text/plain',
     },
-    {
-      version: 1,
-      decision: 'approved',
-      policySha256: policy,
-      subject: {
-        ...owner,
-        operationId: fileId,
-        transferGeneration: transfer.generation,
-        mediaType: 'text/plain',
-        bytes: bytes.length,
-        sha256,
-      },
-      scannerVersion: 'explicit-synthetic/v1',
-      checkedAt: new Date(now).toISOString(),
-      coverage: { complete: true, pages: 1, parts: 1 },
-    },
-    { filename: 'synthetic.txt' },
+    receipt.integrity,
+    approval,
     now,
   );
+  await uploads.accept(principal, transfer, receipt, approval, { filename: 'synthetic.txt' }, now);
   await uploads.confirmCleanup(
     {
       operationId: fileId,

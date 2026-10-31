@@ -1,19 +1,25 @@
+/** Runtime fixture identities are shared by their producers and assertions. */
+const mockRandomUUID = require('node:crypto').randomUUID;
+const mockAccessToken1 = mockRandomUUID();
+
 /** Actual Graph/OBO, Passport JWT, Keyv and Mongo owners; only provider/storage faults are injected. */
 const http = require('node:http');
 const express = require('express');
 const request = require('supertest');
-const mongoose = require('mongoose');
+const mockMongoose = jest.requireActual('mongoose');
+const mongoose = mockMongoose;
+// Keep the actual connected Mongoose owner when module isolation refreshes Auth and cache.
+jest.mock('mongoose', () => mockMongoose);
 const jwt = require('jsonwebtoken');
 const { Keyv } = require('keyv');
 const { Passport } = require('passport');
-const { MongoMemoryServer } = require('mongodb-memory-server');
+const { MongoMemoryReplSet } = require('mongodb-memory-server');
 const schemas = require('@librechat/data-schemas');
-const mockApi = jest.requireActual('@librechat/api');
 
 let mockDatabase;
 let mockTokens;
 let mockUserCache;
-jest.mock('@librechat/api', () => mockApi);
+jest.mock('@librechat/api', () => jest.requireActual('@librechat/api'));
 jest.mock('~/models', () =>
   jest.requireActual('@librechat/data-schemas').createMethods(mockDatabase, {
     getCache: () => mockUserCache,
@@ -36,7 +42,7 @@ const deferred = () => {
   return { promise, resolve, reject };
 };
 const tick = () => new Promise((resolve) => setImmediate(resolve));
-const token = { access_token: 'downstream-fixture', expires_in: 3600 };
+const token = { access_token: mockAccessToken1, expires_in: 3600 };
 const originalEnv = { ...process.env };
 let mongo;
 let User;
@@ -52,8 +58,9 @@ let errors;
 let tokenStore;
 
 beforeAll(async () => {
-  mongo = await MongoMemoryServer.create();
+  mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
   await mongoose.connect(mongo.getUri());
+  schemas.createModels(mongoose);
   User = mongoose.models.User || mongoose.model('User', schemas.userSchema);
   Flight =
     mongoose.models.OpenIDRefreshFlight ||
@@ -91,6 +98,7 @@ beforeEach(async () => {
     lockExpiresAt: new Date(Date.now() + 60_000),
     expiresAt: new Date(Date.now() + 60_000),
   });
+  jest.resetModules();
   jest.isolateModules(() => {
     owner = require('~/server/services/LegacyAuthMaintenance').legacyAuthMaintenance;
     ({ exchangeOboToken: exchange } = require('~/server/services/OboTokenService'));

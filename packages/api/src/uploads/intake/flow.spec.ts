@@ -472,18 +472,20 @@ describe('isolated Intake through native authority, scanner and App promotion', 
         return result;
       },
     };
+    const scannerTls = {
+      ca: await certificate('ca.pem'),
+      cert: await certificate('client.pem'),
+      key: await certificate('client.key'),
+    };
     intake = await startIntakeService({
       channel: observedChannel,
-      security: createHttpUploadSecurityPort({
-        endpoint: `https://127.0.0.1:${scanner!.address.port}`,
-        allowedHosts: ['127.0.0.1'],
-        policySha256,
-        tls: {
-          ca: await certificate('ca.pem'),
-          cert: await certificate('client.pem'),
-          key: await certificate('client.key'),
-        },
-      }),
+      createSecurityPort: () =>
+        createHttpUploadSecurityPort({
+          endpoint: `https://127.0.0.1:${scanner!.address.port}`,
+          allowedHosts: ['127.0.0.1'],
+          policySha256,
+          tls: scannerTls,
+        }),
       worker: intakeWorker,
       stagingRoot,
       localResources: { cgroupDirectory: intakeCgroupDirectory, storage: 'disk' },

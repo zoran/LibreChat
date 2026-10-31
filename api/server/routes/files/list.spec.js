@@ -14,6 +14,7 @@ const mockRefreshS3FileUrls = jest.fn();
 let mockAuthMode = 'default';
 let mockUploadRuntime;
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   getAuthMode: () => mockAuthMode,
   buildDeleteFilesResponse: (result, message) => ({ ...result, message }),
   handleFileListRequest: (...args) => mockHandleFileListRequest(...args),
@@ -66,7 +67,14 @@ jest.mock('~/cache', () => ({
 
 const express = require('express');
 const request = require('supertest');
-const { FileSources } = require('librechat-data-provider');
+const { createHash } = require('node:crypto');
+const assert = require('node:assert/strict');
+const {
+  FileSources,
+  buildManagedFileReadBinding,
+  isManagedFileReadTicket,
+} = require('librechat-data-provider');
+const { createManagedSourceResolver, MANAGED_SOURCE_FILE_FIELDS } = require('@librechat/api');
 const filesRouter = require('./files');
 
 function buildApp(
@@ -143,6 +151,7 @@ describe('Cortex managed File route wiring', () => {
   };
   let file;
   let app;
+  const readIds = { original: 'o'.repeat(43), preview: 'p'.repeat(43) };
   beforeEach(() => {
     jest.clearAllMocks();
     mockAuthMode = 'transition';
@@ -182,7 +191,20 @@ describe('Cortex managed File route wiring', () => {
           fileId: file.file_id,
           state: 'ready',
           principal,
-          original: { outcome: 'durable', source: 's3', bytes: 5, storageKey: file.storageKey },
+          original: {
+            outcome: 'durable',
+            source: 's3',
+            bytes: 5,
+            storageKey: file.storageKey,
+            filepath: '/api/files/managed/operation',
+            integrity: {
+              version: 1,
+              algorithm: 'sha256',
+              chunkBytes: 262144,
+              sha256: createHash('sha256').update('hello').digest('hex'),
+              chunkSha256: [createHash('sha256').update('hello').digest('hex')],
+            },
+          },
         })),
       },
       storage: {
@@ -191,6 +213,81 @@ describe('Cortex managed File route wiring', () => {
         }),
       },
     };
+    const runtime = mockUploadRuntime;
+    runtime.sources = createManagedSourceResolver({
+      allowedOrigins: runtime.allowedOrigins,
+      principal: runtime.principal,
+      operation: (actor, id) => runtime.management.get(actor, id),
+      file: async (actor, id, text) => {
+        const files = await db.getFiles(
+          { tenantId: actor.tenantId, user: actor.userId, file_id: id, uploadOperationId: id },
+          null,
+          `${MANAGED_SOURCE_FILE_FIELDS}${text ? ' text textFormat +documentStructure +securityApproval' : ''}`,
+          1,
+        );
+        return files?.[0] ?? null;
+      },
+      original: (actor, id) => runtime.repository.cleanupForFile(actor, id),
+      policySha256: () => undefined,
+      storage: runtime.storage,
+    });
+    runtime.fileReadWorker = Object.freeze({
+      hostId: 'fixture-http',
+      instanceId: 'fixture-worker',
+    });
+    // HTTP wiring doubles the repository boundary; actual resolver, identity and receipt checks run.
+    runtime.runFileOperation = jest.fn((work) => work());
+    runtime.fileReads = {
+      claimManagedFileRead: jest.fn(async (actor, reference, worker) => {
+        assert.deepEqual(actor, principal);
+        assert.equal(worker, runtime.fileReadWorker);
+        assert.deepEqual(reference, {
+          version: 1,
+          readId: readIds[reference.representation],
+          fileId: file.file_id,
+          representation: reference.representation,
+        });
+        const ticket = {
+          ...reference,
+          admittedAt: file.retentionAcceptedAt.toISOString(),
+          notAfter: file.expiredAt.toISOString(),
+        };
+        assert.equal(isManagedFileReadTicket(ticket), true);
+        const task = await runtime.repository.cleanupForFile(actor, reference.fileId);
+        const representation = reference.representation;
+        return {
+          ...ticket,
+          sourceBindingSha256: buildManagedFileReadBinding(
+            {
+              owner: { tenantId: actor.tenantId, userId: actor.userId },
+              fileId: file.file_id,
+              operationId: file.uploadOperationId,
+              filename: file.filename,
+              mediaType: file.type,
+              source: file.source,
+              bytes: file.bytes,
+              storageKey: file.storageKey,
+              transferGeneration: null,
+              original: task.original,
+              approval: null,
+              representation,
+              ...(representation === 'preview'
+                ? { preview: { text: file.text, structure: null } }
+                : {}),
+            },
+            (value) => createHash('sha256').update(value, 'utf8').digest('hex'),
+          ),
+        };
+      }),
+      completeManagedFileRead: jest.fn(async (actor, claim, result) => {
+        assert.deepEqual(actor, principal);
+        assert.equal(claim.readId, readIds[result.representation]);
+        assert.equal(result.sourceBindingSha256, claim.sourceBindingSha256);
+        return { status: 'completed' };
+      }),
+      inspectManagedFileRead: jest.fn(),
+      abandonManagedFileRead: jest.fn(async () => undefined),
+    };
     app = buildApp(undefined, user);
   });
   afterEach(() => {
@@ -198,10 +295,13 @@ describe('Cortex managed File route wiring', () => {
     mockUploadRuntime = undefined;
   });
 
-  test.each(['/files/managed/operation', '/files/download/foreign-path-user/operation'])(
+  test.each(['/files/managed/operation', '/files/download/user-123/operation'])(
     'serves %s through the authenticated original owner',
     async (url) => {
-      const res = await request(app).get(url).set('Sec-Fetch-Site', 'same-origin');
+      const res = await request(app)
+        .get(url)
+        .set('Sec-Fetch-Site', 'same-origin')
+        .set('X-Cortex-File-Read', readIds.original);
       expect(res.status).toBe(200);
       expect(res.body.toString()).toBe('hello');
       expect(db.getFiles).toHaveBeenCalledWith(
@@ -211,9 +311,41 @@ describe('Cortex managed File route wiring', () => {
         1,
       );
       expect(db.getAgents).not.toHaveBeenCalled();
+      expect(mockUploadRuntime.fileReads.completeManagedFileRead).toHaveBeenCalledWith(
+        principal,
+        expect.objectContaining({ readId: readIds.original }),
+        expect.objectContaining({
+          representation: 'original',
+          verifiedBytes: 5,
+          contentSha256: createHash('sha256').update('hello').digest('hex'),
+        }),
+      );
       expect(res.headers['x-file-metadata']).not.toContain('private-key');
     },
   );
+
+  it('conceals a foreign download path before claiming a read or accessing content', async () => {
+    const res = await request(app)
+      .get('/files/download/foreign-path-user/operation')
+      .set('Sec-Fetch-Site', 'same-origin')
+      .set('X-Cortex-File-Read', readIds.original);
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ code: 'not_found' });
+    expect(mockUploadRuntime.fileReads.claimManagedFileRead).not.toHaveBeenCalled();
+    expect(mockUploadRuntime.storage.read).not.toHaveBeenCalled();
+    expect(db.getFiles).not.toHaveBeenCalled();
+    expect(res.headers['x-file-metadata']).toBeUndefined();
+  });
+
+  it('returns only ready status without a managed preview read ID', async () => {
+    const res = await request(app)
+      .get('/files/operation/preview')
+      .set('Sec-Fetch-Site', 'same-origin');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ file_id: 'operation', status: 'ready' });
+    expect(mockUploadRuntime.fileReads.claimManagedFileRead).not.toHaveBeenCalled();
+    expect(mockUploadRuntime.storage.read).not.toHaveBeenCalled();
+  });
 
   it('uses finite direct-URL fallback and the managed preview without legacy lazy mutation', async () => {
     const direct = await request(app)
@@ -223,7 +355,8 @@ describe('Cortex managed File route wiring', () => {
     expect(direct.body).toEqual({ code: 'authenticated_download_required' });
     const preview = await request(app)
       .get('/files/operation/preview')
-      .set('Sec-Fetch-Site', 'same-origin');
+      .set('Sec-Fetch-Site', 'same-origin')
+      .set('X-Cortex-File-Read', readIds.preview);
     expect(preview.body).toEqual({
       file_id: 'operation',
       status: 'ready',

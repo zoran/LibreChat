@@ -13,6 +13,11 @@ import type {
   UploadStorageReceipt,
 } from 'librechat-data-provider';
 import type { StoredUpload } from './uploadManagementStore';
+import {
+  uploadSecurityFixture,
+  uploadSecuritySettlementFixture,
+  bindUploadOriginalFixture,
+} from './uploadManagement.security.fixture';
 import { completeUnacceptedUploadCleanup } from './uploadManagement.structure.fixture';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createModels } from '~/models';
@@ -61,23 +66,23 @@ describe('bound technical Intake recovery using actual Mongo transactions', () =
     storageKey: `t/${lease.tenantId}/managed-uploads/${lease.userId}/${lease.operationId}.${lease.generation}__original`,
     integrity: { ...integrity, chunkSha256: [...integrity.chunkSha256] },
   });
-  const approval = (lease: UploadLease): UploadSecurityApproval => ({
-    version: 1,
-    decision: 'approved',
-    policySha256: policy,
-    subject: {
-      tenantId: lease.tenantId,
-      userId: lease.userId,
-      operationId: lease.operationId,
-      transferGeneration: lease.generation,
-      mediaType: 'text/plain',
-      bytes: 8,
-      sha256,
-    },
-    scannerVersion: 'explicit-simulated-scanner-fixture',
-    checkedAt: new Date(now).toISOString(),
-    coverage: { complete: true, pages: 1, parts: 1 },
-  });
+  const approval = (lease: UploadLease): UploadSecurityApproval =>
+    uploadSecurityFixture({
+      decision: 'approved',
+      policySha256: policy,
+      subject: {
+        tenantId: lease.tenantId,
+        userId: lease.userId,
+        operationId: lease.operationId,
+        transferGeneration: lease.generation,
+        mediaType: 'text/plain',
+        bytes: 8,
+        sha256,
+      },
+      scannerVersion: 'explicit-simulated-scanner-fixture',
+      checkedAt: new Date(now).toISOString(),
+      coverage: { complete: true, pages: 1, parts: 1 },
+    }).approval;
   const input = (lease: UploadLease): UploadPromotionInput => ({
     version: 1,
     promotionId,
@@ -169,20 +174,23 @@ describe('bound technical Intake recovery using actual Mongo transactions', () =
     await reserve();
     const lease = (await claim())!;
     if (scanned) {
-      const execution = {
-        version: 2 as const,
+      const execution = uploadSecurityFixture(approval(lease), {
         custody: { kind: 'none' as const },
         attemptId: `intake.${lease.generation}`,
         instanceId: '11111111-1111-4111-8111-111111111111',
         executionId: '22222222-2222-4222-8222-222222222222',
         expiresAt: new Date(now + 60_000).toISOString(),
-      };
+      }).execution;
       await first.bindSecurityExecution(lease, execution, now);
       await second.settleSecurityExecution(
         lease,
-        { execution, writerStopped: true, transientDataRemoved: true },
+        uploadSecuritySettlementFixture(execution, {
+          writerStopped: true,
+          transientDataRemoved: true,
+        }),
         now,
       );
+      await bindUploadOriginalFixture(first, lease, receipt(lease), approval(lease), now);
     }
     return lease;
   }
@@ -447,14 +455,13 @@ describe('bound technical Intake recovery using actual Mongo transactions', () =
 
   it('does not combine partial scanner receipts and can acknowledge the exact complete late scanner join', async () => {
     const lease = await transfer(false);
-    const execution = {
-      version: 2 as const,
+    const execution = uploadSecurityFixture(approval(lease), {
       custody: { kind: 'none' as const },
       attemptId: `intake.${lease.generation}`,
       instanceId: '11111111-1111-4111-8111-111111111111',
       executionId: '22222222-2222-4222-8222-222222222222',
       expiresAt: new Date(now + 60_000).toISOString(),
-    };
+    }).execution;
     await first.bindSecurityExecution(lease, execution, now);
     await seal(lease);
     for (const partial of [
@@ -466,7 +473,7 @@ describe('bound technical Intake recovery using actual Mongo transactions', () =
           binding(lease),
           {
             ...local(lease),
-            securitySettlement: { execution, ...partial },
+            securitySettlement: uploadSecuritySettlementFixture(execution, partial),
           },
           now,
         ),
@@ -482,11 +489,10 @@ describe('bound technical Intake recovery using actual Mongo transactions', () =
         binding(lease),
         {
           ...local(lease),
-          securitySettlement: {
-            execution: { ...execution, executionId: '33333333-3333-4333-8333-333333333333' },
-            writerStopped: true,
-            transientDataRemoved: true,
-          },
+          securitySettlement: uploadSecuritySettlementFixture(
+            { ...execution, executionId: '33333333-3333-4333-8333-333333333333' },
+            { writerStopped: true, transientDataRemoved: true },
+          ),
         },
         now,
       ),
@@ -496,7 +502,10 @@ describe('bound technical Intake recovery using actual Mongo transactions', () =
         binding(lease),
         {
           ...local(lease),
-          securitySettlement: { execution, writerStopped: true, transientDataRemoved: true },
+          securitySettlement: uploadSecuritySettlementFixture(execution, {
+            writerStopped: true,
+            transientDataRemoved: true,
+          }),
         },
         now + 60_001,
       ),

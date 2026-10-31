@@ -17,6 +17,7 @@ const express = require('express');
 const request = require('supertest');
 
 const originalDomainClient = process.env.DOMAIN_CLIENT;
+const originalAuthMode = process.env.AUTH_MODE;
 process.env.DOMAIN_CLIENT = 'http://client.test';
 
 const mockLogger = {
@@ -74,6 +75,7 @@ jest.mock('openid-client', () => ({
 }));
 
 jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
   logger: mockLogger,
 }));
 
@@ -85,6 +87,8 @@ jest.mock('librechat-data-provider', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  // Keep the public auth-mode gate real; each case selects its fixture mode.
+  ...jest.requireActual('@librechat/api'),
   buildOAuthFailureLog: (...args) => mockBuildOAuthFailureLog(...args),
   createOpenIDCallbackAuthenticator: (...args) => mockCreateOpenIDCallbackAuthenticator(...args),
   createSetBalanceConfig: jest.fn(() => (_req, _res, next) => next()),
@@ -117,6 +121,15 @@ jest.mock('~/server/services/Config', () => ({
   getAppConfig: jest.fn(),
 }));
 
+afterEach(() => {
+  if (originalAuthMode === undefined) {
+    delete process.env.AUTH_MODE;
+  } else {
+    process.env.AUTH_MODE = originalAuthMode;
+  }
+  jest.restoreAllMocks();
+});
+
 afterAll(() => {
   if (originalDomainClient === undefined) {
     delete process.env.DOMAIN_CLIENT;
@@ -147,6 +160,7 @@ function createApp(sessionMessages) {
 
 describe('OAuth route failure logging', () => {
   beforeEach(() => {
+    process.env.AUTH_MODE = 'default';
     mockLogger.warn.mockClear();
     mockLogger.error.mockClear();
     mockLogger.info.mockClear();
@@ -161,6 +175,19 @@ describe('OAuth route failure logging', () => {
     mockOpenIDCallbackAuthenticatorOptions = undefined;
     mockPassportAuthenticate.mockImplementation(() => (_req, _res, next) => next());
     mockOpenIDCallbackMiddleware.mockImplementation((_req, _res, next) => next());
+  });
+
+  it('keeps legacy OAuth routes closed when email-code authentication is selected', async () => {
+    process.env.AUTH_MODE = 'email_code';
+    const app = createApp();
+
+    await request(app)
+      .get('/oauth/openid/callback?code=secret-code')
+      .expect(404, { code: 'AUTH_MODE_DISABLED' });
+
+    expect(mockOpenIDCallbackMiddleware).not.toHaveBeenCalled();
+    expect(mockOAuthHandler).not.toHaveBeenCalled();
+    expect(mockMarkOAuthNavigation).not.toHaveBeenCalled();
   });
 
   it('marks OAuth requests as browser navigations so rejections can redirect', async () => {

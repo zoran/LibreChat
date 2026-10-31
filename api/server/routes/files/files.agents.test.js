@@ -3,8 +3,13 @@ const fs = require('fs').promises;
 const request = require('supertest');
 const mongoose = require('mongoose');
 const { v4: uuidv4 } = require('uuid');
-const { MongoMemoryServer } = require('mongodb-memory-server');
-const { createMethods, logger, SystemCapabilities } = require('@librechat/data-schemas');
+const { MongoMemoryReplSet } = require('mongodb-memory-server');
+const {
+  createMethods,
+  logger,
+  SystemCapabilities,
+  createHousekeepingStore,
+} = require('@librechat/data-schemas');
 const {
   SystemRoles,
   AccessRoleIds,
@@ -12,7 +17,16 @@ const {
   EToolResources,
   PrincipalType,
 } = require('librechat-data-provider');
-const { createAgent, createFile } = require('~/models');
+const { createAgent, createFile: persistFile } = require('~/models');
+
+/** Preserve real File retention admission and its transactional housekeeping projection. */
+const createFile = (data) =>
+  persistFile(data, false, {
+    retention: {
+      acceptedAt: new Date(),
+      expiredAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+    },
+  });
 
 // Only mock the external dependencies that we don't want to test
 jest.mock('~/server/services/Files/process', () => ({
@@ -92,6 +106,7 @@ describe('File Routes - Agent Files Endpoint', () => {
   let User;
   let Agent;
   let methods;
+  let housekeeping;
   let AclEntry;
   // eslint-disable-next-line no-unused-vars
   let AccessRole;
@@ -99,7 +114,10 @@ describe('File Routes - Agent Files Endpoint', () => {
   let modelsToCleanup = [];
 
   beforeAll(async () => {
-    mongoServer = await MongoMemoryServer.create({ instance: { launchTimeout: 30_000 } });
+    mongoServer = await MongoMemoryReplSet.create({
+      instanceOpts: [{ launchTimeout: 30_000 }],
+      replSet: { count: 1 },
+    });
     const mongoUri = mongoServer.getUri();
     await mongoose.connect(mongoUri);
 
@@ -123,6 +141,11 @@ describe('File Routes - Agent Files Endpoint', () => {
     User = models.User;
     AccessRole = models.AccessRole;
     SystemGrant = models.SystemGrant;
+
+    // Internal HK models belong to their store, not the public createModels registry.
+    housekeeping = createHousekeepingStore(mongoose);
+    modelsToCleanup.push(housekeeping.model.modelName);
+    await Promise.all([File.init(), housekeeping.initialize()]);
 
     // Seed default roles using our methods
     await methods.seedDefaultRoles();
@@ -166,6 +189,7 @@ describe('File Routes - Agent Files Endpoint', () => {
     await Agent.deleteMany({});
     await User.deleteMany({});
     await AclEntry.deleteMany({});
+    await housekeeping.model.deleteMany({});
     // Don't delete AccessRole as they are seeded defaults needed for tests
 
     // Create test users

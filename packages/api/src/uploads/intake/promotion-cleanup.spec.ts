@@ -7,6 +7,10 @@ import type {
 } from 'librechat-data-provider';
 import type { UploadAttemptSettlement } from '../contract';
 import type { UploadAttemptJournal } from '../attempts';
+import {
+  antivirusCustodyFixture,
+  antivirusApprovalFixture,
+} from '../security/antivirus-fixture.helper';
 import { settleUploadPromotionCleanup } from './promotion-cleanup';
 import { createUploadAttemptJournal } from '../attempts';
 
@@ -35,7 +39,31 @@ const promotion = (): UploadPromotionRecord => ({
   worker: { ...app },
   integrity: { ...integrity, chunkSha256: [...integrity.chunkSha256] },
   approval: {
-    version: 1,
+    version: 2,
+    antivirus: antivirusApprovalFixture(
+      {
+        version: 3,
+        custody: { kind: 'none' },
+        attemptId: 'operation.3',
+        instanceId: '11111111-1111-4111-8111-111111111111',
+        executionId: '22222222-2222-4222-8222-222222222222',
+        expiresAt: '2026-10-17T01:00:00.000Z',
+        antivirus: antivirusCustodyFixture(
+          {
+            tenantId: 'tenant',
+            userId: 'user',
+            operationId: 'operation',
+            transferGeneration: 3,
+            mediaType: 'text/plain',
+            bytes: 8,
+            sha256,
+          },
+          '2026-10-17T01:00:00.000Z',
+          Date.parse('2026-10-17T00:00:00.000Z'),
+        ),
+      },
+      Date.parse('2026-10-17T00:00:00.000Z'),
+    ),
     decision: 'approved',
     policySha256: 'b'.repeat(64),
     subject: {

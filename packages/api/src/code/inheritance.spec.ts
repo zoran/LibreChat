@@ -1,7 +1,7 @@
 import mongoose from 'mongoose';
 import { Tools } from 'librechat-data-provider';
 import { MongoMemoryServer } from 'mongodb-memory-server';
-import { agentSchema, createMethods } from '@librechat/data-schemas';
+import { createModels, createMethods } from '@librechat/data-schemas';
 import type { CodeWorkspaceSelection } from 'librechat-data-provider';
 import type { IAgent } from '@librechat/data-schemas';
 import type { CodeWorkspaceInheritanceRoot, SubagentCodeRoutingAgent } from './inheritance';
@@ -110,8 +110,8 @@ describe('resolveSubagentCodeWorkspaceInheritance', () => {
 
   beforeAll(async () => {
     mongoServer = await MongoMemoryServer.create();
-    if (!mongoose.models.Agent) mongoose.model('Agent', agentSchema);
     await mongoose.connect(mongoServer.getUri());
+    createModels(mongoose);
     methods = createMethods(mongoose);
   }, 20000);
 

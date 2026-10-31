@@ -2,6 +2,7 @@
 import mongoose from 'mongoose';
 import { createHash } from 'crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import { UPLOAD_AV_RECORD_BYTES } from 'librechat-data-provider';
 import type {
   UploadAdmissionCommand,
   UploadLease,
@@ -9,6 +10,11 @@ import type {
   UploadSecurityApproval,
 } from 'librechat-data-provider';
 import type { GlobalState } from './uploadManagementStore';
+import {
+  uploadSecurityFixture,
+  uploadSecuritySettlementFixture,
+  bindUploadOriginalFixture,
+} from './uploadManagement.security.fixture';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createModels } from '~/models';
 
@@ -57,23 +63,23 @@ describe('durable upload admission pause', () => {
       chunkSha256: [originalSha256],
     },
   });
-  const approval = (lease: UploadLease, now: number): UploadSecurityApproval => ({
-    version: 1,
-    decision: 'approved',
-    policySha256: securityPolicySha256,
-    subject: {
-      tenantId: lease.tenantId,
-      userId: lease.userId,
-      operationId: lease.operationId,
-      transferGeneration: lease.generation,
-      mediaType: 'text/plain',
-      bytes: original.length,
-      sha256: originalSha256,
-    },
-    scannerVersion: 'simulated-admission-fixture-v1',
-    checkedAt: new Date(now).toISOString(),
-    coverage: { complete: true, pages: 1, parts: 1 },
-  });
+  const approval = (lease: UploadLease, now: number): UploadSecurityApproval =>
+    uploadSecurityFixture({
+      decision: 'approved',
+      policySha256: securityPolicySha256,
+      subject: {
+        tenantId: lease.tenantId,
+        userId: lease.userId,
+        operationId: lease.operationId,
+        transferGeneration: lease.generation,
+        mediaType: 'text/plain',
+        bytes: original.length,
+        sha256: originalSha256,
+      },
+      scannerVersion: 'simulated-admission-fixture-v1',
+      checkedAt: new Date(now).toISOString(),
+      coverage: { complete: true, pages: 1, parts: 1 },
+    }).approval;
   const documentResult = (text: string, bytes = 8) => ({
     text,
     writerStopped: true as const,
@@ -105,20 +111,23 @@ describe('durable upload admission pause', () => {
   });
 
   async function completeScanner(lease: UploadLease, at: number) {
-    const execution = {
-      version: 2 as const,
+    const execution = uploadSecurityFixture(approval(lease, at), {
       custody: { kind: 'none' as const },
       attemptId: `${lease.operationId}.${lease.generation}`,
       instanceId: '11111111-1111-4111-8111-111111111111',
       executionId: '22222222-2222-4222-8222-222222222222',
       expiresAt: new Date(at + 60_000).toISOString(),
-    };
+    }).execution;
     await first.bindSecurityExecution(lease, execution, at);
     await second.settleSecurityExecution(
       lease,
-      { execution, writerStopped: true, transientDataRemoved: true },
+      uploadSecuritySettlementFixture(execution, {
+        writerStopped: true,
+        transientDataRemoved: true,
+      }),
       at,
     );
+    await bindUploadOriginalFixture(first, lease, receipt(lease), approval(lease, at), at);
   }
 
   beforeAll(async () => {
@@ -520,17 +529,38 @@ describe('durable upload admission pause', () => {
     const input = { receipt: seal, baseline, lifecycleReconciled: true as const };
     await target.completeImport(input);
     await expect(target.completeImport(input)).resolves.toBeUndefined();
-    const execution = {
-      version: 2,
-      custody: { kind: 'none' },
-      attemptId: 'current-fixture.1',
-      instanceId: '11111111-1111-4111-8111-111111111111',
-      executionId: '22222222-2222-4222-8222-222222222222',
-      expiresAt: '2099-01-01T00:00:00.000Z',
-    };
-    const settlement = { execution, writerStopped: true, transientDataRemoved: true };
+    const execution = uploadSecurityFixture(
+      {
+        decision: 'approved',
+        policySha256: securityPolicySha256,
+        subject: {
+          tenantId: user.tenantId,
+          userId: user.userId,
+          operationId: 'current-fixture',
+          transferGeneration: 1,
+          mediaType: 'text/plain',
+          bytes: 8,
+          sha256: 'a'.repeat(64),
+        },
+        scannerVersion: 'current-cutover-fixture',
+        checkedAt: new Date(Date.now()).toISOString(),
+        coverage: { complete: true, pages: 1, parts: 1 },
+      },
+      {
+        custody: { kind: 'none' },
+        attemptId: 'current-fixture.1',
+        instanceId: '11111111-1111-4111-8111-111111111111',
+        executionId: '22222222-2222-4222-8222-222222222222',
+        expiresAt: '2099-01-01T00:00:00.000Z',
+      },
+    ).execution;
+    const settlement = uploadSecuritySettlementFixture(execution, {
+      writerStopped: true,
+      transientDataRemoved: true,
+    });
     const currentRecord = {
       _id: 'current-fixture',
+      recordBytes: UPLOAD_AV_RECORD_BYTES,
       tenantId: user.tenantId,
       userId: user.userId,
       idempotencyKey: fixtureKey('current-fixture'),

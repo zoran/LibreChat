@@ -27,6 +27,7 @@ module.exports = {
   maxWorkers,
   testTimeout: 30000, // 30 seconds timeout for all tests
   setupFiles: ['./test/jestSetup.js', './test/__mocks__/logger.js'],
+  setupFilesAfterEnv: ['<rootDir>/../packages/api/jest.setup.cjs'],
   moduleNameMapper: {
     '^~/config/winston$': '<rootDir>/../packages/data-schemas/src/config/winston.ts',
     '~/(.*)': '<rootDir>/$1',

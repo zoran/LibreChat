@@ -21,6 +21,7 @@ jest.mock('~/server/services/Config', () => ({
 }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   provisionSocialUser: jest.requireActual('@librechat/api').provisionSocialUser,
   getBalanceConfig: jest.fn(() => ({
     enabled: false,
@@ -30,11 +31,17 @@ jest.mock('@librechat/api', () => ({
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
 const { resizeAvatar } = require('~/server/services/Files/images/avatar');
 const { updateUser, getUserById, createUserIfAbsent } = require('~/models');
+const { authPersistence, authWrite } = require('~/server/services/LegacyAuthMaintenance');
 
 describe('handleExistingUser', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     process.env.CDN_PROVIDER = FileSources.local;
+  });
+
+  it('retains the exact immutable Auth persistence owner used by user updates', () => {
+    expect(Object.isFrozen(authPersistence)).toBe(true);
+    expect(authPersistence.write).toBe(authWrite);
   });
 
   it('should not process the avatar when the provider supplies no avatarUrl (local storage)', async () => {
@@ -73,7 +80,13 @@ describe('handleExistingUser', () => {
     await handleExistingUser(oldUser, null, undefined, 'new@example.com');
 
     expect(resizeAvatar).not.toHaveBeenCalled();
-    expect(updateUser).toHaveBeenCalledWith('user123', { email: 'new@example.com' });
+    expect(updateUser).toHaveBeenCalledWith(
+      'user123',
+      { email: 'new@example.com' },
+      undefined,
+      undefined,
+      authPersistence,
+    );
   });
 
   it('should handle null avatar without throwing error', async () => {
@@ -85,7 +98,13 @@ describe('handleExistingUser', () => {
 
     await handleExistingUser(oldUser, avatarUrl);
 
-    expect(updateUser).toHaveBeenCalledWith('user123', { avatar: avatarUrl });
+    expect(updateUser).toHaveBeenCalledWith(
+      'user123',
+      { avatar: avatarUrl },
+      undefined,
+      undefined,
+      authPersistence,
+    );
   });
 
   it('should handle undefined avatar without throwing error', async () => {
@@ -97,7 +116,13 @@ describe('handleExistingUser', () => {
 
     await handleExistingUser(oldUser, avatarUrl);
 
-    expect(updateUser).toHaveBeenCalledWith('user123', { avatar: avatarUrl });
+    expect(updateUser).toHaveBeenCalledWith(
+      'user123',
+      { avatar: avatarUrl },
+      undefined,
+      undefined,
+      authPersistence,
+    );
   });
 
   it('should not update avatar if it has manual=true flag', async () => {
@@ -121,7 +146,13 @@ describe('handleExistingUser', () => {
 
     await handleExistingUser(oldUser, avatarUrl);
 
-    expect(updateUser).toHaveBeenCalledWith('user123', { avatar: avatarUrl });
+    expect(updateUser).toHaveBeenCalledWith(
+      'user123',
+      { avatar: avatarUrl },
+      undefined,
+      undefined,
+      authPersistence,
+    );
   });
 
   it('should process avatar for non-local storage', async () => {
@@ -148,7 +179,13 @@ describe('handleExistingUser', () => {
       userId: 'user123',
       manual: 'false',
     });
-    expect(updateUser).toHaveBeenCalledWith('user123', { avatar: 'processed-avatar-url' });
+    expect(updateUser).toHaveBeenCalledWith(
+      'user123',
+      { avatar: 'processed-avatar-url' },
+      undefined,
+      undefined,
+      authPersistence,
+    );
   });
 
   it('should not update if avatar already has manual flag in non-local storage', async () => {
@@ -175,7 +212,13 @@ describe('handleExistingUser', () => {
 
     await handleExistingUser(oldUser, avatarUrl);
 
-    expect(updateUser).toHaveBeenCalledWith('user123', { avatar: avatarUrl });
+    expect(updateUser).toHaveBeenCalledWith(
+      'user123',
+      { avatar: avatarUrl },
+      undefined,
+      undefined,
+      authPersistence,
+    );
   });
 
   it('should handle empty string avatar', async () => {
@@ -187,7 +230,13 @@ describe('handleExistingUser', () => {
 
     await handleExistingUser(oldUser, avatarUrl);
 
-    expect(updateUser).toHaveBeenCalledWith('user123', { avatar: avatarUrl });
+    expect(updateUser).toHaveBeenCalledWith(
+      'user123',
+      { avatar: avatarUrl },
+      undefined,
+      undefined,
+      authPersistence,
+    );
   });
 
   it('should handle avatar with manual=false parameter', async () => {
@@ -199,7 +248,13 @@ describe('handleExistingUser', () => {
 
     await handleExistingUser(oldUser, avatarUrl);
 
-    expect(updateUser).toHaveBeenCalledWith('user123', { avatar: avatarUrl });
+    expect(updateUser).toHaveBeenCalledWith(
+      'user123',
+      { avatar: avatarUrl },
+      undefined,
+      undefined,
+      authPersistence,
+    );
   });
 
   it('should handle oldUser being null gracefully', async () => {
@@ -220,7 +275,13 @@ describe('handleExistingUser', () => {
 
     await handleExistingUser(oldUser, avatarUrl, {}, newEmail);
 
-    expect(updateUser).toHaveBeenCalledWith('user123', { email: 'new@example.com' });
+    expect(updateUser).toHaveBeenCalledWith(
+      'user123',
+      { email: 'new@example.com' },
+      undefined,
+      undefined,
+      authPersistence,
+    );
   });
 
   it('should update both avatar and email when both have changed', async () => {
@@ -234,10 +295,16 @@ describe('handleExistingUser', () => {
 
     await handleExistingUser(oldUser, avatarUrl, {}, newEmail);
 
-    expect(updateUser).toHaveBeenCalledWith('user123', {
-      avatar: avatarUrl,
-      email: 'new@example.com',
-    });
+    expect(updateUser).toHaveBeenCalledWith(
+      'user123',
+      {
+        avatar: avatarUrl,
+        email: 'new@example.com',
+      },
+      undefined,
+      undefined,
+      authPersistence,
+    );
   });
 
   it('should not update email when it has not changed', async () => {
@@ -265,7 +332,13 @@ describe('handleExistingUser', () => {
 
     await handleExistingUser(oldUser, avatarUrl, {}, newEmailWithSpaces);
 
-    expect(updateUser).toHaveBeenCalledWith('user123', { email: 'newemail@example.com' });
+    expect(updateUser).toHaveBeenCalledWith(
+      'user123',
+      { email: 'newemail@example.com' },
+      undefined,
+      undefined,
+      authPersistence,
+    );
   });
 
   it('should not update when email parameter is not provided', async () => {
@@ -347,7 +420,13 @@ describe('createSocialUser', () => {
       });
 
       expect(user).toBe(winner);
-      expect(updateUser).toHaveBeenCalledWith('winner-id', { email: 'user@example.com' });
+      expect(updateUser).toHaveBeenCalledWith(
+        'winner-id',
+        { email: 'user@example.com' },
+        undefined,
+        undefined,
+        authPersistence,
+      );
       expect(getUserById).not.toHaveBeenCalled();
     });
 

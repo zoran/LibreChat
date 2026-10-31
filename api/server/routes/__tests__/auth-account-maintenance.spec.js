@@ -1,9 +1,16 @@
+/** Runtime fixture identities are shared by their producers and assertions. */
+const mockRandomUUID = require('node:crypto').randomUUID;
+const mockPassword1 = `Fixture-${mockRandomUUID()}-17!`;
+
 /** Actual account routes, services, data methods and maintenance owner against an isolated Mongo. */
-const mongoose = require('mongoose');
+const mockMongoose = jest.requireActual('mongoose');
+const mongoose = mockMongoose;
+// Keep the actual connected Mongoose owner when module isolation refreshes Auth and cache.
+jest.mock('mongoose', () => mockMongoose);
 const request = require('supertest');
 const express = require('express');
 const bcrypt = require('bcryptjs');
-const { MongoMemoryServer } = require('mongodb-memory-server');
+const { MongoMemoryReplSet } = require('mongodb-memory-server');
 const schemas = require('@librechat/data-schemas');
 const mockApi = jest.requireActual('@librechat/api');
 
@@ -15,9 +22,7 @@ jest.mock('~/models', () => ({
   }),
 }));
 jest.mock('@librechat/api', () => ({
-  ...mockApi,
-  ...jest.requireActual('../../../../packages/api/src/auth/maintenance.ts'),
-  ...jest.requireActual('../../../../packages/api/src/auth/sessionMaintenance.ts'),
+  ...jest.requireActual('@librechat/api'),
   checkEmailConfig: jest.fn(() => false),
 }));
 jest.mock('~/server/services/Config/app', () => ({
@@ -89,8 +94,9 @@ let invite;
 const cacheMode = process.env.AUTH_USER_CACHE_MODE;
 
 beforeAll(async () => {
-  mongo = await MongoMemoryServer.create();
+  mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
   await mongoose.connect(mongo.getUri());
+  schemas.createModels(mongoose);
   User = mongoose.models.User || mongoose.model('User', schemas.userSchema);
   Token = mongoose.models.Token || mongoose.model('Token', schemas.tokenSchema);
   Balance = mongoose.models.Balance || mongoose.model('Balance', schemas.balanceSchema);
@@ -109,6 +115,7 @@ beforeEach(async () => {
   process.env.AUTH_USER_CACHE_MODE = 'off';
   invite = undefined;
   mockCache = { get: jest.fn(async () => undefined), delete: jest.fn(async () => true) };
+  jest.resetModules();
   jest.isolateModules(() => {
     ({ checkEmailConfig } = require('@librechat/api'));
     owner = require('~/server/services/LegacyAuthMaintenance').legacyAuthMaintenance;
@@ -346,7 +353,7 @@ test.each(['invite consumption', 'reset session removal'])(
       });
       model = mongoose.models.Session;
       path = '/auth/resetPassword';
-      body = { userId: user.id, token: 'fixture-reset', password: 'ChangedFixturePassword17!' };
+      body = { userId: user.id, token: 'fixture-reset', password: mockPassword1 };
     }
     const remove = model.deleteMany.bind(model);
     jest.spyOn(model, 'deleteMany').mockImplementation((...args) => {

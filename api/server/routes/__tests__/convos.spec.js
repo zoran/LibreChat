@@ -269,6 +269,8 @@ describe('Convos Routes', () => {
       expect(response.status).toBe(201);
       expect(importConversations).toHaveBeenCalledWith({
         filepath: '/tmp/test-file.json',
+        onCleanupFailure: require('~/server/services/HistoryMaintenance').historyMaintenance
+          .markUncertain,
         requestUserId: 'test-user-123',
         userRole: 'USER',
         interfaceConfig: undefined,
@@ -2082,9 +2084,14 @@ describe('Convos Routes', () => {
     it('delegates rename semantics to the injected TypeScript handler', async () => {
       const { renameConversationHandler, renameHandlerInputs } = require(MOCKS);
       const arg = { conversationId: 'running-rename', title: 'Renamed' };
+      const current = { conversationId: arg.conversationId, title: 'Original' };
+      const reads = [];
+      getConvo.mockResolvedValueOnce(current);
       saveConvo.mockResolvedValueOnce(arg);
       renameConversationHandler.mockImplementationOnce(async (req, res) => {
-        await renameHandlerInputs.at(-1).saveConvo(req, arg);
+        const inputs = renameHandlerInputs.at(-1);
+        reads.push(await inputs.getConvo(req.user.id, arg.conversationId));
+        await inputs.saveConvo(req, arg);
         res.status(204).end();
       });
       expect((await request(app).post('/api/convos/update').send({ arg })).status).toBe(204);
@@ -2097,10 +2104,13 @@ describe('Convos Routes', () => {
         expect.anything(),
       );
       expect(saveConvo).toHaveBeenCalledWith(expect.objectContaining({ body: { arg } }), arg);
+      expect(getConvo).toHaveBeenCalledWith('test-user-123', arg.conversationId);
+      expect(reads).toEqual([current]);
+      expect(renameHandlerInputs.at(-1).getConvo).not.toBe(getConvo);
       expect(renameHandlerInputs.at(-1)).toEqual(
         expect.objectContaining({
           saveConvo: expect.any(Function),
-          getConvo,
+          getConvo: expect.any(Function),
           getActiveRunIds: expect.any(Function),
           logger: expect.anything(),
         }),

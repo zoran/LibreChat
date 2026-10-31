@@ -1,5 +1,18 @@
-jest.mock('~/strategies/openidStrategy');
-jest.mock('~/cache/getLogStores');
+/** Runtime fixture identities are shared by their producers and assertions. */
+const mockRandomUUID = require('node:crypto').randomUUID;
+const mockAccessToken1 = mockRandomUUID();
+const mockAccessToken2 = mockRandomUUID();
+const mockAccessToken3 = mockRandomUUID();
+const mockAccessToken4 = mockRandomUUID();
+const mockAccessToken5 = mockRandomUUID();
+const mockAccessToken6 = mockRandomUUID();
+
+// Auto-mock metadata uses an isolated registry without the initialized model graph.
+jest.mock('~/strategies/openidStrategy', () => ({
+  ...jest.requireActual('~/strategies/openidStrategy'),
+  getOpenIdConfig: jest.fn(),
+}));
+jest.mock('~/cache/getLogStores', () => jest.fn());
 jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
   logger: {
@@ -45,7 +58,7 @@ describe('OboTokenService', () => {
     getOpenIdConfig.mockReturnValue(mockOpenIdConfig);
 
     client.genericGrantRequest.mockResolvedValue({
-      access_token: 'exchanged-obo-token',
+      access_token: mockAccessToken1,
       expires_in: 3600,
     });
   });
@@ -81,7 +94,7 @@ describe('OboTokenService', () => {
   describe('cache behavior', () => {
     it('should return cached token when fromCache is true and cache hit', async () => {
       const cachedToken = {
-        access_token: 'cached-obo-token',
+        access_token: mockAccessToken2,
         token_type: 'Bearer',
         expires_in: 1800,
         expires_at: Date.now() + 1800 * 1000,
@@ -105,7 +118,7 @@ describe('OboTokenService', () => {
 
     it('should ignore legacy cached tokens without absolute expiry', async () => {
       const cachedToken = {
-        access_token: 'cached-obo-token',
+        access_token: mockAccessToken2,
         token_type: 'Bearer',
         expires_in: 1800,
         scope: 'api://mcp-server/Scope.Read',
@@ -119,13 +132,13 @@ describe('OboTokenService', () => {
         true,
       );
 
-      expect(result.access_token).toBe('exchanged-obo-token');
+      expect(result.access_token).toBe(mockAccessToken1);
       expect(client.genericGrantRequest).toHaveBeenCalledTimes(1);
       expect(mockTokensCache.set).toHaveBeenCalledTimes(1);
     });
 
     it('should skip cache when fromCache is false', async () => {
-      const cachedToken = { access_token: 'cached-obo-token' };
+      const cachedToken = { access_token: mockAccessToken2 };
       mockTokensCache.get.mockResolvedValue(cachedToken);
 
       const result = await exchangeOboToken(
@@ -137,7 +150,7 @@ describe('OboTokenService', () => {
 
       expect(mockTokensCache.get).not.toHaveBeenCalled();
       expect(client.genericGrantRequest).toHaveBeenCalled();
-      expect(result.access_token).toBe('exchanged-obo-token');
+      expect(result.access_token).toBe(mockAccessToken1);
     });
 
     it('should default fromCache to true', async () => {
@@ -174,7 +187,7 @@ describe('OboTokenService', () => {
       );
 
       expect(result).toEqual({
-        access_token: 'exchanged-obo-token',
+        access_token: mockAccessToken1,
         token_type: 'Bearer',
         expires_in: 3600,
         expires_at: expect.any(Number),
@@ -232,7 +245,7 @@ describe('OboTokenService', () => {
 
     it('should keep a positive TTL for very short-lived tokens', async () => {
       client.genericGrantRequest.mockResolvedValue({
-        access_token: 'short-lived-token',
+        access_token: mockAccessToken3,
         expires_in: 10,
       });
 
@@ -241,7 +254,7 @@ describe('OboTokenService', () => {
       expect(result.expires_in).toBe(10);
       expect(mockTokensCache.set).toHaveBeenCalledWith(
         expectedCacheKey(mockUser, 'access-token', 'api://scope'),
-        expect.objectContaining({ access_token: 'short-lived-token', expires_in: 10 }),
+        expect.objectContaining({ access_token: mockAccessToken3, expires_in: 10 }),
         1000,
       );
     });
@@ -265,7 +278,7 @@ describe('OboTokenService', () => {
 
       try {
         client.genericGrantRequest.mockRejectedValueOnce(transientError).mockResolvedValueOnce({
-          access_token: 'retried-obo-token',
+          access_token: mockAccessToken4,
           expires_in: 1800,
         });
 
@@ -273,7 +286,7 @@ describe('OboTokenService', () => {
 
         expect(client.genericGrantRequest).toHaveBeenCalledTimes(2);
         expect(result).toEqual({
-          access_token: 'retried-obo-token',
+          access_token: mockAccessToken4,
           token_type: 'Bearer',
           expires_in: 1800,
           expires_at: expect.any(Number),
@@ -427,11 +440,11 @@ describe('OboTokenService', () => {
       await flushMicrotasks();
       expect(client.genericGrantRequest).toHaveBeenCalledTimes(1);
 
-      resolveGrant({ access_token: 'shared-obo-token', expires_in: 3600 });
+      resolveGrant({ access_token: mockAccessToken5, expires_in: 3600 });
 
       const [resultA, resultB] = await Promise.all([callA, callB]);
       expect(resultA).toEqual(resultB);
-      expect(resultA.access_token).toBe('shared-obo-token');
+      expect(resultA.access_token).toBe(mockAccessToken5);
       expect(client.genericGrantRequest).toHaveBeenCalledTimes(1);
       expect(mockTokensCache.set).toHaveBeenCalledTimes(1);
     });
@@ -486,7 +499,7 @@ describe('OboTokenService', () => {
             resolveFirst = resolve;
           }),
         )
-        .mockResolvedValueOnce({ access_token: 'forced-fresh-token', expires_in: 3600 });
+        .mockResolvedValueOnce({ access_token: mockAccessToken6, expires_in: 3600 });
 
       const callA = exchangeOboToken(mockUser, 'access-token', 'api://scope', true);
       await flushMicrotasks();
@@ -498,7 +511,7 @@ describe('OboTokenService', () => {
 
       const [resultA, resultB] = await Promise.all([callA, callB]);
       expect(resultA.access_token).toBe('in-flight-token');
-      expect(resultB.access_token).toBe('forced-fresh-token');
+      expect(resultB.access_token).toBe(mockAccessToken6);
     });
   });
 });

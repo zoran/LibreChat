@@ -18,8 +18,7 @@ const mockAcknowledge2FASetup = jest.fn((req, res) => res.status(204).end());
 const mockFinalize2FASetup = jest.fn((req, res) => res.status(204).end());
 
 jest.mock('@librechat/api', () => ({
-  ...jest.requireActual('../../../packages/api/src/auth/maintenance.ts'),
-  ...jest.requireActual('../../../packages/api/src/auth/sessionMaintenance.ts'),
+  ...jest.requireActual('@librechat/api'),
   createBrowserAuth: () => {
     const pass = (_req, _res, next) => next();
     return { forget: pass, refresh: pass, bootstrap: pass, reset: pass };

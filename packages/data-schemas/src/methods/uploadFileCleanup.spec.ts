@@ -2,12 +2,17 @@
 import mongoose from 'mongoose';
 import { createHash, randomUUID } from 'node:crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
-import { UPLOAD_RECORD_BYTES, canonicalStorageDeletionReceipt } from 'librechat-data-provider';
+import { UPLOAD_AV_RECORD_BYTES, canonicalStorageDeletionReceipt } from 'librechat-data-provider';
 import type { UploadLease } from 'librechat-data-provider';
 import type { StoredUpload, CounterRow, GlobalState } from './uploadManagementStore';
 import type { FileCleanupProgressResult } from '../types/fileCleanup';
 import type { JobClaim } from '../types/housekeeping';
 import type { IMongoFile } from '../types/file';
+import {
+  uploadSecurityFixture,
+  bindUploadOriginalFixture,
+  uploadSecuritySettlementFixture,
+} from './uploadManagement.security.fixture';
 import {
   prepareNonemptyFileCleanup,
   proveLiteralActorClosure,
@@ -135,20 +140,6 @@ describe('accepted File to Upload accounting owner join', () => {
       worker,
       now,
     }))!;
-    const execution = {
-      version: 2 as const,
-      custody: { kind: 'none' as const },
-      attemptId: `original.${lease.generation}`,
-      instanceId: randomUUID(),
-      executionId: randomUUID(),
-      expiresAt: new Date(now + 60000).toISOString(),
-    };
-    await repository.bindSecurityExecution(lease, execution, now);
-    await repository.settleSecurityExecution(
-      lease,
-      { execution, writerStopped: true, transientDataRemoved: true },
-      now,
-    );
     const receipt = {
       outcome: 'durable' as const,
       source: 's3',
@@ -163,8 +154,43 @@ describe('accepted File to Upload accounting owner join', () => {
         chunkSha256: ['b'.repeat(64)],
       },
     };
-    const approval = {
-      version: 1 as const,
+    const security = uploadSecurityFixture(
+      uploadSecurityFixture({
+        decision: 'approved' as const,
+        policySha256: policy,
+        subject: {
+          tenantId: user.tenantId,
+          userId: user.userId,
+          operationId: 'original',
+          transferGeneration: lease.generation,
+          mediaType: 'text/plain',
+          bytes: 8,
+          sha256: receipt.integrity.sha256,
+        },
+        scannerVersion: 'explicit-fixture',
+        checkedAt: new Date(now).toISOString(),
+        coverage: { complete: true as const, pages: 1, parts: 1 },
+      }).approval,
+      {
+        custody: { kind: 'none' as const },
+        attemptId: `original.${lease.generation}`,
+        instanceId: randomUUID(),
+        executionId: randomUUID(),
+        expiresAt: new Date(now + 60000).toISOString(),
+      },
+    );
+    const execution = security.execution;
+    await repository.bindSecurityExecution(lease, execution, now);
+    await repository.settleSecurityExecution(
+      lease,
+      uploadSecuritySettlementFixture(execution, {
+        writerStopped: true,
+        transientDataRemoved: true,
+      }),
+      now,
+    );
+
+    const approval = uploadSecurityFixture({
       decision: 'approved' as const,
       policySha256: policy,
       subject: {
@@ -179,7 +205,7 @@ describe('accepted File to Upload accounting owner join', () => {
       scannerVersion: 'explicit-fixture',
       checkedAt: new Date(now).toISOString(),
       coverage: { complete: true as const, pages: 1, parts: 1 },
-    };
+    }).approval;
     // Actual promotion custody, independently settled from the Intake writer.
     const app = { hostId: 'app-host', instanceId: 'app-writer' },
       promotionId = randomUUID();
@@ -207,6 +233,7 @@ describe('accepted File to Upload accounting owner join', () => {
       },
       now,
     );
+    await bindUploadOriginalFixture(repository, lease, receipt, approval, now);
     await repository.accept(user, lease, receipt, approval, { filename: 'file.txt' }, now);
     await repository.confirmCleanup(
       {
@@ -352,7 +379,7 @@ describe('accepted File to Upload accounting owner join', () => {
       originalRemoved: true,
       textRemoved: true,
       cleanupPending: false,
-      recordBytes: UPLOAD_RECORD_BYTES,
+      recordBytes: UPLOAD_AV_RECORD_BYTES,
     });
     expect(await totals()).toMatchObject({
       originalBytes: before.originalBytes - 8,
@@ -662,10 +689,10 @@ describe('accepted File to Upload accounting owner join', () => {
           : {}),
       },
     };
-    const room = UPLOAD_RECORD_BYTES - mongoose.mongo.BSON.calculateObjectSize(future);
+    const room = source.recordBytes - mongoose.mongo.BSON.calculateObjectSize(future);
     expect(room).toBeGreaterThan(20000);
     source.filename = 'x'.repeat(room + 1);
-    expect(mongoose.mongo.BSON.calculateObjectSize(source)).toBeLessThan(UPLOAD_RECORD_BYTES);
+    expect(mongoose.mongo.BSON.calculateObjectSize(source)).toBeLessThan(source.recordBytes);
     await db.connection
       .db!.collection<StoredUpload>(db.models.UploadOperation.collection.name)
       .updateOne({ _id: 'original' }, { $set: { filename: source.filename } });

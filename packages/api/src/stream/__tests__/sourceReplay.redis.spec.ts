@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import {
   exerciseSourceMetadataPrefix,
   exercisePreboundSourceFailure,
-} from './sourceReplaySequence.fixture';
+} from './sourceReplaySequence.helper';
 import { createSourceReplayIntent, SOURCE_REPLAY_LIMITS } from '../internal/sourceBudget';
 import { RedisJobStore } from '../implementations/RedisJobStore';
 

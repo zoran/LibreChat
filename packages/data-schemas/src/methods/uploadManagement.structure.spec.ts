@@ -10,6 +10,7 @@ import {
   completeAcceptedUploadFileCleanup,
 } from './uploadManagement.structure.fixture';
 import { createUploadStore, hasValidUploadPublicationTime } from './uploadManagementStore';
+import { uploadSecuritySettlementFixture } from './uploadManagement.security.fixture';
 import { createUploadActivationMethods } from './uploadManagementActivation';
 import { captureManagedRetrievalInventoryEvidence } from './fileRetrieval';
 import { projectFileHousekeeping } from './fileHousekeepingProjection';
@@ -168,7 +169,9 @@ describe('original-bound managed document structure', () => {
               .session(session)
               .lean<StoredUpload>())!;
             const file = (await db.models.File.findOne({ file_id: 'structure' })
-              .select('+securityApproval +retentionActivity +retrievalCreation')
+              .select(
+                '+securityApproval +originalWriteBinding +retentionActivity +retrievalCreation',
+              )
               .session(session)
               .lean<IMongoFile>())!;
             if (
@@ -183,7 +186,11 @@ describe('original-bound managed document structure', () => {
               !row.securityApproval ||
               !row.securityExecution ||
               !row.securitySettlement ||
-              !row.parserExecution
+              !row.parserExecution ||
+              row.securityApproval.version !== 2 ||
+              row.securityExecution.version !== 3 ||
+              !row.writeBinding ||
+              !file.originalWriteBinding
             )
               throw Error('Expected complete published fixture clocks');
             expect(row).toMatchObject({ state: 'ready', stagingHeld: false, writerStopped: true });
@@ -194,26 +201,38 @@ describe('original-bound managed document structure', () => {
             expect(validFileRetentionActivity(file.retentionActivity, file.expiredAt)).toBe(true);
             const date = (value: Date) => new Date(value.getTime() - historyShift);
             const iso = (value: string) => date(new Date(value)).toISOString();
+            const antivirus = {
+              ...row.securityExecution.antivirus,
+              dailyPublishedAt: iso(row.securityExecution.antivirus.dailyPublishedAt),
+              expiresAt: iso(row.securityExecution.antivirus.expiresAt),
+            };
+            const execution = {
+              ...row.securityExecution,
+              expiresAt: iso(row.securityExecution.expiresAt),
+              antivirus,
+            };
+            const securityApproval = {
+              ...row.securityApproval,
+              checkedAt: iso(row.securityApproval.checkedAt),
+              antivirus: {
+                ...row.securityApproval.antivirus,
+                custody: antivirus,
+                readyObservedAt: iso(row.securityApproval.antivirus.readyObservedAt),
+                cleanAt: iso(row.securityApproval.antivirus.cleanAt),
+              },
+            };
             const aged: StoredUpload = {
               ...row,
               createdAt: row.createdAt - historyShift,
               acceptedAt: row.acceptedAt - historyShift,
               expiresAt: row.expiresAt - historyShift,
               firstPublishedAtMs: row.firstPublishedAtMs - historyShift,
-              securityApproval: {
-                ...row.securityApproval,
-                checkedAt: iso(row.securityApproval.checkedAt),
-              },
-              securityExecution: {
-                ...row.securityExecution,
-                expiresAt: iso(row.securityExecution.expiresAt),
-              },
-              securitySettlement: {
-                ...row.securitySettlement,
-                execution: {
-                  ...row.securitySettlement.execution,
-                  expiresAt: iso(row.securitySettlement.execution.expiresAt),
-                },
+              securityApproval,
+              securityExecution: execution,
+              securitySettlement: uploadSecuritySettlementFixture(execution),
+              writeBinding: {
+                ...row.writeBinding,
+                originalDeadline: iso(row.writeBinding.originalDeadline),
               },
               parserExecution: {
                 ...row.parserExecution,
@@ -235,9 +254,10 @@ describe('original-bound managed document structure', () => {
               retentionAcceptedAt: date(file.retentionAcceptedAt),
               expiredAt: date(file.expiredAt),
               retentionActivity: activity,
-              securityApproval: {
-                ...file.securityApproval,
-                checkedAt: iso(file.securityApproval.checkedAt),
+              securityApproval,
+              originalWriteBinding: {
+                ...file.originalWriteBinding,
+                originalDeadline: iso(file.originalWriteBinding.originalDeadline),
               },
               retrievalCreation: {
                 ...file.retrievalCreation,
@@ -284,6 +304,7 @@ describe('original-bound managed document structure', () => {
                   expiredAt: next.expiredAt,
                   retentionActivity: next.retentionActivity,
                   securityApproval: next.securityApproval,
+                  originalWriteBinding: next.originalWriteBinding,
                   retrievalCreation: next.retrievalCreation,
                   createdAt: next.createdAt,
                   updatedAt: next.updatedAt,

@@ -24,6 +24,7 @@ import type {
 } from 'librechat-data-provider';
 import type { Request, RequestHandler } from 'express';
 import type { RawUploadBodyDependencies } from '../transport/body';
+import type { UploadSecurityPort } from '../contract';
 import type { IntakeChannel } from './channel';
 import { cancelSecurityExecution } from '../security/cancellation';
 import { createRawUploadBodyHandler } from '../transport/body';
@@ -34,11 +35,16 @@ export type RemoteIntakeBodyOptions = Omit<
   | 'management'
   | 'principal'
   | 'storage'
+  | 'security'
   | 'claimBytes'
   | 'completeBytes'
   | 'recoverAttempt'
   | 'requiresCleanupAcknowledgement'
-> & { channel: IntakeChannel };
+> & {
+  channel: IntakeChannel;
+  /** Each request owns one backend selection through inspection and original recovery. */
+  createSecurityPort(): UploadSecurityPort;
+};
 export type RemoteIntakeBodyHandler = RequestHandler & {
   principal(request: Request): Promise<UploadPrincipal>;
 };
@@ -209,6 +215,7 @@ export function createRemoteIntakeBodyHandler(
       !CAPABILITY.test(capability)
     )
       fail('unauthorized');
+    const security = options.createSecurityPort();
     const controller = new AbortController();
     const abort = () => {
       controller.abort();
@@ -230,7 +237,7 @@ export function createRemoteIntakeBodyHandler(
         capability,
         command: {
           ...(command as Record<string, unknown>),
-          dispatch: readUploadOcrDispatchObservation(options.security.dispatchObservation?.()),
+          dispatch: readUploadOcrDispatchObservation(security.dispatchObservation?.()),
         },
         signal: signal ?? (cleanup ? AbortSignal.timeout(5000) : controller.signal),
       });
@@ -284,6 +291,7 @@ export function createRemoteIntakeBodyHandler(
       return result;
     };
     return {
+      security,
       async principal(): Promise<UploadPrincipal> {
         controller.signal.throwIfAborted();
         const result = data(await call({ action: 'authorize' }), [
@@ -391,7 +399,7 @@ export function createRemoteIntakeBodyHandler(
             !matchesUploadSecurityApproval(
               input.securityApproval,
               subject,
-              options.security.policySha256,
+              security.policySha256,
               (options.now ?? Date.now)(),
             )
           )
@@ -502,11 +510,8 @@ export function createRemoteIntakeBodyHandler(
           !isCompleteUploadSecuritySettlement(settlement, recovered.securityExecution)
         ) {
           settlement =
-            (await cancelSecurityExecution(
-              options.security,
-              recovered.securityExecution,
-              signal,
-            )) ?? undefined;
+            (await cancelSecurityExecution(security, recovered.securityExecution, signal)) ??
+            undefined;
           if (!settlement) return recovered;
         } else if (!recovered.securityExecution && proof.securityPending) return recovered;
         signal.throwIfAborted();
@@ -561,6 +566,7 @@ export function createRemoteIntakeBodyHandler(
       const body = createRawUploadBodyHandler({
         ...options,
         worker,
+        security: current.security,
         principal: () => current.principal(),
         management: current.management,
         storage: current.storage,

@@ -314,6 +314,7 @@ describe('scheduled denial lifecycle with the real generation manager', () => {
       stream: string,
       epoch: number,
     ) => void;
+    await GenerationJobManager.destroy({ settlementBudgetMs: 0 });
     store = new InMemoryJobStore({ ttlAfterComplete: 0 });
     GenerationJobManager.configure({
       jobStore: store,

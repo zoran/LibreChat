@@ -2,8 +2,6 @@
 const { EventEmitter } = require('node:events');
 jest.mock('@librechat/api', () => ({
   ...jest.requireActual('@librechat/api'),
-  ...jest.requireActual('../../../packages/api/src/auth/maintenance.ts'),
-  ...jest.requireActual('../../../packages/api/src/auth/sessionMaintenance.ts'),
   isEnabled: (value) => value === 'true',
 }));
 jest.mock('~/server/services/GraphApiService', () => ({
@@ -11,8 +9,9 @@ jest.mock('~/server/services/GraphApiService', () => ({
   getUserEntraGroups: async () => ['existing-group'],
 }));
 jest.mock('~/models', () => {
-  const { createMethods } = jest.requireActual('@librechat/data-schemas');
+  const { createModels, createMethods } = jest.requireActual('@librechat/data-schemas');
   const mongoose = jest.requireActual('mongoose');
+  createModels(mongoose);
   const cache = {
     get: async () => undefined,
     set: async () => true,
@@ -22,6 +21,7 @@ jest.mock('~/models', () => {
   };
   const database = Object.assign(Object.create(mongoose), {
     models: {
+      ...mongoose.models,
       Group: {
         updateMany: async () => ({ acknowledged: true, modifiedCount: 1, upsertedCount: 0 }),
         find: () => ({ lean: async () => [{ idOnTheSource: 'existing-group' }] }),

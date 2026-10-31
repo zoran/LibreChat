@@ -7,6 +7,12 @@ import type { UploadLease, UploadSecurityApproval } from 'librechat-data-provide
 import type { ClientSession } from 'mongoose';
 import type { ManagedUploadAcceptance } from './fileRetention';
 import {
+  uploadSecurityFixture,
+  originalWriteBindingFixture,
+  bindUploadOriginalFixture,
+  uploadSecuritySettlementFixture,
+} from './uploadManagement.security.fixture';
+import {
   createFileRetentionMethods,
   FileSourceUnavailableError,
   resolveFileSources,
@@ -33,7 +39,7 @@ describe('native File security boundary', () => {
   };
 
   function acceptance(id = 'approved', scope = owner): ManagedUploadAcceptance {
-    return {
+    const input: ManagedUploadAcceptance = {
       principal: { ...scope, authentication: 'verified-email' },
       operationId: id,
       filename: `private-${id}.txt`,
@@ -54,8 +60,7 @@ describe('native File security boundary', () => {
           chunkSha256: [sha256],
         },
       },
-      securityApproval: {
-        version: 1,
+      securityApproval: uploadSecurityFixture({
         decision: 'approved',
         policySha256: policy,
         subject: {
@@ -69,7 +74,15 @@ describe('native File security boundary', () => {
         scannerVersion: 'trusted-fixture/v1',
         checkedAt: new Date(now).toISOString(),
         coverage: { complete: true, pages: 1, parts: 1 },
-      },
+      }).approval,
+    };
+    return {
+      ...input,
+      writeBinding: originalWriteBindingFixture(
+        input.receipt,
+        input.securityApproval,
+        input.acceptedAt,
+      ),
     };
   }
 
@@ -116,18 +129,28 @@ describe('native File security boundary', () => {
     });
     if (!transfer) throw new Error('Fixture transfer claim unavailable');
     expect(transfer.generation).toBe(input.transferGeneration);
-    const execution = {
-      version: 2 as const,
+    const security = uploadSecurityFixture(input.securityApproval, {
       custody: { kind: 'none' as const },
       attemptId: `${input.operationId}.${transfer.generation}`,
       instanceId: randomUUID(),
       executionId: randomUUID(),
       expiresAt: new Date(at + 60_000).toISOString(),
-    };
+    });
+    const execution = security.execution;
     await repository.bindSecurityExecution(transfer, execution, at);
     await repository.settleSecurityExecution(
       transfer,
-      { execution, writerStopped: true, transientDataRemoved: true },
+      uploadSecuritySettlementFixture(execution, {
+        writerStopped: true,
+        transientDataRemoved: true,
+      }),
+      at,
+    );
+    input.writeBinding = await bindUploadOriginalFixture(
+      repository,
+      transfer,
+      input.receipt,
+      input.securityApproval,
       at,
     );
     await repository.accept(

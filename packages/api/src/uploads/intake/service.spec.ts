@@ -52,7 +52,7 @@ describe('isolated intake HTTP service with real router, socket lifecycle and at
     };
     const service = await startIntakeService({
       channel: channel ?? { control, promote },
-      security,
+      createSecurityPort: () => security,
       worker: { hostId: 'intake-host', instanceId: 'intake-pod' },
       stagingRoot,
       localResources: { cgroupDirectory, storage: 'disk' },

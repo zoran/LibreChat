@@ -1,5 +1,6 @@
 /** Real Mongo original publication and Status receipts share the existing upload transaction. */
 import mongoose from 'mongoose';
+import { readUploadDerivedOrigin } from 'librechat-data-provider';
 import type { UploadPrincipal } from 'librechat-data-provider';
 import type { UploadPublicationPort } from './uploadManagementTypes';
 import { useUploadStructureFixture } from './uploadManagement.structure.fixture';
@@ -121,22 +122,36 @@ describe('original-bound managed status publication', () => {
     it('does not count a restored derived publication as a new original', async () => {
       const { recordOriginalPublication } = await bridge();
       const lease = await processing();
-      const file = await raw();
-      const origin = {
-        version: 1,
+      // Classification-only restored specimen; no parent or native source hash is invented.
+      const origin = readUploadDerivedOrigin({
+        version: 2,
         binding: { purpose: 'workspace-draft', sourceId: 'draft', sourceRevision: 1 },
-        directSourceFileIds: ['structure'],
-        ancestors: [
-          {
-            subject: file!.securityApproval.subject,
-            policySha256: policy,
-            expiresAt: now + 3600000,
-          },
-        ],
-      };
+        directSourceFileIds: [],
+        ancestors: [],
+      });
+      if (!origin) throw new Error('Expected supported current empty derived origin');
       await db.models.UploadOperation.updateOne(
         { _id: 'structure' },
         { $set: { derivedOrigin: origin } },
+      );
+      const file = await raw();
+      if (!file?.expiredAt || !file.retentionAcceptedAt)
+        throw new Error('Expected actual accepted File dates');
+      await db.models.File.collection.updateOne(
+        { _id: file._id },
+        {
+          $set: {
+            derivedOrigin: origin,
+            derivedRetention: {
+              version: 1,
+              ownDeadlineAt: file.expiredAt,
+              capBasis: 'admission',
+              trackedSince: file.retentionAcceptedAt,
+              deadlineGeneration: 0,
+            },
+          },
+          $unset: { retentionActivity: '' },
+        },
       );
       await fixture.repository.publish(lease, result(), now);
       expect(recordOriginalPublication).not.toHaveBeenCalled();

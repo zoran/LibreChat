@@ -1,20 +1,33 @@
 const mongoose = require('mongoose');
-const { tenantStorage } = require('@librechat/data-schemas');
+const { tenantStorage, createHousekeepingStore } = require('@librechat/data-schemas');
 const { ResourceType, PrincipalType, PrincipalModel } = require('librechat-data-provider');
-const { MongoMemoryServer } = require('mongodb-memory-server');
+const { MongoMemoryReplSet } = require('mongodb-memory-server');
 const { fileAccess } = require('./fileAccess');
 const { User, Role, AclEntry } = require('~/db/models');
-const { createAgent, createFile } = require('~/models');
+const { createAgent, createFile: persistFile } = require('~/models');
+
+/** Permission checks read genuine retained rows rather than bypassing File admission. */
+const createFile = (data) =>
+  persistFile(data, false, {
+    retention: {
+      acceptedAt: new Date(),
+      expiredAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+    },
+  });
 
 describe('fileAccess middleware', () => {
   let mongoServer;
+  let housekeeping;
   let req, res, next;
   let testUser, otherUser, thirdUser;
 
   beforeAll(async () => {
-    mongoServer = await MongoMemoryServer.create();
+    mongoServer = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
     const mongoUri = mongoServer.getUri();
     await mongoose.connect(mongoUri);
+    // Internal HK models belong to their store, not the public createModels registry.
+    housekeeping = createHousekeepingStore(mongoose);
+    await Promise.all([mongoose.models.File.init(), housekeeping.initialize()]);
   });
 
   afterAll(async () => {
@@ -23,7 +36,9 @@ describe('fileAccess middleware', () => {
   });
 
   beforeEach(async () => {
-    await mongoose.connection.dropDatabase();
+    for (const collection of Object.values(mongoose.connection.collections)) {
+      await collection.deleteMany({});
+    }
 
     // Create test role
     await Role.create({
@@ -82,7 +97,7 @@ describe('fileAccess middleware', () => {
         filepath: '/test/file.txt',
         filename: 'file.txt',
         type: 'text/plain',
-        size: 100,
+        bytes: 100,
       });
 
       req.params.file_id = 'file_owned_by_user';
@@ -102,7 +117,7 @@ describe('fileAccess middleware', () => {
         filepath: '/test/file.txt',
         filename: 'file.txt',
         type: 'text/plain',
-        size: 100,
+        bytes: 100,
       });
 
       req.params.file_id = 'file_owned_by_other';
@@ -124,7 +139,7 @@ describe('fileAccess middleware', () => {
           filepath: '/test/file.txt',
           filename: 'file.txt',
           type: 'text/plain',
-          size: 100,
+          bytes: 100,
           tenantId: 'tenant-a',
         }),
       );
@@ -142,14 +157,17 @@ describe('fileAccess middleware', () => {
     });
 
     test('should allow tenant-scoped users to access owned legacy files without tenantId', async () => {
-      await createFile({
-        user: testUser._id.toString(),
-        file_id: 'legacy_file_owned_by_user',
-        filepath: '/test/legacy.txt',
-        filename: 'legacy.txt',
-        type: 'text/plain',
-        size: 100,
-      });
+      await persistFile(
+        {
+          user: testUser._id.toString(),
+          file_id: 'legacy_file_owned_by_user',
+          filepath: '/test/legacy.txt',
+          filename: 'legacy.txt',
+          type: 'text/plain',
+          bytes: 100,
+        },
+        true,
+      );
 
       req.user.tenantId = 'tenant-b';
       req.params.file_id = 'legacy_file_owned_by_user';
@@ -208,7 +226,7 @@ describe('fileAccess middleware', () => {
         filepath: '/test/shared.txt',
         filename: 'shared.txt',
         type: 'text/plain',
-        size: 100,
+        bytes: 100,
       });
     });
 
@@ -274,7 +292,7 @@ describe('fileAccess middleware', () => {
           filepath: '/test/cross-tenant.txt',
           filename: 'cross-tenant.txt',
           type: 'text/plain',
-          size: 100,
+          bytes: 100,
           tenantId: 'tenant-a',
         }),
       );
@@ -421,7 +439,7 @@ describe('fileAccess middleware', () => {
         filepath: '/test/multi.txt',
         filename: 'multi.txt',
         type: 'text/plain',
-        size: 100,
+        bytes: 100,
       });
 
       // Create first agent (owned by otherUser, no access for testUser)
@@ -494,7 +512,7 @@ describe('fileAccess middleware', () => {
         filepath: '/test/tool.txt',
         filename: 'tool.txt',
         type: 'text/plain',
-        size: 100,
+        bytes: 100,
       });
 
       // Agent 1: file in file_search (no access for testUser)
@@ -569,7 +587,7 @@ describe('fileAccess middleware', () => {
         filepath: '/test/orphan.txt',
         filename: 'orphan.txt',
         type: 'text/plain',
-        size: 100,
+        bytes: 100,
       });
 
       // Create agent with no files in tool_resources
@@ -596,7 +614,7 @@ describe('fileAccess middleware', () => {
         filepath: '/test/orphan2.txt',
         filename: 'orphan2.txt',
         type: 'text/plain',
-        size: 100,
+        bytes: 100,
       });
 
       // Create agent with null tool_resources

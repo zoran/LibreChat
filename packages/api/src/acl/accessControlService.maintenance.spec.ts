@@ -18,9 +18,7 @@ const { createPermissionMaintenance } = jest.requireActual(
 jest.mock('~/cache', () => ({ userPrincipalsCache: jest.fn() }));
 jest.mock('~/config/winston', () => ({ debug: jest.fn(), error: jest.fn(), warn: jest.fn() }));
 jest.mock('@librechat/data-schemas', () => ({
-  ...jest.requireActual('../../../data-schemas/src/utils/transactions'),
-  runAfterTransaction: jest.requireActual('../../../data-schemas/src/methods/userGroup')
-    .runAfterTransaction,
+  ...jest.requireActual('@librechat/data-schemas'),
   logger: { debug: jest.fn(), error: jest.fn(), warn: jest.fn() },
   createMethods: jest.fn(() => {
     throw new Error('Fixture must pass its actual methods');

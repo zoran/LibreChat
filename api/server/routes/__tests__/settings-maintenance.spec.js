@@ -6,14 +6,13 @@ jest.mock('mongoose', () => {
   const actual = jest.requireActual('mongoose');
   const mongoose = Object.create(actual);
   Object.defineProperties(mongoose, {
-    models: { get: () => mockFixture?.models ?? actual.models },
+    models: { get: () => ({ ...actual.models, ...mockFixture?.models }) },
     default: { value: mongoose },
   });
   return mongoose;
 });
 jest.mock('~/models', () => mockFixture.methods);
 jest.mock('~/cache', () => ({ getLogStores: () => mockFixture.store }));
-jest.mock('~/cache/cacheConfig', () => ({ cacheConfig: { USE_REDIS: false } }), { virtual: true });
 jest.mock('~/server/middleware', () => ({ requireJwtAuth: (_req, _res, next) => next() }));
 jest.mock('~/server/services/PermissionService', () => ({
   findAccessibleResources: async () => [mockFixture.skillId],
@@ -22,18 +21,8 @@ jest.mock('dotenv/config', () => ({}));
 jest.mock('~/config/winston', () => ({ debug: jest.fn(), error: jest.fn(), warn: jest.fn() }));
 jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
-  ...jest.requireActual('../../../../packages/data-schemas/src/utils/eviction'),
 }));
-jest.mock('@librechat/api', () => ({
-  ...jest.requireActual('@librechat/api'),
-  ...jest.requireActual('../../../../packages/api/src/auth/maintenance'),
-  ...jest.requireActual('../../../../packages/api/src/auth/userDocCache'),
-  ...jest.requireActual('../../../../packages/api/src/favorites/handlers'),
-  ...jest.requireActual('../../../../packages/api/src/favorites/pinned'),
-  ...jest.requireActual('../../../../packages/api/src/skills/skillStates'),
-  mongoCacheMaintenance: jest.requireActual('../../../../packages/api/src/cache/keyvMongo')
-    .mongoCacheMaintenance,
-}));
+jest.mock('@librechat/api', () => jest.requireActual('@librechat/api'));
 
 function deferred() {
   let resolve;
@@ -100,14 +89,9 @@ function createFixture() {
     ),
   });
   const mongoose = require('mongoose');
-  const { createUserMethods } = require('../../../../packages/data-schemas/src/methods/user');
-  const {
-    createToolFavoriteMethods,
-  } = require('../../../../packages/data-schemas/src/methods/favorite');
-  f.methods = {
-    ...createUserMethods(mongoose, { getCache: () => f.store }),
-    ...createToolFavoriteMethods(mongoose),
-  };
+  const schemas = jest.requireActual('@librechat/data-schemas');
+  schemas.createModels(jest.requireActual('mongoose'));
+  f.methods = schemas.createMethods(mongoose, { getCache: () => f.store });
   f.owner = require('~/server/services/LegacyAuthMaintenance').legacyAuthMaintenance;
   f.router = require('../settings');
   f.hold = (name) => {

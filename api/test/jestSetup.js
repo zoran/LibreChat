@@ -38,3 +38,7 @@ process.env.ALLOW_EMAIL_LOGIN = 'true';
 // This can be overridden in individual tests if needed
 jest.setTimeout(30000);
 process.env.OPENAI_API_KEY = 'test';
+
+// Register the actual model graph before eager legacy method consumers are imported.
+// Schema factories are idempotent and open no connection or database queries.
+jest.requireActual('@librechat/data-schemas').createModels(jest.requireActual('mongoose'));

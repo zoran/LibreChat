@@ -20,7 +20,7 @@ jest.mock('~/server/services/LegacyAuthMaintenance', () => ({
 }));
 const mongoose = require('mongoose');
 const { RoleBits, createModels, tenantStorage } = require('@librechat/data-schemas');
-const { MongoMemoryServer } = require('mongodb-memory-server');
+const { MongoMemoryReplSet } = require('mongodb-memory-server');
 const {
   ResourceType,
   AccessRoleIds,
@@ -43,12 +43,15 @@ const {
 const db = require('~/models');
 const { findRoleByIdentifier, getUserPrincipals, seedDefaultRoles } = db;
 
-// Mock the getTransactionSupport function for testing
-jest.mock('@librechat/data-schemas', () => ({
-  ...jest.requireActual('@librechat/data-schemas'),
-  getTransactionSupport: jest.fn().mockResolvedValue(false),
-  createModels: jest.requireActual('@librechat/data-schemas').createModels,
-}));
+/** Caller-owned real transactions retry complete callbacks after Mongo write conflicts. */
+async function withAclTransaction(action) {
+  const session = await mongoose.startSession();
+  try {
+    return await session.withTransaction(() => action(session));
+  } finally {
+    await session.endSession();
+  }
+}
 
 // Mock GraphApiService to prevent config loading issues
 jest.mock('~/server/services/GraphApiService', () => ({
@@ -73,7 +76,7 @@ let User;
 let Group;
 
 beforeAll(async () => {
-  mongoServer = await MongoMemoryServer.create();
+  mongoServer = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
   const mongoUri = mongoServer.getUri();
   await mongoose.connect(mongoUri);
 
@@ -1099,18 +1102,21 @@ describe('PermissionService', () => {
           });
 
         try {
-          await bulkUpdateResourcePermissions({
-            resourceType: ResourceType.AGENT,
-            resourceId,
-            updatedPrincipals: [
-              {
-                type: PrincipalType.USER,
-                id: userId,
-                accessRoleId: AccessRoleIds.AGENT_EDITOR,
-              },
-            ],
-            grantedBy: grantedById,
-          });
+          await withAclTransaction((session) =>
+            bulkUpdateResourcePermissions({
+              resourceType: ResourceType.AGENT,
+              resourceId,
+              updatedPrincipals: [
+                {
+                  type: PrincipalType.USER,
+                  id: userId,
+                  accessRoleId: AccessRoleIds.AGENT_EDITOR,
+                },
+              ],
+              grantedBy: grantedById,
+              session,
+            }),
+          );
           expect(bulkWriteSpy).toHaveBeenCalled();
         } finally {
           bulkWriteSpy.mockRestore();
@@ -1143,19 +1149,22 @@ describe('PermissionService', () => {
 
       let result;
       try {
-        result = await bulkUpdateResourcePermissions({
-          resourceType: ResourceType.AGENT,
-          resourceId,
-          updatedPrincipals: [
-            {
-              type: PrincipalType.USER,
-              id: userId,
-              accessRoleId: AccessRoleIds.AGENT_EDITOR,
-              viewInsights: true,
-            },
-          ],
-          grantedBy: grantedById,
-        });
+        result = await withAclTransaction((session) =>
+          bulkUpdateResourcePermissions({
+            resourceType: ResourceType.AGENT,
+            resourceId,
+            updatedPrincipals: [
+              {
+                type: PrincipalType.USER,
+                id: userId,
+                accessRoleId: AccessRoleIds.AGENT_EDITOR,
+                viewInsights: true,
+              },
+            ],
+            grantedBy: grantedById,
+            session,
+          }),
+        );
       } finally {
         bulkWriteSpy.mockRestore();
       }
@@ -1175,6 +1184,38 @@ describe('PermissionService', () => {
           resourceId,
         }),
       ).resolves.toBeNull();
+    });
+
+    test('rolls back every ACL write when the caller-owned audit transaction aborts', async () => {
+      const filter = { resourceType: ResourceType.AGENT, resourceId };
+      const before = await AclEntry.find(filter).sort({ _id: 1 }).lean();
+      const auditFailure = new Error('Audit persistence failed');
+
+      await expect(
+        withAclTransaction(async (session) => {
+          await bulkUpdateResourcePermissions({
+            ...filter,
+            updatedPrincipals: [userId, otherUserId].map((id) => ({
+              type: PrincipalType.USER,
+              id,
+              accessRoleId: AccessRoleIds.AGENT_EDITOR,
+              viewInsights: true,
+            })),
+            revokedPrincipals: [{ type: PrincipalType.GROUP, id: groupId }],
+            grantedBy: grantedById,
+            session,
+          });
+          expect(session.inTransaction()).toBe(true);
+          const pending = await AclEntry.find(filter).session(session).lean();
+          expect(
+            pending.filter((entry) => entry.principalType === PrincipalType.USER),
+          ).toHaveLength(2);
+          expect(pending.some((entry) => entry.principalType === PrincipalType.GROUP)).toBe(false);
+          throw auditFailure;
+        }),
+      ).rejects.toBe(auditFailure);
+
+      expect(await AclEntry.find(filter).sort({ _id: 1 }).lean()).toEqual(before);
     });
 
     test('restores the prior ACL document after an Insights audit failure', async () => {

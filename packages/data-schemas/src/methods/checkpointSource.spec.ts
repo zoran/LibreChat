@@ -8,6 +8,11 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import type { UploadLease, UploadPrincipal } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
 import type { IMessage, IMongoFile } from '~/types';
+import {
+  uploadSecurityFixture,
+  bindUploadOriginalFixture,
+  uploadSecuritySettlementFixture,
+} from './uploadManagement.security.fixture';
 import { createCheckpointSourceMethods, snapshotCheckpointSourceBinding } from './checkpointSource';
 import { createFileRetentionMethods, resizeRetainedDerivatives } from './fileRetention';
 import { createUploadManagementRepository } from './uploadManagement';
@@ -88,39 +93,8 @@ describe('atomic checkpoint source witnesses', () => {
       now: at,
     });
     if (!transfer) throw new Error('Managed fixture transfer was not admitted');
-    const execution = {
-      version: 2 as const,
-      custody: { kind: 'none' as const },
-      attemptId: `${fileId}.${transfer.generation}`,
-      instanceId: uuid(),
-      executionId: uuid(),
-      expiresAt: new Date(at + 60000).toISOString(),
-    };
-    await uploads.bindSecurityExecution(transfer, execution, at);
-    await uploads.settleSecurityExecution(
-      transfer,
-      { execution, writerStopped: true, transientDataRemoved: true },
-      at,
-    );
-    await uploads.accept(
-      principal,
-      transfer,
-      {
-        outcome: 'durable',
-        bytes: 6,
-        source: 's3',
-        filepath: `/api/files/download/${fileId}`,
-        storageKey: `t/${owner.tenantId}/managed-uploads/${owner.userId}/${fileId}.${transfer.generation}__original`,
-        integrity: {
-          version: 1,
-          algorithm: 'sha256',
-          sha256: 'a'.repeat(64),
-          chunkBytes: 262144,
-          chunkSha256: ['b'.repeat(64)],
-        },
-      },
-      {
-        version: 1,
+    const security = uploadSecurityFixture(
+      uploadSecurityFixture({
         decision: 'approved',
         policySha256: policy,
         subject: {
@@ -135,7 +109,81 @@ describe('atomic checkpoint source witnesses', () => {
         scannerVersion: 'fixture-v1',
         checkedAt: new Date(at).toISOString(),
         coverage: { complete: true, pages: 1, parts: 1 },
+      }).approval,
+      {
+        custody: { kind: 'none' as const },
+        attemptId: `${fileId}.${transfer.generation}`,
+        instanceId: uuid(),
+        executionId: uuid(),
+        expiresAt: new Date(at + 60000).toISOString(),
       },
+    );
+    const execution = security.execution;
+    const originalFixture: Parameters<typeof uploads.accept>[2] = {
+      outcome: 'durable',
+      bytes: 6,
+      source: 's3',
+      filepath: `/api/files/download/${fileId}`,
+      storageKey: `t/${owner.tenantId}/managed-uploads/${owner.userId}/${fileId}.${transfer.generation}__original`,
+      integrity: {
+        version: 1,
+        algorithm: 'sha256',
+        sha256: 'a'.repeat(64),
+        chunkBytes: 262144,
+        chunkSha256: ['b'.repeat(64)],
+      },
+    };
+    await uploads.bindSecurityExecution(transfer, execution, at);
+    await uploads.settleSecurityExecution(
+      transfer,
+      uploadSecuritySettlementFixture(execution, {
+        writerStopped: true,
+        transientDataRemoved: true,
+      }),
+      at,
+    );
+    await bindUploadOriginalFixture(
+      uploads,
+      transfer,
+      originalFixture,
+      uploadSecurityFixture({
+        decision: 'approved',
+        policySha256: policy,
+        subject: {
+          userId: owner.userId,
+          tenantId: owner.tenantId,
+          operationId: fileId,
+          transferGeneration: transfer.generation,
+          mediaType: 'text/plain',
+          bytes: 6,
+          sha256: 'a'.repeat(64),
+        },
+        scannerVersion: 'fixture-v1',
+        checkedAt: new Date(at).toISOString(),
+        coverage: { complete: true, pages: 1, parts: 1 },
+      }).approval,
+      at,
+    );
+    await uploads.accept(
+      principal,
+      transfer,
+      originalFixture,
+      uploadSecurityFixture({
+        decision: 'approved',
+        policySha256: policy,
+        subject: {
+          userId: owner.userId,
+          tenantId: owner.tenantId,
+          operationId: fileId,
+          transferGeneration: transfer.generation,
+          mediaType: 'text/plain',
+          bytes: 6,
+          sha256: 'a'.repeat(64),
+        },
+        scannerVersion: 'fixture-v1',
+        checkedAt: new Date(at).toISOString(),
+        coverage: { complete: true, pages: 1, parts: 1 },
+      }).approval,
       { filename: 'A.txt' },
       at,
     );

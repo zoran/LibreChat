@@ -2,6 +2,11 @@
 import mongoose from 'mongoose';
 import { performance } from 'node:perf_hooks';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import {
+  uploadSecuritySettlementFixture,
+  uploadSecurityFixture,
+  originalWriteBindingFixture,
+} from './uploadManagement.security.fixture';
 import { createStatusUsageCurrentMethods } from './statusUsageCurrent';
 
 const at = 1792454400000;
@@ -46,31 +51,48 @@ async function account(email = 'test@bwi.de') {
 async function document() {
   const id = 'original-1';
   const storage = `t/${tenant}/managed-uploads/${user}/${id}.1__original`;
-  const approval = {
-    version: 1,
-    decision: 'approved',
-    policySha256: hash,
-    subject: {
-      tenantId: tenant,
-      userId: String(user),
-      operationId: id,
-      transferGeneration: 1,
-      mediaType: 'text/plain',
-      bytes: 8,
-      sha256: hash,
+  const security = uploadSecurityFixture(
+    {
+      decision: 'approved',
+      policySha256: hash,
+      subject: {
+        tenantId: tenant,
+        userId: String(user),
+        operationId: id,
+        transferGeneration: 1,
+        mediaType: 'text/plain',
+        bytes: 8,
+        sha256: hash,
+      },
+      scannerVersion: 'fixture-v1',
+      checkedAt: new Date(at - 1000).toISOString(),
+      coverage: { complete: true, pages: 1, parts: 1 },
     },
-    scannerVersion: 'fixture-v1',
-    checkedAt: new Date(at - 1000).toISOString(),
-    coverage: { complete: true, pages: 1, parts: 1 },
+    {
+      custody: { kind: 'none' },
+      attemptId: `${id}.1`,
+      instanceId: '11111111-1111-4111-8111-111111111111',
+      executionId: '22222222-2222-4222-8222-222222222222',
+      expiresAt: new Date(at + 60000).toISOString(),
+    },
+  );
+  const approval = security.approval;
+  const execution = security.execution;
+  const original: Parameters<typeof originalWriteBindingFixture>[0] = {
+    outcome: 'durable',
+    source: 's3',
+    storageKey: storage,
+    filepath: `/api/files/managed/${id}`,
+    bytes: 8,
+    integrity: {
+      version: 1,
+      algorithm: 'sha256',
+      sha256: hash,
+      chunkBytes: 262144,
+      chunkSha256: [hash],
+    },
   };
-  const execution = {
-    version: 2,
-    custody: { kind: 'none' },
-    attemptId: `${id}.1`,
-    instanceId: '11111111-1111-4111-8111-111111111111',
-    executionId: '22222222-2222-4222-8222-222222222222',
-    expiresAt: new Date(at + 60000).toISOString(),
-  };
+  const writeBinding = originalWriteBindingFixture(original, approval, at);
   await collection('UploadOperation').insertOne({
     _id: id as never,
     tenantId: tenant,
@@ -87,20 +109,12 @@ async function document() {
     actualBytes: 8,
     securityApproval: approval,
     securityExecution: execution,
-    securitySettlement: { execution, writerStopped: true, transientDataRemoved: true },
-    original: {
-      outcome: 'durable',
-      source: 's3',
-      storageKey: storage,
-      bytes: 8,
-      integrity: {
-        version: 1,
-        algorithm: 'sha256',
-        sha256: hash,
-        chunkBytes: 262144,
-        chunkSha256: [hash],
-      },
-    },
+    securitySettlement: uploadSecuritySettlementFixture(execution, {
+      writerStopped: true,
+      transientDataRemoved: true,
+    }),
+    original,
+    writeBinding,
   });
   await collection('File').insertOne({
     file_id: id,
@@ -116,6 +130,7 @@ async function document() {
     bytes: 8,
     storageKey: storage,
     securityApproval: approval,
+    originalWriteBinding: writeBinding,
   });
 }
 describe('current usage Mongo predicates', () => {

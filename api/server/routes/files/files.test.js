@@ -3,8 +3,12 @@ const request = require('supertest');
 const mongoose = require('mongoose');
 const { Readable } = require('stream');
 const { v4: uuidv4 } = require('uuid');
-const { createMethods, tenantStorage } = require('@librechat/data-schemas');
-const { MongoMemoryServer } = require('mongodb-memory-server');
+const {
+  createMethods,
+  tenantStorage,
+  createHousekeepingStore,
+} = require('@librechat/data-schemas');
+const { MongoMemoryReplSet } = require('mongodb-memory-server');
 const {
   SystemRoles,
   ResourceType,
@@ -12,7 +16,11 @@ const {
   PrincipalType,
   FileSources,
 } = require('librechat-data-provider');
-const { createAgent, createFile } = require('~/models');
+const { createAgent, createFile: persistFile } = require('~/models');
+
+/** Admit real retained rows; legacy temporary TTL births are no longer supported. */
+const createFile = (data, expiredAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)) =>
+  persistFile(data, false, { retention: { acceptedAt: new Date(), expiredAt } });
 
 // Only mock the external dependencies that we don't want to test
 jest.mock('~/server/services/Files/process', () => ({
@@ -89,11 +97,12 @@ describe('File Routes - Delete with Agent Access', () => {
   let AclEntry;
   let User;
   let methods;
+  let housekeeping;
   let requestConfig;
   let modelsToCleanup = [];
 
   beforeAll(async () => {
-    mongoServer = await MongoMemoryServer.create();
+    mongoServer = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
     const mongoUri = mongoServer.getUri();
     await mongoose.connect(mongoUri);
 
@@ -115,6 +124,11 @@ describe('File Routes - Delete with Agent Access', () => {
     Agent = models.Agent;
     AclEntry = models.AclEntry;
     User = models.User;
+
+    // Internal HK models belong to their store, not the public createModels registry.
+    housekeeping = createHousekeepingStore(mongoose);
+    modelsToCleanup.push(housekeeping.model.modelName);
+    await Promise.all([File.init(), housekeeping.initialize()]);
 
     // Seed default roles using our methods
     await methods.seedDefaultRoles();
@@ -162,6 +176,7 @@ describe('File Routes - Delete with Agent Access', () => {
     await Agent.deleteMany({});
     await User.deleteMany({});
     await AclEntry.deleteMany({});
+    await housekeeping.model.deleteMany({});
     // Don't delete AccessRole as they are seeded defaults needed for tests
 
     // Create test data
@@ -1421,69 +1436,63 @@ describe('File Routes - Delete with Agent Access', () => {
   });
 
   describe('POST /files/usage', () => {
-    const createQueuedFile = async (expiresAt) => {
+    const createQueuedFile = async (expiredAt) => {
       const ownFileId = uuidv4();
-      await createFile({
-        user: otherUserId,
-        file_id: ownFileId,
-        filename: 'queued.png',
-        filepath: '/uploads/queued.png',
-        bytes: 10,
-        type: 'image/png',
-      });
-      await File.updateOne({ file_id: ownFileId }, { $set: { expiresAt } });
+      await createFile(
+        {
+          user: otherUserId,
+          file_id: ownFileId,
+          filename: 'queued.png',
+          filepath: '/uploads/queued.png',
+          bytes: 10,
+          type: 'image/png',
+        },
+        expiredAt,
+      );
       return ownFileId;
     };
 
-    it('extends the upload TTL of owned files without clearing it', async () => {
+    it('preserves the admitted retention deadline of an owned queued file', async () => {
       const soon = new Date(Date.now() + 60 * 1000);
       const ownFileId = await createQueuedFile(soon);
+      const before = await File.findOne({ file_id: ownFileId }).lean();
 
       const response = await request(app)
         .post('/files/usage')
         .send({ file_ids: [ownFileId] });
 
       expect(response.status).toBe(200);
-      expect(response.body).toEqual({ held: 1 });
+      expect(response.body).toEqual({ held: 0 });
       const held = await File.findOne({ file_id: ownFileId }).lean();
-      /* The hold must remain a hold: still reapable, just later. */
-      expect(held.expiresAt).toBeDefined();
-      expect(held.expiresAt.getTime()).toBeGreaterThan(soon.getTime());
-      /* The 24h baseline plus the default 24h approval window, so a queue
-       * waiting on a paused run outlives that pause. Renewed from now, but
-       * never past the ceiling measured from upload time. */
-      const HOUR = 60 * 60 * 1000;
-      expect(held.expiresAt.getTime()).toBeGreaterThan(Date.now() + 47 * HOUR);
-      expect(held.expiresAt.getTime()).toBeLessThanOrEqual(
-        held.createdAt.getTime() + 24 * HOUR + 8 * 24 * HOUR,
-      );
+      expect(held).toEqual(before);
+      expect(held.expiredAt.getTime()).toBe(soon.getTime());
+      expect(held.expiresAt).toBeUndefined();
       /* A queue touch is not a send, so it must not inflate usage. */
       expect(held.usage).toBe(0);
     });
 
     it('cannot be replayed to preserve a file indefinitely', async () => {
       const ownFileId = await createQueuedFile(new Date(Date.now() + 60 * 1000));
+      const before = await File.findOne({ file_id: ownFileId }).lean();
 
       const first = await request(app)
         .post('/files/usage')
         .send({ file_ids: [ownFileId] });
-      expect(first.body).toEqual({ held: 1 });
+      expect(first.status).toBe(200);
+      expect(first.body).toEqual({ held: 0 });
 
       for (let i = 0; i < 5; i++) {
         const repeat = await request(app)
           .post('/files/usage')
           .send({ file_ids: [ownFileId] });
         expect(repeat.status).toBe(200);
+        expect(repeat.body).toEqual({ held: 0 });
       }
 
-      /* Every renewal is clamped to the ceiling measured from upload time, so
-       * replay converges there instead of advancing a window per call. */
-      const HOUR = 60 * 60 * 1000;
+      // Queue usage cannot renew expiry, revisions, activity or housekeeping ownership.
       const held = await File.findOne({ file_id: ownFileId }).lean();
-      expect(held.expiresAt).toBeDefined();
-      expect(held.expiresAt.getTime()).toBeLessThanOrEqual(
-        held.createdAt.getTime() + 24 * HOUR + 8 * 24 * HOUR,
-      );
+      expect(held).toEqual(before);
+      expect(held.expiresAt).toBeUndefined();
     });
 
     it('never re-adds a TTL to a file that was already sent', async () => {
@@ -1496,7 +1505,7 @@ describe('File Routes - Delete with Agent Access', () => {
         bytes: 10,
         type: 'image/png',
       });
-      await File.updateOne({ file_id: sentFileId }, { $unset: { expiresAt: '' } });
+      const before = await File.findOne({ file_id: sentFileId }).lean();
 
       const response = await request(app)
         .post('/files/usage')
@@ -1505,10 +1514,12 @@ describe('File Routes - Delete with Agent Access', () => {
       expect(response.status).toBe(200);
       expect(response.body).toEqual({ held: 0 });
       const permanent = await File.findOne({ file_id: sentFileId }).lean();
+      expect(permanent).toEqual(before);
       expect(permanent.expiresAt).toBeUndefined();
+      expect(permanent.expiredAt).toBeInstanceOf(Date);
     });
 
-    it('never shortens an existing hold', async () => {
+    it('never shortens an admitted retention deadline', async () => {
       const farOut = new Date(Date.now() + 90 * 24 * 60 * 60 * 1000);
       const ownFileId = await createQueuedFile(farOut);
 
@@ -1519,12 +1530,12 @@ describe('File Routes - Delete with Agent Access', () => {
       expect(response.status).toBe(200);
       expect(response.body).toEqual({ held: 0 });
       const untouched = await File.findOne({ file_id: ownFileId }).lean();
-      expect(untouched.expiresAt.getTime()).toBe(farOut.getTime());
+      expect(untouched.expiredAt.getTime()).toBe(farOut.getTime());
+      expect(untouched.expiresAt).toBeUndefined();
     });
 
     it("is owner-scoped: another user's file stays untouched (best-effort 200)", async () => {
-      const soon = new Date(Date.now() + 60 * 1000);
-      await File.updateOne({ file_id: fileId }, { $set: { expiresAt: soon } });
+      const before = await File.findOne({ file_id: fileId }).lean();
 
       const response = await request(app)
         .post('/files/usage')
@@ -1533,8 +1544,25 @@ describe('File Routes - Delete with Agent Access', () => {
       expect(response.status).toBe(200);
       expect(response.body).toEqual({ held: 0 });
       const untouched = await File.findOne({ file_id: fileId }).lean();
+      expect(untouched).toEqual(before);
       expect(untouched.usage).toBe(0);
-      expect(untouched.expiresAt.getTime()).toBe(soon.getTime());
+      expect(untouched.expiredAt).toEqual(before.expiredAt);
+    });
+
+    it('rejects an owned legacy temporary file without renewing or erasing its TTL', async () => {
+      const soon = new Date(Date.now() + 60 * 1000);
+      const ownFileId = await createQueuedFile(soon);
+      // Historical malformed state is intentional; normal fixture births stay retained.
+      await File.updateOne({ file_id: ownFileId }, { $set: { expiresAt: soon } });
+      const before = await File.findOne({ file_id: ownFileId }).lean();
+
+      const response = await request(app)
+        .post('/files/usage')
+        .send({ file_ids: [ownFileId] });
+
+      expect(response.status).toBe(500);
+      expect(response.body).toEqual({ code: 'FILES_USAGE_FAILED' });
+      expect(await File.findOne({ file_id: ownFileId }).lean()).toEqual(before);
     });
 
     it('rejects a list over the cap', async () => {

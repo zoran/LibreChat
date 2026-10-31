@@ -2,21 +2,20 @@
 const http = require('node:http');
 const express = require('express');
 const request = require('supertest');
-const mongoose = require('mongoose');
+const mockMongoose = jest.requireActual('mongoose');
+const mongoose = mockMongoose;
+// Keep the actual connected Mongoose owner when module isolation refreshes Auth and cache.
+jest.mock('mongoose', () => mockMongoose);
 const { Keyv } = require('keyv');
-const { MongoMemoryServer } = require('mongodb-memory-server');
+const { MongoMemoryReplSet } = require('mongodb-memory-server');
 const schemas = require('@librechat/data-schemas');
 const { ViolationTypes } = require('librechat-data-provider');
-const mockApi = jest.requireActual('@librechat/api');
 
 let mockDatabase;
 let mockStores;
 let mockBanCacheStore;
 jest.mock('@librechat/api', () => ({
-  ...mockApi,
-  ...jest.requireActual('../../../../packages/api/src/auth/maintenance.ts'),
-  ...jest.requireActual('../../../../packages/api/src/auth/sessionMaintenance.ts'),
-  keyvMongo: mockBanCacheStore,
+  ...jest.requireActual('@librechat/api'),
   // The installed limiter uses its actual MemoryStore here; real Redis has its own integration test.
   limiterCache: () => undefined,
 }));
@@ -64,8 +63,9 @@ const waitForStorage = (entered, response) =>
   ]);
 
 beforeAll(async () => {
-  mongo = await MongoMemoryServer.create();
+  mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
   await mongoose.connect(mongo.getUri());
+  schemas.createModels(mongoose);
   Session = mongoose.models.Session || mongoose.model('Session', schemas.sessionSchema);
   mockDatabase = mongoose;
 });
@@ -82,7 +82,13 @@ beforeEach(async () => {
   process.env.LOGIN_VIOLATION_SCORE = '1';
   process.env.USE_REDIS = 'false';
   userId = new mongoose.Types.ObjectId();
-  mockBanCacheStore = new Map();
+  mockBanCacheStore = mongoose.connection.db.collection('logs');
+  const collection = mongoose.connection.db.collection.bind(mongoose.connection.db);
+  jest
+    .spyOn(mongoose.connection.db, 'collection')
+    .mockImplementation((name, ...args) =>
+      name === 'logs' ? mockBanCacheStore : collection(name, ...args),
+    );
   errors = [];
   configuredDone = deferred();
   peerClosed = deferred();
@@ -92,6 +98,7 @@ beforeEach(async () => {
       new Keyv({ store: new Map(), namespace: type, ttl: 60_000 }),
     ]),
   );
+  jest.resetModules();
   jest.isolateModules(() => {
     owner = require('~/server/services/LegacyAuthMaintenance').legacyAuthMaintenance;
     const checkBan = require('../checkBan');
@@ -183,7 +190,7 @@ test('a sanitized first ban-cache failure cannot hide its pending sibling', asyn
   const second = deferred();
   const entered = deferred();
   let writes = 0;
-  jest.spyOn(mockBanCacheStore, 'set').mockImplementation(() => {
+  jest.spyOn(mockBanCacheStore, 'updateOne').mockImplementation(() => {
     writes++;
     if (writes === 1) throw new Error('cache refused first write');
     entered.resolve();
@@ -199,9 +206,10 @@ test('a sanitized first ban-cache failure cannot hide its pending sibling', asyn
     await waitForStorage(entered, response);
     owner.pauseAdmissions('ban-cache');
     await tick();
+    // Auth tracks the facade and driver as two ports of the same pending Mongo action.
     expect(await owner.getMaintenanceCensus('ban-cache')).toMatchObject({
       queuedContinuations: 1,
-      pendingWrites: 1,
+      pendingWrites: 2,
       complete: false,
     });
     second.resolve(true);

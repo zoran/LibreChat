@@ -1,5 +1,5 @@
 import mongoose, { Types, Model } from 'mongoose';
-import { MongoMemoryServer } from 'mongodb-memory-server';
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import { createModels, createMethods, logger, RoleBits } from '@librechat/data-schemas';
 import {
   ResourceType,
@@ -22,7 +22,7 @@ jest.mock('@librechat/data-schemas', () => ({
   },
 }));
 
-let mongoServer: MongoMemoryServer;
+let mongoServer: MongoMemoryReplSet;
 let AclEntry: Model<IAclEntry>;
 let service: AccessControlService;
 let dbMethods: ReturnType<typeof createMethods>;
@@ -31,7 +31,10 @@ let dbMethods: ReturnType<typeof createMethods>;
 const mockGetUserPrincipals = jest.fn();
 
 beforeAll(async () => {
-  mongoServer = await MongoMemoryServer.create();
+  mongoServer = await MongoMemoryReplSet.create({
+    replSet: { count: 1 },
+    instanceOpts: [{ args: ['--nounixsocket'] }],
+  });
   const mongoUri = mongoServer.getUri();
   await mongoose.connect(mongoUri);
 
@@ -43,6 +46,7 @@ beforeAll(async () => {
   // Create methods and seed default roles
   dbMethods = createMethods(mongoose);
   await dbMethods.seedDefaultRoles();
+  await Promise.all([AclEntry.init(), mongoose.models.AccessRole.init()]);
 
   // Create service instance
   service = new AccessControlService(mongoose);

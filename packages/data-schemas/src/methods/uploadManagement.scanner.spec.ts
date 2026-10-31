@@ -5,6 +5,11 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import { UPLOAD_RECORD_BYTES, UPLOAD_DERIVED_MAX_ORIGIN_BYTES } from 'librechat-data-provider';
 import type { UploadLease, UploadSecurityExecution } from 'librechat-data-provider';
 import type { StoredUpload } from './uploadManagementStore';
+import {
+  uploadSecurityFixture,
+  bindUploadOriginalFixture,
+  uploadSecuritySettlementFixture,
+} from './uploadManagement.security.fixture';
 import { completeUnacceptedUploadCleanup } from './uploadManagement.structure.fixture';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createModels } from '~/models';
@@ -53,19 +58,22 @@ describe('durable scanner execution', () => {
       quality: { status: 'complete' as const, warnings: [] },
     },
   });
-  const execution = (lease: UploadLease): UploadSecurityExecution => ({
-    version: 2,
-    custody: { kind: 'none' as const },
-    attemptId: `${lease.operationId}.${lease.generation}`,
-    instanceId: '11111111-1111-4111-8111-111111111111',
-    executionId: '22222222-2222-4222-8222-222222222222',
-    expiresAt: new Date(now + 60_000).toISOString(),
-  });
-  const settlement = (value: UploadSecurityExecution) => ({
-    execution: value,
-    writerStopped: true,
-    transientDataRemoved: true,
-  });
+  const execution = (lease: UploadLease, mediaType = 'text/plain') =>
+    uploadSecurityFixture(
+      {
+        ...approval(lease),
+        subject: { ...approval(lease).subject, mediaType },
+      },
+      {
+        custody: { kind: 'none' as const },
+        attemptId: `${lease.operationId}.${lease.generation}`,
+        instanceId: '11111111-1111-4111-8111-111111111111',
+        executionId: '22222222-2222-4222-8222-222222222222',
+        expiresAt: new Date(now + 60_000).toISOString(),
+      },
+    ).execution;
+  const settlement = (value: UploadSecurityExecution) =>
+    uploadSecuritySettlementFixture(value, { writerStopped: true, transientDataRemoved: true });
   const cleanup = (lease: UploadLease) => ({
     operationId: lease.operationId,
     generation: lease.generation,
@@ -88,23 +96,23 @@ describe('durable scanner execution', () => {
       chunkSha256: [sha256],
     },
   });
-  const approval = (lease: UploadLease) => ({
-    version: 1 as const,
-    decision: 'approved' as const,
-    policySha256: policy,
-    subject: {
-      tenantId: lease.tenantId,
-      userId: lease.userId,
-      operationId: lease.operationId,
-      transferGeneration: lease.generation,
-      mediaType: 'text/plain',
-      bytes: 8,
-      sha256,
-    },
-    scannerVersion: 'simulated-scanner-fixture-v1',
-    checkedAt: new Date(now).toISOString(),
-    coverage: { complete: true as const, pages: 1, parts: 1 },
-  });
+  const approval = (lease: UploadLease) =>
+    uploadSecurityFixture({
+      decision: 'approved' as const,
+      policySha256: policy,
+      subject: {
+        tenantId: lease.tenantId,
+        userId: lease.userId,
+        operationId: lease.operationId,
+        transferGeneration: lease.generation,
+        mediaType: 'text/plain',
+        bytes: 8,
+        sha256,
+      },
+      scannerVersion: 'simulated-scanner-fixture-v1',
+      checkedAt: new Date(now).toISOString(),
+      coverage: { complete: true as const, pages: 1, parts: 1 },
+    }).approval;
   const row = () => b.models.UploadOperation.findById('scan').lean<StoredUpload>();
   beforeAll(async () => {
     mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
@@ -167,13 +175,14 @@ describe('durable scanner execution', () => {
     const bound = execution(lease);
     await first.bindSecurityExecution(lease, bound, now);
     await second.settleSecurityExecution(lease, settlement(bound), now);
+    await bindUploadOriginalFixture(first, lease, receipt(lease), approval(lease), now);
     return { lease, bound };
   }
   const accept = (lease: UploadLease) =>
     first.accept(user, lease, receipt(lease), approval(lease), { filename: 'note.txt' }, now);
 
   function pdfExecution(lease: UploadLease): UploadSecurityExecution {
-    const value = execution(lease);
+    const value = execution(lease, 'application/pdf');
     return {
       ...value,
       custody: {
@@ -333,6 +342,7 @@ describe('durable scanner execution', () => {
       now,
     );
     expect((await row())!.securitySettlement).toEqual(settlement(value));
+    await bindUploadOriginalFixture(first, lease, receipt(lease), approval(lease), now);
     await expect(accept(lease)).resolves.toMatchObject({ state: 'queued_processing' });
   });
 

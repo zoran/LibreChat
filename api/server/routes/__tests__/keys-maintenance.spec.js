@@ -7,16 +7,20 @@ jest.mock('mongoose', () => {
   const actual = jest.requireActual('mongoose');
   const mongoose = Object.create(actual);
   Object.defineProperties(mongoose, {
-    models: { get: () => mockFixture?.models ?? actual.models },
+    models: { get: () => ({ ...actual.models, ...mockFixture?.models }) },
     default: { value: mongoose },
   });
   return mongoose;
 });
 jest.mock('~/models', () => mockFixture.methods);
 jest.mock('~/server/middleware', () => ({ requireJwtAuth: (_req, _res, next) => next() }));
-jest.mock('~/cache/cacheConfig', () => ({ cacheConfig: { USE_REDIS: false } }), { virtual: true });
 jest.mock('dotenv/config', () => ({}));
 jest.mock('~/config/winston', () => ({ debug: jest.fn(), error: jest.fn(), warn: jest.fn() }));
+jest.mock('../../../../packages/data-schemas/src/config/winston', () => ({
+  debug: jest.fn(),
+  error: jest.fn(),
+  warn: jest.fn(),
+}));
 jest.mock('../../../../packages/data-schemas/src/crypto', () => ({
   encrypt: (...args) => mockFixture.result('encrypt', 'encrypted-fixture', args),
   decrypt: () => {
@@ -25,14 +29,7 @@ jest.mock('../../../../packages/data-schemas/src/crypto', () => ({
   getRandomValues: (...args) => mockFixture.result('random', 'fixture-random', args),
   hashToken: (...args) => mockFixture.result('hash', 'fixture-hash', args),
 }));
-jest.mock('@librechat/api', () => ({
-  ...jest.requireActual('@librechat/api'),
-  ...jest.requireActual('../../../../packages/api/src/auth/maintenance'),
-  ...jest.requireActual('../../../../packages/api/src/apiKeys/handlers'),
-  ...jest.requireActual('../../../../packages/api/src/middleware/access'),
-  mongoCacheMaintenance: jest.requireActual('../../../../packages/api/src/cache/keyvMongo')
-    .mongoCacheMaintenance,
-}));
+jest.mock('@librechat/api', () => jest.requireActual('@librechat/api'));
 
 function deferred() {
   let resolve, reject;

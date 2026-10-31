@@ -9,6 +9,8 @@ const mockDeleteUserKey = jest.fn();
 const mockDeleteConvos = jest.fn();
 const mockDeleteFiles = jest.fn();
 const mockGetFiles = jest.fn();
+const mockGetAccountFileCleanupCandidates = jest.fn();
+const mockDeleteAccountDocumentWorkspaces = jest.fn();
 const mockUpdateUserPlugins = jest.fn();
 const mockUpdateUser = jest.fn();
 const mockFindToken = jest.fn();
@@ -37,18 +39,21 @@ const mockRevokeUserCodeEnvironmentWorkers = jest.fn();
 const mockDeletePasskeysByUser = jest.fn();
 
 jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
   logger: { error: jest.fn(), info: jest.fn() },
   webSearchKeys: [],
 }));
 
 jest.mock('librechat-data-provider', () => ({
+  ...jest.requireActual('librechat-data-provider'),
   Tools: {},
-  CacheKeys: {},
+  CacheKeys: { ...jest.requireActual('librechat-data-provider').CacheKeys },
   Constants: { mcp_delimiter: '::', mcp_prefix: 'mcp_' },
   FileSources: {},
 }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   createEmailChangeService: jest.fn(() => ({
     requestEmailChange: jest.fn(),
     confirmEmailChange: jest.fn(),
@@ -102,6 +107,8 @@ jest.mock('~/models', () => ({
   updateUser: (...args) => mockUpdateUser(...args),
   findToken: (...args) => mockFindToken(...args),
   getFiles: (...args) => mockGetFiles(...args),
+  getAccountFileCleanupCandidates: (...args) => mockGetAccountFileCleanupCandidates(...args),
+  deleteAccountDocumentWorkspaces: (...args) => mockDeleteAccountDocumentWorkspaces(...args),
   deleteToolCalls: (...args) => mockDeleteToolCalls(...args),
   deleteUserAgents: (...args) => mockDeleteUserAgents(...args),
   deleteUserPrompts: (...args) => mockDeleteUserPrompts(...args),
@@ -201,6 +208,8 @@ function stubDeletionMocks() {
   mockDeleteAllSharedLinks.mockResolvedValue();
   mockDeleteAllSharedLinksWithCleanup.mockResolvedValue({ deletedCount: 0 });
   mockGetFiles.mockResolvedValue([]);
+  mockGetAccountFileCleanupCandidates.mockResolvedValue([]);
+  mockDeleteAccountDocumentWorkspaces.mockResolvedValue(0);
   mockProcessDeleteRequest.mockResolvedValue({ deletedFileIds: [], failedFileIds: [] });
   mockDeleteFiles.mockResolvedValue();
   mockDeleteToolCalls.mockResolvedValue();
@@ -238,6 +247,12 @@ describe('deleteUserController - 2FA enforcement', () => {
     await deleteUserController(req, res);
 
     expect(res.status).toHaveBeenCalledWith(200);
+    const owner = { userId: req.user.id, tenantId: null };
+    expect(mockGetAccountFileCleanupCandidates).toHaveBeenCalledWith(owner);
+    expect(mockDeleteAccountDocumentWorkspaces).toHaveBeenCalledWith(
+      owner,
+      mockBeginAgentTriggerUserDeletion.mock.calls[0][1],
+    );
     expect(res.send).toHaveBeenCalledWith({ message: 'User deleted' });
     expect(mockDeleteMessages).toHaveBeenCalled();
     expect(mockDeleteUserAgents).toHaveBeenCalledWith('user1');
@@ -333,7 +348,7 @@ describe('deleteUserController - 2FA enforcement', () => {
     expect(mockCancelAgentTriggerUserDeletion).not.toHaveBeenCalled();
   });
 
-  it('proceeds with deletion when user has no 2FA record', async () => {
+  it('refuses destructive account cleanup when the account and deletion fence are missing', async () => {
     const req = { user: { id: 'user1', _id: 'user1', email: 'a@b.com' }, body: {} };
     const res = createRes();
     mockGetUserById.mockResolvedValue(null);
@@ -341,8 +356,13 @@ describe('deleteUserController - 2FA enforcement', () => {
 
     await deleteUserController(req, res);
 
-    expect(res.status).toHaveBeenCalledWith(200);
-    expect(res.send).toHaveBeenCalledWith({ message: 'User deleted' });
+    expect(res.status).toHaveBeenCalledWith(500);
+    expect(res.json).toHaveBeenCalledWith({ message: 'Something went wrong.' });
+    expect(res.send).not.toHaveBeenCalled();
+    expect(mockDeleteAccountDocumentWorkspaces).not.toHaveBeenCalled();
+    expect(mockDeleteFiles).not.toHaveBeenCalled();
+    expect(mockDeleteMessages).not.toHaveBeenCalled();
+    expect(mockDeleteUserById).not.toHaveBeenCalled();
   });
 
   it('returns error when 2FA is enabled and verification fails with 400', async () => {

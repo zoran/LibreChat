@@ -6,6 +6,10 @@ import type {
   UploadAttemptSettlement,
   UploadAttemptLocalReservation,
 } from './contract';
+import {
+  antivirusCustodyFixture,
+  antivirusReceiptFixture,
+} from './security/antivirus-fixture.helper';
 import { createUploadAttemptJournal } from './attempts';
 
 const worker = { hostId: 'host', instanceId: 'current' };
@@ -394,7 +398,20 @@ describe('bound technical recovery in the existing journal', () => {
     acknowledgementPending: true,
   };
   const execution: UploadSecurityExecution = {
-    version: 2,
+    version: 3,
+    antivirus: antivirusCustodyFixture(
+      {
+        tenantId: 'tenant',
+        userId: 'user',
+        operationId: 'operation',
+        transferGeneration: 1,
+        mediaType: 'text/plain',
+        bytes: 8,
+        sha256: 'a'.repeat(64),
+      },
+      '2026-10-17T00:00:00.000Z',
+      Date.parse('2026-10-16T23:59:00.000Z'),
+    ),
     custody: { kind: 'none' as const },
     attemptId: 'operation.1',
     instanceId: '11111111-1111-4111-8111-111111111111',
@@ -499,6 +516,7 @@ describe('bound technical recovery in the existing journal', () => {
       securityExecution: execution,
       securitySettlement: {
         execution: { ...execution, executionId: '33333333-3333-4333-8333-333333333333' },
+        antivirusReceipt: antivirusReceiptFixture(execution),
         writerStopped: true,
         transientDataRemoved: true,
       },
@@ -550,14 +568,24 @@ describe('bound technical recovery in the existing journal', () => {
     handler.mockResolvedValue(
       view({
         securityExecution: other,
-        securitySettlement: { execution: other, writerStopped: true, transientDataRemoved: true },
+        securitySettlement: {
+          execution: other,
+          antivirusReceipt: antivirusReceiptFixture(other),
+          writerStopped: true,
+          transientDataRemoved: true,
+        },
       }),
     );
     expect((await journal.recoverPending(signal())).settled).toBe(0);
     handler.mockResolvedValue(
       view({
         securityExecution: execution,
-        securitySettlement: { execution, writerStopped: true, transientDataRemoved: true },
+        securitySettlement: {
+          execution,
+          antivirusReceipt: antivirusReceiptFixture(execution),
+          writerStopped: true,
+          transientDataRemoved: true,
+        },
       }),
     );
     expect((await journal.recoverPending(signal())).settled).toBe(1);
@@ -584,6 +612,7 @@ describe('bound technical recovery in the existing journal', () => {
           securityExecution: changed,
           securitySettlement: {
             execution: changed,
+            antivirusReceipt: antivirusReceiptFixture(changed),
             writerStopped: true,
             transientDataRemoved: true,
           },
@@ -606,7 +635,12 @@ describe('bound technical recovery in the existing journal', () => {
     handler.mockResolvedValue(
       view({
         securityExecution: execution,
-        securitySettlement: { execution, writerStopped: true, transientDataRemoved: true },
+        securitySettlement: {
+          execution,
+          antivirusReceipt: antivirusReceiptFixture(execution),
+          writerStopped: true,
+          transientDataRemoved: true,
+        },
       }),
     );
     expect((await journal.recoverPending(signal())).settled).toBe(1);

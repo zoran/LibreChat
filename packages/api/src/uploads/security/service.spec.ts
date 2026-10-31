@@ -183,8 +183,8 @@ describe('scanner service maintenance', () => {
     expect(await service.maintenance.getMaintenanceCensus('owner')).toEqual({
       admissionClosed: true,
       queuedContinuations: 2,
-      pendingWrites: 0,
-      complete: true,
+      pendingWrites: 1,
+      complete: false,
     });
     await expect(
       client.prepare({

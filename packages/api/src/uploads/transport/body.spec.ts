@@ -4,6 +4,10 @@ import { createHash } from 'node:crypto';
 import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import {
+  readUploadOriginalWriteBinding,
+  readUploadSecurityExecution,
+} from 'librechat-data-provider';
 import type {
   UploadLease,
   UploadPrincipal,
@@ -19,6 +23,12 @@ import type {
   UploadAttemptLocalReservation,
 } from '../contract';
 import type { RawUploadBodyDependencies, RawUploadObservation } from './body';
+import type { StoragePort } from '../contract';
+import {
+  antivirusCustodyFixture,
+  antivirusApprovalFixture,
+  antivirusReceiptFixture,
+} from '../security/antivirus-fixture.helper';
 import { createRawUploadBodyHandler, validateRawUploadHeaders } from './body';
 import { createUploadAttemptJournal } from '../attempts';
 import { UploadManagementError } from '../errors';
@@ -35,31 +45,61 @@ const lease = {
 };
 const policySha256 = 'a'.repeat(64);
 const now = Date.parse('2026-10-17T02:00:00.000Z');
-const execution: UploadSecurityExecution = {
-  version: 2 as const,
+const originalSubject: UploadSecuritySubject = {
+  tenantId: principal.tenantId,
+  userId: principal.userId,
+  operationId: lease.operationId,
+  transferGeneration: lease.generation,
+  mediaType: 'text/plain',
+  bytes: 5,
+  sha256: createHash('sha256').update('hello').digest('hex'),
+};
+const execution = {
+  version: 3 as const,
   custody: { kind: 'none' as const },
   attemptId: 'operation.1',
   instanceId: '11111111-1111-4111-8111-111111111111',
   executionId: '22222222-2222-4222-8222-222222222222',
   expiresAt: '2026-10-17T02:01:00.000Z',
+  antivirus: antivirusCustodyFixture(originalSubject, '2026-10-17T02:01:00.000Z', now),
 };
+function boundExecution(subject: UploadSecuritySubject) {
+  const result = readUploadSecurityExecution({
+    ...execution,
+    antivirus: { ...execution.antivirus, subject: { ...subject } },
+  });
+  if (!result) throw new Error('Current external scanner fixture rejected');
+  return result;
+}
+function settlement(original: UploadSecurityExecution = execution) {
+  return {
+    execution: original,
+    writerStopped: true as const,
+    transientDataRemoved: true as const,
+    antivirusReceipt: antivirusReceiptFixture(original),
+  };
+}
 
 function approval(subject: UploadSecuritySubject): UploadSecurityApproval {
   return {
-    version: 1,
+    version: 2,
     decision: 'approved',
     policySha256,
     subject: { ...subject },
     scannerVersion: 'bounded-test-scanner/1',
     checkedAt: '2026-10-17T02:00:00.000Z',
     coverage: { complete: true, pages: 1, parts: 1 },
+    antivirus: antivirusApprovalFixture(boundExecution(subject), now),
   };
 }
 
-function inspection<T extends UploadSecurityDecision>(decision: T) {
+function inspection<T extends UploadSecurityDecision>(
+  decision: T,
+  original: UploadSecurityExecution = execution,
+) {
   return {
     decision,
-    settlement: { execution, writerStopped: true as const, transientDataRemoved: true as const },
+    settlement: settlement(original),
   };
 }
 
@@ -156,6 +196,7 @@ describe('raw upload body admission and streaming', () => {
         return this;
       },
     });
+    let boundWrite: ReturnType<typeof readUploadOriginalWriteBinding> | undefined;
     const management = {
       get: jest.fn(async () => {
         if (options.authorized === false) throw new Error('private authorization detail');
@@ -168,30 +209,78 @@ describe('raw upload body admission and streaming', () => {
       renew: jest.fn(async (): Promise<UploadLease> => lease),
       bindSecurityExecution: jest.fn(async () => undefined),
       settleSecurityExecution: jest.fn(async () => undefined),
+      bindOriginalWrite: jest.fn(
+        async (
+          ...[held, proposal, integrity, approved]: Parameters<
+            RawUploadBodyDependencies['management']['bindOriginalWrite']
+          >
+        ) => {
+          expect(proposal.operationId).toBe(held.operationId);
+          expect(proposal.generation).toBe(String(held.generation));
+          expect(proposal.wholeSHA256).toBe(integrity.sha256);
+          expect(proposal.bytes).toBe(inputBytes.byteLength);
+          expect(approved.subject).toMatchObject({
+            operationId: held.operationId,
+            transferGeneration: held.generation,
+            sha256: integrity.sha256,
+          });
+          const binding = readUploadOriginalWriteBinding({
+            version: 1,
+            ...proposal,
+            originalDeadline: new Date(now + 300000).toISOString(),
+          });
+          if (!binding) throw new Error('Actual Raw write proposal is not canonical');
+          if (boundWrite) expect(boundWrite).toEqual(binding);
+          boundWrite ??= binding;
+          return { ...boundWrite };
+        },
+      ),
       accept: jest.fn(async () => ({ id: 'operation', state: 'queued_processing' })),
       fail: jest.fn(async () => ({})),
       cancel: jest.fn(async () => ({})),
       confirmCleanup: jest.fn(async () => ({})),
     };
     const storage = {
-      put: jest.fn(
-        async ({ body, integrity }: { body: AsyncIterable<Uint8Array>; integrity?: unknown }) => {
-          const chunks: Buffer[] = [];
-          for await (const chunk of body) chunks.push(Buffer.from(chunk));
-          const stored = Buffer.concat(chunks);
-          expect(stored).toEqual(inputBytes);
-          // A real ordinary-storage side effect makes forbidden publication observable.
-          await writeFile(ordinaryPath, stored, { flag: 'wx' });
-          return {
-            outcome: options.outcome ?? 'durable',
-            bytes: inputBytes.byteLength,
-            source: 's3',
-            filepath: 'private',
-            storageKey: 'private',
-            integrity,
-          };
-        },
-      ),
+      put: jest.fn(async (input: Parameters<StoragePort['put']>[0]) => {
+        const { body, integrity } = input;
+        const key = `t/${input.lease.tenantId}/managed-uploads/${input.lease.userId}/${input.lease.operationId}.${input.lease.generation}__original`;
+        const proposal = {
+          bucket: 'fixture-body-originals',
+          key,
+          operationId: input.lease.operationId,
+          generation: String(input.lease.generation),
+          bytes: input.bytes,
+          wholeSHA256: integrity.sha256,
+          mediaType: input.mediaType,
+        };
+        const binding = { ...(await input.bindWrite(proposal)) };
+        expect(readUploadOriginalWriteBinding(binding)).toEqual(binding);
+        expect(binding).toEqual({
+          version: 1,
+          ...proposal,
+          originalDeadline: new Date(now + 300000).toISOString(),
+        });
+        expect(management.bindOriginalWrite).toHaveBeenCalledWith(
+          input.lease,
+          proposal,
+          integrity,
+          input.securityApproval,
+        );
+        const chunks: Buffer[] = [];
+        for await (const chunk of body) chunks.push(Buffer.from(chunk));
+        const stored = Buffer.concat(chunks);
+        expect(stored).toEqual(inputBytes);
+        // A real ordinary-storage side effect makes forbidden publication observable.
+        await writeFile(ordinaryPath, stored, { flag: 'wx' });
+        return {
+          outcome: options.outcome ?? 'durable',
+          bytes: inputBytes.byteLength,
+          source: 's3',
+          filepath: 'private',
+          storageKey: key,
+          integrity,
+        };
+      }),
       read: jest.fn(),
       remove: jest.fn(),
     };
@@ -203,14 +292,26 @@ describe('raw upload body admission and streaming', () => {
     }));
     const security = {
       policySha256,
-      prepare: jest.fn(async () => ({ ...execution })),
-      cancel: jest.fn(async (_input: Parameters<UploadSecurityPort['cancel']>[0]) => ({
-        execution: { ...execution },
-        writerStopped: false,
-        transientDataRemoved: false,
-      })),
+      prepare: jest.fn(async ({ subject }: Parameters<UploadSecurityPort['prepare']>[0]) =>
+        boundExecution(subject),
+      ),
+      cancel: jest.fn(
+        async (
+          _input: Parameters<UploadSecurityPort['cancel']>[0],
+        ): ReturnType<UploadSecurityPort['cancel']> => ({
+          execution: { ..._input.execution },
+          antivirusReceipt: null,
+          writerStopped: false,
+          transientDataRemoved: false,
+        }),
+      ),
       inspect: jest.fn(
-        async ({ subject, body, signal }: Parameters<UploadSecurityPort['inspect']>[0]) => {
+        async ({
+          execution: original,
+          subject,
+          body,
+          signal,
+        }: Parameters<UploadSecurityPort['inspect']>[0]) => {
           const hash = createHash('sha256');
           let bytes = 0;
           for await (const chunk of body) {
@@ -218,7 +319,7 @@ describe('raw upload body admission and streaming', () => {
             hash.update(chunk);
             bytes += chunk.byteLength;
           }
-          return inspection(approval({ ...subject, bytes, sha256: hash.digest('hex') }));
+          return inspection(approval({ ...subject, bytes, sha256: hash.digest('hex') }), original);
         },
       ),
     };
@@ -392,11 +493,7 @@ describe('raw upload body admission and streaming', () => {
     expect(test.management.bindSecurityExecution.mock.invocationCallOrder[0]).toBeLessThan(
       test.security.inspect.mock.invocationCallOrder[0],
     );
-    expect(test.management.settleSecurityExecution).toHaveBeenCalledWith(lease, {
-      execution,
-      writerStopped: true,
-      transientDataRemoved: true,
-    });
+    expect(test.management.settleSecurityExecution).toHaveBeenCalledWith(lease, settlement());
     expect(test.management.settleSecurityExecution.mock.invocationCallOrder[0]).toBeLessThan(
       test.storage.put.mock.invocationCallOrder[0],
     );
@@ -455,11 +552,7 @@ describe('raw upload body admission and streaming', () => {
   it('can prove scanner cleanup through an independent matching cancellation after disconnect', async () => {
     const test = fixture();
     test.security.inspect.mockRejectedValueOnce(new Error('lost connection'));
-    test.security.cancel.mockResolvedValueOnce({
-      execution,
-      writerStopped: true,
-      transientDataRemoved: true,
-    });
+    test.security.cancel.mockResolvedValueOnce(settlement());
     const done = test.run();
     test.req.end('hello');
     await done;
@@ -469,7 +562,7 @@ describe('raw upload body admission and streaming', () => {
     expect(test.management.confirmCleanup).toHaveBeenCalledWith(
       expect.objectContaining({
         writerStopped: true,
-        securitySettlement: { execution, writerStopped: true, transientDataRemoved: true },
+        securitySettlement: settlement(),
       }),
     );
     expect(test.response.value).toEqual({ code: 'security_uninspectable' });
@@ -613,9 +706,11 @@ describe('raw upload body admission and streaming', () => {
     async (_name, change, cleaned) => {
       const ticket = { bind: jest.fn(), settle: jest.fn() };
       const test = fixture('hello', { attempts: { begin: () => ticket } as never });
+      // Invalid decision data never proves cleanup. Cases with explicit cleanup use the independent exact cancellation channel.
+      if (cleaned) test.security.cancel.mockResolvedValueOnce(settlement());
       const inspect = test.security.inspect.getMockImplementation()!;
       test.security.inspect.mockImplementationOnce(async (input) =>
-        inspection(change((await inspect(input)).decision) as never),
+        inspection(change((await inspect(input)).decision) as never, input.execution),
       );
       const done = test.run();
       test.req.end('hello');
@@ -740,7 +835,7 @@ describe('raw upload body admission and streaming', () => {
       const test = fixture(bytes, { declared: bytes.byteLength });
       test.security.inspect.mockImplementationOnce(async ({ body, subject }) => {
         if (readChunks) for await (const _chunk of body) break;
-        return inspection(approval(subject));
+        return inspection(approval(subject), boundExecution(subject));
       });
       const done = test.run();
       test.req.end(bytes);
@@ -816,6 +911,7 @@ describe('raw upload body admission and streaming', () => {
       });
       test.security.cancel.mockImplementationOnce(async ({ execution }) => ({
         execution,
+        antivirusReceipt: antivirusReceiptFixture(execution),
         writerStopped: true,
         transientDataRemoved: true,
       }));
@@ -1165,7 +1261,7 @@ describe('raw upload body admission and streaming', () => {
         for await (const _chunk of body) {
           /* consume */
         }
-        return inspection(approval(subject));
+        return inspection(approval(subject), boundExecution(subject));
       });
       const done = test.run();
       test.req.end(received);

@@ -1,5 +1,5 @@
 import mongoose, { Types } from 'mongoose';
-import { MongoMemoryServer, MongoMemoryReplSet } from 'mongodb-memory-server';
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import {
   ResourceType,
   AccessRoleIds,
@@ -18,7 +18,7 @@ import type { IAclEntry } from '@librechat/data-schemas';
 import type { Model } from 'mongoose';
 import { AccessControlService } from './accessControlService';
 
-let mongo: MongoMemoryServer;
+let mongo: MongoMemoryReplSet;
 let entries: Model<IAclEntry>;
 let methods: ReturnType<typeof createMethods>;
 let service: AccessControlService;
@@ -33,12 +33,16 @@ const filter = {
 };
 
 beforeAll(async () => {
-  mongo = await MongoMemoryServer.create({ instance: { args: ['--nounixsocket'] } });
+  mongo = await MongoMemoryReplSet.create({
+    replSet: { count: 1 },
+    instanceOpts: [{ args: ['--nounixsocket'] }],
+  });
   await mongoose.connect(mongo.getUri());
   createModels(mongoose);
   entries = mongoose.models.AclEntry as Model<IAclEntry>;
   methods = createMethods(mongoose);
   await methods.seedDefaultRoles();
+  await Promise.all([entries.init(), mongoose.models.AccessRole.init()]);
 });
 
 beforeEach(async () => {
@@ -70,6 +74,21 @@ function updateRole(accessRoleId = AccessRoleIds.AGENT_EDITOR) {
     updatedPrincipals: [{ type: PrincipalType.USER, id: userId.toString(), accessRoleId }],
     grantedBy,
   });
+}
+
+/** CAS races belong to the public row writer outside the service-owned atomic transaction.
+ * The service cases retain real transaction commit/abort and caller-owned session coverage. */
+async function replaceRole(accessRoleId = AccessRoleIds.AGENT_EDITOR) {
+  const role = await methods.findRoleByIdentifier(accessRoleId);
+  if (!role) throw new Error('Real seeded access role missing');
+  return methods.replaceRoleBits([
+    {
+      filter,
+      insert: { principalModel: PrincipalModel.USER, grantedBy },
+      roleBits: role.permBits,
+      metadata: { roleId: role._id },
+    },
+  ]);
 }
 
 describe('role-only ACL writes', () => {
@@ -186,10 +205,9 @@ describe('role-only ACL writes', () => {
         if (concurrent === null) await entries.deleteMany(filter);
         else await entries.updateMany(filter, { $set: { permBits: concurrent } });
       });
-      const result = await updateRole();
+      const result = await replaceRole();
       expect((await entries.findOne(filter))!.permBits).toBe(expected);
-      expect(result.insightsChanges).toEqual([]);
-      expect(result.errors).toEqual([]);
+      expect(result.upsertedWrites).toEqual(new Set());
     },
   );
 
@@ -209,7 +227,7 @@ describe('role-only ACL writes', () => {
 
   test('applies the role to an entry created after the read, without duplicating it', async () => {
     raceBeforeWrite(() => seed(PermissionBits.VIEW | PermissionBits.VIEW_INSIGHTS));
-    await updateRole();
+    await replaceRole();
     /**
      * The identity upsert matched the entry that appeared instead of inserting,
      * so the role had not been applied; that is a miss, and the retry applies it
@@ -222,15 +240,48 @@ describe('role-only ACL writes', () => {
   test('keeps explicit Insights upsert indices correct after expanded role-only writes', async () => {
     await seed(17);
     raceBeforeWrite(() => entries.deleteMany(filter));
+    const newPrincipalId = new Types.ObjectId().toString();
+    const update = () =>
+      service.bulkUpdateResourcePermissions({
+        resourceType: ResourceType.AGENT,
+        resourceId,
+        updatedPrincipals: [
+          {
+            type: PrincipalType.USER,
+            id: newPrincipalId,
+            accessRoleId: AccessRoleIds.AGENT_EDITOR,
+          },
+          {
+            type: PrincipalType.USER,
+            id: userId.toString(),
+            accessRoleId: AccessRoleIds.AGENT_EDITOR,
+            viewInsights: false,
+          },
+        ],
+        grantedBy,
+      });
+    // A real concurrent write invalidates the transaction; only an explicit fresh call may retry it.
+    await expect(update()).rejects.toMatchObject({ code: 112 });
+    const result = await update();
+    // The failed original rolled back; the retry sees no prior grant, so no revocation may be invented.
+    expect(result.insightsChanges).toEqual([]);
+    await service.restoreInsightsPermissionChanges({
+      resourceType: ResourceType.AGENT,
+      resourceId,
+      changes: result.insightsChanges,
+    });
+    expect((await entries.findOne(filter))!.permBits).toBe(RoleBits.EDITOR);
+    expect(await entries.countDocuments({ resourceId })).toBe(2);
+  });
+
+  test('restores the actual Insights grant at its correct index after expanded role-only writes', async () => {
+    await seed(17);
+    const newPrincipalId = new Types.ObjectId().toString();
     const result = await service.bulkUpdateResourcePermissions({
       resourceType: ResourceType.AGENT,
       resourceId,
       updatedPrincipals: [
-        {
-          type: PrincipalType.USER,
-          id: new Types.ObjectId().toString(),
-          accessRoleId: AccessRoleIds.AGENT_EDITOR,
-        },
+        { type: PrincipalType.USER, id: newPrincipalId, accessRoleId: AccessRoleIds.AGENT_EDITOR },
         {
           type: PrincipalType.USER,
           id: userId.toString(),
@@ -240,16 +291,23 @@ describe('role-only ACL writes', () => {
       ],
       grantedBy,
     });
+    expect(result.errors).toEqual([]);
     expect(result.insightsChanges).toEqual([
-      expect.objectContaining({ action: 'removed', previousEntry: null }),
+      expect.objectContaining({
+        action: 'removed',
+        previousEntry: expect.objectContaining({ permBits: 17 }),
+      }),
     ]);
     await service.restoreInsightsPermissionChanges({
       resourceType: ResourceType.AGENT,
       resourceId,
       changes: result.insightsChanges,
     });
-    expect(await entries.findOne(filter)).toBeNull();
-    expect(await entries.countDocuments({ resourceId })).toBe(1);
+    expect((await entries.findOne(filter))!.permBits).toBe(17);
+    expect(
+      (await entries.findOne({ resourceId, principalId: new Types.ObjectId(newPrincipalId) }))!
+        .permBits,
+    ).toBe(RoleBits.EDITOR);
   });
 
   test('initializes missing legacy permission fields without inheriting Insights', async () => {
@@ -267,19 +325,8 @@ describe('role-only ACL writes', () => {
       /** An admin revokes Insights between our read and our write. */
       await entries.updateMany(filter, { $set: { permBits: RoleBits.OWNER } });
     });
-    const result = await service.bulkUpdateResourcePermissions({
-      resourceType: ResourceType.AGENT,
-      resourceId,
-      updatedPrincipals: [
-        {
-          type: PrincipalType.USER,
-          id: userId.toString(),
-          accessRoleId: AccessRoleIds.AGENT_VIEWER,
-        },
-      ],
-      grantedBy,
-    });
-    expect(result.errors).toEqual([]);
+    const result = await replaceRole(AccessRoleIds.AGENT_VIEWER);
+    expect(result.upsertedWrites).toEqual(new Set());
     const entry = await entries.findOne(filter).lean();
     /** The downgrade lands: no retained owner bits, no resurrected Insights. */
     expect(entry!.permBits).toBe(RoleBits.VIEWER);
@@ -323,7 +370,7 @@ describe('role-only ACL writes', () => {
   test('does not resurrect an ACL deleted between read and write', async () => {
     await seed(17);
     const spy = raceBeforeWrite(() => entries.deleteMany(filter));
-    await expect(updateRole()).rejects.toThrow('ACL deleted');
+    await expect(replaceRole()).rejects.toThrow('ACL deleted');
     expect(spy).toHaveBeenCalledTimes(1);
     expect(await entries.countDocuments(filter)).toBe(0);
   });
@@ -344,8 +391,8 @@ describe('role-only ACL writes', () => {
       return real(...args);
     }) as unknown as typeof entries.bulkWrite;
     const spy = jest.spyOn(entries, 'bulkWrite').mockImplementation(intercept);
-    const result = await updateRole();
-    expect(result.errors).toEqual([]);
+    const result = await replaceRole();
+    expect(result.upsertedWrites).toEqual(new Set());
     expect(spy).toHaveBeenCalledTimes(3);
     expect(await entries.findById(before[0]._id)).toBeNull();
     expect((await entries.findById(before[1]._id))!.permBits).toBe(3);
@@ -362,7 +409,7 @@ describe('role-only ACL writes', () => {
       return real(...args);
     }) as unknown as typeof entries.bulkWrite;
     jest.spyOn(entries, 'bulkWrite').mockImplementation(intercept);
-    await expect(updateRole()).rejects.toMatchObject({ completedEntries: 1 });
+    await expect(replaceRole()).rejects.toMatchObject({ completedEntries: 1 });
     expect(calls).toBe(2);
     const after = await entries.find(filter).sort({ _id: 1 }).lean();
     expect(after.map((entry) => entry.permBits)).toEqual([3, 31]);
@@ -370,6 +417,21 @@ describe('role-only ACL writes', () => {
       permBits: number;
     }>();
     expect(storedRole!.permBits).toBe(3);
+  });
+
+  test('rolls back the whole service-owned transaction after a later write fails', async () => {
+    await seed(15);
+    await seed(31);
+    const real = entries.bulkWrite.bind(entries);
+    let calls = 0;
+    jest.spyOn(entries, 'bulkWrite').mockImplementation(async (...args) => {
+      if (++calls === 2) throw new Error('injected transactional second-write failure');
+      return real(...args);
+    });
+    await expect(updateRole()).rejects.toThrow('injected transactional second-write failure');
+    expect(calls).toBe(2);
+    const after = await entries.find(filter).sort({ _id: 1 }).lean();
+    expect(after.map((entry) => entry.permBits)).toEqual([15, 31]);
   });
 
   test('reads from primary even with a nontransactional secondaryPreferred session', async () => {
@@ -541,8 +603,8 @@ describe('role-only ACL writes', () => {
       }),
     );
 
-    const result = await updateRole(AccessRoleIds.AGENT_EDITOR);
-    expect(result.errors).toEqual([]);
+    const result = await replaceRole(AccessRoleIds.AGENT_EDITOR);
+    expect(result.upsertedWrites).toEqual(new Set());
 
     const entry = (await entries.findOne(filter).lean())!;
     /**
@@ -576,7 +638,7 @@ describe('role-only ACL writes', () => {
       { once: false },
     );
 
-    await expect(updateRole()).rejects.toThrow(/permBits|attempt/i);
+    await expect(replaceRole()).rejects.toThrow(/permBits|attempt/i);
     const entry = (await entries.findOne(filter).lean())!;
     /** Failed loudly and left the competing writer's state intact. */
     expect(entry.roleId?.toString()).toBe(viewer!._id.toString());

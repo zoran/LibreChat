@@ -7,8 +7,15 @@ import type {
   MessageSourceCleanupResult,
 } from './messageSourceCleanup';
 import type { CounterRow } from './uploadManagementStore';
+import {
+  uploadSecurityFixture,
+  bindUploadOriginalFixture,
+  uploadSecuritySettlementFixture,
+} from './uploadManagement.security.fixture';
+import { completeAcceptedUploadFileCleanup } from './uploadManagement.structure.fixture';
 import { createUploadStore, RESOURCE_MAX } from './uploadManagementStore';
 import { createMessageMethods, CLIENT_MESSAGE_SELECT } from './message';
+import { initialFileRetentionActivity } from './fileActivityTransition';
 import { createUploadManagementRepository } from './uploadManagement';
 import { tenantStorage, runAsSystem } from '~/config/tenantContext';
 import { createFileRetentionMethods } from './fileRetention';
@@ -47,6 +54,7 @@ afterEach(async () => {
   await runAsSystem(() => mongoose.models.File.deleteMany({}));
   if (mongoose.models.UploadCounter) await mongoose.models.UploadCounter.deleteMany({});
   if (mongoose.models.UploadOperation) await mongoose.models.UploadOperation.deleteMany({});
+  if (mongoose.models.HousekeepingJob) await mongoose.models.HousekeepingJob.deleteMany({});
 });
 
 describe('managed document derivative storage', () => {
@@ -62,6 +70,8 @@ describe('managed document derivative storage', () => {
   });
   async function source() {
     const fileId = uuid();
+    const acceptedAt = new Date();
+    const expiresAt = new Date(acceptedAt.getTime() + 60_000);
     await mongoose.models.File.create({
       user: userId,
       file_id: fileId,
@@ -71,14 +81,28 @@ describe('managed document derivative storage', () => {
       bytes: 10,
       text: 'source text',
       retainedDerivativeBytes: 0,
-      retentionAcceptedAt: new Date(),
-      expiredAt: new Date(Date.now() + 60_000),
+      retentionAcceptedAt: acceptedAt,
+      expiredAt: expiresAt,
+      retentionActivity: initialFileRetentionActivity(expiresAt, acceptedAt, 'complete'),
     });
     return { sourceFileIds: [fileId], sourceExpiresAt: new Date(Date.now() + 60_000) };
   }
   let previousCleanupPolicy: string | undefined;
-  beforeEach(() => {
+  beforeEach(async () => {
     previousCleanupPolicy = process.env.UPLOAD_SECURITY_POLICY_SHA256;
+    await run(() =>
+      mongoose.models.User.updateOne(
+        { _id: userId, tenantId: owner.tenantId },
+        {
+          $setOnInsert: {
+            email: `${userId}@example.invalid`,
+            emailVerified: true,
+            provider: 'local',
+          },
+        },
+        { upsert: true },
+      ),
+    );
   });
   afterEach(() => {
     if (previousCleanupPolicy === undefined) delete process.env.UPLOAD_SECURITY_POLICY_SHA256;
@@ -131,39 +155,8 @@ describe('managed document derivative storage', () => {
       now: at,
     });
     if (!transfer) throw new Error('Managed fixture transfer was not admitted');
-    const execution = {
-      version: 2 as const,
-      custody: { kind: 'none' as const },
-      attemptId: `${sourceId}.${transfer.generation}`,
-      instanceId: uuid(),
-      executionId: uuid(),
-      expiresAt: new Date(at + 60000).toISOString(),
-    };
-    await uploads.bindSecurityExecution(transfer, execution, at);
-    await uploads.settleSecurityExecution(
-      transfer,
-      { execution, writerStopped: true, transientDataRemoved: true },
-      at,
-    );
-    await uploads.accept(
-      principal,
-      transfer,
-      {
-        outcome: 'durable',
-        bytes: 6,
-        source: 's3',
-        filepath: `/api/files/download/${sourceId}`,
-        storageKey: `t/${owner.tenantId}/managed-uploads/${userId}/${sourceId}.${transfer.generation}__original`,
-        integrity: {
-          version: 1,
-          algorithm: 'sha256',
-          sha256: 'a'.repeat(64),
-          chunkBytes: 262144,
-          chunkSha256: ['b'.repeat(64)],
-        },
-      },
-      {
-        version: 1,
+    const security = uploadSecurityFixture(
+      uploadSecurityFixture({
         decision: 'approved',
         policySha256: policy,
         subject: {
@@ -178,7 +171,81 @@ describe('managed document derivative storage', () => {
         scannerVersion: 'fixture-v1',
         checkedAt: new Date(at).toISOString(),
         coverage: { complete: true, pages: 1, parts: 1 },
+      }).approval,
+      {
+        custody: { kind: 'none' as const },
+        attemptId: `${sourceId}.${transfer.generation}`,
+        instanceId: uuid(),
+        executionId: uuid(),
+        expiresAt: new Date(at + 60000).toISOString(),
       },
+    );
+    const execution = security.execution;
+    const originalFixture: Parameters<typeof uploads.accept>[2] = {
+      outcome: 'durable',
+      bytes: 6,
+      source: 's3',
+      filepath: `/api/files/download/${sourceId}`,
+      storageKey: `t/${owner.tenantId}/managed-uploads/${userId}/${sourceId}.${transfer.generation}__original`,
+      integrity: {
+        version: 1,
+        algorithm: 'sha256',
+        sha256: 'a'.repeat(64),
+        chunkBytes: 262144,
+        chunkSha256: ['b'.repeat(64)],
+      },
+    };
+    await uploads.bindSecurityExecution(transfer, execution, at);
+    await uploads.settleSecurityExecution(
+      transfer,
+      uploadSecuritySettlementFixture(execution, {
+        writerStopped: true,
+        transientDataRemoved: true,
+      }),
+      at,
+    );
+    await bindUploadOriginalFixture(
+      uploads,
+      transfer,
+      originalFixture,
+      uploadSecurityFixture({
+        decision: 'approved',
+        policySha256: policy,
+        subject: {
+          userId,
+          tenantId: owner.tenantId,
+          operationId: sourceId,
+          transferGeneration: transfer.generation,
+          mediaType: 'text/plain',
+          bytes: 6,
+          sha256: 'a'.repeat(64),
+        },
+        scannerVersion: 'fixture-v1',
+        checkedAt: new Date(at).toISOString(),
+        coverage: { complete: true, pages: 1, parts: 1 },
+      }).approval,
+      at,
+    );
+    await uploads.accept(
+      principal,
+      transfer,
+      originalFixture,
+      uploadSecurityFixture({
+        decision: 'approved',
+        policySha256: policy,
+        subject: {
+          userId,
+          tenantId: owner.tenantId,
+          operationId: sourceId,
+          transferGeneration: transfer.generation,
+          mediaType: 'text/plain',
+          bytes: 6,
+          sha256: 'a'.repeat(64),
+        },
+        scannerVersion: 'fixture-v1',
+        checkedAt: new Date(at).toISOString(),
+        coverage: { complete: true, pages: 1, parts: 1 },
+      }).approval,
       { filename: 'A.txt' },
       at,
     );
@@ -306,36 +373,8 @@ describe('managed document derivative storage', () => {
       const managedFiles = createFileRetentionMethods(mongoose, {
         securityPolicySha256: 'c'.repeat(64),
       });
-      const context = await source();
+      const context = await managedSource();
       const operationId = context.sourceFileIds[0];
-      await mongoose.models.File.updateOne(
-        { file_id: operationId },
-        {
-          $set: {
-            uploadOperationId: operationId,
-            embedded: false,
-            status: 'pending',
-            source: 's3',
-            storageKey: `t/${owner.tenantId}/managed-uploads/${owner.userId}/${operationId}.1__original`,
-            securityApproval: {
-              version: 1,
-              decision: 'approved',
-              policySha256: 'c'.repeat(64),
-              subject: {
-                ...owner,
-                operationId,
-                transferGeneration: 1,
-                bytes: 10,
-                mediaType: 'text/plain',
-                sha256: 'a'.repeat(64),
-              },
-              scannerVersion: 'fixture-v1',
-              checkedAt: new Date().toISOString(),
-              coverage: { complete: true, pages: 1, parts: 1 },
-            },
-          },
-        },
-      );
       const session = await mongoose.startSession();
       try {
         await session.withTransaction(async () => {
@@ -354,7 +393,7 @@ describe('managed document derivative storage', () => {
               text: 'usable parsed text',
               structure: {
                 version: 1,
-                source: { sha256: 'a'.repeat(64), bytes: 10, mediaType: 'text/plain' },
+                source: { sha256: 'a'.repeat(64), bytes: 6, mediaType: 'text/plain' },
                 extractor: { name: 'fixture', version: '1' },
                 pages: [],
                 elements: [
@@ -427,16 +466,22 @@ describe('managed document derivative storage', () => {
   it('reserves source-job copies idempotently and refunds only stored content bytes after purge', async () =>
     run(async () => {
       await initialize();
-      const context = await source();
+      const context = await managedSource();
+      const original = await mongoose.models.UploadOperation.findById(context.sourceFileIds[0])
+        .lean<{ textBytes: number }>()
+        .orFail();
+      const originalCharge = original.textBytes;
+      expect(originalCharge).toBeGreaterThan(0);
+      expect(await total()).toBe(originalCharge);
       const input = {
         reservationId: 'a'.repeat(64),
         sourceFileIds: context.sourceFileIds,
         bytes: 4096,
       };
       const receipt = await files.reserveFileSourceCopies(owner, input);
-      expect(await total()).toBe(4096 + 256);
+      expect(await total()).toBe(originalCharge + 4096 + 256);
       expect(await files.reserveFileSourceCopies(owner, input)).toEqual(receipt);
-      expect(await total()).toBe(4096 + 256);
+      expect(await total()).toBe(originalCharge + 4096 + 256);
       await expect(
         files.releaseFileSourceCopies(
           { ...owner, userId: new mongoose.Types.ObjectId().toString() },
@@ -444,11 +489,16 @@ describe('managed document derivative storage', () => {
         ),
       ).rejects.toThrow();
       await files.releaseFileSourceCopies(owner, { ...receipt, bytes: RESOURCE_MAX.textBytes });
-      expect(await total()).toBe(256);
+      expect(await total()).toBe(originalCharge + 256);
       await files.releaseFileSourceCopies(owner, receipt);
-      expect(await total()).toBe(256);
+      expect(await total()).toBe(originalCharge + 256);
       await expect(files.reserveFileSourceCopies(owner, input)).rejects.toThrow();
       await files.revokeFileSources(owner, context.sourceFileIds);
+      await completeAcceptedUploadFileCleanup(
+        mongoose,
+        { ...owner, authentication: 'verified-email' },
+        context.sourceFileIds[0],
+      );
       await files.finalizeFileSourceDeletion(owner, context.sourceFileIds);
       expect(await total()).toBe(0);
       await files.releaseFileSourceCopies(owner, receipt);
@@ -619,6 +669,11 @@ describe('managed document derivative storage', () => {
       expect(await derivativeTotal()).toBe(charged);
       await files.revokeFileSources(owner, context.sourceFileIds);
       await methods.redactFileSourceContent(owner, context.sourceFileIds);
+      await completeAcceptedUploadFileCleanup(
+        mongoose,
+        { ...owner, authentication: 'verified-email' },
+        context.sourceFileIds[0],
+      );
       await files.finalizeFileSourceDeletion(owner, context.sourceFileIds);
       expect(await derivativeTotal()).toBe(0);
       await files.finalizeFileSourceDeletion(owner, context.sourceFileIds);

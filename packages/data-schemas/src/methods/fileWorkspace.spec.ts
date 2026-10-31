@@ -11,6 +11,11 @@ import { uploadReservationFingerprint } from 'librechat-data-provider';
 import type { UploadDerivedOrigin } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
 import type { ManagedUploadAcceptance } from '~/types/file';
+import {
+  uploadSecurityFixture,
+  bindUploadOriginalFixture,
+  uploadSecuritySettlementFixture,
+} from './uploadManagement.security.fixture';
 import { createFileRetentionMethods, FileSourceUnavailableError } from './fileRetention';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createHousekeepingStore } from './housekeepingStore';
@@ -84,8 +89,7 @@ describe('Workspace File access through the actual retained File authority', () 
           chunkSha256: [sha256],
         },
       },
-      securityApproval: {
-        version: 1,
+      securityApproval: uploadSecurityFixture({
         decision: 'approved',
         policySha256: policy,
         subject: {
@@ -99,7 +103,7 @@ describe('Workspace File access through the actual retained File authority', () 
         scannerVersion: 'synthetic-scanner/v1',
         checkedAt: new Date(now).toISOString(),
         coverage: { complete: true, pages: 1, parts: 1 },
-      },
+      }).approval,
     };
   }
   async function ready(id: string, origin?: UploadDerivedOrigin) {
@@ -133,20 +137,24 @@ describe('Workspace File access through the actual retained File authority', () 
       worker,
       now,
     }))!;
-    const execution = {
-      version: 2 as const,
+    const security = uploadSecurityFixture(input.securityApproval!, {
       custody: { kind: 'none' as const },
       attemptId: `${id}.${transfer.generation}`,
       instanceId: '11111111-1111-4111-8111-111111111111',
       executionId: '22222222-2222-4222-8222-222222222222',
       expiresAt: new Date(now + 60000).toISOString(),
-    };
+    });
+    const execution = security.execution;
     await uploads.bindSecurityExecution(transfer, execution, now);
     await uploads.settleSecurityExecution(
       transfer,
-      { execution, writerStopped: true, transientDataRemoved: true },
+      uploadSecuritySettlementFixture(execution, {
+        writerStopped: true,
+        transientDataRemoved: true,
+      }),
       now,
     );
+    await bindUploadOriginalFixture(uploads, transfer, input.receipt, input.securityApproval!, now);
     await uploads.accept(
       principal(),
       transfer,

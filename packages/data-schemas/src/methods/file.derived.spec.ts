@@ -19,6 +19,12 @@ import type { FileCleanupProgressResult } from '../types/fileCleanup';
 import type { ManagedUploadAcceptance } from '~/types/file';
 import type { JobClaim } from '../types/housekeeping';
 import {
+  uploadSecurityFixture,
+  originalWriteBindingFixture,
+  bindUploadOriginalFixture,
+  uploadSecuritySettlementFixture,
+} from './uploadManagement.security.fixture';
+import {
   createFileRetentionMethods,
   FileSourceCapacityError,
   FileSourceUnavailableError,
@@ -197,7 +203,7 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
     origin?: UploadDerivedOrigin,
     acceptedAt = now,
   ): ManagedUploadAcceptance {
-    return {
+    const input: ManagedUploadAcceptance = {
       principal: { ...owner, authentication: 'verified-email' },
       operationId: id,
       filename: `synthetic-${id}.txt`,
@@ -219,8 +225,7 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
           chunkSha256: [sha256],
         },
       },
-      securityApproval: {
-        version: 1,
+      securityApproval: uploadSecurityFixture({
         decision: 'approved',
         policySha256: policy,
         subject: {
@@ -234,7 +239,15 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
         scannerVersion: 'explicit-synthetic-scanner/v1',
         checkedAt: new Date(acceptedAt).toISOString(),
         coverage: { complete: true, pages: 1, parts: 1 },
-      },
+      }).approval,
+    };
+    return {
+      ...input,
+      writeBinding: originalWriteBindingFixture(
+        input.receipt,
+        input.securityApproval,
+        input.acceptedAt,
+      ),
     };
   }
   const intent = (ids: string[]): UploadDerivedIntent => ({
@@ -302,18 +315,28 @@ describe('private derived File lifecycle using actual Mongo transactions', () =>
       now,
     }))!;
     expect(transfer.generation).toBe(input.transferGeneration);
-    const execution = {
-      version: 2 as const,
+    const security = uploadSecurityFixture(input.securityApproval!, {
       custody: { kind: 'none' as const },
       attemptId: `${id}.${transfer.generation}`,
       instanceId: '11111111-1111-4111-8111-111111111111',
       executionId: '22222222-2222-4222-8222-222222222222',
       expiresAt: new Date(now + 60_000).toISOString(),
-    };
+    });
+    const execution = security.execution;
     await uploads.bindSecurityExecution(transfer, execution, now);
     await uploads.settleSecurityExecution(
       transfer,
-      { execution, writerStopped: true, transientDataRemoved: true },
+      uploadSecuritySettlementFixture(execution, {
+        writerStopped: true,
+        transientDataRemoved: true,
+      }),
+      now,
+    );
+    input.writeBinding = await bindUploadOriginalFixture(
+      uploads,
+      transfer,
+      input.receipt,
+      input.securityApproval!,
       now,
     );
     await uploads.accept(

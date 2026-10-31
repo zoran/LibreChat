@@ -1,6 +1,10 @@
 jest.mock('@microsoft/microsoft-graph-client');
-jest.mock('~/strategies/openidStrategy');
-jest.mock('~/cache/getLogStores');
+// Auto-mock metadata uses an isolated registry without the initialized model graph.
+jest.mock('~/strategies/openidStrategy', () => ({
+  ...jest.requireActual('~/strategies/openidStrategy'),
+  getOpenIdConfig: jest.fn(),
+}));
+jest.mock('~/cache/getLogStores', () => jest.fn());
 jest.mock('@librechat/data-schemas', () => ({
   ...jest.requireActual('@librechat/data-schemas'),
   logger: {

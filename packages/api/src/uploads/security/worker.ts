@@ -197,10 +197,10 @@ export function createSecurityWorker(options: Options): SecurityWorker {
         if (
           !execution ||
           execution.custody.kind !== 'pdf-ocr' ||
-          execution.attemptId !== record.execution.attemptId ||
-          execution.instanceId !== record.execution.instanceId ||
-          execution.executionId !== record.execution.executionId ||
-          execution.expiresAt !== record.execution.expiresAt ||
+          !matchesUploadSecurityExecution(
+            { ...execution, custody: record.execution.custody },
+            record.execution,
+          ) ||
           execution.custody.scope.documentSha256 !== record.subject.sha256 ||
           execution.custody.scope.workDeadline !== preparation.workDeadline ||
           execution.custody.scope.cleanupDeadline !== preparation.cleanupDeadline
@@ -591,6 +591,10 @@ export function createSecurityWorker(options: Options): SecurityWorker {
         live(record);
         return snapshot(record);
       } catch (error) {
+        if (record.preparation && !record.provider && !input.signal.aborted) {
+          live(record);
+          throw error;
+        }
         stop(record);
         await retire(record, true);
         throw error;

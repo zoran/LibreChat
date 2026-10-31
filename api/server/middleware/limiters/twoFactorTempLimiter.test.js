@@ -1,13 +1,6 @@
 const jwt = require('jsonwebtoken');
 const express = require('express');
 const request = require('supertest');
-const {
-  createTwoFactorLimiters,
-  createTwoFactorTempUser,
-  createAuthMaintenance,
-  createAuthSessionStore,
-  observeAuthCacheWrite,
-} = jest.requireActual('@librechat/api');
 
 const originalEnv = process.env;
 const jwtSecret = 'test-two-factor-secret';
@@ -29,11 +22,7 @@ const createApp = (max = '2', setupMax = '2') => {
   };
 
   jest.doMock('@librechat/api', () => ({
-    createTwoFactorLimiters,
-    createTwoFactorTempUser,
-    createAuthMaintenance,
-    createAuthSessionStore,
-    observeAuthCacheWrite,
+    ...jest.requireActual('@librechat/api'),
     limiterCache: jest.fn(() => undefined),
     removePorts: (req) => req?.['ip'],
   }));

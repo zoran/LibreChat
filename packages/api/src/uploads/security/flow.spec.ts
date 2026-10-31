@@ -5,8 +5,8 @@ import { PassThrough } from 'node:stream';
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
-import { UPLOAD_RETENTION_MS } from 'librechat-data-provider';
 import { readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { UPLOAD_RETENTION_MS, readUploadOriginalWriteBinding } from 'librechat-data-provider';
 import type {
   UploadDerivedOrigin,
   UploadSecurityApproval,
@@ -395,6 +395,34 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
           stored: await readOperation(),
           files: await fixture.observer.models.File.countDocuments({}),
         });
+        expect(input.lease.operationId).toBe(operation.id);
+        const storageKey = `t/${input.lease.tenantId}/managed-uploads/${input.lease.userId}/${input.lease.operationId}.${input.lease.generation}__original`;
+        const proposal = {
+          bucket: 'fixture-security-originals',
+          key: storageKey,
+          operationId: input.lease.operationId,
+          generation: String(input.lease.generation),
+          bytes: input.bytes,
+          wholeSHA256: input.integrity.sha256,
+          mediaType: input.mediaType,
+        };
+        // Match the real S3 adapter: persist the exact original before consuming body bytes.
+        expect(typeof input.bindWrite).toBe('function');
+        const binding = { ...(await input.bindWrite(proposal)) };
+        expect(readUploadOriginalWriteBinding(binding)).toEqual(binding);
+        expect(binding).toEqual({
+          version: 1,
+          ...proposal,
+          originalDeadline: binding.originalDeadline,
+        });
+        expect(Date.parse(binding.originalDeadline)).toBeGreaterThan(Date.now());
+        const persisted = await fixture.observer.models.UploadOperation.findById(
+          operation.id,
+        ).lean<{ writeBinding?: unknown }>();
+        expect(persisted).toHaveProperty('writeBinding');
+        expect(readUploadOriginalWriteBinding(Object.assign({}, persisted?.writeBinding))).toEqual(
+          binding,
+        );
         const chunks: Buffer[] = [];
         for await (const chunk of input.body) {
           input.signal.throwIfAborted();
@@ -407,7 +435,7 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
           bytes: input.bytes,
           integrity: input.integrity,
           filepath: `/api/files/download/${operation.id}`,
-          storageKey: `t/${input.lease.tenantId}/managed-uploads/${input.lease.userId}/${operation.id}.${input.lease.generation}__original`,
+          storageKey,
         };
       });
       const storage: StoragePort = {

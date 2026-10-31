@@ -1192,7 +1192,7 @@ describe('message route conversation ownership filters', () => {
         content: [{ type: 'text', text: 'updated artifact' }],
         userSubmittedPaths: ['/content/1/steer', '/content/0/text'],
       }),
-      { context: 'POST /api/messages/artifact/:messageId' },
+      { context: 'POST /api/messages/artifact/:messageId', expectedVersion: null },
     );
   });
 

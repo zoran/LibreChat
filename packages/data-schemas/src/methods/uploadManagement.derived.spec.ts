@@ -5,6 +5,7 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import {
   UPLOAD_RETENTION_MS,
   UPLOAD_RECORD_BYTES,
+  UPLOAD_AV_RECORD_BYTES,
   UPLOAD_DERIVED_MAX_ORIGIN_BYTES,
   uploadReservationFingerprint,
   readUploadDerivedOrigin,
@@ -15,11 +16,16 @@ import type {
   UploadDerivedOrigin,
   UploadLease,
   UploadPrincipal,
-  UploadSecurityApproval,
+  CurrentUploadSecurityApproval,
   UploadStorageReceipt,
 } from 'librechat-data-provider';
 import type { StoredUpload } from './uploadManagementStore';
 import type { IMongoFile } from '~/types';
+import {
+  uploadSecurityFixture,
+  uploadSecuritySettlementFixture,
+  bindUploadOriginalFixture,
+} from './uploadManagement.security.fixture';
 import { createFileRetentionMethods, FileSourceUnavailableError } from './fileRetention';
 import { createUploadManagementRepository } from './uploadManagement';
 import { loadManagedFileSource } from './fileSourceAuthority';
@@ -69,23 +75,23 @@ describe('private derived upload reservations', () => {
       chunkSha256: [sha256],
     },
   });
-  const approval = (lease: UploadLease, at: number): UploadSecurityApproval => ({
-    version: 1,
-    decision: 'approved',
-    policySha256: policy,
-    subject: {
-      tenantId: user.tenantId,
-      userId: user.userId,
-      operationId: lease.operationId,
-      transferGeneration: lease.generation,
-      mediaType: 'text/plain',
-      bytes,
-      sha256,
-    },
-    scannerVersion: 'synthetic-fixture',
-    checkedAt: new Date(at).toISOString(),
-    coverage: { complete: true, pages: 1, parts: 1 },
-  });
+  const approval = (lease: UploadLease, at: number): CurrentUploadSecurityApproval =>
+    uploadSecurityFixture({
+      decision: 'approved',
+      policySha256: policy,
+      subject: {
+        tenantId: user.tenantId,
+        userId: user.userId,
+        operationId: lease.operationId,
+        transferGeneration: lease.generation,
+        mediaType: 'text/plain',
+        bytes,
+        sha256,
+      },
+      scannerVersion: 'synthetic-fixture',
+      checkedAt: new Date(at).toISOString(),
+      coverage: { complete: true, pages: 1, parts: 1 },
+    }).approval;
   beforeAll(async () => {
     mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
     await db.connect(mongo.getUri('upload-derived'));
@@ -130,20 +136,23 @@ describe('private derived upload reservations', () => {
       worker,
       now: at,
     }))!;
-    const execution = {
-      version: 2 as const,
+    const execution = uploadSecurityFixture(approval(lease, at), {
       custody: { kind: 'none' as const },
       attemptId: `${id}.${lease.generation}`,
       instanceId: randomUUID(),
       executionId: randomUUID(),
       expiresAt: new Date(at + 60_000).toISOString(),
-    };
+    }).execution;
     await repository.bindSecurityExecution(lease, execution, at);
     await repository.settleSecurityExecution(
       lease,
-      { execution, writerStopped: true, transientDataRemoved: true },
+      uploadSecuritySettlementFixture(execution, {
+        writerStopped: true,
+        transientDataRemoved: true,
+      }),
       at,
     );
+    await bindUploadOriginalFixture(repository, lease, original(lease), approval(lease, at), at);
     return lease;
   }
   async function accept(lease: UploadLease, at: number) {
@@ -593,12 +602,13 @@ describe('private derived upload reservations', () => {
       operationId: 'x'.repeat(128),
       hostId: 'h'.repeat(128),
       instanceId: 'i'.repeat(128),
-      generation: Number.MAX_SAFE_INTEGER,
+      generation: 999_999_999_999_999,
     };
     const proof = approval(wideLease, now);
     proof.subject.tenantId = wideLease.tenantId;
     proof.subject.bytes = 65536;
     proof.scannerVersion = 's'.repeat(128);
+    proof.antivirus = uploadSecurityFixture(proof).approval.antivirus;
     const receipt = {
       ...original(wideLease),
       bytes: 65536,
@@ -619,14 +629,13 @@ describe('private derived upload reservations', () => {
       receipt,
     };
     expect(readUploadPromotionRecord(promotion)).not.toBeNull();
-    const execution = {
-      version: 2,
+    const execution = uploadSecurityFixture(proof, {
       custody: { kind: 'none' as const },
       attemptId: `${wideLease.operationId}.${wideLease.generation}`,
-      instanceId: 's'.repeat(128),
+      instanceId: '11111111-1111-4111-8111-111111111111',
       executionId: randomUUID(),
       expiresAt: new Date(now + 60_000).toISOString(),
-    };
+    }).execution;
     const maximum = {
       ...(await raw('derived')),
       tenantId: wideLease.tenantId,
@@ -644,7 +653,10 @@ describe('private derived upload reservations', () => {
       promotion,
       securityApproval: proof,
       securityExecution: execution,
-      securitySettlement: { execution, writerStopped: true, transientDataRemoved: true },
+      securitySettlement: uploadSecuritySettlementFixture(execution, {
+        writerStopped: true,
+        transientDataRemoved: true,
+      }),
       worker: { hostId: wideLease.hostId, instanceId: wideLease.instanceId },
       parserExecution: {
         attemptId: execution.attemptId,
@@ -691,8 +703,8 @@ describe('private derived upload reservations', () => {
     const journalBytes = mongoose.mongo.BSON.calculateObjectSize(journal);
     const totalBytes = mongoose.mongo.BSON.calculateObjectSize(maximum);
     expect(originBytes).toBeLessThanOrEqual(UPLOAD_RECORD_BYTES / 2);
-    expect(journalBytes).toBeLessThanOrEqual(UPLOAD_RECORD_BYTES / 2);
-    expect(totalBytes).toBeLessThanOrEqual(UPLOAD_RECORD_BYTES);
+    expect(journalBytes).toBeLessThanOrEqual(UPLOAD_AV_RECORD_BYTES - UPLOAD_RECORD_BYTES / 2);
+    expect(totalBytes).toBeLessThanOrEqual(UPLOAD_AV_RECORD_BYTES);
     console.info('Native derived BSON bounds', { originBytes, journalBytes, totalBytes });
   });
   it('fences both processing input and parser binding after File revocation despite a current Upload lease', async () => {

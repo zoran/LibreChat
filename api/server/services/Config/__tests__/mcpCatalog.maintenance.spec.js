@@ -4,9 +4,9 @@ const path = require('node:path');
 const vm = require('node:vm');
 const { EventEmitter } = require('node:events');
 const { CacheKeys } = require('librechat-data-provider');
-const catalog = require('../../../../../packages/api/src/mcp/catalog/store');
-const publications = require('../../../../../packages/api/src/mcp/toolsChanged');
-const { createMCPToolCacheService } = require('../../../../../packages/api/src/mcp/tools');
+const catalog = jest.requireActual('@librechat/api');
+const publications = catalog;
+const { createMCPToolCacheService } = catalog;
 
 function deferred() {
   let resolve, reject;
@@ -56,6 +56,11 @@ function fixture() {
     }),
     getAllServerConfigs: async () => ({ server: f.config }),
     isAppServerConfig: async () => true,
+    getAllowedDomains: () => undefined,
+    getAllowedAddresses: () => undefined,
+    reset: jest.fn(async () => {
+      f.config = undefined;
+    }),
   };
   const store = load('../getCachedTools.js', {
     'librechat-data-provider': { CacheKeys },
@@ -178,54 +183,52 @@ test('registered publication preserves its write failure before notification ret
 });
 
 test('actual reinitialization retains the detached refresh publication after its caller returns', async () => {
-  const { MCPConnection } = require('../../../../../packages/api/src/mcp/connection');
-  const {
-    ConnectionsRepository,
-  } = require('../../../../../packages/api/src/mcp/ConnectionsRepository');
-  const {
-    MCPConnectionFactory,
-  } = require('../../../../../packages/api/src/mcp/MCPConnectionFactory');
-  const {
-    MCPServersRegistry,
-  } = require('../../../../../packages/api/src/mcp/registry/MCPServersRegistry');
+  const { MCPManager, MCPConnection, MCPServersRegistry } = catalog;
   const f = fixture();
   await f.startup();
   await f.store.getMCPToolsCacheGeneration({ userId: 'user', serverName: 'server' });
   f.registry.resolveAllowlists = async () => ({ useSSRFProtection: false });
-  const connection = new MCPConnection({ serverName: 'server', serverConfig: f.config });
-  // No transport is constructed or connected. The real refresh has no tools to fetch.
-  connection.emit('connectionChange', 'connected');
-  const capabilities = jest.spyOn(connection.client, 'getServerCapabilities').mockReturnValue({});
-  const initialSnapshot = jest.spyOn(connection, 'fetchOrderedToolsSnapshot').mockResolvedValue({
-    tools: [],
-    complete: true,
-    orderingUnavailable: true,
-  });
-  const refresh = jest.spyOn(connection, 'refreshToolList');
-  const factory = jest.spyOn(MCPConnectionFactory, 'create').mockResolvedValue(connection);
+  const suppliedConfig = f.config;
+  let connection, ping, capabilities, initialSnapshot, refresh;
+  // The real factory constructs the connection; only its external transport is controlled.
+  const transport = jest
+    .spyOn(MCPConnection.prototype, 'connect')
+    .mockImplementation(async function () {
+      connection = this;
+      ping = jest.spyOn(this.client, 'ping').mockResolvedValue({});
+      capabilities = jest.spyOn(this.client, 'getServerCapabilities').mockReturnValue({});
+      initialSnapshot = jest.spyOn(this, 'fetchOrderedToolsSnapshot').mockResolvedValue({
+        tools: [],
+        complete: true,
+        orderingUnavailable: true,
+      });
+      refresh = jest.spyOn(this, 'refreshToolList');
+      this.emit('connectionChange', 'connected');
+    });
   const registry = jest.spyOn(MCPServersRegistry, 'getInstance').mockReturnValue(f.registry);
-  const repository = new ConnectionsRepository();
+  const manager = new MCPManager();
   let drain;
   try {
+    // Empty startup still executes the real initializer and installs its real repository.
+    await manager.initialize({});
+    expect(f.registry.reset).toHaveBeenCalledTimes(1);
+    expect(await f.registry.getServerConfig('server')).toBeUndefined();
+    f.config = suppliedConfig;
+    const repository = manager.appConnections;
+    expect(repository).not.toBeNull();
     // Register the actual repository's toolsChanged -> notifyMCPToolsChanged continuation.
     expect(await repository.get('server', { refreshTools: false })).toBe(connection);
+    expect(transport).toHaveBeenCalledTimes(1);
+    expect(ping).toHaveBeenCalledTimes(1);
     const reinitializer = load('../../Tools/mcp.js', {
       '@librechat/data-schemas': {
         logger: { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() },
       },
-      '@librechat/api': {
-        ...require('../../../../../packages/api/src/mcp/utils'),
-        ...require('../../../../../packages/api/src/mcp/reinitialize'),
-        ...require('../../../../../packages/api/src/mcp/capabilities'),
-        ...require('../../../../../packages/api/src/mcp/errors'),
-      },
+      '@librechat/api': catalog,
       'librechat-data-provider': require('librechat-data-provider'),
       '~/config': {
         getMCPServersRegistry: () => f.registry,
-        getMCPManager: () => ({
-          getConnection: async () => connection,
-          getToolPublicationGeneration: () => undefined,
-        }),
+        getMCPManager: () => manager,
       },
       '~/models': {},
       '~/server/services/GraphTokenService': {},
@@ -276,12 +279,13 @@ test('actual reinitialization retains the detached refresh publication after its
     });
   } finally {
     f.write?.resolve();
-    await Promise.all(repository.disconnectAll());
+    await manager.disconnectAppServers();
     await (drain ?? f.store.mcpCatalogMaintenance.drain());
-    capabilities.mockRestore();
-    initialSnapshot.mockRestore();
-    refresh.mockRestore();
-    factory.mockRestore();
+    ping?.mockRestore();
+    capabilities?.mockRestore();
+    initialSnapshot?.mockRestore();
+    refresh?.mockRestore();
+    transport.mockRestore();
     registry.mockRestore();
   }
 });

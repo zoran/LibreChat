@@ -2,7 +2,7 @@ const mongoose = require('mongoose');
 const express = require('express');
 const request = require('supertest');
 const { v4: uuidv4 } = require('uuid');
-const { MongoMemoryServer } = require('mongodb-memory-server');
+const { MongoMemoryReplSet } = require('mongodb-memory-server');
 
 const mockDb = { methods: null };
 
@@ -121,7 +121,7 @@ describe('tool-call previews on the message routes', () => {
   };
 
   beforeAll(async () => {
-    mongoServer = await MongoMemoryServer.create();
+    mongoServer = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
     const { createModels, createMethods } = jest.requireActual('@librechat/data-schemas');
     createModels(mongoose);
     mockDb.methods = createMethods(mongoose);

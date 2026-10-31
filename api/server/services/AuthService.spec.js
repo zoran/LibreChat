@@ -1,3 +1,16 @@
+/** Runtime fixture identities are shared by their producers and assertions. */
+const mockRandomUUID = require('node:crypto').randomUUID;
+const mockAccessToken1 = mockRandomUUID();
+const mockRefreshToken2 = mockRandomUUID();
+const mockIdToken3 = mockRandomUUID();
+const mockAccessToken4 = mockRandomUUID();
+const mockRefreshToken5 = mockRandomUUID();
+const mockAccessToken6 = mockRandomUUID();
+const mockRefreshToken7 = mockRandomUUID();
+const mockCredential8 = mockRandomUUID();
+const mockCredential9 = mockRandomUUID();
+const mockPassword10 = `Fixture-${mockRandomUUID()}-17!`;
+
 // Policy fixtures isolate lifecycle; actual owner/consumer settlement is covered by maintenance suites.
 jest.mock('~/server/services/LegacyAuthMaintenance', () => ({
   withAuthRequest: async (_req, action) => action(),
@@ -17,6 +30,7 @@ jest.mock('~/server/services/LegacyAuthMaintenance', () => ({
 jest.mock(
   '@librechat/data-schemas',
   () => ({
+    ...jest.requireActual('@librechat/data-schemas'),
     logger: { info: jest.fn(), warn: jest.fn(), debug: jest.fn(), error: jest.fn() },
     runAsSystem: (callback) => callback(),
     getTenantId: jest.fn(() => undefined),
@@ -28,6 +42,7 @@ jest.mock(
 jest.mock(
   'librechat-data-provider',
   () => ({
+    ...jest.requireActual('librechat-data-provider'),
     ErrorTypes: {},
     SystemRoles: { USER: 'USER', ADMIN: 'ADMIN' },
     errorsToString: jest.fn(),
@@ -39,6 +54,7 @@ jest.mock(
   () => {
     const shouldUseSecureCookie = jest.fn(() => false);
     return {
+      ...jest.requireActual('@librechat/api'),
       isEnabled: jest.fn((val) => val === 'true' || val === true),
       checkEmailConfig: jest.fn(),
       isEmailDomainAllowed: jest.fn(),
@@ -268,8 +284,8 @@ describe('setOpenIDAuthTokens', () => {
     it('should return id_token when both id_token and access_token are present', () => {
       const tokenset = {
         id_token: 'the-id-token',
-        access_token: 'the-access-token',
-        refresh_token: 'the-refresh-token',
+        access_token: mockAccessToken1,
+        refresh_token: mockRefreshToken2,
       };
       const req = mockRequest();
       const res = mockResponse();
@@ -280,45 +296,45 @@ describe('setOpenIDAuthTokens', () => {
 
     it('should return access_token when id_token is not available', () => {
       const tokenset = {
-        access_token: 'the-access-token',
-        refresh_token: 'the-refresh-token',
+        access_token: mockAccessToken1,
+        refresh_token: mockRefreshToken2,
       };
       const req = mockRequest();
       const res = mockResponse();
 
       const result = setOpenIDAuthTokens(tokenset, req, res, 'user-123');
-      expect(result).toBe('the-access-token');
+      expect(result).toBe(mockAccessToken1);
     });
 
     it('should return access_token when id_token is undefined', () => {
       const tokenset = {
         id_token: undefined,
-        access_token: 'the-access-token',
-        refresh_token: 'the-refresh-token',
+        access_token: mockAccessToken1,
+        refresh_token: mockRefreshToken2,
       };
       const req = mockRequest();
       const res = mockResponse();
 
       const result = setOpenIDAuthTokens(tokenset, req, res, 'user-123');
-      expect(result).toBe('the-access-token');
+      expect(result).toBe(mockAccessToken1);
     });
 
     it('should return access_token when id_token is null', () => {
       const tokenset = {
         id_token: null,
-        access_token: 'the-access-token',
-        refresh_token: 'the-refresh-token',
+        access_token: mockAccessToken1,
+        refresh_token: mockRefreshToken2,
       };
       const req = mockRequest();
       const res = mockResponse();
 
       const result = setOpenIDAuthTokens(tokenset, req, res, 'user-123');
-      expect(result).toBe('the-access-token');
+      expect(result).toBe(mockAccessToken1);
     });
 
     it('should return id_token even when id_token and access_token differ', () => {
       const tokenset = {
-        id_token: 'id-token-jwt-signed-by-idp',
+        id_token: mockIdToken3,
         access_token: 'opaque-graph-api-token',
         refresh_token: 'refresh-token',
       };
@@ -326,7 +342,7 @@ describe('setOpenIDAuthTokens', () => {
       const res = mockResponse();
 
       const result = setOpenIDAuthTokens(tokenset, req, res, 'user-123');
-      expect(result).toBe('id-token-jwt-signed-by-idp');
+      expect(result).toBe(mockIdToken3);
       expect(result).not.toBe('opaque-graph-api-token');
     });
   });
@@ -335,26 +351,26 @@ describe('setOpenIDAuthTokens', () => {
     it('should store the original access_token in session (not id_token)', () => {
       const tokenset = {
         id_token: 'the-id-token',
-        access_token: 'the-access-token',
-        refresh_token: 'the-refresh-token',
+        access_token: mockAccessToken1,
+        refresh_token: mockRefreshToken2,
       };
       const req = mockRequest();
       const res = mockResponse();
 
       setOpenIDAuthTokens(tokenset, req, res, 'user-123');
 
-      expect(req.session.openidTokens.accessToken).toBe('the-access-token');
+      expect(req.session.openidTokens.accessToken).toBe(mockAccessToken1);
       expect(req.session.openidTokens.idToken).toBe('the-id-token');
-      expect(req.session.openidTokens.refreshToken).toBe('the-refresh-token');
-      expect(req.session.openidTokens.browserRefreshToken).toBe('the-refresh-token');
+      expect(req.session.openidTokens.refreshToken).toBe(mockRefreshToken2);
+      expect(req.session.openidTokens.browserRefreshToken).toBe(mockRefreshToken2);
       expect(req.session.openidTokens.lastRefreshedAt).toEqual(expect.any(Number));
     });
 
     it('should bind session tokens to the OpenID user identity', () => {
       const tokenset = {
         id_token: 'the-id-token',
-        access_token: 'the-access-token',
-        refresh_token: 'the-refresh-token',
+        access_token: mockAccessToken1,
+        refresh_token: mockRefreshToken2,
       };
       const req = mockRequest();
       const res = mockResponse();
@@ -387,8 +403,8 @@ describe('setOpenIDAuthTokens', () => {
     it('should persist accessTokenExpiresAt when tokenset.expires_in is provided', () => {
       const tokenset = {
         id_token: 'the-id-token',
-        access_token: 'the-access-token',
-        refresh_token: 'the-refresh-token',
+        access_token: mockAccessToken1,
+        refresh_token: mockRefreshToken2,
         expires_in: 3600,
       };
       const req = mockRequest();
@@ -406,8 +422,8 @@ describe('setOpenIDAuthTokens', () => {
     it('should persist accessTokenExpiresAt when tokenset.expires_in is a numeric string', () => {
       const tokenset = {
         id_token: 'the-id-token',
-        access_token: 'the-access-token',
-        refresh_token: 'the-refresh-token',
+        access_token: mockAccessToken1,
+        refresh_token: mockRefreshToken2,
         expires_in: '3600',
       };
       const req = mockRequest();
@@ -424,8 +440,8 @@ describe('setOpenIDAuthTokens', () => {
     it('should NOT persist accessTokenExpiresAt when tokenset.expires_in is missing', () => {
       const tokenset = {
         id_token: 'the-id-token',
-        access_token: 'the-access-token',
-        refresh_token: 'the-refresh-token',
+        access_token: mockAccessToken1,
+        refresh_token: mockRefreshToken2,
         // expires_in deliberately omitted
       };
       const req = mockRequest();
@@ -442,14 +458,14 @@ describe('setOpenIDAuthTokens', () => {
         'idp-signing-secret',
       );
       const tokenset = {
-        access_token: 'new-access-token',
-        refresh_token: 'new-refresh-token',
+        access_token: mockAccessToken4,
+        refresh_token: mockRefreshToken5,
       };
       const req = mockRequest({
         openidTokens: {
-          accessToken: 'old-access-token',
+          accessToken: mockAccessToken6,
           idToken: existingIdToken,
-          refreshToken: 'old-refresh-token',
+          refreshToken: mockRefreshToken7,
         },
       });
       const res = mockResponse();
@@ -457,9 +473,9 @@ describe('setOpenIDAuthTokens', () => {
       const result = setOpenIDAuthTokens(tokenset, req, res, 'user-123');
 
       expect(result).toBe(existingIdToken);
-      expect(req.session.openidTokens.accessToken).toBe('new-access-token');
+      expect(req.session.openidTokens.accessToken).toBe(mockAccessToken4);
       expect(req.session.openidTokens.idToken).toBe(existingIdToken);
-      expect(req.session.openidTokens.refreshToken).toBe('new-refresh-token');
+      expect(req.session.openidTokens.refreshToken).toBe(mockRefreshToken5);
       expect(req.session.openidTokens.lastRefreshedAt).toEqual(expect.any(Number));
     });
 
@@ -469,23 +485,23 @@ describe('setOpenIDAuthTokens', () => {
         'idp-signing-secret',
       );
       const tokenset = {
-        access_token: 'new-access-token',
-        refresh_token: 'new-refresh-token',
+        access_token: mockAccessToken4,
+        refresh_token: mockRefreshToken5,
       };
       const req = mockRequest({
         openidTokens: {
-          accessToken: 'old-access-token',
+          accessToken: mockAccessToken6,
           idToken: expiredIdToken,
-          refreshToken: 'old-refresh-token',
+          refreshToken: mockRefreshToken7,
         },
       });
       const res = mockResponse();
 
       const result = setOpenIDAuthTokens(tokenset, req, res, 'user-123');
 
-      expect(result).toBe('new-access-token');
+      expect(result).toBe(mockAccessToken4);
       expect(req.session.openidTokens.idToken).toBe(expiredIdToken);
-      expect(req.session.openidTokens.accessToken).toBe('new-access-token');
+      expect(req.session.openidTokens.accessToken).toBe(mockAccessToken4);
     });
 
     it('falls back to access_token when the refresh carried an expired id_token forward', () => {
@@ -495,29 +511,29 @@ describe('setOpenIDAuthTokens', () => {
       );
       const tokenset = {
         id_token: expiredIdToken,
-        access_token: 'new-access-token',
-        refresh_token: 'new-refresh-token',
+        access_token: mockAccessToken4,
+        refresh_token: mockRefreshToken5,
       };
       const req = mockRequest({
         openidTokens: {
-          accessToken: 'old-access-token',
+          accessToken: mockAccessToken6,
           idToken: expiredIdToken,
-          refreshToken: 'old-refresh-token',
+          refreshToken: mockRefreshToken7,
         },
       });
       const res = mockResponse();
 
       const result = setOpenIDAuthTokens(tokenset, req, res, 'user-123');
 
-      expect(result).toBe('new-access-token');
+      expect(result).toBe(mockAccessToken4);
       expect(req.session.openidTokens.idToken).toBe(expiredIdToken);
     });
 
     it('still prefers an id_token whose expiry cannot be read', () => {
       const tokenset = {
         id_token: 'opaque-but-not-a-jwt',
-        access_token: 'new-access-token',
-        refresh_token: 'new-refresh-token',
+        access_token: mockAccessToken4,
+        refresh_token: mockRefreshToken5,
       };
       const req = mockRequest();
       const res = mockResponse();
@@ -531,35 +547,35 @@ describe('setOpenIDAuthTokens', () => {
         'idp-signing-secret',
       );
       const tokenset = {
-        access_token: 'new-access-token',
-        refresh_token: 'new-refresh-token',
+        access_token: mockAccessToken4,
+        refresh_token: mockRefreshToken5,
       };
       const req = mockRequest({
         openidTokens: {
-          accessToken: 'old-access-token',
+          accessToken: mockAccessToken6,
           idToken: nearExpiryIdToken,
-          refreshToken: 'old-refresh-token',
+          refreshToken: mockRefreshToken7,
         },
       });
       const res = mockResponse();
 
       const result = setOpenIDAuthTokens(tokenset, req, res, 'user-123');
 
-      expect(result).toBe('new-access-token');
+      expect(result).toBe(mockAccessToken4);
       expect(req.session.openidTokens.idToken).toBe(nearExpiryIdToken);
-      expect(req.session.openidTokens.accessToken).toBe('new-access-token');
+      expect(req.session.openidTokens.accessToken).toBe(mockAccessToken4);
     });
   });
 
   it('stores an OpenID refresh token for durable revocation checks', async () => {
     storeOpenIdSession.mockResolvedValue(true);
 
-    await storeOpenIDSession('user-123', 'the-refresh-token', 'tenant-a');
+    await storeOpenIDSession('user-123', mockRefreshToken2, 'tenant-a');
 
     expect(storeOpenIdSession).toHaveBeenCalledWith(
       {
         userId: 'user-123',
-        refreshToken: 'the-refresh-token',
+        refreshToken: mockRefreshToken2,
         tenantId: 'tenant-a',
         previousRefreshToken: undefined,
       },
@@ -570,14 +586,14 @@ describe('setOpenIDAuthTokens', () => {
   it('revokes the previous durable session when the IdP rotates the refresh token', async () => {
     storeOpenIdSession.mockResolvedValue(true);
 
-    await storeOpenIDSession('user-123', 'new-refresh-token', 'tenant-a', 'old-refresh-token');
+    await storeOpenIDSession('user-123', mockRefreshToken5, 'tenant-a', mockRefreshToken7);
 
     expect(storeOpenIdSession).toHaveBeenCalledWith(
       {
         userId: 'user-123',
-        refreshToken: 'new-refresh-token',
+        refreshToken: mockRefreshToken5,
         tenantId: 'tenant-a',
-        previousRefreshToken: 'old-refresh-token',
+        previousRefreshToken: mockRefreshToken7,
       },
       { upsertSession: expect.any(Function), deleteSession: expect.any(Function) },
     );
@@ -587,24 +603,20 @@ describe('setOpenIDAuthTokens', () => {
     it('delegates session-path refresh and marker cookies to shared cookie helpers', () => {
       const tokenset = {
         id_token: 'the-id-token',
-        access_token: 'the-access-token',
-        refresh_token: 'the-refresh-token',
+        access_token: mockAccessToken1,
+        refresh_token: mockRefreshToken2,
       };
       const req = mockRequest();
       const res = mockResponse();
 
       setOpenIDAuthTokens(tokenset, req, res, 'user-123');
 
-      expect(setRefreshTokenCookie).toHaveBeenCalledWith(
-        res,
-        'the-refresh-token',
-        expect.any(Date),
-      );
+      expect(setRefreshTokenCookie).toHaveBeenCalledWith(res, mockRefreshToken2, expect.any(Date));
       expect(setOpenIDMarkerCookies).toHaveBeenCalledWith(res, {
         userId: 'user-123',
         expires: expect.any(Date),
         refreshExpiryMs: 604800000,
-        refreshToken: 'the-refresh-token',
+        refreshToken: mockRefreshToken2,
       });
       expect(res.cookie).not.toHaveBeenCalledWith(
         'openid_access_token',
@@ -621,28 +633,24 @@ describe('setOpenIDAuthTokens', () => {
     it('uses cookie fallback for OpenID access tokens when no session is available', () => {
       const tokenset = {
         id_token: 'the-id-token',
-        access_token: 'the-access-token',
-        refresh_token: 'the-refresh-token',
+        access_token: mockAccessToken1,
+        refresh_token: mockRefreshToken2,
       };
       const req = { session: null };
       const res = mockResponse();
 
       setOpenIDAuthTokens(tokenset, req, res, 'user-123');
 
-      expect(setRefreshTokenCookie).toHaveBeenCalledWith(
-        res,
-        'the-refresh-token',
-        expect.any(Date),
-      );
+      expect(setRefreshTokenCookie).toHaveBeenCalledWith(res, mockRefreshToken2, expect.any(Date));
       expect(setOpenIDMarkerCookies).toHaveBeenCalledWith(res, {
         userId: 'user-123',
         expires: expect.any(Date),
         refreshExpiryMs: 604800000,
-        refreshToken: 'the-refresh-token',
+        refreshToken: mockRefreshToken2,
       });
       expect(res.cookie).toHaveBeenCalledWith(
         'openid_access_token',
-        'the-access-token',
+        mockAccessToken1,
         expect.objectContaining({
           expires: expect.any(Date),
           httpOnly: true,
@@ -688,7 +696,7 @@ describe('setOpenIDAuthTokens', () => {
     it('should use existingRefreshToken when tokenset has no refresh_token', () => {
       const tokenset = {
         id_token: 'the-id-token',
-        access_token: 'the-access-token',
+        access_token: mockAccessToken1,
       };
       const req = mockRequest();
       const res = mockResponse();
@@ -1096,7 +1104,7 @@ describe('verifyEmail', () => {
   });
 
   it('should scope verification token lookup to the user and token category', async () => {
-    const verificationHash = bcrypt.hashSync('verification-token', 10);
+    const verificationHash = bcrypt.hashSync(mockCredential8, 10);
     const user = {
       _id: 'user-verify',
       email: 'user@example.com',
@@ -1119,7 +1127,7 @@ describe('verifyEmail', () => {
     const result = await verifyEmail({
       body: {
         email: encodeURIComponent(user.email),
-        token: 'verification-token',
+        token: mockCredential8,
       },
     });
 
@@ -1142,7 +1150,7 @@ describe('verifyEmail', () => {
   });
 
   it('should fall back only to legacy verification tokens for the same user', async () => {
-    const verificationHash = bcrypt.hashSync('legacy-verification-token', 10);
+    const verificationHash = bcrypt.hashSync(mockCredential9, 10);
     const user = {
       _id: 'user-verify',
       email: 'user@example.com',
@@ -1167,7 +1175,7 @@ describe('verifyEmail', () => {
     const result = await verifyEmail({
       body: {
         email: encodeURIComponent(user.email),
-        token: 'legacy-verification-token',
+        token: mockCredential9,
       },
     });
 
@@ -1464,8 +1472,8 @@ describe('CloudFront cookie integration', () => {
   describe('setOpenIDAuthTokens', () => {
     const validTokenset = {
       id_token: 'the-id-token',
-      access_token: 'the-access-token',
-      refresh_token: 'the-refresh-token',
+      access_token: mockAccessToken1,
+      refresh_token: mockRefreshToken2,
     };
 
     it('calls setCloudFrontCookies with response object and user scope from options', () => {
@@ -1647,7 +1655,7 @@ describe('CloudFront cookie integration', () => {
 describe('registerUser - allowedDomains admin-panel override', () => {
   const validUser = {
     email: 'new-user@example.com',
-    password: 'a-secure-password',
+    password: mockPassword10,
     name: 'New User',
     username: 'new-user',
   };

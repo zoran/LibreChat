@@ -5,6 +5,7 @@ import { PassThrough } from 'node:stream';
 import { EventEmitter } from 'node:events';
 import { createHash, X509Certificate } from 'node:crypto';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import { readUploadOriginalWriteBinding } from 'librechat-data-provider';
 import { createModels, createUploadManagementRepository } from '@librechat/data-schemas';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import type { Request, Response } from 'express';
@@ -172,6 +173,34 @@ export function createSecurityFlowFixture() {
         },
       });
       expect(await observer.models.File.countDocuments({ file_id: id })).toBe(0);
+      expect(input.lease.operationId).toBe(id);
+      const storageKey = `t/${input.lease.tenantId}/managed-uploads/${input.lease.userId}/${input.lease.operationId}.${input.lease.generation}__original`;
+      const proposal = {
+        bucket: 'fixture-security-originals',
+        key: storageKey,
+        operationId: input.lease.operationId,
+        generation: String(input.lease.generation),
+        bytes: input.bytes,
+        wholeSHA256: input.integrity.sha256,
+        mediaType: input.mediaType,
+      };
+      // Match the real S3 adapter: persist the exact original before consuming body bytes.
+      expect(typeof input.bindWrite).toBe('function');
+      const binding = { ...(await input.bindWrite(proposal)) };
+      expect(readUploadOriginalWriteBinding(binding)).toEqual(binding);
+      expect(binding).toEqual({
+        version: 1,
+        ...proposal,
+        originalDeadline: binding.originalDeadline,
+      });
+      expect(Date.parse(binding.originalDeadline)).toBeGreaterThan(Date.now());
+      const persisted = await observer.models.UploadOperation.findById(id).lean<{
+        writeBinding?: unknown;
+      }>();
+      expect(persisted).toHaveProperty('writeBinding');
+      expect(readUploadOriginalWriteBinding(Object.assign({}, persisted?.writeBinding))).toEqual(
+        binding,
+      );
       const chunks: Buffer[] = [];
       for await (const chunk of input.body) {
         input.signal.throwIfAborted();
@@ -187,7 +216,7 @@ export function createSecurityFlowFixture() {
         bytes: input.bytes,
         integrity: input.integrity,
         filepath: `/api/files/managed/${id}`,
-        storageKey: `t/${input.lease.tenantId}/managed-uploads/${input.lease.userId}/${id}.${input.lease.generation}__original`,
+        storageKey,
       };
     });
     const request = Object.assign(new PassThrough(), {

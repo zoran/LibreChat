@@ -601,6 +601,12 @@ jobs:
           name: build-data-schemas
           path: packages/data-schemas/dist
 
+      - name: Download api build
+        uses: actions/download-artifact@v7
+        with:
+          name: build-api
+          path: packages/api/dist
+
       # mongodb-memory-server cold-downloads a ~122MB MongoDB binary into
       # ~/.cache/mongodb-binaries on first use — inside a 15s beforeAll hook, which is a
       # timeout on a slow mirror day. Every MISSED verdict the codegraph shadow evaluator has

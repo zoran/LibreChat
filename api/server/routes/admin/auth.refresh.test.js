@@ -1,3 +1,12 @@
+/** Runtime fixture identities are shared by their producers and assertions. */
+const mockRandomUUID = require('node:crypto').randomUUID;
+const mockAccessToken1 = mockRandomUUID();
+const mockRefreshToken2 = mockRandomUUID();
+const mockRefreshToken3 = mockRandomUUID();
+const mockRefreshToken4 = mockRandomUUID();
+const mockSecret5 = mockRandomUUID();
+const mockRefreshToken6 = mockRandomUUID();
+
 const express = require('express');
 const request = require('supertest');
 
@@ -11,10 +20,15 @@ jest.mock('openid-client', () => ({
 }));
 
 jest.mock('librechat-data-provider', () => ({
-  CacheKeys: { ADMIN_OAUTH_EXCHANGE: 'admin-oauth-exchange' },
+  ...jest.requireActual('librechat-data-provider'),
+  CacheKeys: {
+    ...jest.requireActual('librechat-data-provider').CacheKeys,
+    ADMIN_OAUTH_EXCHANGE: 'admin-oauth-exchange',
+  },
 }));
 
 jest.mock('@librechat/data-schemas', () => ({
+  ...jest.requireActual('@librechat/data-schemas'),
   logger: {
     debug: jest.fn(),
     error: jest.fn(),
@@ -37,6 +51,7 @@ jest.mock('@librechat/api', () => {
   }
 
   return {
+    ...jest.requireActual('@librechat/api'),
     isEnabled: jest.fn(),
     getAdminPanelUrl: jest.fn(() => 'http://admin.example.com'),
     exchangeAdminCode: jest.fn(),
@@ -131,9 +146,9 @@ describe('admin auth OpenID refresh route', () => {
     serverMetadata: jest.fn(() => ({ issuer: 'https://issuer.example.com' })),
   };
   const tokenset = {
-    access_token: 'new-admin-access',
+    access_token: mockAccessToken1,
     id_token: 'new-admin-id',
-    refresh_token: 'new-admin-refresh',
+    refresh_token: mockRefreshToken2,
     expires_in: 3600,
     claims: jest.fn(() => ({ sub: 'admin-openid-id' })),
   };
@@ -155,7 +170,7 @@ describe('admin auth OpenID refresh route', () => {
     openIdClient.refreshTokenGrant.mockResolvedValue(tokenset);
     applyAdminRefresh.mockResolvedValue({
       token: 'admin-jwt',
-      refreshToken: 'new-admin-refresh',
+      refreshToken: mockRefreshToken2,
       user: { id: 'user-id', email: 'admin@example.com' },
       expiresAt: 1234567890,
     });
@@ -202,19 +217,19 @@ describe('admin auth OpenID refresh route', () => {
 
     const response = await request(app)
       .post('/api/admin/oauth/refresh')
-      .send({ refresh_token: 'incoming-refresh-token' });
+      .send({ refresh_token: mockRefreshToken3 });
 
     expect(response.status).toBe(200);
     expect(buildOpenIDRefreshParams).toHaveBeenCalledTimes(1);
     expect(openIdClient.refreshTokenGrant).toHaveBeenCalledWith(
       openIdConfig,
-      'incoming-refresh-token',
+      mockRefreshToken3,
       expectedParams,
     );
     expect(applyAdminRefresh).toHaveBeenCalledWith(
       tokenset,
       expect.any(Object),
-      expect.objectContaining({ previousRefreshToken: 'incoming-refresh-token' }),
+      expect.objectContaining({ previousRefreshToken: mockRefreshToken3 }),
     );
   });
 
@@ -226,7 +241,7 @@ describe('admin auth OpenID refresh route', () => {
 
     const response = await request(app)
       .post('/api/admin/oauth/refresh')
-      .send({ refresh_token: 'incoming-refresh-token' });
+      .send({ refresh_token: mockRefreshToken3 });
 
     expect(response.status).toBe(401);
     expect(response.body).toEqual({
@@ -240,9 +255,7 @@ describe('admin auth OpenID refresh route', () => {
     process.env.OPENID_SCOPE = 'openid profile email';
     process.env.OPENID_REFRESH_AUDIENCE = 'https://api.example.com';
 
-    await request(app)
-      .post('/api/admin/oauth/refresh')
-      .send({ refresh_token: 'incoming-refresh-token' });
+    await request(app).post('/api/admin/oauth/refresh').send({ refresh_token: mockRefreshToken3 });
 
     expect(logger.debug).toHaveBeenCalledWith('[admin/oauth/refresh] OpenID refresh params', {
       has_scope: true,
@@ -255,10 +268,10 @@ describe('admin auth OpenID refresh route', () => {
       expires_in: 3600,
     });
     const debugOutput = JSON.stringify(logger.debug.mock.calls);
-    expect(debugOutput).not.toContain('incoming-refresh-token');
-    expect(debugOutput).not.toContain('new-admin-access');
+    expect(debugOutput).not.toContain(mockRefreshToken3);
+    expect(debugOutput).not.toContain(mockAccessToken1);
     expect(debugOutput).not.toContain('new-admin-id');
-    expect(debugOutput).not.toContain('new-admin-refresh');
+    expect(debugOutput).not.toContain(mockRefreshToken2);
     expect(debugOutput).not.toContain('https://api.example.com');
   });
 });
@@ -275,7 +288,7 @@ describe('admin auth Google refresh route', () => {
     app.use('/api/admin', adminAuthRouter);
 
     process.env.GOOGLE_CLIENT_ID = 'google-client-id';
-    process.env.GOOGLE_CLIENT_SECRET = 'google-client-secret';
+    process.env.GOOGLE_CLIENT_SECRET = mockSecret5;
 
     applyGoogleAdminRefresh.mockResolvedValue({
       token: 'admin-jwt',
@@ -295,7 +308,7 @@ describe('admin auth Google refresh route', () => {
 
   it('delegates to applyGoogleAdminRefresh with route-supplied deps and options', async () => {
     const response = await request(app).post('/api/admin/oauth/refresh').send({
-      refresh_token: 'incoming-google-refresh',
+      refresh_token: mockRefreshToken4,
       user_id: '6a343eb8b5025a84b6ca2767',
       provider: 'google',
     });
@@ -323,11 +336,11 @@ describe('admin auth Google refresh route', () => {
         mintToken: expect.any(Function),
       }),
       {
-        refreshToken: 'incoming-google-refresh',
+        refreshToken: mockRefreshToken4,
         userId: '6a343eb8b5025a84b6ca2767',
         tenantId: undefined,
         clientId: 'google-client-id',
-        clientSecret: 'google-client-secret',
+        clientSecret: mockSecret5,
       },
     );
   });
@@ -338,7 +351,7 @@ describe('admin auth Google refresh route', () => {
 
     const response = await request(app)
       .post('/api/admin/oauth/refresh')
-      .send({ refresh_token: 'incoming-google-refresh', provider: 'google' });
+      .send({ refresh_token: mockRefreshToken4, provider: 'google' });
 
     expect(response.status).toBe(200);
     expect(applyGoogleAdminRefresh).toHaveBeenCalledWith(
@@ -376,7 +389,7 @@ describe('admin auth Google refresh route', () => {
 
     const response = await request(app)
       .post('/api/admin/oauth/refresh')
-      .send({ refresh_token: 'incoming-google-refresh', provider: 'google' });
+      .send({ refresh_token: mockRefreshToken4, provider: 'google' });
 
     expect(response.status).toBe(200);
   });
@@ -389,7 +402,7 @@ describe('admin auth Google refresh route', () => {
 
     const response = await request(app)
       .post('/api/admin/oauth/refresh')
-      .send({ refresh_token: 'incoming-google-refresh', provider: 'google' });
+      .send({ refresh_token: mockRefreshToken4, provider: 'google' });
 
     expect(response.status).toBe(503);
     expect(response.body).toEqual({
@@ -403,7 +416,7 @@ describe('admin auth Google refresh route', () => {
 
     const response = await request(app)
       .post('/api/admin/oauth/refresh')
-      .send({ refresh_token: 'incoming-google-refresh', provider: 'google' });
+      .send({ refresh_token: mockRefreshToken4, provider: 'google' });
 
     expect(response.status).toBe(500);
     expect(response.body.error_code).toBe('INTERNAL_ERROR');
@@ -412,7 +425,7 @@ describe('admin auth Google refresh route', () => {
   it('rejects unknown provider values with INVALID_PROVIDER before calling either helper', async () => {
     const response = await request(app)
       .post('/api/admin/oauth/refresh')
-      .send({ refresh_token: 'incoming-refresh', provider: 'github' });
+      .send({ refresh_token: mockRefreshToken6, provider: 'github' });
 
     expect(response.status).toBe(400);
     expect(response.body.error_code).toBe('INVALID_PROVIDER');
@@ -434,7 +447,7 @@ describe('admin auth Google refresh route', () => {
 
     const response = await request(app)
       .post('/api/admin/oauth/refresh')
-      .send({ refresh_token: 'incoming-google-refresh', provider: 'google' });
+      .send({ refresh_token: mockRefreshToken4, provider: 'google' });
 
     expect(response.status).toBe(403);
     expect(middleware.checkBan).toHaveBeenCalledTimes(2);

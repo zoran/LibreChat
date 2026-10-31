@@ -7,7 +7,13 @@ import type { UploadPromotionRecord, UploadPrincipal, UploadLease } from 'librec
 import type { Request, Response } from 'express';
 import type { UploadSecurityPort } from '../contract';
 import type { IntakeChannel } from './channel';
+import {
+  antivirusCustodyFixture,
+  antivirusApprovalFixture,
+  antivirusReceiptFixture,
+} from '../security/antivirus-fixture.helper';
 import { createRemoteIntakeBodyHandler } from './remote';
+import { createPinnedServiceEndpoint } from './endpoint';
 import { createUploadAttemptJournal } from '../attempts';
 import { UploadManagementError } from '../errors';
 
@@ -48,7 +54,9 @@ describe('remote intake adapters with the real Raw lifecycle and controlled App/
     await rm(root, { recursive: true, force: true });
   });
 
-  function fixture() {
+  function fixture(
+    decorateSecurity: (security: UploadSecurityPort) => UploadSecurityPort = (port) => port,
+  ) {
     const records = new Map<string, UploadPromotionRecord>();
     const events: string[] = [];
     const transmitted: Buffer[] = [];
@@ -117,13 +125,14 @@ describe('remote intake adapters with the real Raw lifecycle and controlled App/
     );
     const security: UploadSecurityPort = {
       policySha256: 'a'.repeat(64),
-      prepare: async ({ attemptId }) => ({
-        version: 2,
+      prepare: async ({ attemptId, subject }) => ({
+        version: 3,
         custody: { kind: 'none' as const },
         attemptId,
         instanceId: firstId,
         executionId: secondId,
         expiresAt,
+        antivirus: antivirusCustodyFixture(subject, expiresAt, now),
       }),
       inspect: async ({ execution, subject, body }) => {
         for await (const _chunk of body) {
@@ -131,28 +140,36 @@ describe('remote intake adapters with the real Raw lifecycle and controlled App/
         }
         return {
           decision: {
-            version: 1,
+            version: 2,
             decision: 'approved',
             subject,
             policySha256: 'a'.repeat(64),
             scannerVersion: 'test-scanner/1',
             checkedAt: new Date(now).toISOString(),
             coverage: { complete: true, pages: 1, parts: 1 },
+            antivirus: antivirusApprovalFixture(execution, now),
           },
-          settlement: { execution, writerStopped: true, transientDataRemoved: true },
+          settlement: {
+            execution,
+            writerStopped: true,
+            transientDataRemoved: true,
+            antivirusReceipt: antivirusReceiptFixture(execution),
+          },
         };
       },
       cancel: async ({ execution }) => ({
         execution,
         writerStopped: true,
         transientDataRemoved: true,
+        antivirusReceipt: antivirusReceiptFixture(execution),
       }),
     };
     const journal = createUploadAttemptJournal(worker);
+    const createSecurityPort = jest.fn(() => decorateSecurity(security));
     const handler = createRemoteIntakeBodyHandler({
       channel: { control, promote },
       worker,
-      security,
+      createSecurityPort,
       attempts: journal.attempts,
       stagingRoot: root,
       now: () => now,
@@ -198,8 +215,98 @@ describe('remote intake adapters with the real Raw lifecycle and controlled App/
           ),
       };
     };
-    return { handler, control, promote, records, events, transmitted, journal, security, request };
+    return {
+      handler,
+      control,
+      promote,
+      records,
+      events,
+      transmitted,
+      journal,
+      security,
+      createSecurityPort,
+      request,
+    };
   }
+
+  it('keeps failed DNS and current backend pins local while later requests discover the survivor', async () => {
+    let answer: string | undefined;
+    const resolve = jest.fn(async () => {
+      if (!answer) throw new Error('Synthetic DNS outage');
+      return [{ address: answer, family: 4 }];
+    });
+    const selected: { lookup: () => Promise<string>; calls: string[] }[] = [];
+    const f = fixture((security) => {
+      // Use the shipped DNS pin; only scanner I/O is controlled by this fixture.
+      const endpoint = createPinnedServiceEndpoint({
+        endpoint: 'https://scanner.test:8443',
+        allowedHosts: ['scanner.test'],
+        resolve,
+      });
+      const lookup = () =>
+        new Promise<string>((accept, reject) => {
+          endpoint.lookup('scanner.test', {}, (error, address) => {
+            if (error) reject(error);
+            else if (typeof address === 'string') accept(address);
+            else reject(new Error('Expected one pinned scanner address'));
+          });
+        });
+      const calls: string[] = [];
+      selected.push({ lookup, calls });
+      return {
+        ...security,
+        async prepare(input) {
+          calls.push(`prepare:${await lookup()}`);
+          const execution = await security.prepare(input);
+          answer = '127.0.0.2';
+          return execution;
+        },
+        async inspect(input) {
+          const address = await lookup();
+          calls.push(`inspect:${address}`);
+          if (address === '127.0.0.1') throw new Error('Synthetic lost scan response');
+          return security.inspect(input);
+        },
+        async cancel(input) {
+          calls.push(`cancel:${await lookup()}`);
+          return security.cancel(input);
+        },
+      };
+    });
+    const failed = f.request();
+    await f.handler.principal(failed.req as unknown as Request);
+    const failedRun = failed.run();
+    failed.req.end('hello');
+    await failedRun;
+    expect(failed.response.statusCode).not.toBe(202);
+    expect(f.events).not.toContain('bind-security');
+    answer = '127.0.0.1';
+    await expect(selected[0].lookup()).rejects.toThrow('service_endpoint_unavailable');
+
+    const interrupted = f.request(secondId);
+    await f.handler.principal(interrupted.req as unknown as Request);
+    const interruptedRun = interrupted.run();
+    interrupted.req.end('hello');
+    await interruptedRun;
+    expect(interrupted.response.statusCode).not.toBe(202);
+    expect(selected[1].calls).toEqual([
+      'prepare:127.0.0.1',
+      'inspect:127.0.0.1',
+      'cancel:127.0.0.1',
+    ]);
+
+    const survivor = f.request('33333333-3333-4333-8333-333333333333');
+    const survivorRun = survivor.run();
+    survivor.req.end('hello');
+    await survivorRun;
+    expect(survivor.response.statusCode).toBe(202);
+    expect(selected[2].calls).toEqual(['prepare:127.0.0.2', 'inspect:127.0.0.2']);
+    expect(f.createSecurityPort).toHaveBeenCalledTimes(3);
+    expect(resolve).toHaveBeenCalledTimes(3);
+    expect(f.promote).toHaveBeenCalledTimes(1);
+    // DNS never dispatched an original, and the interrupted scan retired through its own port.
+    expect(await f.journal.close()).toEqual({ complete: true });
+  });
 
   it('prepares before transmitting, forwards real approval, and accepts only the retrieved App promotion ID', async () => {
     const f = fixture();

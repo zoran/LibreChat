@@ -65,9 +65,13 @@ describe('RedisJobStore tool timing reconstruction', () => {
       },
     ];
     const store = Object.create(RedisJobStore.prototype) as RedisJobStore;
+    // Captured empty job hash: this snapshot has no retained source authority or live Redis.
+    const jobHash = jest.fn(async () => ({}));
+    Object.defineProperty(store, 'redis', { value: { hgetall: jobHash } });
     const snapshot = jest.fn(async () => ({ chunks, durableEventCount: chunks.length }));
     Object.defineProperty(store, 'getChunkSnapshot', { value: snapshot });
     const result = await store.getContentParts('tool-run', undefined, { durableOnly: true });
+    expect(jobHash).toHaveBeenCalledTimes(1);
     expect(snapshot).toHaveBeenCalledWith('tool-run', undefined, true);
     expect(result).toMatchObject({
       reconstructedEventCount: chunks.length,

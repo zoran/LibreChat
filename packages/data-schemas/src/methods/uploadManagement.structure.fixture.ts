@@ -12,6 +12,11 @@ import type {
 } from 'librechat-data-provider';
 import type { FileCleanupProgressResult } from '../types/fileCleanup';
 import type { IMongoFile } from '../types/file';
+import {
+  uploadSecurityFixture,
+  bindUploadOriginalFixture,
+  uploadSecuritySettlementFixture,
+} from './uploadManagement.security.fixture';
 import { createFileCleanupLifecycleMethods } from './fileCleanupLifecycle';
 import { createFileCleanupProgressMethods } from './fileCleanupProgress';
 import { createUploadManagementRepository } from './uploadManagement';
@@ -402,39 +407,8 @@ export function useUploadStructureFixture(): UploadStructureFixture {
       worker,
       now,
     }))!;
-    const execution = {
-      version: 2 as const,
-      custody: { kind: 'none' as const },
-      attemptId: `structure.${transfer.generation}`,
-      instanceId: randomUUID(),
-      executionId: randomUUID(),
-      expiresAt: new Date(now + 60_000).toISOString(),
-    };
-    await repository.bindSecurityExecution(transfer, execution, now);
-    await repository.settleSecurityExecution(
-      transfer,
-      { execution, writerStopped: true, transientDataRemoved: true },
-      now,
-    );
-    await repository.accept(
-      principal,
-      transfer,
-      {
-        outcome: 'durable',
-        bytes: bytes.length,
-        source: 's3',
-        filepath: '/api/files/download/structure',
-        storageKey: `${principal.tenantId === null ? '' : `t/${principal.tenantId}/`}managed-uploads/${principal.userId}/structure.${transfer.generation}__original`,
-        integrity: {
-          version: 1,
-          algorithm: 'sha256',
-          sha256,
-          chunkBytes: 262144,
-          chunkSha256: [sha256],
-        },
-      },
-      {
-        version: 1,
+    const security = uploadSecurityFixture(
+      uploadSecurityFixture({
         decision: 'approved',
         policySha256: policy,
         subject: {
@@ -449,7 +423,81 @@ export function useUploadStructureFixture(): UploadStructureFixture {
         scannerVersion: 'fixture-v1',
         checkedAt: new Date(now).toISOString(),
         coverage: { complete: true, pages: 1, parts: 1 },
+      }).approval,
+      {
+        custody: { kind: 'none' as const },
+        attemptId: `structure.${transfer.generation}`,
+        instanceId: randomUUID(),
+        executionId: randomUUID(),
+        expiresAt: new Date(now + 60_000).toISOString(),
       },
+    );
+    const execution = security.execution;
+    const originalFixture: Parameters<typeof repository.accept>[2] = {
+      outcome: 'durable',
+      bytes: bytes.length,
+      source: 's3',
+      filepath: '/api/files/download/structure',
+      storageKey: `${principal.tenantId === null ? '' : `t/${principal.tenantId}/`}managed-uploads/${principal.userId}/structure.${transfer.generation}__original`,
+      integrity: {
+        version: 1,
+        algorithm: 'sha256',
+        sha256,
+        chunkBytes: 262144,
+        chunkSha256: [sha256],
+      },
+    };
+    await repository.bindSecurityExecution(transfer, execution, now);
+    await repository.settleSecurityExecution(
+      transfer,
+      uploadSecuritySettlementFixture(execution, {
+        writerStopped: true,
+        transientDataRemoved: true,
+      }),
+      now,
+    );
+    await bindUploadOriginalFixture(
+      repository,
+      transfer,
+      originalFixture,
+      uploadSecurityFixture({
+        decision: 'approved',
+        policySha256: policy,
+        subject: {
+          tenantId: principal.tenantId,
+          userId: principal.userId,
+          operationId: 'structure',
+          transferGeneration: transfer.generation,
+          mediaType: 'text/plain',
+          bytes: bytes.length,
+          sha256,
+        },
+        scannerVersion: 'fixture-v1',
+        checkedAt: new Date(now).toISOString(),
+        coverage: { complete: true, pages: 1, parts: 1 },
+      }).approval,
+      now,
+    );
+    await repository.accept(
+      principal,
+      transfer,
+      originalFixture,
+      uploadSecurityFixture({
+        decision: 'approved',
+        policySha256: policy,
+        subject: {
+          tenantId: principal.tenantId,
+          userId: principal.userId,
+          operationId: 'structure',
+          transferGeneration: transfer.generation,
+          mediaType: 'text/plain',
+          bytes: bytes.length,
+          sha256,
+        },
+        scannerVersion: 'fixture-v1',
+        checkedAt: new Date(now).toISOString(),
+        coverage: { complete: true, pages: 1, parts: 1 },
+      }).approval,
       { filename: 'original.txt' },
       now,
     );

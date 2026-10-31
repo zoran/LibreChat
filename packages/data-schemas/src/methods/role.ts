@@ -8,11 +8,16 @@ import {
 } from 'librechat-data-provider';
 import type { Model } from 'mongoose';
 import type { AuthPersistenceObserver } from './authPersistence';
-import type { CacheStore, IRole, IUser } from '~/types';
-import { scopedCacheKey, getTenantId, runAsSystem, SYSTEM_TENANT_ID } from '~/config/tenantContext';
+import type { CacheStore, IRole, IUser } from '../types';
+import {
+  scopedCacheKey,
+  getTenantId,
+  runAsSystem,
+  SYSTEM_TENANT_ID,
+} from '../config/tenantContext';
 import { observeAuthPersistence } from './authPersistence';
-import { escapeRegExp } from '~/utils/string';
-import logger from '~/config/winston';
+import { escapeRegExp } from '../utils/string';
+import logger from '../config/winston';
 
 const systemRoleValues = new Set<string>(Object.values(SystemRoles));
 

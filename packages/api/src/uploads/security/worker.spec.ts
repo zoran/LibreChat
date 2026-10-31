@@ -186,8 +186,8 @@ describe('bounded security worker', () => {
     expect(await port.getMaintenanceCensus('owner')).toEqual({
       admissionClosed: true,
       queuedContinuations: 2,
-      pendingWrites: 0,
-      complete: true,
+      pendingWrites: 1,
+      complete: false,
     });
     expect(await port.getMaintenanceCensus('foreign')).toMatchObject({
       admissionClosed: false,
@@ -236,10 +236,24 @@ describe('bounded security worker', () => {
   it('accounts for prepared expiry without needing another admission', async () => {
     let now = Date.now();
     const instance = worker({ now: () => now, ttlMs: 10 });
-    await instance.prepare({ attemptId: 'upload.1', subject: subject(), signal: signal() });
+    const execution = await instance.prepare({
+      attemptId: 'upload.1',
+      subject: subject(),
+      signal: signal(),
+    });
     expect(instance.maintenance.pauseAdmissions('owner')).toBe(true);
     expect((await instance.maintenance.getMaintenanceCensus('owner')).queuedContinuations).toBe(1);
     now += 11;
+    expect(await instance.maintenance.getMaintenanceCensus('owner')).toMatchObject({
+      queuedContinuations: 0,
+      pendingWrites: 1,
+      complete: false,
+    });
+    expect(await instance.cancel({ execution, signal: signal() })).toMatchObject({
+      writerStopped: true,
+      transientDataRemoved: true,
+      antivirusReceipt: antivirusReceiptFixture(execution),
+    });
     expect(await instance.maintenance.getMaintenanceCensus('owner')).toMatchObject({
       queuedContinuations: 0,
       pendingWrites: 0,
@@ -469,8 +483,17 @@ describe('bounded security worker', () => {
     const pending = new Promise<IteratorResult<Uint8Array>>((resolve) => {
       release = resolve;
     });
+    let entered!: () => void;
+    const nextEntered = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
     const stream: AsyncIterable<Uint8Array> = {
-      [Symbol.asyncIterator]: () => ({ next: () => pending }),
+      [Symbol.asyncIterator]: () => ({
+        next: () => {
+          entered();
+          return pending;
+        },
+      }),
     };
     const nextSubject = { ...input, operationId: 'next' };
     const next = await instance.prepare({
@@ -486,28 +509,32 @@ describe('bounded security worker', () => {
       signal: abort.signal,
     });
     const failed = inspecting.catch((error: unknown) => error);
-    expect(instance.maintenance.pauseAdmissions('owner')).toBe(true);
-    abort.abort();
-    expect(await failed).toEqual(new Error('Security worker unavailable'));
-    expect(await instance.maintenance.getMaintenanceCensus('owner')).toEqual({
-      admissionClosed: true,
-      queuedContinuations: 1,
-      pendingWrites: 1,
-      complete: false,
-    });
-    expect(instance.maintenance.resumeAdmissions('owner')).toBe(false);
-    expect(await instance.cancel({ execution, signal: AbortSignal.timeout(20) })).toEqual({
-      execution,
-      antivirusReceipt: antivirusReceiptFixture(execution),
-      writerStopped: false,
-      transientDataRemoved: false,
-    });
-    await expect(
-      instance.inspect({ execution: next, subject: nextSubject, body: body(), signal: signal() }),
-    ).rejects.toThrow();
-    expect(await instance.close(AbortSignal.timeout(20))).toEqual({ complete: false });
-    expect(await instance.close(AbortSignal.abort())).toEqual({ complete: false });
-    release({ done: true, value: undefined });
+    await nextEntered;
+    try {
+      expect(instance.maintenance.pauseAdmissions('owner')).toBe(true);
+      abort.abort();
+      expect(await failed).toEqual(new Error('Security worker unavailable'));
+      expect(await instance.maintenance.getMaintenanceCensus('owner')).toEqual({
+        admissionClosed: true,
+        queuedContinuations: 1,
+        pendingWrites: 1,
+        complete: false,
+      });
+      expect(instance.maintenance.resumeAdmissions('owner')).toBe(false);
+      expect(await instance.cancel({ execution, signal: AbortSignal.timeout(20) })).toEqual({
+        execution,
+        antivirusReceipt: antivirusReceiptFixture(execution),
+        writerStopped: false,
+        transientDataRemoved: false,
+      });
+      await expect(
+        instance.inspect({ execution: next, subject: nextSubject, body: body(), signal: signal() }),
+      ).rejects.toThrow();
+      expect(await instance.close(AbortSignal.timeout(20))).toEqual({ complete: false });
+      expect(await instance.close(AbortSignal.abort())).toEqual({ complete: false });
+    } finally {
+      release({ done: true, value: undefined });
+    }
     expect(await instance.cancel({ execution, signal: signal() })).toEqual({
       execution,
       antivirusReceipt: antivirusReceiptFixture(execution),

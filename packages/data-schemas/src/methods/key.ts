@@ -2,8 +2,8 @@ import { ErrorTypes } from 'librechat-data-provider';
 import type { AuthPersistenceObserver } from './authPersistence';
 import { observeAuthPersistence } from './authPersistence';
 // Note: checkUserKeyExpiry moved to @librechat/api (utils/key.ts) as it's a pure validation utility
-import { encrypt, decrypt } from '~/crypto';
-import logger from '~/config/winston';
+import { encrypt, decrypt } from '../crypto';
+import logger from '../config/winston';
 
 /** Factory function that takes mongoose instance and returns the key methods */
 export function createKeyMethods(mongoose: typeof import('mongoose')): {

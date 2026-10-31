@@ -510,7 +510,7 @@ describe('GenerationJobManager terminal host actions', () => {
       const job = await manager.createJob(streamId, 'user-1', streamId, {
         initialMetadata: { agentEventDeliveryKey: 'trigger_lost_provider' },
       });
-      await manager.beginProviderExecution(
+      await store.beginProviderExecution(
         streamId,
         job.createdAt,
         job.metadata.providerExecutionId!,

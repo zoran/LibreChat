@@ -1,3 +1,7 @@
+/** Runtime fixture identities are shared by their producers and assertions. */
+const mockRandomUUID = require('node:crypto').randomUUID;
+const mockCredential1 = mockRandomUUID();
+
 /**
  * Integration test: verifies that requireJwtAuth chains tenantContextMiddleware
  * after successful passport authentication, so ALS tenant context is set for
@@ -74,6 +78,7 @@ jest.mock('@librechat/api', () => {
     normalizeContextValue(req.headers?.['x-request-id']) ??
     normalizeContextValue(req.headers?.['x-correlation-id']);
   return {
+    ...jest.requireActual('@librechat/api'),
     isEnabled: jest.fn(() => false),
     createRequiredTwoFactorGate: actualApi.createRequiredTwoFactorGate,
     clearCloudFrontCookies: jest.fn(),
@@ -465,7 +470,7 @@ describe('requireJwtAuth tenant context chaining', () => {
       method: 'GET',
       path: '/api/messages',
       headers: {
-        authorization: 'Bearer valid-openid-token',
+        authorization: 'Bearer ' + mockCredential1,
         cookie: `token_provider=openid; openid_user_id=${signedOpenIdUserCookie('user-jwt')}`,
       },
       _mockStrategies: {

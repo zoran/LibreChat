@@ -2,7 +2,21 @@ const { duplicateAgent } = require('../v1');
 const { getAgent, createAgent, getActions } = require('~/models');
 const { nanoid } = require('nanoid');
 
-jest.mock('~/models');
+// Preserve the initialized model graph and replace only this controller's database I/O.
+jest.mock('~/models', () => ({
+  ...jest.requireActual('~/models'),
+  getAgent: jest.fn(),
+  createAgent: jest.fn(),
+  getActions: jest.fn(),
+}));
+jest.mock('~/server/services/Config', () => ({
+  ...jest.requireActual('~/server/services/Config'),
+  getCachedTools: jest.fn().mockResolvedValue({}),
+}));
+jest.mock('~/server/services/MCP', () => ({
+  ...jest.requireActual('~/server/services/MCP'),
+  resolveConfigServers: jest.fn().mockResolvedValue({}),
+}));
 jest.mock('nanoid');
 
 describe('duplicateAgent', () => {

@@ -12,6 +12,7 @@ const createApp = () => {
   };
 
   jest.doMock('@librechat/api', () => ({
+    ...jest.requireActual('@librechat/api'),
     limiterCache: jest.fn(() => undefined),
     removePorts: (req) => req?.['ip'],
   }));

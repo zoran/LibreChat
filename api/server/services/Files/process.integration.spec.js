@@ -26,10 +26,12 @@ jest.mock('@librechat/data-schemas', () => {
 });
 
 jest.mock('@librechat/agents', () => ({
-  EnvVar: { CODE_API_KEY: 'CODE_API_KEY' },
+  ...jest.requireActual('@librechat/agents'),
+  EnvVar: { ...jest.requireActual('@librechat/agents').EnvVar, CODE_API_KEY: 'CODE_API_KEY' },
 }));
 
 jest.mock('@librechat/api', () => ({
+  ...jest.requireActual('@librechat/api'),
   sanitizeFilename: jest.fn((n) => n),
   parseText: jest.fn().mockResolvedValue({ text: '', bytes: 0 }),
   processAudioFile: jest.fn(),

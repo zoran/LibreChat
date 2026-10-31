@@ -8,6 +8,11 @@ import { uploadReservationFingerprint } from 'librechat-data-provider';
 import type { UploadDerivedIntent } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
 import type { ManagedUploadAcceptance } from '~/types/file';
+import {
+  uploadSecurityFixture,
+  bindUploadOriginalFixture,
+  uploadSecuritySettlementFixture,
+} from './uploadManagement.security.fixture';
 import { createUploadManagementRepository } from './uploadManagement';
 import { createDocumentWorkspaceMethods } from './documentWorkspace';
 import { createHousekeepingStore } from './housekeepingStore';
@@ -53,8 +58,7 @@ describe('independent document workspace metadata and native File commits', () =
           chunkSha256: [sha256],
         },
       },
-      securityApproval: {
-        version: 1,
+      securityApproval: uploadSecurityFixture({
         decision: 'approved',
         policySha256: policy,
         subject: {
@@ -68,7 +72,7 @@ describe('independent document workspace metadata and native File commits', () =
         scannerVersion: 'explicit-synthetic-fixture/v1',
         checkedAt: new Date(at).toISOString(),
         coverage: { complete: true, pages: 1, parts: 1 },
-      },
+      }).approval,
     };
     await ready(input, intent);
   }
@@ -108,20 +112,24 @@ describe('independent document workspace metadata and native File commits', () =
       now,
     }))!;
     expect(transfer.generation).toBe(input.transferGeneration);
-    const execution = {
-      version: 2 as const,
+    const security = uploadSecurityFixture(input.securityApproval!, {
       custody: { kind: 'none' as const },
       attemptId: `${id}.${transfer.generation}`,
       instanceId: '11111111-1111-4111-8111-111111111111',
       executionId: '22222222-2222-4222-8222-222222222222',
       expiresAt: new Date(now + 60_000).toISOString(),
-    };
+    });
+    const execution = security.execution;
     await uploads.bindSecurityExecution(transfer, execution, now);
     await uploads.settleSecurityExecution(
       transfer,
-      { execution, writerStopped: true, transientDataRemoved: true },
+      uploadSecuritySettlementFixture(execution, {
+        writerStopped: true,
+        transientDataRemoved: true,
+      }),
       now,
     );
+    await bindUploadOriginalFixture(uploads, transfer, input.receipt, input.securityApproval!, now);
     await uploads.accept(
       principal,
       transfer,

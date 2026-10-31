@@ -2,7 +2,7 @@ import mongoose from 'mongoose';
 import { v4 as uuidv4 } from 'uuid';
 import { MongoMemoryServer } from 'mongodb-memory-server';
 import { Constants, FileSources } from 'librechat-data-provider';
-import { agentSchema, createMethods } from '@librechat/data-schemas';
+import { createModels, createMethods } from '@librechat/data-schemas';
 import type {
   Agent as LibreChatAgent,
   AgentModelParameters,
@@ -15,7 +15,7 @@ import { STANDARD_MCP_CAPABILITY_PROFILE } from '~/mcp/capabilities';
 import { loadAddedAgent } from '../added';
 import { loadAgent } from '../load';
 
-let Agent: mongoose.Model<unknown>;
+let Agent: ReturnType<typeof createModels>['Agent'];
 let createAgent: ReturnType<typeof createMethods>['createAgent'];
 let getAgentWithVersionCount: ReturnType<typeof createMethods>['getAgentWithVersionCount'];
 
@@ -35,8 +35,8 @@ describe('loadAgent', () => {
   beforeAll(async () => {
     mongoServer = await MongoMemoryServer.create();
     const mongoUri = mongoServer.getUri();
-    Agent = mongoose.models.Agent || mongoose.model('Agent', agentSchema);
     await mongoose.connect(mongoUri);
+    Agent = createModels(mongoose).Agent;
     const methods = createMethods(mongoose);
     createAgent = methods.createAgent;
     getAgentWithVersionCount = methods.getAgentWithVersionCount;

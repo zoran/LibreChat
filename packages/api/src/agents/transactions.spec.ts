@@ -1,11 +1,6 @@
 import mongoose from 'mongoose';
-import { MongoMemoryServer } from 'mongodb-memory-server';
-import {
-  CANCEL_RATE,
-  createMethods,
-  balanceSchema,
-  transactionSchema,
-} from '@librechat/data-schemas';
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import { CANCEL_RATE, createMethods, createModels } from '@librechat/data-schemas';
 import type { PricingFns, TxMetadata, PreparedEntry } from './transactions';
 import {
   prepareStructuredTokenSpend,
@@ -26,16 +21,17 @@ jest.mock('@librechat/data-schemas', () => {
   };
 });
 
-let mongoServer: MongoMemoryServer;
+let mongoServer: MongoMemoryReplSet;
 let Transaction: mongoose.Model<unknown>;
 let Balance: mongoose.Model<unknown>;
 let dbMethods: ReturnType<typeof createMethods>;
 
 beforeAll(async () => {
-  mongoServer = await MongoMemoryServer.create();
+  mongoServer = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
   await mongoose.connect(mongoServer.getUri());
-  Transaction = mongoose.models.Transaction || mongoose.model('Transaction', transactionSchema);
-  Balance = mongoose.models.Balance || mongoose.model('Balance', balanceSchema);
+  createModels(mongoose);
+  Transaction = mongoose.models.Transaction;
+  Balance = mongoose.models.Balance;
   dbMethods = createMethods(mongoose);
 });
 

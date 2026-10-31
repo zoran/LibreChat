@@ -575,6 +575,8 @@ describe('managed personal File consumers', () => {
     );
     expect(f.owner.repository.cleanupForFile).toHaveBeenCalledWith(user, 'operation');
     expect(f.owner.storage.read).toHaveBeenCalledWith({
+      principal: user,
+      operationId: 'operation',
       original: f.receipt,
       signal: expect.any(AbortSignal),
     });

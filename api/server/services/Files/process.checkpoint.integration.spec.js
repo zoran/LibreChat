@@ -1,3 +1,7 @@
+// Explicit synthetic AV contract only; no native scan/readiness evidence.
+const {
+  antivirusFixture,
+} = require('../../../../packages/data-provider/src/__fixtures__/upload-antivirus.ts');
 /**
  * Built-API foreground/File/HK composition with real Mongo accounting and generation drain.
  * Upload custody uses actual repository transitions; scanner/parser/census evidence, historical
@@ -209,8 +213,20 @@ async function acceptOriginal(fileId, scope) {
     now,
   });
   expect(lease).not.toBeNull();
+  const antivirus = antivirusFixture(
+    {
+      ...scope,
+      operationId: fileId,
+      transferGeneration: lease.generation,
+      mediaType: 'text/plain',
+      bytes: originalBytes.length,
+      sha256: originalSHA256,
+    },
+    now,
+  );
   const execution = {
-    version: 2,
+    version: 3,
+    antivirus: antivirus.custody,
     custody: { kind: 'none' },
     attemptId: `${fileId}.${lease.generation}`,
     instanceId: randomUUID(),
@@ -220,7 +236,12 @@ async function acceptOriginal(fileId, scope) {
   await uploads.bindSecurityExecution(lease, execution, now);
   await uploads.settleSecurityExecution(
     lease,
-    { execution, writerStopped: true, transientDataRemoved: true },
+    {
+      execution,
+      writerStopped: true,
+      transientDataRemoved: true,
+      antivirusReceipt: antivirus.receipt,
+    },
     now,
   );
   const receipt = {
@@ -240,8 +261,9 @@ async function acceptOriginal(fileId, scope) {
   const path = join(originalDirectory, fileId);
   await writeFile(path, originalBytes, { flag: 'wx', mode: 0o600 });
   originals.set(fileId, { scope, path, receipt, generation: lease.generation });
-  const approval = {
-    version: 1,
+  const approval = require('librechat-data-provider').readUploadSecurityApproval({
+    version: 2,
+    antivirus: antivirus.approval,
     decision: 'approved',
     policySha256: policy,
     subject: {
@@ -255,7 +277,23 @@ async function acceptOriginal(fileId, scope) {
     scannerVersion: 'explicit-checkpoint-fixture',
     checkedAt: new Date(now).toISOString(),
     coverage: { complete: true, pages: 1, parts: 1 },
-  };
+  });
+  expect(approval).not.toBeNull();
+  await uploads.bindOriginalWrite(
+    lease,
+    {
+      bucket: 'isolated',
+      key: receipt.storageKey,
+      operationId: fileId,
+      generation: String(lease.generation),
+      bytes: receipt.bytes,
+      wholeSHA256: receipt.integrity.sha256,
+      mediaType: 'text/plain',
+    },
+    receipt.integrity,
+    approval,
+    now,
+  );
   const promotionId = randomUUID();
   const app = { hostId: 'checkpoint-host', instanceId: 'checkpoint-promotion' };
   await uploads.preparePromotion(

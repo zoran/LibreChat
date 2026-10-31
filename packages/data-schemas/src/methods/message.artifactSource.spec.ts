@@ -9,6 +9,11 @@ import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import type { UploadLease } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
 import type { IMessage, IMongoFile } from '~/types';
+import {
+  uploadSecurityFixture,
+  bindUploadOriginalFixture,
+  uploadSecuritySettlementFixture,
+} from './uploadManagement.security.fixture';
 import { createUploadManagementRepository } from './uploadManagement';
 import { tenantStorage, runAsSystem } from '~/config/tenantContext';
 import { createFileRetentionMethods } from './fileRetention';
@@ -81,39 +86,8 @@ describe('atomic native artifact source capture', () => {
       now,
     });
     expect(transfer).not.toBeNull();
-    const execution = {
-      version: 2 as const,
-      custody: { kind: 'none' as const },
-      attemptId: `${id}.${transfer!.generation}`,
-      instanceId: uuid(),
-      executionId: uuid(),
-      expiresAt: new Date(now + 60_000).toISOString(),
-    };
-    await uploads.bindSecurityExecution(transfer!, execution, now);
-    await uploads.settleSecurityExecution(
-      transfer!,
-      { execution, writerStopped: true, transientDataRemoved: true },
-      now,
-    );
-    await uploads.accept(
-      principal,
-      transfer!,
-      {
-        outcome: 'durable',
-        bytes,
-        source: 's3',
-        filepath: `/api/files/download/${id}`,
-        storageKey: `t/${owner.tenantId}/managed-uploads/${owner.userId}/${id}.${transfer!.generation}__original`,
-        integrity: {
-          version: 1,
-          algorithm: 'sha256',
-          sha256,
-          chunkBytes: 262144,
-          chunkSha256: [sha256],
-        },
-      },
-      {
-        version: 1,
+    const security = uploadSecurityFixture(
+      uploadSecurityFixture({
         decision: 'approved',
         policySha256: policy,
         subject: {
@@ -127,7 +101,79 @@ describe('atomic native artifact source capture', () => {
         scannerVersion: 'explicit-synthetic-scanner/v1',
         checkedAt: new Date(now).toISOString(),
         coverage: { complete: true, pages: 1, parts: 1 },
+      }).approval,
+      {
+        custody: { kind: 'none' as const },
+        attemptId: `${id}.${transfer!.generation}`,
+        instanceId: uuid(),
+        executionId: uuid(),
+        expiresAt: new Date(now + 60_000).toISOString(),
       },
+    );
+    const execution = security.execution;
+    const originalFixture: Parameters<typeof uploads.accept>[2] = {
+      outcome: 'durable',
+      bytes,
+      source: 's3',
+      filepath: `/api/files/download/${id}`,
+      storageKey: `t/${owner.tenantId}/managed-uploads/${owner.userId}/${id}.${transfer!.generation}__original`,
+      integrity: {
+        version: 1,
+        algorithm: 'sha256',
+        sha256,
+        chunkBytes: 262144,
+        chunkSha256: [sha256],
+      },
+    };
+    await uploads.bindSecurityExecution(transfer!, execution, now);
+    await uploads.settleSecurityExecution(
+      transfer!,
+      uploadSecuritySettlementFixture(execution, {
+        writerStopped: true,
+        transientDataRemoved: true,
+      }),
+      now,
+    );
+    await bindUploadOriginalFixture(
+      uploads,
+      transfer!,
+      originalFixture,
+      uploadSecurityFixture({
+        decision: 'approved',
+        policySha256: policy,
+        subject: {
+          ...owner,
+          operationId: id,
+          transferGeneration: transfer!.generation,
+          mediaType: 'text/plain',
+          bytes,
+          sha256,
+        },
+        scannerVersion: 'explicit-synthetic-scanner/v1',
+        checkedAt: new Date(now).toISOString(),
+        coverage: { complete: true, pages: 1, parts: 1 },
+      }).approval,
+      now,
+    );
+    await uploads.accept(
+      principal,
+      transfer!,
+      originalFixture,
+      uploadSecurityFixture({
+        decision: 'approved',
+        policySha256: policy,
+        subject: {
+          ...owner,
+          operationId: id,
+          transferGeneration: transfer!.generation,
+          mediaType: 'text/plain',
+          bytes,
+          sha256,
+        },
+        scannerVersion: 'explicit-synthetic-scanner/v1',
+        checkedAt: new Date(now).toISOString(),
+        coverage: { complete: true, pages: 1, parts: 1 },
+      }).approval,
       { filename: 'synthetic.txt' },
       now,
     );

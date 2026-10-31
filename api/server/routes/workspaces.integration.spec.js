@@ -1,4 +1,4 @@
-/** Real HTTP/Mongo/intake/scanner/parser flow; S3, login and resource admission are fixtures. */
+/** Real HTTP/Mongo/intake/scanner/parser flow; S3, AV engine, login and resource admission are fixtures. */
 const assert = require('node:assert/strict');
 const path = require('node:path');
 const { tmpdir } = require('node:os');
@@ -9,6 +9,10 @@ const express = require('express');
 const mongoose = require('mongoose');
 const request = require('supertest');
 const { MongoMemoryReplSet } = require('mongodb-memory-server');
+const { readUploadSecurityApproval } = require('librechat-data-provider');
+const {
+  createInertAntivirusFixture,
+} = require('../../../packages/api/src/uploads/security/antivirus-fixture.helper');
 const {
   createModels,
   createDocumentWorkspaceMethods,
@@ -123,6 +127,7 @@ describe('Workspace HTTP saves through native security and File lifecycle', () =
     parserScratch = path.join(root, 'parser-scratch');
     await Promise.all([intakeRoot, processingRoot, parserScratch].map((dir) => mkdir(dir)));
     scanner = createSecurityWorker({
+      antivirus: createInertAntivirusFixture().runtime,
       instanceId: '11111111-1111-4111-8111-111111111111',
       policy,
       policySha256,
@@ -163,6 +168,8 @@ describe('Workspace HTTP saves through native security and File lifecycle', () =
         'File',
         'UploadOperation',
         'UploadCounter',
+        'HousekeepingJob',
+        'FileReadReceipt',
         'User',
       ])
         if (db.models[name]) await db.models[name].deleteMany({});
@@ -318,9 +325,20 @@ describe('Workspace HTTP saves through native security and File lifecycle', () =
       .select('+securityApproval')
       .lean();
     expect(approved.securityApproval).toMatchObject({
+      version: 2,
       decision: 'approved',
-      subject: { operationId: id, bytes: bytes.length },
+      policySha256,
+      subject: {
+        operationId: id,
+        tenantId: owner.tenantId,
+        userId: owner.userId,
+        bytes: bytes.length,
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+      },
     });
+    expect(readUploadSecurityApproval(approved.securityApproval)).toEqual(
+      approved.securityApproval,
+    );
     const processed = await processNextManagedUpload(
       { management, storage, documents, worker, stagingRoot: processingRoot },
       AbortSignal.timeout(15_000),
