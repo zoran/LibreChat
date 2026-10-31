@@ -395,6 +395,7 @@ export function createManagedFileHandlers(
   async function download(req: ManagedFileRouteRequest, res: Response) {
     if (req.headers.range !== undefined) return sendFailure(res, unavailable('invalid_request'));
     return withManagedRead(req, res, 'original', async (access, scope, recheck) => {
+      if (!access.storageAuthority) throw unavailable();
       res.setHeader('Content-Disposition', getContentDisposition(access.file.filename));
       res.setHeader('Content-Type', 'application/octet-stream');
       res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -409,6 +410,7 @@ export function createManagedFileHandlers(
         if (!res.write(chunk)) await scope.within(once(res, 'drain', { signal: scope.signal }));
       };
       for await (const value of access.storage.read({
+        ...access.storageAuthority,
         original: access.receipt!,
         signal: scope.signal,
       })) {

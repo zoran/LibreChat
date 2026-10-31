@@ -1,10 +1,11 @@
-import logger from '~/config/winston';
 import {
   EModelEndpoint,
+  azureGroupConfigsSchema,
   validateAzureGroups,
   mapModelToAzureConfig,
 } from 'librechat-data-provider';
 import type { TCustomConfig, TAzureConfig } from 'librechat-data-provider';
+import logger from '~/config/winston';
 
 /**
  * Sets up the Azure OpenAI configuration from the config (`librechat.yaml`) file.
@@ -17,7 +18,17 @@ export function azureConfigSetup(config: Partial<TCustomConfig>): TAzureConfig {
     throw new Error('Azure OpenAI configuration is missing.');
   }
   const { groups, ...azureConfiguration } = azureConfig;
-  const { isValid, modelNames, modelGroupMap, groupMap, errors } = validateAzureGroups(groups);
+  const parsedGroups = azureGroupConfigsSchema.safeParse(groups);
+  if (!parsedGroups.success) {
+    const message =
+      'Invalid Azure OpenAI configuration:\n' +
+      parsedGroups.error.issues.map((issue) => issue.message).join('\n');
+    logger.error(message);
+    throw new Error(message);
+  }
+  const { isValid, modelNames, modelGroupMap, groupMap, errors } = validateAzureGroups(
+    parsedGroups.data,
+  );
 
   if (!isValid) {
     const errorString = errors.join('\n');
@@ -31,6 +42,7 @@ export function azureConfigSetup(config: Partial<TCustomConfig>): TAzureConfig {
   for (const modelName of modelNames) {
     mapModelToAzureConfig({ modelName, modelGroupMap, groupMap });
     const groupName = modelGroupMap?.[modelName]?.group;
+    if (groupName === undefined) continue;
     const modelGroup = groupMap?.[groupName];
     const supportsAssistants = modelGroup?.assistants || modelGroup?.[modelName]?.assistants;
     if (supportsAssistants) {

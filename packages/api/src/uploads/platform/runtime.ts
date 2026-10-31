@@ -9,6 +9,7 @@ import type {
   UploadResourceSnapshot,
 } from '../control/types';
 import type { UploadBackendCapture } from '../../storage/providerObservation';
+import type { UploadStorageAvailabilityOwner } from '../storageAvailability';
 import type { UploadSnapshotOptions } from '../control/snapshotClient';
 import type { UploadBackendObservation } from '../metrics/metrics';
 import type { ResourcePort, UploadRepository } from '../contract';
@@ -48,6 +49,7 @@ export interface UploadPlatformMetrics {
   }): void;
 }
 export interface UploadPlatformRuntime {
+  readonly storageAvailability?: UploadStorageAvailabilityOwner;
   resources: ResourcePort;
   snapshots: { refresh(): Promise<void>; current(): readonly UploadResourceSnapshot[] };
   expected: readonly UploadResourceKey[];
@@ -59,6 +61,8 @@ export interface UploadPlatformRuntime {
   readStorageBackend(): UploadBackendCapture | undefined;
 }
 export interface UploadPlatformRuntimeOptions {
+  /** Explicit NAS selection replaces legacy backend evidence, preserving all local guards. */
+  storageAvailability?: UploadStorageAvailabilityOwner;
   repository: Pick<UploadRepository, 'localReservations'>;
   worker: UploadWorker;
   stagingRoot: string;
@@ -89,6 +93,13 @@ export function createUploadPlatformRuntime(
     options.backendBinding === undefined
       ? undefined
       : immutableUploadBackendBinding(options.backendBinding, options.expectedHosts);
+  if (binding && options.storageAvailability)
+    throw new Error('conflicting_upload_storage_backends');
+  if (
+    options.storageAvailability &&
+    !options.storageAvailability.matchesHosts(options.expectedHosts)
+  )
+    throw new Error('conflicting_upload_storage_cohort');
   const backendCapture = binding && Object.freeze({ instanceId: randomUUID(), binding });
   const clock = options.clock ?? (() => ({ nowMs: Date.now(), monotonicMs: performance.now() }));
   const expected: UploadResourceKey[] = options.expectedHosts.flatMap((node) =>
@@ -109,11 +120,13 @@ export function createUploadPlatformRuntime(
   let closed = false;
   const disk = createUploadLocalSampler({ root: options.stagingRoot, clock });
   const parser = createUploadParserResourceClient({ socketPath: options.parserSocketPath, clock });
-  const backend = createUploadBackendClient({
-    binding,
-    ca: options.backendCa ?? '',
-    clock,
-  });
+  const backend = options.storageAvailability
+    ? undefined
+    : createUploadBackendClient({
+        binding,
+        ca: options.backendCa ?? '',
+        clock,
+      });
   const observe = (callback: (value: UploadPlatformMetrics) => void): void => {
     try {
       if (metrics) callback(metrics);
@@ -171,6 +184,7 @@ export function createUploadPlatformRuntime(
     };
   };
   const local = createUploadResourcePort({
+    durabilityMaxAgeMs: options.storageAvailability ? 90000 : 70000,
     cgroupDirectory: options.cgroupDirectory ?? '/sys/fs/cgroup',
     mounts: [
       {
@@ -181,7 +195,7 @@ export function createUploadPlatformRuntime(
       },
     ],
     reservations,
-    durability: async () => backend.current(),
+    durability: async () => options.storageAvailability?.durability() ?? backend!.current(),
     clock,
     observeResources: (input) => observe((value) => value.observeResources(input)),
   });
@@ -266,11 +280,13 @@ export function createUploadPlatformRuntime(
     ]).finally(() => clearTimeout(timeout));
   }
   return {
+    storageAvailability: options.storageAvailability,
     readStorageBackend: () => (closed ? undefined : backendCapture),
     expected,
     snapshots,
     resources: {
       async assertSafe(input): Promise<void> {
+        options.storageAvailability?.assertSafe();
         const state = parser.current();
         if (
           closed ||
@@ -280,6 +296,7 @@ export function createUploadPlatformRuntime(
           throw new UploadManagementError('unavailable');
         }
         await local.assertSafe(input);
+        options.storageAvailability?.assertSafe();
       },
     },
     async hardGuards(workers): Promise<UploadHardGuards> {
@@ -294,7 +311,9 @@ export function createUploadPlatformRuntime(
               worker.instanceId.length > 0 &&
               worker.instanceId.length <= 128,
           ),
-        durability: closed ? 'unknown' : backend.current().state,
+        durability: closed
+          ? 'unknown'
+          : (options.storageAvailability?.durability() ?? backend!.current()).state,
       };
     },
     get metrics(): UploadPlatformMetrics | undefined {
@@ -305,7 +324,8 @@ export function createUploadPlatformRuntime(
     },
     async start(): Promise<void> {
       if (closed || timer) return;
-      await Promise.all([disk.start(), parser.start(), backend.start()]);
+      options.storageAvailability?.start();
+      await Promise.all([disk.start(), parser.start(), backend?.start()]);
       await publishLocal();
       if (!closed && !timer) {
         timer = setInterval(() => {
@@ -318,7 +338,7 @@ export function createUploadPlatformRuntime(
       closed = true;
       clearInterval(timer);
       disk.close();
-      await Promise.all([parser.close(), backend.close()]);
+      await Promise.all([parser.close(), backend?.close(), options.storageAvailability?.stop()]);
     },
   };
 }

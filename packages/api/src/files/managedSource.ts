@@ -5,10 +5,10 @@ import {
   buildManagedFileReadBinding,
   isUploadPrincipal,
   isUploadOriginalIntegrity,
-  isUploadSecurityApproval,
+  readHistoricalUploadSecurityApproval,
   isUploadStorageReceipt,
   readManagedDocumentResult,
-  matchesUploadSecurityApproval,
+  matchesHistoricalUploadSecurityApproval,
 } from 'librechat-data-provider';
 import type {
   ManagedRevision,
@@ -19,7 +19,9 @@ import type {
   UploadStorageReceipt,
   UploadSecurityApproval,
 } from 'librechat-data-provider';
+import type { FileStorageAuthority } from './storageAuthority';
 import type { StoragePort } from '~/uploads/contract';
+import { resolveFileStorageAuthority } from './storageAuthority';
 
 export const MANAGED_SOURCE_FILE_FIELDS =
   'file_id uploadOperationId tenantId user filename type source bytes embedded llmDeliveryPath status expiredAt retentionAcceptedAt deletionRequestedAt deletionCompletedAt storageKey +securityApproval';
@@ -87,6 +89,8 @@ export type ManagedSourceAccess = Readonly<{
   sourceBindingSha256?: string;
   expiresAt: number;
   storage: Pick<StoragePort, 'read'>;
+  /** Internal non-enumerable owner authority, never actor/request or public metadata. */
+  storageAuthority: FileStorageAuthority | undefined;
 }>;
 
 export type ManagedSourceResolver = {
@@ -202,12 +206,9 @@ export function createManagedSourceResolver(options: Options): ManagedSourceReso
     const storageKey = raw.storageKey;
     let approval: UploadSecurityApproval | undefined;
     if (raw.securityApproval !== undefined) {
-      if (!isUploadSecurityApproval(raw.securityApproval)) throw unavailable();
-      approval = {
-        ...raw.securityApproval,
-        subject: { ...raw.securityApproval.subject },
-        coverage: { ...raw.securityApproval.coverage },
-      };
+      const parsed = readHistoricalUploadSecurityApproval(raw.securityApproval);
+      if (!parsed) throw unavailable();
+      approval = parsed;
     }
     let document: ManagedDocumentResult | undefined;
     if (input.text && Object.prototype.hasOwnProperty.call(raw, 'documentStructure')) {
@@ -222,6 +223,7 @@ export function createManagedSourceResolver(options: Options): ManagedSourceReso
     )
       throw unavailable();
     let receipt: UploadStorageReceipt | undefined;
+    let storageAuthority: FileStorageAuthority | undefined;
     let generation: number | undefined;
     const policy = options.policySha256();
     const extractionPolicy = options.extractionPolicySha256?.();
@@ -246,10 +248,41 @@ export function createManagedSourceResolver(options: Options): ManagedSourceReso
         task.principal?.tenantId !== user.tenantId ||
         task.principal?.userId !== user.userId ||
         receipt?.outcome !== 'durable' ||
-        receipt.source !== 's3' ||
+        !['s3', 'nas-s3'].includes(receipt.source) ||
         !receipt.storageKey ||
         receipt.storageKey !== storageKey ||
         receipt.bytes !== file.bytes
+      )
+        throw unavailable();
+      storageAuthority = resolveFileStorageAuthority(task, {
+        operationId: id,
+        source: file.source,
+        storageKey: storageKey ?? '',
+        bytes: file.bytes,
+        mediaType: file.type,
+      });
+      if (!storageAuthority) throw unavailable();
+      if (
+        receipt.source === 'nas-s3' &&
+        (!approval ||
+          approval.version !== 2 ||
+          !receipt.integrity ||
+          generation === undefined ||
+          typeof policy !== 'string' ||
+          !matchesHistoricalUploadSecurityApproval(
+            approval,
+            {
+              tenantId: storageAuthority.principal.tenantId,
+              userId: storageAuthority.principal.userId,
+              operationId: id,
+              transferGeneration: generation,
+              mediaType: file.type,
+              bytes: file.bytes,
+              sha256: receipt.integrity.sha256,
+            },
+            policy,
+            now(),
+          ))
       )
         throw unavailable();
       if (document) {
@@ -260,7 +293,7 @@ export function createManagedSourceResolver(options: Options): ManagedSourceReso
           source.sha256 !== receipt.integrity.sha256 ||
           source.bytes !== file.bytes ||
           source.mediaType !== file.type ||
-          !matchesUploadSecurityApproval(
+          !matchesHistoricalUploadSecurityApproval(
             approval,
             {
               tenantId: user.tenantId,
@@ -329,6 +362,7 @@ export function createManagedSourceResolver(options: Options): ManagedSourceReso
       document,
       revision,
       receipt,
+      storageAuthority,
       expiresAt: Math.min(operationExpiry, expiry),
       fingerprint,
     };
@@ -351,7 +385,7 @@ export function createManagedSourceResolver(options: Options): ManagedSourceReso
       representationRevision: value.revision?.representationRevision,
       expiresAt: value.expiresAt,
     };
-    const access: ManagedSourceAccess = Object.freeze({
+    const access: ManagedSourceAccess = {
       file: value.file,
       document: freezeData(value.document),
       revision: freezeData(value.revision),
@@ -361,7 +395,10 @@ export function createManagedSourceResolver(options: Options): ManagedSourceReso
         return binding.expiresAt;
       },
       storage: options.storage,
-    });
+      storageAuthority: value.storageAuthority,
+    };
+    Object.defineProperty(access, 'storageAuthority', { enumerable: false });
+    Object.freeze(access);
     bindings.set(access, binding);
     return access;
   }

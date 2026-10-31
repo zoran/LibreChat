@@ -68,6 +68,7 @@ function createHousekeepingService(configuration) {
     let connector;
     let redis;
     let client;
+    let nas;
     let retrieval;
     let acquisitionOriginal;
     let transferred = false;
@@ -87,6 +88,7 @@ function createHousekeepingService(configuration) {
           Promise.resolve().then(() => retrieval?.close(signal)),
           Promise.resolve().then(() => redis?.close()),
           Promise.resolve().then(() => client?.destroy()),
+          Promise.resolve().then(() => nas?.close()),
         ]);
         const errors = results.filter((result) => result.status === 'rejected');
         if (errors.length) {
@@ -139,7 +141,13 @@ function createHousekeepingService(configuration) {
       redis = await createOwnedRedisGenerationCleanup(env, signal);
       signal.throwIfAborted();
       client = api.createManagedS3Client(env);
-      const storage = api.createManagedS3Storage({ client, bucket: env.AWS_BUCKET_NAME });
+      const managedStorage = api.createManagedS3Storage({ client, bucket: env.AWS_BUCKET_NAME });
+      const selected = (nas = await api.createHousekeepingUploadStorage({
+        configuration: configuration.managedUploads,
+        repository: uploads,
+        managedStorage,
+        signal,
+      }));
       signal.throwIfAborted();
       retrieval = await api.createManagedFilePurge({
         trustedFile,
@@ -181,14 +189,18 @@ function createHousekeepingService(configuration) {
         },
         { sourceId },
       );
-      const cleanup = api.createManagedUploadCleanup({ repository: uploads, storage });
+      const cleanup = api.createManagedUploadCleanup({
+        repository: uploads,
+        storage: selected.managedCleanup,
+        nasStorage: selected.nasCleanup,
+      });
       return {
         env,
         readStorageProviders: () => ({
           ordinaryS3: { state: 'not-owned' },
           managedS3: providerClosing
             ? { state: 'unavailable' }
-            : api.getManagedS3Provider(storage, null),
+            : api.getManagedS3Provider(managedStorage, null),
         }),
         repository,
         fileNotice: schemas.createFileNoticePort(mongoose, jobs, { allowedDomains, timezone }),
@@ -197,7 +209,8 @@ function createHousekeepingService(configuration) {
           targets,
           lifecycle,
           generations: redis.port,
-          storage,
+          storage: selected.managedCleanup,
+          nasStorage: selected.nasCleanup,
           storageBudgetMs: 10000,
         }),
         uploadCleanup: {

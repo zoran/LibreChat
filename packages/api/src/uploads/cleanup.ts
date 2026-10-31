@@ -3,6 +3,8 @@ import type { UploadCleanupTask, UploadCleanupProof } from 'librechat-data-provi
 import type { JobClaim, StepOutcome } from '@librechat/data-schemas';
 import type { UploadRepository, StoragePort } from './contract';
 import type { UploadActorSettlement } from './actorSettlement';
+import type { NasStoragePort } from '../storage/nas';
+import { getNasS3StorageCapture } from '../storage/nas';
 
 type FileOwner = { tenantId?: string | null; userId?: string };
 type CleanupRepository = Pick<
@@ -31,6 +33,8 @@ export interface ManagedUploadCleanup {
 export function createManagedUploadCleanup(options: {
   repository: CleanupRepository;
   storage: StoragePort;
+  /** Existing operations retain their selected backend; NAS failures never select managed S3. */
+  nasStorage?: NasStoragePort;
   actor?: Pick<UploadActorSettlement, 'settle'>;
   now?: () => number;
 }): ManagedUploadCleanup {
@@ -49,6 +53,33 @@ export function createManagedUploadCleanup(options: {
   async function storageSettlement(task: UploadCleanupTask, signal: AbortSignal, claim?: JobClaim) {
     if (task.attemptGeneration == null || task.fileId || signal.aborted)
       return { state: 'pending' as const };
+    const writeBinding = task.writeBinding;
+    if (writeBinding?.version === 2 || task.original?.backend?.kind === 'nas-s3') {
+      const nasStorage = options.nasStorage;
+      const capture = nasStorage && getNasS3StorageCapture(nasStorage);
+      if (
+        !nasStorage ||
+        !capture ||
+        writeBinding?.version !== 2 ||
+        capture.backend.uid !== writeBinding.backend.uid ||
+        capture.backend.configurationSha256 !== writeBinding.backend.configurationSha256 ||
+        capture.backend.protocol !== writeBinding.backend.protocol ||
+        capture.bucket !== writeBinding.bucket ||
+        writeBinding.operationId !== task.operationId ||
+        writeBinding.generation !== String(task.attemptGeneration)
+      )
+        return { state: 'pending' as const };
+      const result = await nasStorage.cleanupOriginal({
+        principal: task.principal,
+        operationId: task.operationId,
+        ...(claim ? { claim } : {}),
+        signal,
+        deadlineAtMs: now() + 30_000,
+      });
+      return result.state === 'complete'
+        ? { state: 'complete' as const, receiptRef: `nas:${result.consumerCommitId}` }
+        : { state: 'pending' as const };
+    }
     const authority = {
       operationId: task.operationId,
       principal: task.principal,

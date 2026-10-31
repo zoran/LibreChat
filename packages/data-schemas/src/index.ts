@@ -24,6 +24,14 @@ export type {
 } from './methods/fileWorkspace';
 export { createUploadManagementRepository } from './methods/uploadManagement';
 export type { UploadManagementRepository } from './methods/uploadManagement';
+export type {
+  UploadNasMethods,
+  NasUploadWriteInput,
+  NasOriginalObserver,
+  NasOriginalDispatch,
+  NasDeletionObserver,
+  NasAntivirusAdmission,
+} from './methods/uploadManagementNasTypes';
 export {
   createFileRetrievalOperationOwner,
   parseFileRetrievalPolicySnapshot,
@@ -205,3 +213,7 @@ export type {
   ManagedUploadWriteBinding,
   ManagedUploadWriteBinder,
 } from './methods/uploadManagementWriteTypes';
+
+export { uploadDigest } from './methods/uploadManagementState';
+
+export { createNasAntivirusAdmission } from './methods/uploadManagement.security';

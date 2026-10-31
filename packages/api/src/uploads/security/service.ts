@@ -4,6 +4,7 @@ import { createServer } from 'node:https';
 import type { AddressInfo } from 'node:net';
 import type { SecurityProcessProfile } from './process-launcher';
 import type { SecurityPdfOcrConfiguration } from './pdf-ocr';
+import type { AntivirusRuntime } from './antivirus-runtime';
 import type { UploadSecurityClientPeer } from './transport';
 import type { ApplicationWorkPort } from '~/app';
 import { createSecurityProcessLauncher } from './process-launcher';
@@ -15,6 +16,7 @@ import { createSecurityWorker } from './worker';
 
 export async function startSecurityService(options: {
   instanceId: string;
+  antivirus: AntivirusRuntime;
   policyBytes: Uint8Array;
   policySha256: string;
   tls: { ca: Buffer; cert: Buffer; key: Buffer };
@@ -26,6 +28,7 @@ export async function startSecurityService(options: {
 }): Promise<{
   address: AddressInfo;
   maintenance: ApplicationWorkPort;
+  available(): boolean;
   close(signal?: AbortSignal): Promise<{ complete: boolean }>;
 }> {
   if (
@@ -48,7 +51,10 @@ export async function startSecurityService(options: {
     });
     if (result.decision !== 'rejected') throw new Error('Required security markings unavailable');
   }
+  if (!options.antivirus) throw new Error('Antivirus unavailable');
+  await options.antivirus.initialise(AbortSignal.timeout(60_000));
   const worker = createSecurityWorker({
+    antivirus: options.antivirus,
     instanceId: options.instanceId,
     policy,
     policySha256: options.policySha256,
@@ -117,6 +123,7 @@ export async function startSecurityService(options: {
   });
   return {
     address: server.address() as AddressInfo,
+    available: () => !stopped && options.antivirus.available(),
     maintenance,
     async close(signal = AbortSignal.timeout(10000)): Promise<{ complete: boolean }> {
       if (!stopped) {

@@ -62,6 +62,7 @@ describe('upload HTTP boundary', () => {
       return user;
     });
     management = {
+      assertAdmissionSafe: jest.fn(async () => undefined),
       list: jest.fn(async () => [operation]),
       usage: jest.fn(async () => usage),
       reserve: jest.fn(async () => operation),
@@ -118,6 +119,12 @@ describe('upload HTTP boundary', () => {
     expect(response.data).toMatchObject({ operationId: 'operation', capability: 'A'.repeat(43) });
     expect(issueIntake).toHaveBeenCalledWith(expect.anything(), user, 'operation');
     expect(runFileOperation).toHaveBeenCalledTimes(1);
+  });
+  it('checks the authoritative storage/resource gate before issuing any intake capability', async () => {
+    management.assertAdmissionSafe.mockRejectedValue(new UploadManagementError('storage_stale'));
+    const response = await call('POST', '/api/uploads/operations/operation/intake', {});
+    expect(response).toEqual({ status: 503, data: { code: 'storage_stale' } });
+    expect(issueIntake).not.toHaveBeenCalled();
   });
 
   it.each([

@@ -3,8 +3,9 @@ import { Readable } from 'node:stream';
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import { mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
-import type { UploadProcessingInput } from 'librechat-data-provider';
+import type { UploadProcessingInput, UploadLease, UploadWorker } from 'librechat-data-provider';
 import type { S3Client } from '@aws-sdk/client-s3';
+import { managedOriginalKey } from '../../storage/s3/managed';
 import { documentResultFixture } from './result.helper';
 import { createManagedS3Storage } from '../storage';
 import { processNextManagedUpload } from './run';
@@ -106,7 +107,7 @@ describe('one managed processing claim', () => {
     extract = jest.fn(async () => ({ ...documentResultFixture(), writerStopped: true as const })),
   ) {
     const management = {
-      claimProcessing: jest.fn(async () => lease),
+      claimProcessing: jest.fn<Promise<UploadLease | null>, [UploadWorker]>(async () => lease),
       getProcessingInput: jest.fn(async () => processingInputFor(Buffer.from('hello'))),
       renew: jest.fn(async () => lease),
       bindProcessingExecution: jest.fn(async (): Promise<void> => undefined),
@@ -179,31 +180,52 @@ describe('one managed processing claim', () => {
     return { ...deps, storage, body, send, receipt };
   }
 
-  it('stages an intact version through the actual S3 reader before dispatching the parser', async () => {
-    const original = Buffer.concat([
-      Buffer.alloc(integrityChunkBytes, 65),
-      Buffer.from('useful final text'),
-    ]);
-    const deps = storedOriginal(original);
-    deps.documents.extract.mockImplementationOnce(async () => {
-      expect(await readFile(path.join(root, 'op.2', 'original'))).toEqual(original);
-      expect(deps.body.readableEnded).toBe(true);
-      return { ...documentResultFixture(), writerStopped: true as const };
-    });
-    await processNextManagedUpload(deps as never, new AbortController().signal);
-    expect(deps.send).toHaveBeenCalledTimes(1);
-    expect(deps.send.mock.calls[0][0].input).toMatchObject({
-      Key: deps.receipt.storageKey,
-      VersionId: 'recorded-version',
-    });
-    expect(deps.management.publish).toHaveBeenCalledWith(lease, {
-      ...documentResultFixture(),
-      writerStopped: true,
-    });
-    expect(deps.management.fail).not.toHaveBeenCalled();
-    expect(deps.body.destroyed).toBe(true);
-    expect(await readdir(root)).toEqual([]);
-  });
+  it.each(['tenant', null])(
+    'stages an intact version with its lease owner (%s) through the actual S3 reader',
+    async (tenantId) => {
+      const original = Buffer.concat([
+        Buffer.alloc(integrityChunkBytes, 65),
+        Buffer.from('useful final text'),
+      ]);
+      const deps = storedOriginal(original);
+      const selectedLease: UploadLease = { ...lease, tenantId };
+      deps.management.claimProcessing.mockResolvedValueOnce(selectedLease);
+      deps.receipt.storageKey = managedOriginalKey({ ...selectedLease, generation: 1 });
+      const acceptedInput = processingInputFor(original);
+      acceptedInput.original = deps.receipt;
+      acceptedInput.securityApproval.subject.tenantId = tenantId;
+      deps.management.getProcessingInput.mockResolvedValueOnce(acceptedInput);
+      const read = jest.spyOn(deps.storage, 'read');
+      deps.documents.extract.mockImplementationOnce(async () => {
+        expect(await readFile(path.join(root, 'op.2', 'original'))).toEqual(original);
+        expect(deps.body.readableEnded).toBe(true);
+        return { ...documentResultFixture(), writerStopped: true as const };
+      });
+      await processNextManagedUpload(deps as never, new AbortController().signal);
+      expect(deps.send).toHaveBeenCalledTimes(1);
+      expect(deps.send.mock.calls[0][0].input).toMatchObject({
+        Key: deps.receipt.storageKey,
+        VersionId: 'recorded-version',
+      });
+      expect(deps.management.publish).toHaveBeenCalledWith(selectedLease, {
+        ...documentResultFixture(),
+        writerStopped: true,
+      });
+      expect(deps.management.fail).not.toHaveBeenCalled();
+      expect(deps.body.destroyed).toBe(true);
+      expect(await readdir(root)).toEqual([]);
+      expect(read).toHaveBeenCalledWith(
+        expect.objectContaining({
+          operationId: 'op',
+          principal: {
+            userId: 'user',
+            tenantId,
+            authentication: tenantId === null ? 'guest' : 'verified-email',
+          },
+        }),
+      );
+    },
+  );
 
   it.each([
     ['first block', 7, 0],

@@ -27,6 +27,7 @@ const {
   resolveCodeWorkspaceInheritanceCapability,
   resolveCodeEnvironmentTransitionVersion,
   loadConversationListLimits,
+  managedUploadStartupCapability,
 } = require('@librechat/api');
 const {
   DEFAULT_MCP_APP_CSP_LIMITS,
@@ -269,10 +270,10 @@ router.get('/', async function (req, res) {
           appTitle: process.env.APP_TITLE,
           interfaceConfig: baseConfig?.interfaceConfig,
         }),
-        managedUploads: {
+        managedUploads: managedUploadStartupCapability(baseConfig, {
           enabled: process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED === 'true',
           eligible: false,
-        },
+        }),
         documentWorkspace: {
           enabled:
             process.env.CORTEX_DOCUMENT_WORKSPACE_ENABLED === 'true' &&
@@ -354,7 +355,7 @@ router.get('/', async function (req, res) {
       }),
       ...publicSharePayload,
       ...buildPostLoginPayload(appConfig),
-      managedUploads: {
+      managedUploads: managedUploadStartupCapability(appConfig, {
         enabled: process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED === 'true',
         eligible:
           (req.authenticationClass === 'verified-email' && req.user.provider === 'email_code') ||
@@ -363,7 +364,7 @@ router.get('/', async function (req, res) {
             req.user.provider === 'browser' &&
             req.browserGrant?.userId === req.user.id &&
             req.browserGrant?.tenantId === null),
-      },
+      }),
       documentWorkspace: {
         enabled:
           process.env.CORTEX_DOCUMENT_WORKSPACE_ENABLED === 'true' &&

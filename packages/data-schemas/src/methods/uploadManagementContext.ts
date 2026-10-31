@@ -13,6 +13,7 @@ import type {
   createUploadStore,
   storedUploadPrincipal,
 } from './uploadManagementStore';
+import type { NasAntivirusAdmission } from './uploadManagementNasTypes';
 import type { createFileRetentionMethods } from './fileRetention';
 
 /** Internal ports share the sole store, transaction and retention owners. */
@@ -39,4 +40,5 @@ export interface UploadManagementContext {
   applyCleanup(row: StoredUpload, proof: UploadCleanupProof, global: GlobalState): void;
   usage(principal: UploadPrincipal, now: number, session?: ClientSession): Promise<UploadUsage>;
   recordOriginalPublication?: UploadPublicationPort;
+  nasAntivirusAdmission?: NasAntivirusAdmission;
 }

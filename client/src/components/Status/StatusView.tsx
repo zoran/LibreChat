@@ -1,3 +1,4 @@
+import { statusTranslationKeys } from './classification';
 /** Integrated Cortex Status route. The production path never falls back to Demo fixtures. */
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { STATUS_ZOOM_PRESETS } from 'librechat-data-provider';
@@ -123,7 +124,7 @@ export function StatusPresentation({
                 );
               }}
             >
-              {t(`com_status_preset_${p}` as never)}
+              {t(statusTranslationKeys.preset[p])}
             </button>
           ))}
         </nav>
@@ -242,7 +243,7 @@ export function StatusPresentation({
               <svg aria-hidden="true" viewBox="0 0 10 10" width="10" height="10">
                 <StatusStateIcon state={state} />
               </svg>
-              {t(`com_status_state_${state}` as never)}
+              {t(statusTranslationKeys.state[state])}
             </span>
           ))}
         </span>

@@ -1,3 +1,4 @@
+/** useDragHelpers applies the same upload admission to drops before routing or chooser effects. */
 import { useRef, useMemo, useCallback } from 'react';
 import { useDrop } from 'react-dnd';
 import { useToastContext } from '@librechat/client';
@@ -20,7 +21,8 @@ export default function useDragHelpers() {
     [conversation?.endpoint],
   );
 
-  const { getOptions, isConfigResolved, isUnifiedMode, uploadsDisabled } = useUploadOptions();
+  const { getOptions, isConfigResolved, isUnifiedMode, uploadsDisabled, uploadAdmissionError } =
+    useUploadOptions();
   const routeFiles = useFileUploadRouter();
   const { openModal } = useUploadModalContext();
 
@@ -30,6 +32,7 @@ export default function useDragHelpers() {
   const isConfigResolvedRef = useRef(isConfigResolved);
   const isUnifiedModeRef = useRef(isUnifiedMode);
   const uploadsDisabledRef = useRef(uploadsDisabled);
+  const admissionErrorRef = useRef(uploadAdmissionError);
   const routeFilesRef = useRef(routeFiles);
   const openModalRef = useRef(openModal);
   const isAssistantsRef = useRef(isAssistants);
@@ -39,6 +42,7 @@ export default function useDragHelpers() {
   isConfigResolvedRef.current = isConfigResolved;
   isUnifiedModeRef.current = isUnifiedMode;
   uploadsDisabledRef.current = uploadsDisabled;
+  admissionErrorRef.current = uploadAdmissionError;
   routeFilesRef.current = routeFiles;
   openModalRef.current = openModal;
   isAssistantsRef.current = isAssistants;
@@ -49,7 +53,10 @@ export default function useDragHelpers() {
        * Resolving the endpoint config here as well missed an agent's provider entry, so a
        * named custom provider's rules applied to one flow and not the others. */
       if (uploadsDisabledRef.current) {
-        showToast({ message: localize('com_ui_attach_error_disabled'), status: 'error' });
+        showToast({
+          message: localize(admissionErrorRef.current ?? 'com_ui_attach_error_disabled'),
+          status: 'error',
+        });
         return;
       }
       /* Neither answer is safe before the config lands: offering the chooser sends an

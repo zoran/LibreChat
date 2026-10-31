@@ -9,6 +9,7 @@ import type {
   UploadSecurityApproval,
   UploadPrincipal,
   UploadStorageReceipt,
+  UploadOriginalWriteBinding,
   DocumentStructure,
   ManagedRetrievalState,
   UploadDerivedOrigin,
@@ -140,6 +141,8 @@ export interface IMongoFile extends Omit<Document, 'model'> {
   retainedDerivativeBytes?: number;
   retainedDerivativeReservations?: Array<Omit<FileSourceCopyReservation, 'fileId'>>;
   uploadOperationId?: string;
+  /** Trusted immutable repository snapshot; absent only for historical legacy originals. */
+  originalWriteBinding?: UploadOriginalWriteBinding;
   /** Private immutable upload-owner proof; never part of TFile or client projections. */
   securityApproval?: UploadSecurityApproval;
   /** Private immutable source identities; ordinary File consumers must not expose drafts. */
@@ -268,6 +271,7 @@ export type ManagedUploadAcceptance = {
   filename: string;
   mediaType: string;
   receipt: UploadStorageReceipt;
+  writeBinding?: UploadOriginalWriteBinding;
   transferGeneration: number;
   securityApproval: UploadSecurityApproval;
   derivedOrigin?: UploadDerivedOrigin;

@@ -1,3 +1,4 @@
+/** useAttachItems owns file source selection; central admission remains authoritative for uploads. */
 import React, { useRef, useMemo, useState, useCallback } from 'react';
 import { SharePointIcon } from '@librechat/client';
 import { useRecoilState, useRecoilValue } from 'recoil';
@@ -29,6 +30,7 @@ import type { SharePointFile } from '~/data-provider/Files/sharepoint';
 import type { ExtendedFile, FileSetter } from '~/common';
 import { useSharePointFileHandlingNoChatContext } from '~/hooks/Files/useSharePointFileHandling';
 import { useAgentToolPermissions, useAgentCapabilities, useGetAgentsConfig } from '~/hooks';
+import { useManagedUploads } from '~/features/uploads/useManagedUploads';
 import { useFileHandlingNoChatContext } from '~/hooks/Files';
 import { useGetStartupConfig } from '~/data-provider';
 import { getUploadToolAllowances } from '~/utils';
@@ -125,6 +127,7 @@ export default function useAttachItems({
   setFilesLoading,
 }: UseAttachItemsParams): UseAttachItems {
   const localize = useLocalize();
+  const { enabled: managedEnabled, getNewUploadError } = useManagedUploads();
   const inputRef = useRef<HTMLInputElement>(null);
   /* The local picker reads this at event time, where a ref is the only thing
      fast enough: the change event can arrive before React has committed. The
@@ -171,6 +174,7 @@ export default function useAttachItems({
 
   const handleUploadClick = useCallback(
     (fileType?: FileUploadType) => {
+      if (managedEnabled && getNewUploadError()) return;
       if (!inputRef.current) {
         return;
       }
@@ -200,11 +204,12 @@ export default function useAttachItems({
       inputRef.current.click();
       inputRef.current.accept = '';
     },
-    [endpointFileConfig?.supportedMimeTypes],
+    [endpointFileConfig?.supportedMimeTypes, managedEnabled, getNewUploadError],
   );
 
   const entries = useMemo<AttachEntry[]>(() => {
     const setToolResource = (value: EToolResources | undefined) => {
+      if (managedEnabled && getNewUploadError()) return;
       toolResourceRef.current = value;
       setSharePointResource(value);
     };
@@ -388,6 +393,8 @@ export default function useAttachItems({
     handleUploadClick,
     setEphemeralAgent,
     sharePointEnabled,
+    managedEnabled,
+    getNewUploadError,
     codeAllowedByAgent,
     fileSearchAllowedByAgent,
   ]);
@@ -402,6 +409,7 @@ export default function useAttachItems({
 
   const onSharePointFilesSelected = useCallback(
     async (sharePointFiles: unknown[]) => {
+      if (managedEnabled && getNewUploadError()) return;
       try {
         await handleSharePointFiles(sharePointFiles as Parameters<typeof handleSharePointFiles>[0]);
         setIsSharePointDialogOpen(false);
@@ -409,11 +417,22 @@ export default function useAttachItems({
         console.error('SharePoint file processing error:', error);
       }
     },
-    [handleSharePointFiles],
+    [handleSharePointFiles, managedEnabled, getNewUploadError],
   );
 
+  const guardedEntries = useMemo(
+    () =>
+      entries.map((entry) => ({
+        ...entry,
+        onSelect: () => {
+          if (managedEnabled && getNewUploadError()) return;
+          entry.onSelect();
+        },
+      })),
+    [entries, managedEnabled, getNewUploadError],
+  );
   return {
-    entries,
+    entries: guardedEntries,
     inputRef,
     onFileChange,
     isSharePointDialogOpen,

@@ -11,6 +11,7 @@ import {
 import type { EToolResources } from 'librechat-data-provider';
 import { getViableUploadOptions, getUploadToolAllowances, isUnifiedUploadMode } from '~/utils';
 import useAgentToolPermissions from '~/hooks/Agents/useAgentToolPermissions';
+import { useManagedUploads } from '~/features/uploads/useManagedUploads';
 import useAgentCapabilities from '~/hooks/Agents/useAgentCapabilities';
 import useGetAgentsConfig from '~/hooks/Agents/useGetAgentsConfig';
 import { useGetFileConfig } from '~/data-provider';
@@ -23,6 +24,7 @@ import { useDragDropContext } from '~/Providers';
  * consistently from one source.
  */
 export default function useUploadOptions() {
+  const uploads = useManagedUploads();
   const { conversationId, agentId, endpoint, endpointType, useResponsesApi } = useDragDropContext();
   const { agentsConfig } = useGetAgentsConfig();
   const capabilities = useAgentCapabilities(agentsConfig?.capabilities ?? defaultAgentCapabilities);
@@ -60,7 +62,8 @@ export default function useUploadOptions() {
     endpoint: fileConfigEndpoint,
     endpointType,
   });
-  const uploadsDisabled = endpointFileConfig.disabled === true;
+  const uploadAdmissionError = uploads.newUploadError;
+  const uploadsDisabled = endpointFileConfig.disabled === true || !!uploadAdmissionError;
   const isConfigResolved = isFileConfigLoaded && !awaitingAgentProvider;
   const isUnifiedMode = isUnifiedUploadMode(endpointFileConfig, isConfigResolved);
   const endpointSupportedMimeTypes = endpointFileConfig.supportedMimeTypes;
@@ -98,6 +101,7 @@ export default function useUploadOptions() {
   return {
     getOptions,
     uploadsDisabled,
+    uploadAdmissionError,
     isConfigPending,
     isConfigResolved,
     isUnifiedMode,

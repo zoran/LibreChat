@@ -1,3 +1,4 @@
+import { uploadOriginalSource } from './uploadManagementState';
 /** Transfer/security and processing publication methods on the shared upload transaction owner. */
 import {
   UPLOAD_MAX_FILE_BYTES,
@@ -29,6 +30,7 @@ import {
 } from './uploadManagementStore';
 import {
   captureUploadSecurityApproval,
+  upgradeUploadAvRecord,
   hasCurrentUploadSecurityApproval,
   requireUploadSecurityApproval,
   recordUploadSecuritySettlement,
@@ -36,6 +38,8 @@ import {
 import { bindUploadIntakeClaim, requireUploadPromotionAcceptance } from './uploadManagementIntake';
 import { touchActiveUserPrincipal } from './userPrincipal';
 import { FileSourceCapacityError } from './fileRetention';
+import { uploadOriginalKey } from './uploadManagementState';
+import { assertNasOriginalPublication } from './uploadManagementNasState';
 /** Transfer and processing lifecycle; every transition uses the injected Upload store transaction. */
 export function createUploadProcessingMethods(
   context: UploadManagementContext,
@@ -190,12 +194,22 @@ export function createUploadProcessingMethods(
         Date.parse(execution.expiresAt) <= now
       )
         reject('invalid_request');
-      await store.transaction(async (session) => {
+      await store.transaction(async (session, global) => {
         const row = await store.Operation.findById(lease.operationId)
           .session(session)
           .lean<StoredUpload>();
         assertLease(row, lease, now);
         if (row.state !== 'transferring' || row.slot !== 'transfer') reject('lease_lost');
+        const subject = execution.antivirus.subject;
+        if (
+          subject.tenantId !== row.tenantId ||
+          subject.userId !== row.userId ||
+          subject.operationId !== row._id ||
+          subject.transferGeneration !== row.attemptGeneration ||
+          subject.bytes !== row.declaredBytes ||
+          subject.mediaType !== row.mediaType
+        )
+          reject('invalid_request');
         if (
           (row.mediaType === 'application/pdf') !== (execution.custody.kind === 'pdf-ocr') ||
           (execution.custody.kind === 'pdf-ocr' &&
@@ -206,8 +220,12 @@ export function createUploadProcessingMethods(
         if (row.securityExecution) {
           if (!matchesUploadSecurityExecution(row.securityExecution, execution))
             reject('lease_lost');
+          const priorCharge = row.recordBytes;
+          upgradeUploadAvRecord(row, global);
+          if (row.recordBytes !== priorCharge) await store.save(row, session);
           return;
         }
+        upgradeUploadAvRecord(row, global);
         row.securityExecution = execution;
         await store.save(row, session);
       });
@@ -239,6 +257,7 @@ export function createUploadProcessingMethods(
       const original = isUploadStorageReceipt(receipt)
         ? {
             ...receipt,
+            ...(receipt.backend ? { backend: structuredClone(receipt.backend) } : {}),
             ...(receipt.integrity
               ? {
                   integrity: {
@@ -251,6 +270,7 @@ export function createUploadProcessingMethods(
         : undefined;
       return store.transaction(async (session) => {
         const row = await owned(principal, lease.operationId, session);
+        assertNasOriginalPublication(row, original, now);
         await touchActiveUserPrincipal(mongoose, principal, session);
         if (
           row.derivedOrigin !== undefined &&
@@ -286,10 +306,10 @@ export function createUploadProcessingMethods(
           bytes > UPLOAD_MAX_FILE_BYTES
         )
           reject('size_mismatch');
-        const expectedKey = `${row.tenantId === null ? '' : `t/${row.tenantId}/`}managed-uploads/${row.userId}/${row._id}.${row.attemptGeneration}__original`;
+        const expectedKey = uploadOriginalKey(row);
         if (
           !original ||
-          original.source !== 's3' ||
+          original.source !== uploadOriginalSource(row) ||
           original.storageKey !== expectedKey ||
           !isUploadOriginalIntegrity(original.integrity, original.bytes)
         )
@@ -327,6 +347,7 @@ export function createUploadProcessingMethods(
               filename: row.filename,
               mediaType: row.mediaType,
               receipt: original,
+              writeBinding: row.writeBinding,
               securityApproval: row.securityApproval,
               acceptedAt: now,
               ...(derivedOrigin ? { derivedOrigin } : {}),

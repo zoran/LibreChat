@@ -3,6 +3,8 @@ import {
   UPLOAD_MAX_FILE_BYTES,
   isUploadOriginalIntegrity,
   matchesUploadSecurityApproval,
+  readUploadOriginalWriteBinding,
+  readUploadSecurityApproval,
 } from 'librechat-data-provider';
 import type { UploadSecurityApproval } from 'librechat-data-provider';
 import type { FilterQuery } from 'mongoose';
@@ -21,6 +23,20 @@ export function captureManagedFileApproval(
   policy: unknown,
 ): UploadSecurityApproval | undefined {
   const policySha256 = uploadSecurityPolicySha256(policy);
+  const binding = input.writeBinding ? readUploadOriginalWriteBinding(input.writeBinding) : null;
+  if (
+    input.receipt.source === 'nas-s3' &&
+    (!binding ||
+      binding.version !== 2 ||
+      binding.operationId !== input.operationId ||
+      binding.generation !== String(input.transferGeneration) ||
+      binding.key !== input.receipt.storageKey ||
+      binding.bytes !== input.receipt.bytes ||
+      binding.wholeSHA256 !== input.receipt.integrity?.sha256 ||
+      JSON.stringify(binding.backend) !== JSON.stringify(input.receipt.backend))
+  )
+    return undefined;
+  if (!binding || (input.receipt.source === 'nas-s3') !== (binding.version === 2)) return undefined;
   if (
     !policySha256 ||
     input.receipt.outcome !== 'durable' ||
@@ -41,8 +57,7 @@ export function captureManagedFileApproval(
     )
   )
     return undefined;
-  const approval = input.securityApproval;
-  return { ...approval, subject: { ...approval.subject }, coverage: { ...approval.coverage } };
+  return readUploadSecurityApproval(input.securityApproval) ?? undefined;
 }
 
 /** Used in the query itself, before counts, names, text or references can leave Mongo. */
@@ -53,7 +68,15 @@ export function approvedFileFilter(
   const policySha256 = uploadSecurityPolicySha256(policy);
   if (!policySha256) return { _id: { $exists: false } };
   return {
-    'securityApproval.version': 1,
+    $or: [
+      { 'securityApproval.version': 2, 'originalWriteBinding.version': { $in: [1, 2] } },
+      {
+        'securityApproval.version': 1,
+        uploadOperationId: { $type: 'string' },
+        retentionAcceptedAt: { $type: 'date' },
+        originalWriteBinding: { $exists: false },
+      },
+    ],
     'securityApproval.decision': 'approved',
     'securityApproval.policySha256': policySha256,
     'securityApproval.checkedAt': {
@@ -67,7 +90,7 @@ export function approvedFileFilter(
     'securityApproval.subject.sha256': { $regex: /^[a-f0-9]{64}$/ },
     'securityApproval.subject.bytes': { $gt: 0, $lte: UPLOAD_MAX_FILE_BYTES },
     'securityApproval.subject.transferGeneration': { $gt: 0 },
-    source: 's3',
+    source: { $in: ['s3', 'nas-s3'] },
     $expr: {
       $and: [
         {
@@ -114,20 +137,70 @@ export function approvedFileFilter(
         { $eq: ['$securityApproval.subject.mediaType', '$type'] },
         { $eq: ['$securityApproval.subject.bytes', '$bytes'] },
         {
+          $cond: [
+            { $eq: ['$securityApproval.version', 2] },
+            {
+              $and: [
+                { $eq: ['$originalWriteBinding.operationId', '$uploadOperationId'] },
+                {
+                  $eq: [
+                    '$originalWriteBinding.generation',
+                    { $toString: '$securityApproval.subject.transferGeneration' },
+                  ],
+                },
+                { $eq: ['$originalWriteBinding.bytes', '$bytes'] },
+                { $eq: ['$originalWriteBinding.wholeSHA256', '$securityApproval.subject.sha256'] },
+                {
+                  $eq: ['$securityApproval.antivirus.custody.subject', '$securityApproval.subject'],
+                },
+                {
+                  $or: [
+                    {
+                      $and: [
+                        { $eq: ['$originalWriteBinding.version', 1] },
+                        { $eq: ['$source', 's3'] },
+                      ],
+                    },
+                    {
+                      $and: [
+                        { $eq: ['$originalWriteBinding.version', 2] },
+                        { $eq: ['$source', 'nas-s3'] },
+                        { $eq: ['$originalWriteBinding.backend.kind', 'nas-s3'] },
+                        { $eq: ['$originalWriteBinding.backend.protocol', 'acknowledged-only-v1'] },
+                      ],
+                    },
+                  ],
+                },
+              ],
+            },
+            true,
+          ],
+        },
+        {
           $eq: [
             '$storageKey',
             {
-              $concat: [
+              $cond: [
+                { $eq: ['$securityApproval.version', 2] },
+                '$originalWriteBinding.key',
                 {
-                  $cond: [{ $eq: ['$tenantId', null] }, '', { $concat: ['t/', '$tenantId', '/'] }],
+                  $concat: [
+                    {
+                      $cond: [
+                        { $eq: ['$tenantId', null] },
+                        '',
+                        { $concat: ['t/', '$tenantId', '/'] },
+                      ],
+                    },
+                    'managed-uploads/',
+                    { $toString: '$user' },
+                    '/',
+                    '$file_id',
+                    '.',
+                    { $toString: '$securityApproval.subject.transferGeneration' },
+                    '__original',
+                  ],
                 },
-                'managed-uploads/',
-                { $toString: '$user' },
-                '/',
-                '$file_id',
-                '.',
-                { $toString: '$securityApproval.subject.transferGeneration' },
-                '__original',
               ],
             },
           ],

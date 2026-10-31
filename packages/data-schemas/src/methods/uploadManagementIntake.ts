@@ -1,4 +1,5 @@
 import { uploadOriginalKey as key } from './uploadManagementState';
+import { uploadOriginalSource } from './uploadManagementState';
 /** Private Intake capability and App-promotion fences on the existing transactional upload row. */
 import {
   readUploadIntakeGrant,
@@ -151,7 +152,13 @@ export function bindUploadIntakeClaim(row: StoredUpload, input: UploadClaimInput
 
 export function readStoredUploadPromotion(row: StoredUpload): UploadPromotionRecord | undefined {
   if (row.promotion === undefined) return undefined;
-  const record = readUploadPromotionRecord(row.promotion);
+  const record = readUploadPromotionRecord(
+    row.promotion,
+    row.writeBinding?.version !== 2 &&
+      (row.writeBinding?.version === 1 ||
+        row.acceptedAt != null ||
+        ['failed', 'cancelled', 'deleted', 'expired'].includes(row.state)),
+  );
   if (
     !record ||
     record.lease.operationId !== row._id ||
@@ -165,7 +172,7 @@ export function readStoredUploadPromotion(row: StoredUpload): UploadPromotionRec
       (row.intake.generation !== record.lease.generation ||
         !sameWorker(row.intake.worker, record.lease))) ||
     (record.receipt &&
-      (record.receipt.source !== 's3' ||
+      (record.receipt.source !== uploadOriginalSource(row) ||
         record.receipt.storageKey !== key(row) ||
         (record.receipt.outcome === 'durable' &&
           !same(record.receipt.integrity, record.integrity))))
@@ -616,7 +623,7 @@ export function createUploadIntakeMethods(
         if (record.state === 'prepared') reject('not_ready');
         if (
           input.receipt &&
-          (input.receipt.source !== 's3' ||
+          (input.receipt.source !== uploadOriginalSource(row) ||
             input.receipt.storageKey !== key(row) ||
             input.receipt.bytes !== row.declaredBytes ||
             (input.receipt.outcome === 'durable' &&

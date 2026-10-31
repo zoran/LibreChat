@@ -4,6 +4,7 @@ import {
   lifecycle,
   derivativesComplete,
   validateStorage,
+  validateNasFileStorage,
   validId,
   same,
   digest,
@@ -126,10 +127,10 @@ export function createFileCleanupLifecycleMethods(
       v.upload.operationId !== context.file.uploadOperationId
     )
       throw new Pending('invalid_upload_binding');
-    const storage = v.storage;
-    if (storage) validateStorage(value);
+    const storage = v.nasStorage ? validateNasFileStorage(value) : v.storage;
+    if (storage && !v.nasStorage) validateStorage(value);
     if (storage?.state === 'committed' || storage?.state === 'consumed') {
-      validateStorage(value);
+      if (!v.nasStorage) validateStorage(value);
       const result = mustOwner(await upload.acknowledgeAcceptedFileCleanup({ claim }, session));
       if (result.state !== 'acknowledged' || !same(result.ack, storage.uploadAck))
         throw new Pending('owner_pending');
@@ -288,6 +289,8 @@ export function createFileCleanupLifecycleMethods(
         )
           throw new Pending('owner_pending');
         const u = v.upload;
+        if (u.backend?.kind === 'nas-s3')
+          return a.save(claim, c, value, 'removing_original', session);
         v.storage = {
           state: 'binding',
           request: {
@@ -434,7 +437,7 @@ export function createFileCleanupLifecycleMethods(
         const c = await a.load(claim, session);
         const value = a.progress(c);
         const v = lifecycle(value);
-        const storage = validateStorage(value);
+        const storage = v.nasStorage ? validateNasFileStorage(value) : validateStorage(value);
         if (
           storage.state !== 'consumed' ||
           v.contentPrepared !== true ||

@@ -62,6 +62,8 @@ export function assessUploadLocalResources(resources: UploadLocalResources): {
 
 /** Trusted composition provides reservation accounting; no directory walk or request path input. */
 export interface UploadResourcePortOptions {
+  /** Selected NAS health uses90s; legacy qualified observers retain their70s bound. */
+  durabilityMaxAgeMs?: 70000 | 90000;
   cgroupDirectory: string;
   mounts: readonly { slot: string; path: string; capacityBytes: number; floorBytes: number }[];
   reservations: (
@@ -88,6 +90,8 @@ export function createUploadResourcePort(options: UploadResourcePortOptions): Re
     !options.cgroupDirectory.startsWith('/') ||
     options.mounts.length < 1 ||
     options.mounts.length > 8 ||
+    (options.durabilityMaxAgeMs !== undefined &&
+      ![70000, 90000].includes(options.durabilityMaxAgeMs)) ||
     new Set(options.mounts.map((mount) => mount.slot)).size !== options.mounts.length ||
     options.mounts.some((mount) => !mount.path.startsWith('/'))
   )
@@ -199,7 +203,7 @@ export function createUploadResourcePort(options: UploadResourcePortOptions): Re
             clock.monotonicMs,
           ].every(Number.isFinite) ||
           backend.observedAtMs > clock.nowMs ||
-          clock.nowMs - backend.observedAtMs >= 70000 ||
+          clock.nowMs - backend.observedAtMs >= (options.durabilityMaxAgeMs ?? 70000) ||
           backend.expiresAtMs <= clock.nowMs ||
           backend.expiresMonotonicMs <= clock.monotonicMs
         )

@@ -8,5 +8,14 @@
     "preserveConstEnums": true,
     "declarationMap": true
   },
-  "exclude": ["node_modules", "dist", "types", "src/**/*.test.ts", "src/**/*.spec.ts"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "types",
+    "src/**/*.test.ts",
+    "src/**/*.spec.ts",
+    "src/**/__tests__/**",
+    "src/**/*.helper.ts",
+    "src/**/*.fixture.ts"
+  ]
 }

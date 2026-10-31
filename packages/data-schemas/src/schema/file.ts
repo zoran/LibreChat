@@ -280,6 +280,7 @@ const file: Schema<IMongoFile> = new Schema(
     },
     // Managed upload publication joins the existing File lifecycle transaction.
     uploadOperationId: { type: String },
+    originalWriteBinding: { type: mongoose.Schema.Types.Mixed, select: false },
     securityApproval: { type: mongoose.Schema.Types.Mixed, select: false },
     derivedOrigin: { type: mongoose.Schema.Types.Mixed, select: false },
     managedRetrieval: { type: mongoose.Schema.Types.Mixed, select: false },
@@ -311,6 +312,7 @@ const file: Schema<IMongoFile> = new Schema(
         delete value.retainedDerivativeBytes;
         delete value.retainedDerivativeReservations;
         delete value.securityApproval;
+        delete value.originalWriteBinding;
         delete value.derivedOrigin;
         delete value.derivedRetention;
         delete value.retentionRevocationId;
@@ -327,6 +329,7 @@ const file: Schema<IMongoFile> = new Schema(
         delete value.retainedDerivativeBytes;
         delete value.retainedDerivativeReservations;
         delete value.securityApproval;
+        delete value.originalWriteBinding;
         delete value.derivedOrigin;
         delete value.derivedRetention;
         delete value.retentionRevocationId;

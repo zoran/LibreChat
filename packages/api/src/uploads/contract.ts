@@ -42,6 +42,7 @@ import type {
   UploadSecurityExecution,
   UploadSecuritySettlement,
   UploadIntakeRecovery,
+  NasUploadWriteBinding,
 } from 'librechat-data-provider';
 import type { UploadManagementRepository } from '@librechat/data-schemas';
 
@@ -75,7 +76,8 @@ export type StorageDeletionInput = {
 export interface StoragePort {
   /** Private read-only status from the persisted write binding; never HEAD/absence proof. */
   observeOriginal(input: {
-    binding: import('@librechat/data-schemas').ManagedUploadWriteBinding;
+    principal: UploadPrincipal;
+    binding: import('@librechat/data-schemas').ManagedUploadWriteBinding | NasUploadWriteBinding;
     integrity: UploadOriginalIntegrity;
     signal: AbortSignal;
   }): Promise<UploadStorageReceipt>;
@@ -101,7 +103,12 @@ export interface StoragePort {
     body: AsyncIterable<Uint8Array>;
     signal: AbortSignal;
   }): Promise<UploadStorageReceipt>;
-  read(input: { original: UploadStorageReceipt; signal: AbortSignal }): AsyncIterable<Uint8Array>;
+  read(input: {
+    principal: UploadPrincipal;
+    operationId: string;
+    original: UploadStorageReceipt;
+    signal: AbortSignal;
+  }): AsyncIterable<Uint8Array>;
   remove(input: {
     operationId: string;
     generation: number;

@@ -32,6 +32,8 @@ export { instrumentMongooseQueryMetrics } from './app/metrics';
 export { optionalEnabled } from './utils/common';
 export { createManagedS3Client } from './storage/s3/managedClient';
 export { createManagedS3Storage, getManagedS3Provider } from './storage/s3/managed';
+export { createNasS3Storage } from './storage/nas';
+export { createNasS3Client } from './storage/nas/client';
 export { createManagedUploadCleanup } from './uploads/cleanup';
 
 export { createFileCleanupPort } from './files/lifecycleCleanup';
@@ -50,3 +52,13 @@ export { parseManagedFileDeploymentConfiguration } from './files/rag/configurati
 export type { ManagedFileDeploymentExpectations } from './files/rag/configuration';
 export { loadManagedFileDeploymentConfiguration } from './files/rag/deployment';
 export type { ManagedFileDeploymentOptions } from './files/rag/deployment';
+
+export { createNasStorageDeployment } from './storage/nas/deployment';
+export { composeUploadStorage } from './storage/uploads';
+export { readHousekeepingLocalConfiguration } from './housekeeping/localConfiguration';
+export type {
+  HousekeepingLocalConfiguration,
+  HousekeepingLocalConfigurationOptions,
+} from './housekeeping/localConfiguration';
+
+export { createHousekeepingUploadStorage } from './uploads/composition/storage';

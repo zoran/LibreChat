@@ -1,8 +1,13 @@
+/** managed.ts owns only the legacy managed-S3 protocol; NAS bindings never enter this adapter. */
 import { Readable } from 'node:stream';
 import { randomUUID } from 'node:crypto';
 import { finished } from 'node:stream/promises';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { isUploadOriginalIntegrity, isUploadStorageReceipt } from 'librechat-data-provider';
+import {
+  isUploadPrincipal,
+  isUploadOriginalIntegrity,
+  isUploadStorageReceipt,
+} from 'librechat-data-provider';
 import {
   PutObjectCommand,
   GetObjectCommand,
@@ -187,11 +192,19 @@ export function createManagedS3Storage(options: {
       }),
     beginDeletion: (input) => deletion.begin(deletionInput(input)),
     observeDeletion: (input) => deletion.observe(deletionInput(input)),
-    async observeOriginal({ binding: supplied, integrity: suppliedIntegrity, signal }) {
+    async observeOriginal({ principal, binding: supplied, integrity: suppliedIntegrity, signal }) {
+      if (supplied.version !== 1 || !isUploadPrincipal(principal))
+        throw new Error('Managed original binding unavailable');
       const binding = snapshotManagedWrite(supplied);
       const integrity = identitySnapshot(suppliedIntegrity, binding.bytes);
       if (
         binding.bucket !== Bucket ||
+        binding.key !==
+          managedOriginalKey({
+            ...principal,
+            operationId: binding.operationId,
+            generation: Number(binding.generation),
+          }) ||
         !validKey(binding.key) ||
         binding.wholeSHA256 !== integrity.sha256
       )
@@ -286,7 +299,19 @@ export function createManagedS3Storage(options: {
         const reconcile = async () => {
           if (!complete || input.signal.aborted) return;
           return storage
-            .observeOriginal({ binding, integrity, signal: input.signal })
+            .observeOriginal({
+              principal:
+                input.lease.tenantId === null
+                  ? { authentication: 'guest', tenantId: null, userId: input.lease.userId }
+                  : {
+                      authentication: 'verified-email',
+                      tenantId: input.lease.tenantId,
+                      userId: input.lease.userId,
+                    },
+              binding,
+              integrity,
+              signal: input.signal,
+            })
             .catch(() => undefined);
         };
         try {
@@ -342,9 +367,16 @@ export function createManagedS3Storage(options: {
         await closeStreams(source, body);
       }
     },
-    read({ original, signal }) {
+    read({ principal, operationId, original, signal }) {
+      const parsed = parseS3Key(original.storageKey);
       if (
         !isUploadStorageReceipt(original) ||
+        !isUploadPrincipal(principal) ||
+        !parsed ||
+        (parsed.tenantId ?? null) !== principal.tenantId ||
+        parsed.userId !== principal.userId ||
+        !parsed.fileName.startsWith(operationId + '.') ||
+        original.backend !== undefined ||
         original.source !== 's3' ||
         original.outcome !== 'durable' ||
         !validKey(original.storageKey) ||

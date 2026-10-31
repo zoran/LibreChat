@@ -1,3 +1,4 @@
+import { uploadRecordBudget } from './uploadManagementState';
 /** Upload custody of opaque storage receipts; no native inventory or physical deletion authority. */
 import { createHash, randomUUID } from 'crypto';
 import {
@@ -6,7 +7,6 @@ import {
   isStorageDeletionRequest,
   isStorageDeletionResult,
   isStorageDeletionConsumptionResult,
-  UPLOAD_RECORD_BYTES,
 } from 'librechat-data-provider';
 import type {
   StorageDeletionBinding,
@@ -31,6 +31,7 @@ import {
 import { uploadOriginalKey, assertUploadCleanupCapacity } from './uploadManagementState';
 import { hasCompleteUploadSecurityExecution } from './uploadManagement.security';
 import { ownershipFilter } from './housekeepingStore';
+import { hasNasCleanupCompletion, validateNasUploadState } from './uploadManagementNasState';
 
 export type { UploadCleanupCustody } from './uploadManagementState';
 export { assertUploadCleanupCapacity, UPLOAD_CLEANUP_HEADROOM } from './uploadManagementState';
@@ -95,6 +96,7 @@ const sameWorker = (a?: UploadWorker, b?: UploadWorker): boolean =>
   !!a && !!b && a.hostId === b.hostId && a.instanceId === b.instanceId;
 
 export function hasUploadStorageCompletion(row: StoredUpload): boolean {
+  if (row.writeBinding?.version === 2) return hasNasCleanupCompletion(row);
   const custody = row.cleanupCustody;
   return (
     !!custody?.binding &&
@@ -159,6 +161,8 @@ export function hasUploadAcceptedFileAck(row: StoredUpload): boolean {
 }
 /** Migration preserves original unknown history; a boolean cannot synthesize a new receipt. */
 export function validateUploadCleanupCustody(row: StoredUpload): void {
+  validateNasUploadState(row);
+  if (row.writeBinding?.version === 2) return;
   const c = row.cleanupCustody;
   if (c === undefined) return;
   const keys = [
@@ -207,7 +211,7 @@ export function validateUploadCleanupCustody(row: StoredUpload): void {
       row.slot ||
       row.stagingHeld ||
       !hasUploadActorClosure(row) ||
-      row.recordBytes !== UPLOAD_RECORD_BYTES)
+      row.recordBytes !== uploadRecordBudget(row))
   )
     reject('migration_conflict');
 
@@ -259,7 +263,7 @@ export function validateUploadCleanupCustody(row: StoredUpload): void {
       row.textBytes ||
       row.stagingHeld ||
       row.slot ||
-      row.recordBytes !== UPLOAD_RECORD_BYTES)
+      row.recordBytes !== uploadRecordBudget(row))
   )
     reject('migration_conflict');
   if (
@@ -330,7 +334,13 @@ export function createUploadCleanupReceiptMethods(
         row.generation !== authority.claim.work.cleanupGeneration)
     )
       return null;
-    if (row.acceptedAt != null || row.fileId || !terminal.has(row.state)) return null;
+    if (
+      row.writeBinding?.version === 2 ||
+      row.acceptedAt != null ||
+      row.fileId ||
+      !terminal.has(row.state)
+    )
+      return null;
     validateUploadCleanupCustody(row);
     return { row, job, authority };
   }

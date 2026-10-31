@@ -1,6 +1,7 @@
+/** live owns one identity-bound upload stream and independent admission freshness causes. */
 import { SSE } from 'sse.js';
-import { getTokenHeader } from 'librechat-data-provider';
-import type { ManagedUploadSnapshot } from 'librechat-data-provider';
+import { getTokenHeader, readUploadStorageAvailability } from 'librechat-data-provider';
+import type { ManagedUploadSnapshot, UploadStorageAvailability } from 'librechat-data-provider';
 import type { QueryClient } from '@tanstack/react-query';
 import { readUploadSnapshot, uploadsUrl } from './api';
 
@@ -10,28 +11,42 @@ type LiveOwner = {
   stop: () => void;
   read: (signal?: AbortSignal) => Promise<ManagedUploadSnapshot>;
   admission: () => boolean | null;
+  storage: (required?: boolean) => UploadStorageAvailability | undefined;
 };
 type Observation = {
   value: boolean;
   source: 'live' | 'http';
   generation: number;
   expiresAt: number;
+  storageAvailability?: UploadStorageAvailability;
 };
 const ownersByClient = new WeakMap<QueryClient, Map<string, LiveOwner>>();
+const storageRequiredByClient = new WeakMap<QueryClient, Set<string>>();
 
-/** Admission frames carry one advisory bit, never file data or server instructions. */
-function parseStatus(event: Event & { data?: string }): boolean | null {
-  if (typeof event.data !== 'string' || event.data.length > 128) return null;
+/** Closed public status carries only manual pause and optional safe storage availability. */
+type Status = { admissionsPaused: boolean | null; storageAvailability?: UploadStorageAvailability };
+function parseStatus(event: Event & { data?: string }): Status | null {
+  if (typeof event.data !== 'string' || event.data.length > 512) return null;
   try {
-    const value = JSON.parse(event.data);
+    const value: unknown = JSON.parse(event.data);
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+    const row = value as Record<string, unknown>;
     if (
-      !value ||
-      Array.isArray(value) ||
-      Object.keys(value).length !== 1 ||
-      !Object.hasOwn(value, 'admissionsPaused')
+      Object.keys(row).some((key) => !['admissionsPaused', 'storageAvailability'].includes(key)) ||
+      typeof row.admissionsPaused !== 'boolean'
     )
       return null;
-    return typeof value.admissionsPaused === 'boolean' ? value.admissionsPaused : null;
+    return {
+      admissionsPaused: row.admissionsPaused,
+      ...(Object.hasOwn(row, 'storageAvailability')
+        ? {
+            storageAvailability: readUploadStorageAvailability(row.storageAvailability) ?? {
+              available: false,
+              reason: 'storage-unavailable',
+            },
+          }
+        : {}),
+    };
   } catch {
     return null;
   }
@@ -46,13 +61,24 @@ function createOwner(client: QueryClient, key: string[]): LiveOwner {
   let identityEpoch = 0;
   let sequence = 0;
   let observation: Observation | undefined;
+  const identity = JSON.stringify(key);
+  let requiredIdentities = storageRequiredByClient.get(client);
+  if (!requiredIdentities) {
+    requiredIdentities = new Set();
+    storageRequiredByClient.set(client, requiredIdentities);
+  }
+  let storageRequired = requiredIdentities.has(identity);
+  const requireStorage = () => {
+    storageRequired = true;
+    requiredIdentities.add(identity);
+  };
   let stream: SSE | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let refreshTimer: ReturnType<typeof setTimeout> | undefined;
   let nextRefresh = 0;
   let nextConnect: number | undefined;
   let failures = 0;
-  const admission = () =>
+  const manualPause = () =>
     !stopped &&
     !paused &&
     !document.hidden &&
@@ -60,13 +86,36 @@ function createOwner(client: QueryClient, key: string[]): LiveOwner {
     performance.now() < observation.expiresAt
       ? observation.value
       : null;
+  const storage = (required = false): UploadStorageAvailability | undefined => {
+    if (required) requireStorage();
+    if (!storageRequired) return undefined;
+    if (stopped || paused || document.hidden || !observation)
+      return { available: false, reason: 'storage-unavailable' };
+    if (performance.now() >= observation.expiresAt)
+      return { available: false, reason: 'storage-stale' };
+    return observation.storageAvailability ?? { available: false, reason: 'storage-unavailable' };
+  };
+  // The selection getter closes on either cause, without changing the manual policy bit.
+  const admission = () => {
+    if (manualPause() === true) return true;
+    if (storage()?.available === false) return null;
+    return manualPause();
+  };
   const patchAdmission = () => {
     const query = client.getQueryCache().find<ManagedUploadSnapshot>(key, { exact: true });
     const data = query?.state.data;
-    const admissionsPaused = admission();
-    if (query && data && data.admissionsPaused !== admissionsPaused) {
+    const admissionsPaused = manualPause();
+    const storageAvailability = storage();
+    if (
+      query &&
+      data &&
+      (data.admissionsPaused !== admissionsPaused ||
+        JSON.stringify(data.storageAvailability) !== JSON.stringify(storageAvailability))
+    ) {
       // A heartbeat is not a file refresh: preserve its age, errors and fetch state.
-      query.setState({ data: { ...data, admissionsPaused } });
+      query.setState({
+        data: { ...data, admissionsPaused, ...(storageRequired ? { storageAvailability } : {}) },
+      });
     }
   };
   const close = () => {
@@ -97,7 +146,9 @@ function createOwner(client: QueryClient, key: string[]): LiveOwner {
       Math.max(0, wake - performance.now()),
     );
   };
-  const observe = (value: boolean | null, source: Observation['source']) => {
+  const observe = (status: Status | null, source: Observation['source']) => {
+    if (status && Object.hasOwn(status, 'storageAvailability')) requireStorage();
+    const value = status?.admissionsPaused;
     sequence++;
     observation =
       typeof value === 'boolean' && !document.hidden
@@ -106,6 +157,7 @@ function createOwner(client: QueryClient, key: string[]): LiveOwner {
             source,
             generation,
             expiresAt: performance.now() + (source === 'live' ? 20_000 : 75_000),
+            storageAvailability: status?.storageAvailability,
           }
         : undefined;
     patchAdmission();
@@ -119,8 +171,26 @@ function createOwner(client: QueryClient, key: string[]): LiveOwner {
     try {
       const data = await readUploadSnapshot(signal);
       if (cancelled()) throw new DOMException('Aborted', 'AbortError');
-      if (sequence === received) observe(data.admissionsPaused, 'http');
-      return { ...data, admissionsPaused: admission() };
+      if (sequence === received)
+        observe(
+          {
+            admissionsPaused: data.admissionsPaused,
+            ...(Object.hasOwn(data, 'storageAvailability')
+              ? {
+                  storageAvailability: readUploadStorageAvailability(data.storageAvailability) ?? {
+                    available: false as const,
+                    reason: 'storage-unavailable' as const,
+                  },
+                }
+              : {}),
+          },
+          'http',
+        );
+      return {
+        ...data,
+        admissionsPaused: manualPause(),
+        ...(storageRequired ? { storageAvailability: storage() } : {}),
+      };
     } catch (error) {
       // Both HTTP readers share this fence; an older failure cannot erase a newer frame.
       if (!cancelled() && sequence === received) observe(null, 'http');
@@ -223,6 +293,7 @@ function createOwner(client: QueryClient, key: string[]): LiveOwner {
   return {
     references: 0,
     admission,
+    storage,
     read,
     start: () => {
       if (started) return;
@@ -264,15 +335,21 @@ export const readManagedUploadSnapshot = (
   client: QueryClient,
   key: string[],
   signal?: AbortSignal,
-) => ownerFor(client, key).read(signal);
+  storageRequired = false,
+) => {
+  const owner = ownerFor(client, key);
+  owner.storage(storageRequired);
+  return owner.read(signal);
+};
 
 /** Read at the selection boundary after queue waits; a render is not a new observation. */
 export const getUploadAdmission = (client: QueryClient, key: string[]) =>
   ownersByClient.get(client)?.get(JSON.stringify(key))?.admission() ?? null;
 
 /** One authenticated stream per identity and tab. Hints trigger a coalesced authoritative read. */
-export function acquireUploadLive(client: QueryClient, key: string[]) {
+export function acquireUploadLive(client: QueryClient, key: string[], storageRequired = false) {
   const owner = ownerFor(client, key);
+  owner.storage(storageRequired);
   if (owner.references++ === 0) owner.start();
   let released = false;
   return () => {
@@ -284,3 +361,16 @@ export function acquireUploadLive(client: QueryClient, key: string[]) {
     }
   };
 }
+
+/** Current storage lease; once NAS status is observed, absent/reset frames never downgrade it. */
+export const getUploadStorageAvailability = (
+  client: QueryClient,
+  key: string[],
+  required = false,
+) => ownerFor(client, key).storage(required);
+
+/** Manual policy is independent of automatic storage recovery. */
+export const getUploadManualPause = (client: QueryClient, key: string[]) => {
+  const state = client.getQueryData<ManagedUploadSnapshot>(key);
+  return state?.admissionsPaused ?? null;
+};

@@ -4,6 +4,7 @@ import {
   isUploadPrincipal,
   readUploadAcceptedMetadata,
   readUploadIntakeTicket,
+  readUploadStorageAvailability,
 } from 'librechat-data-provider';
 import type {
   ManagedUploadSnapshot,
@@ -27,14 +28,17 @@ export interface UploadHttpOptions extends AuthorityOptions {
   runFileOperation<T>(work: () => Promise<T>): Promise<T>;
   management: Pick<
     UploadManagement,
-    'list' | 'usage' | 'reserve' | 'cancel' | 'delete' | 'retryProcessing'
+    'list' | 'usage' | 'reserve' | 'cancel' | 'delete' | 'retryProcessing' | 'assertAdmissionSafe'
   >;
   /** Existing File owner rechecks availability and supplies browser-safe attachment paths. */
   projectAttachments(
     principal: UploadPrincipal,
     operations: readonly UploadOperation[],
   ): Promise<ReadonlyMap<string, Attachment>>;
-  status(): Pick<ManagedUploadSnapshot, 'throttled' | 'waitingReason' | 'admissionsPaused'>;
+  status(): Pick<
+    ManagedUploadSnapshot,
+    'throttled' | 'waitingReason' | 'admissionsPaused' | 'storageAvailability'
+  >;
   live: Pick<UploadLiveHub, 'open'>;
   /** A private native grant is retained server-side; only this bounded capability is returned. */
   issueIntake?(
@@ -259,6 +263,14 @@ export function createUploadHttpRouter(options: UploadHttpOptions): Router {
         waitingReason: status.waitingReason,
         admissionsPaused:
           typeof status.admissionsPaused === 'boolean' ? status.admissionsPaused : null,
+        ...('storageAvailability' in status
+          ? {
+              storageAvailability: readUploadStorageAvailability(status.storageAvailability) ?? {
+                available: false,
+                reason: 'storage-unavailable',
+              },
+            }
+          : {}),
       };
       response.json(snapshot);
     }),
@@ -323,6 +335,7 @@ export function createUploadHttpRouter(options: UploadHttpOptions): Router {
     owned(async (request, response) => {
       exact(request.body, []);
       if (!options.issueIntake) throw new UploadManagementError('unavailable');
+      await options.management.assertAdmissionSafe();
       const id = operationId(request);
       const ticket = readUploadIntakeTicket(
         await options.issueIntake(request, principal(request), id),

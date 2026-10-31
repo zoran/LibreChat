@@ -162,6 +162,47 @@ describe('independent upload hard guards', () => {
       code: 'unavailable',
     });
   });
+  it('uses the selected NAS90s bound without raising legacy70s or local resource ceilings', async () => {
+    (readFile as jest.Mock).mockImplementation(async (path: string) =>
+      path.endsWith('memory.max') ? String(2048 * MiB) : String(256 * MiB),
+    );
+    (statfs as jest.Mock).mockResolvedValue({
+      bavail: BigInt(1024),
+      bsize: BigInt(MiB),
+      ffree: BigInt(10000),
+    });
+    for (const durabilityMaxAgeMs of [undefined, 90000] as const) {
+      const port = createUploadResourcePort({
+        durabilityMaxAgeMs,
+        cgroupDirectory: '/trusted/cgroup',
+        mounts: [
+          {
+            slot: 'staging',
+            path: '/trusted/staging',
+            capacityBytes: 128 * MiB,
+            floorBytes: 16 * MiB,
+          },
+        ],
+        reservations: async () => ({
+          memoryBytes: 0,
+          mounts: { staging: { usedBytes: 0, reservedBytes: 0, requiredBytes: 0 } },
+        }),
+        durability: async () => ({
+          state: 'safe',
+          observedAtMs: 20000,
+          expiresAtMs: 110000,
+          expiresMonotonicMs: 110000,
+        }),
+        clock: () => ({ nowMs: 100000, monotonicMs: 100000 }),
+      });
+      if (durabilityMaxAgeMs)
+        await expect(port.assertSafe({ phase: 'admission' })).resolves.toBeUndefined();
+      else
+        await expect(port.assertSafe({ phase: 'admission' })).rejects.toMatchObject({
+          code: 'unavailable',
+        });
+    }
+  });
   it('bounds stalled filesystem waits without accumulating replacement kernel reads', async () => {
     jest.useFakeTimers();
     try {
@@ -197,16 +238,18 @@ describe('independent upload hard guards', () => {
         }),
         clock: () => ({ nowMs: Date.now(), monotonicMs: 0 }),
       });
-      const first = await expect(port.assertSafe({ phase: 'admission' })).rejects.toMatchObject({
-        code: 'unavailable',
-      });
-      await jest.advanceTimersByTimeAsync(3000);
-      await first;
-      const second = await expect(port.assertSafe({ phase: 'admission' })).rejects.toMatchObject({
-        code: 'unavailable',
-      });
-      await jest.advanceTimersByTimeAsync(3000);
-      await second;
+      await Promise.all([
+        expect(port.assertSafe({ phase: 'admission' })).rejects.toMatchObject({
+          code: 'unavailable',
+        }),
+        jest.advanceTimersByTimeAsync(3000),
+      ]);
+      await Promise.all([
+        expect(port.assertSafe({ phase: 'admission' })).rejects.toMatchObject({
+          code: 'unavailable',
+        }),
+        jest.advanceTimersByTimeAsync(3000),
+      ]);
       expect(readFile).toHaveBeenCalledTimes(2);
       expect(statfs).toHaveBeenCalledTimes(1);
     } finally {

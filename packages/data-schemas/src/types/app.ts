@@ -2,6 +2,7 @@ import type {
   TEndpoint,
   FileStorage,
   TFileConfig,
+  ManagedUploadsConfig,
   TAzureConfig,
   TCustomConfig,
   TChatProjectsConfig,
@@ -115,7 +116,9 @@ export interface AppConfig {
   /** Deployment-owned MCP App sandbox transport limits. */
   mcpAppSandbox?: TCustomConfig['mcpAppSandbox'];
   /** File configuration */
-  fileConfig?: TFileConfig;
+  fileConfig?: Omit<TFileConfig, 'managedUploads'>;
+  /** Server-only deployment configuration; never include in public File configuration responses. */
+  managedUploads?: ManagedUploadsConfig;
   /** Secure image links configuration, enabled unless explicitly disabled */
   secureImageLinks?: TCustomConfig['secureImageLinks'];
   /** Validation limits for the conversation list's filter facets */

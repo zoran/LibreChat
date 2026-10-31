@@ -10,6 +10,7 @@ import type { FileOwnerScope } from '../types/file';
 import {
   lifecycle,
   validateStorage,
+  validateNasFileStorage,
   derivativesComplete,
   validId,
   same,
@@ -79,7 +80,7 @@ export function createFileCleanupCompletionMethods(
           )
             throw new Error('FILE_COMPLETION_CUSTODY');
           const v = lifecycle(value),
-            storage = validateStorage(value),
+            storage = v.nasStorage ? validateNasFileStorage(value) : validateStorage(value),
             deadline = currentFileDeadline(file);
           if (
             storage.state !== 'consumed' ||

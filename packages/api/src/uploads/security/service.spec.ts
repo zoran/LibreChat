@@ -4,6 +4,7 @@ import { request } from 'node:https';
 import { readFileSync, statSync } from 'node:fs';
 import { createHash, randomUUID, X509Certificate } from 'node:crypto';
 import type { ClientRequest } from 'node:http';
+import { createInertAntivirusFixture, antivirusCustodyFixture } from './antivirus-fixture.helper';
 import { createSecurityTlsFixture } from './tls-fixture.helper';
 import { createHttpUploadSecurityPort } from './transport';
 import { startSecurityService } from './service';
@@ -55,6 +56,7 @@ describe('scanner service maintenance', () => {
     const threadPath = join(__dirname, '../../../dist/uploads/security/worker-thread.cjs');
     statSync(threadPath);
     const service = await startSecurityService({
+      antivirus: createInertAntivirusFixture().runtime,
       instanceId: randomUUID(),
       peers: [
         {
@@ -147,16 +149,19 @@ describe('scanner service maintenance', () => {
         pendingWrites: 0,
         complete: true,
       });
+      const missingExpiry = new Date(Date.now() + 60_000).toISOString();
       const missing = {
-        version: 2 as const,
+        version: 3 as const,
+        antivirus: antivirusCustodyFixture(subject, missingExpiry),
         custody: { kind: 'none' as const },
         attemptId: 'upload.1',
         instanceId: randomUUID(),
         executionId: randomUUID(),
-        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        expiresAt: missingExpiry,
       };
       expect(await client.cancel({ execution: missing, signal: signal() })).toEqual({
         execution: missing,
+        antivirusReceipt: null,
         writerStopped: false,
         transientDataRemoved: false,
       });

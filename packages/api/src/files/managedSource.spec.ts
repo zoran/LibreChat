@@ -1,6 +1,11 @@
 /** Shared source authority exercised through actual context preparation, never a provider success mock. */
 import { createHash } from 'node:crypto';
-import type { UploadCleanupTask, UploadPrincipal } from 'librechat-data-provider';
+import { readHistoricalUploadSecurityApproval } from 'librechat-data-provider';
+import type {
+  UploadCleanupTask,
+  UploadPrincipal,
+  UploadSecurityApproval,
+} from 'librechat-data-provider';
 import type { ManagedSourceRecord } from './managedSource';
 import type { ServerRequest } from '~/types';
 import { bindManagedContextSources, createManagedSourceResolver } from './managedSource';
@@ -13,6 +18,42 @@ const principal: UploadPrincipal = {
 };
 const epoch = Date.parse('2026-10-18T00:00:00Z');
 const policy = 'c'.repeat(64);
+
+/** Synthetic accepted-row metadata only; no engine execution or AV readiness is claimed. */
+function syntheticNasApproval(base: UploadSecurityApproval): UploadSecurityApproval {
+  const checkedAt = base.checkedAt;
+  return {
+    ...base,
+    version: 2,
+    antivirus: {
+      engineVersion: 'synthetic-1.4.6',
+      readyObservedAt: checkedAt,
+      cleanAt: checkedAt,
+      custody: {
+        version: 1,
+        slot: 'synthetic-slot',
+        podUid: 'synthetic-pod',
+        runtimeImage: 'synthetic@sha256:' + 'd'.repeat(64),
+        sourceRevision: 'e'.repeat(40),
+        engineArtifactSha256: '1'.repeat(64),
+        profileSha256: '2'.repeat(64),
+        signatureManifestSha256: '3'.repeat(64),
+        signatureVerificationSha256: '4'.repeat(64),
+        dailyDatabaseVersion: 1,
+        dailyPublishedAt: checkedAt,
+        subject: { ...base.subject },
+        expiresAt: new Date(Date.parse(checkedAt) + 60000).toISOString(),
+        original: {
+          id: '11111111-1111-4111-8111-111111111111',
+          pid: 123,
+          startTicks: '1',
+          bootId: '22222222-2222-4222-8222-222222222222',
+          configurationSha256: '5'.repeat(64),
+        },
+      },
+    },
+  };
+}
 
 function fixture() {
   let clock = epoch;
@@ -303,4 +344,45 @@ it('revalidates current retention after another successful activity extends the 
   expect(access.expiresAt).toBe(epoch + 604860000);
   f.record.deletionRequestedAt = new Date(epoch + 60001);
   await expect(f.resolver.revalidate(f.req, access)).rejects.toThrow();
+});
+
+it('keeps NAS original/preview authority on the existing bound row with no extra query', async () => {
+  const f = fixture();
+  const original = f.task.original;
+  if (!original?.integrity) throw new Error('Fixture original missing');
+  const backend = {
+    kind: 'nas-s3' as const,
+    protocol: 'acknowledged-only-v1' as const,
+    uid: 'private-backend',
+    configurationSha256: 'a'.repeat(64),
+  };
+  const accepted = readHistoricalUploadSecurityApproval(f.record.securityApproval);
+  if (!accepted) throw new Error('Fixture approval unavailable');
+  f.record.securityApproval = syntheticNasApproval(accepted);
+  f.record.source = 'nas-s3';
+  f.record.storageKey = 'originals/opaque-server-key';
+  f.task.original = { ...original, source: 'nas-s3', storageKey: f.record.storageKey, backend };
+  f.task.writeBinding = {
+    version: 2,
+    backend,
+    bucket: 'private-files',
+    key: f.record.storageKey,
+    operationId: 'source-a',
+    generation: '1',
+    bytes: f.record.bytes,
+    wholeSHA256: original.integrity.sha256,
+    mediaType: f.record.type,
+    originalDeadline: '2099-01-01T00:00:00.000Z',
+  };
+  const access = await f.resolver.resolve(f.req, 'source-a', { text: true });
+  expect(access.storageAuthority).toEqual({ principal, operationId: 'source-a' });
+  expect(Object.keys(access)).not.toContain('storageAuthority');
+  expect(f.ports.original).toHaveBeenCalledTimes(1);
+  expect(f.ports.operation).toHaveBeenCalledTimes(1);
+  await f.resolver.revalidate(f.req, access);
+  expect(f.ports.original).toHaveBeenCalledTimes(2);
+  delete f.task.writeBinding;
+  await expect(f.resolver.resolve(f.req, 'source-a', { text: true })).rejects.toMatchObject({
+    code: 'not_found',
+  });
 });

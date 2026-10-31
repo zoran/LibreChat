@@ -3,7 +3,10 @@ import { acquireUploadLive, readManagedUploadSnapshot, getUploadAdmission } from
 import { readUploadSnapshot } from './api';
 
 jest.mock('./api', () => ({ uploadsUrl: '/api/uploads', readUploadSnapshot: jest.fn() }));
-jest.mock('librechat-data-provider', () => ({ getTokenHeader: () => 'Bearer session' }));
+jest.mock('librechat-data-provider', () => ({
+  ...jest.requireActual('librechat-data-provider'),
+  getTokenHeader: () => 'Bearer session',
+}));
 const streams: {
   listeners: Record<string, (event?: unknown) => void>;
   close: jest.Mock;

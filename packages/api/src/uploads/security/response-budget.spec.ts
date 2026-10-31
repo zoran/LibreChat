@@ -35,7 +35,7 @@ import { createHttpUploadSecurityPort, createSecurityRequestHandler } from './tr
 
 const fixtureBytes = readFileSync(join(__dirname, 'fixtures/response-budget.json'));
 const fixture = () => JSON.parse(fixtureBytes.toString());
-const RESPONSE_LIMIT = 12 * 1024;
+const RESPONSE_LIMIT = 24 * 1024;
 function connect(
   value = fixture(),
   options: { responseBytes?: number; invalidRequest?: string } = {},
@@ -75,7 +75,7 @@ function connect(
         let payload = Buffer.concat(chunks);
         const headers = { ...input.headers };
         if (options.invalidRequest === 'context')
-          headers['x-upload-security-context'] = 'A'.repeat(4097);
+          headers['x-upload-security-context'] = 'A'.repeat(8193);
         if (options.invalidRequest === 'headers') headers['x-too-long'] = 'a'.repeat(8193);
         if (options.invalidRequest === 'json')
           payload = Buffer.concat([payload, Buffer.alloc(8193 - payload.length, ' ')]);
@@ -141,25 +141,25 @@ function connect(
 }
 
 describe('complete v2 response budget with unchanged request boundaries', () => {
-  it('keeps the exact independently reviewed contract-valid fixture', () => {
+  it('keeps the exact current contract-valid fixture', () => {
     expect(createHash('sha256').update(fixtureBytes).digest('hex')).toBe(
-      '2471f3aec527d2f69eb9d2c96199cfb5bcd8486a894005fd25e4e7ff0dd2beb2',
+      '0842da871fc21e598ffa9993c121273a591057f0478e32c80fbe3a86ccf585e3',
     );
     const value = fixture();
     expect(readUploadSecurityExecution(value.execution)).not.toBeNull();
     expect(readUploadSecurityInspection(value.inspection)).not.toBeNull();
     expect(readUploadOcrDispatchObservation(value.dispatch)).not.toBeNull();
-    expect(Buffer.byteLength(JSON.stringify(value.payload))).toBe(7637);
+    expect(Buffer.byteLength(JSON.stringify(value.payload))).toBe(18670);
     expect(
       Buffer.byteLength(
         JSON.stringify({ version: 2, payload: value.payload, dispatch: value.dispatch }),
       ),
-    ).toBe(8650);
+    ).toBe(19683);
     expect(
       Buffer.from(JSON.stringify({ execution: value.execution, subject: value.subject })).toString(
         'base64',
       ).length,
-    ).toBe(3804);
+    ).toBe(7408);
   });
   it('returns the valid PDF inspection with its complete non-null dispatch', async () => {
     const value = fixture();
@@ -167,7 +167,7 @@ describe('complete v2 response budget with unchanged request boundaries', () => 
     await expect(client.inspect(input())).resolves.toEqual(value.inspection);
     expect(core.inspect).toHaveBeenCalledTimes(1);
     expect(client.dispatchObservation!()).toEqual(value.dispatch);
-    expect(observed.responseBytes).toBe(8650);
+    expect(observed.responseBytes).toBe(19683);
     expect(observed.headers).toBe(8192);
   });
   it('budgets the fixed counter table at maximum safe integer widths', async () => {
@@ -209,7 +209,7 @@ describe('complete v2 response budget with unchanged request boundaries', () => 
     },
   );
   it.each(['context', 'headers', 'json'])(
-    'keeps original %s request limit',
+    'keeps the bounded current %s request limit',
     async (invalidRequest) => {
       const { client, input, core } = connect(fixture(), { invalidRequest });
       const pending =

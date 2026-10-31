@@ -2,6 +2,7 @@
 import path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import type { AppMaintenance } from '../../app/maintenance';
+import { createAntivirusRuntime, readAntivirusConfiguration } from './antivirus-runtime';
 import { NOT_OWNED_STORAGE_PROVIDERS } from '../../storage/providerObservation';
 import { createWorkloadMaintenance } from '../../app/maintenance';
 import { createMaintenanceIdentity } from '../../app/identity';
@@ -61,7 +62,19 @@ async function main() {
       apiKeyBytes.fill(0);
     }
   }
+  // Fixed readonly Root-published files; no request can opt into AV or supply a loaded tuple.
+  const antivirus = createAntivirusRuntime(
+    readAntivirusConfiguration({
+      profileSha256: process.env.UPLOAD_SECURITY_AV_PROFILE_SHA256 ?? '',
+      generationSha256: process.env.UPLOAD_SECURITY_AV_GENERATION_SHA256 ?? '',
+      signatureMaxAgeMs: Number(process.env.UPLOAD_SECURITY_AV_SIGNATURE_MAX_AGE_MS ?? ''),
+      slot: process.env.UPLOAD_SECURITY_AV_SLOT ?? '',
+      podUid: process.env.POD_UID ?? '',
+      sourceRevision: process.env.BUILD_COMMIT ?? '',
+    }),
+  );
   const service = await startSecurityService({
+    antivirus,
     instanceId: identity.incarnation,
     port,
     policySha256: process.env.UPLOAD_SECURITY_POLICY_SHA256 ?? '',
@@ -80,7 +93,8 @@ async function main() {
       workOwners: { scanner: service.maintenance },
       fileDomainOwners: ['scanner'],
       readStorageProviders: () => NOT_OWNED_STORAGE_PROVIDERS,
-      startupReady: () => !closing,
+      // Availability proves startup selftests+retirement, not a currently loaded/live AV original.
+      startupReady: () => !closing && service.available(),
     });
     await maintenance.listen();
   } catch (error) {

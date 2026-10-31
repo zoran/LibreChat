@@ -31,6 +31,7 @@ import {
   readUploadOcrDispatchObservation,
 } from 'librechat-data-provider';
 import { createSecurityPdfOcrProvider } from './pdf-ocr';
+import { antivirusCustodyFixture } from './antivirus-fixture.helper';
 import { createUploadMetrics } from '../metrics/metrics';
 
 const instanceId = '11111111-1111-4111-8111-111111111111';
@@ -57,16 +58,9 @@ function provider() {
     },
   });
 }
-const prepared = (signal = new AbortController().signal, milliseconds = 1000) => ({
-  execution: {
-    version: 2 as const,
-    attemptId: 'document.1',
-    instanceId,
-    executionId: '22222222-2222-4222-8222-222222222222',
-    expiresAt: new Date(Date.now() + 60000).toISOString(),
-    custody: { kind: 'none' as const },
-  },
-  subject: {
+const prepared = (signal = new AbortController().signal, milliseconds = 1000) => {
+  const now = Date.now();
+  const subject = {
     tenantId: 'private',
     userId: 'private',
     operationId: 'document',
@@ -74,11 +68,24 @@ const prepared = (signal = new AbortController().signal, milliseconds = 1000) =>
     mediaType: 'application/pdf',
     bytes: 10,
     sha256: 'e'.repeat(64),
-  },
-  workDeadline: (Date.now() + milliseconds) / 1000,
-  cleanupDeadline: (Date.now() + milliseconds + 1000) / 1000,
-  signal,
-});
+  };
+  const expiresAt = new Date(now + 60000).toISOString();
+  return {
+    execution: {
+      version: 3 as const,
+      attemptId: 'document.1',
+      instanceId,
+      executionId: '22222222-2222-4222-8222-222222222222',
+      expiresAt,
+      custody: { kind: 'none' as const },
+      antivirus: antivirusCustodyFixture(subject, expiresAt, now),
+    },
+    subject,
+    workDeadline: (now + milliseconds) / 1000,
+    cleanupDeadline: (now + milliseconds + 1000) / 1000,
+    signal,
+  };
+};
 function transport(mode: number | string) {
   (request as jest.Mock).mockImplementation(() => {
     const req = new EventEmitter() as EventEmitter & {

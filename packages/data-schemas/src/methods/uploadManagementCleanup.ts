@@ -3,16 +3,11 @@ import {
   UPLOAD_MAX_FILE_BYTES,
   UPLOAD_WINDOW_MS,
   UPLOAD_REPLAY_MS,
-  readUploadSecuritySettlement,
+  readHistoricalUploadSecuritySettlement,
 } from 'librechat-data-provider';
-import type {
-  UploadOperation,
-  UploadWorker,
-  UploadCleanupProof,
-  UploadErrorCode,
-} from 'librechat-data-provider';
+import type { UploadOperation, UploadWorker } from 'librechat-data-provider';
 import type { UploadManagementRepository, UploadManagementContext } from './uploadManagementTypes';
-import type { StoredUpload, GlobalState, UploadStore } from './uploadManagementStore';
+import type { StoredUpload, GlobalState } from './uploadManagementStore';
 import {
   principalFilter,
   storedUploadPrincipal,
@@ -21,17 +16,14 @@ import {
   WAIT_MS,
   PROCESS_MS,
 } from './uploadManagementStore';
-import {
-  hasUploadStorageCompletion,
-  hasUploadActorClosure,
-  hasUploadAcceptedFileAck,
-} from './uploadCleanupReceipts';
+
 import {
   hasCompleteUploadSecurityExecution,
   recordUploadSecuritySettlement,
 } from './uploadManagement.security';
 import { retireUploadHousekeeping } from './uploadHousekeepingProjection';
 import { hasStoppedUploadPromotion } from './uploadManagementIntake';
+import { releaseUploadRecordCharge } from './uploadManagementState';
 import { readUploadAdmission } from './uploadManagementAdmission';
 /** One-operation timeout predicate. Accepted content expiry is deliberately File-owned. */
 export function uploadTimeoutTransition(
@@ -146,7 +138,7 @@ export function createUploadCleanupMethods(
       const settlement =
         input.securitySettlement === undefined
           ? undefined
-          : readUploadSecuritySettlement(input.securitySettlement);
+          : readHistoricalUploadSecuritySettlement(input.securitySettlement);
       const proof = {
         operationId: input.operationId,
         generation: input.generation,
@@ -475,7 +467,7 @@ export function createUploadCleanupMethods(
                 tenantId: row.tenantId,
               }).session(session));
             if (!tombstone && (await retireUploadHousekeeping(mongoose, row, session))) {
-              global.recordBytes -= row.recordBytes;
+              releaseUploadRecordCharge(row, global);
               global.bundles--;
               await store.Operation.deleteOne({ _id: row._id }, { session });
               continue;
@@ -598,94 +590,4 @@ export function createUploadCleanupMethods(
   };
 }
 
-/** Existing terminal/accounting transitions shared by the two actual Upload cleanup owners. */
-export function createUploadCleanupTransitions(store: UploadStore): {
-  terminal(
-    row: StoredUpload,
-    global: GlobalState,
-    state: StoredUpload['state'],
-    code?: UploadErrorCode,
-  ): void;
-  applyCleanup(row: StoredUpload, proof: UploadCleanupProof, global: GlobalState): void;
-} {
-  function terminal(
-    row: StoredUpload,
-    global: GlobalState,
-    state: StoredUpload['state'],
-    code?: UploadErrorCode,
-  ): void {
-    row.state = state;
-    row.error = code;
-    row.pendingBytes = 0;
-    row.generation++;
-    store.releaseQueue(row, global);
-    row.cleanupPending =
-      row.slot != null || row.stagingHeld || row.originalBytes > 0 || row.textBytes > 0;
-    if (row.attemptGeneration == null && row.acceptedAt == null) {
-      global.originalBytes -= row.originalBytes;
-      global.objectBytes -= row.originalBytes;
-      row.originalBytes = 0;
-      row.originalRemoved = true;
-      row.cleanupPending = false;
-    }
-  }
-  function applyCleanup(row: StoredUpload, proof: UploadCleanupProof, global: GlobalState): void {
-    const settlement =
-      proof.securitySettlement === undefined
-        ? undefined
-        : readUploadSecuritySettlement(proof.securitySettlement);
-    if (settlement === null) reject('invalid_request');
-    if ((row.workerGeneration ?? row.generation) !== proof.generation) reject('lease_lost');
-    if (settlement) recordUploadSecuritySettlement(row, settlement);
-    if (row.securityExecution && !hasCompleteUploadSecurityExecution(row)) reject('not_ready');
-    if (!hasStoppedUploadPromotion(row)) reject('not_ready');
-    if (!proof.writerStopped) reject('not_ready');
-    row.writerStopped = true;
-    if (row.slot && ['transferring', 'processing'].includes(row.state))
-      terminal(row, global, 'failed', 'processing_failed');
-    delete row.slot;
-    delete row.leaseExpiresAt;
-    if (proof.localCopiesAbsent) row.stagingHeld = false;
-    const removeOriginal = row.acceptedAt == null || ['deleted', 'expired'].includes(row.state);
-    if (
-      proof.originalAbsent &&
-      removeOriginal &&
-      (row.attemptGeneration == null ||
-        ((hasUploadStorageCompletion(row) || hasUploadAcceptedFileAck(row)) &&
-          hasUploadActorClosure(row)))
-    ) {
-      global.originalBytes -= row.originalBytes;
-      global.objectBytes -= row.originalBytes;
-      row.originalBytes = 0;
-      row.originalRemoved = true;
-    }
-    if (
-      proof.textAndHistoryRemoved &&
-      row.state !== 'ready' &&
-      (row.attemptGeneration == null ||
-        ((hasUploadStorageCompletion(row) || hasUploadAcceptedFileAck(row)) &&
-          hasUploadActorClosure(row)))
-    ) {
-      global.textBytes -= row.textBytes;
-      row.textBytes = 0;
-      row.textRemoved = true;
-    }
-    row.cleanupPending =
-      row.stagingHeld ||
-      (removeOriginal && (row.originalBytes > 0 || row.textBytes > 0)) ||
-      (!!row.cleanupCustody?.request && row.cleanupCustody.consumed === undefined);
-    // Preserve the original Intake acknowledgement before a later processing claim replaces
-    // the active worker fields. This bit never attests that later processing generation.
-    if (
-      row.intake?.generation === proof.generation &&
-      row.attemptGeneration === proof.generation &&
-      row.intake.worker?.hostId === row.worker?.hostId &&
-      row.intake.worker?.instanceId === row.worker?.instanceId &&
-      proof.localCopiesAbsent &&
-      row.promotion?.receipt?.outcome !== 'unknown' &&
-      row.promotion?.state !== 'writing'
-    )
-      row.intake.cleanupAcknowledged = true;
-  }
-  return { terminal, applyCleanup };
-}
+export { createUploadCleanupTransitions } from './uploadCleanupTransitions';

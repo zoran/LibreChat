@@ -2,8 +2,8 @@
 import { z } from 'zod';
 import type { ManagedDocumentResult } from './document-structure';
 import type { UploadSecurityApproval } from './upload-security';
+import { readHistoricalUploadSecurityApproval } from './upload-security';
 import { readManagedDocumentResult } from './document-structure';
-import { isUploadSecurityApproval } from './upload-security';
 
 export const MANAGED_RETRIEVAL_VERSION = 1;
 export const MANAGED_RETRIEVAL_ADMISSION_DEFAULT = false;
@@ -314,7 +314,7 @@ export function buildManagedRevision(
   canonicalManagedJson(input);
   const document = readManagedDocumentResult(input.document);
   const approval = input.approval;
-  if (!document || !isUploadSecurityApproval(approval))
+  if (!document || !readHistoricalUploadSecurityApproval(approval))
     throw new Error('Invalid extraction evidence');
   const { owner, fileId, operationId } = input;
   const original = document.structure.source;

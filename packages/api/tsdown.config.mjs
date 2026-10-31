@@ -21,6 +21,8 @@ export default defineConfig({
     'src/uploads/security/pdf-child.ts',
     'src/uploads/security/process-launcher.ts',
     'src/uploads/security/process-policy.ts',
+    'src/uploads/security/antivirus-policy.ts',
+    'src/uploads/security/antivirus-process.ts',
     'src/uploads/security/security-entry.ts',
     'src/uploads/intake/intake-entry.ts',
   ],

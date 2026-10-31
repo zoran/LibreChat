@@ -1,3 +1,4 @@
+/** ProjectResources tests preserve reference lifecycle and close every device upload admission path. */
 import { useState } from 'react';
 import { RecoilRoot } from 'recoil';
 import userEvent from '@testing-library/user-event';
@@ -9,9 +10,23 @@ import type * as ClientModule from '@librechat/client';
 import type * as ReactModule from 'react';
 import type { ReactNode } from 'react';
 import { useDeleteFilesMutation } from '~/data-provider/Files/mutations';
+import mockGerman from '~/locales/de/translation.json';
 import ProjectResources from './ProjectResources';
 
 const mockUploadMutateAsync = jest.fn();
+let mockUploadSessionKey = 'tenant/user';
+let mockUploadAdmissionError: string | null = null;
+let mockLiveUploadAdmissionError: string | null | undefined;
+jest.mock('~/features/uploads/useManagedUploads', () => ({
+  useManagedUploads: () => ({
+    sessionKey: mockUploadSessionKey,
+    newUploadError: mockUploadAdmissionError,
+    getNewUploadError: () =>
+      mockLiveUploadAdmissionError === undefined
+        ? mockUploadAdmissionError
+        : mockLiveUploadAdmissionError,
+  }),
+}));
 const mockCanUseFileSearch = jest.fn(() => true);
 const mockAddMutateAsync = jest.fn();
 const mockRemoveMutateAsync = jest.fn();
@@ -132,6 +147,11 @@ jest.mock('~/hooks', () => ({
   useToolFavorites: () => ({ favoriteKeys: new Set(), toggle: jest.fn() }),
   useLocalize: () => (key: string, options?: { count?: number; name?: string; 0?: string }) => {
     const translations: Record<string, string> = {
+      com_upload_storage_unavailable: mockGerman.com_upload_storage_unavailable,
+      com_upload_storage_stale: mockGerman.com_upload_storage_stale,
+      com_upload_status_unavailable: mockGerman.com_upload_status_unavailable,
+      com_upload_admission_paused: mockGerman.com_upload_admission_paused,
+      com_upload_quota_exceeded: mockGerman.com_upload_quota_exceeded,
       com_error_files_upload: 'An error occurred while uploading the file.',
       com_error_files_upload_canceled: 'The file upload was canceled.',
       com_ui_project_add_files: 'Add files',
@@ -191,6 +211,9 @@ function renderResources() {
 describe('ProjectResources', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    mockUploadAdmissionError = null;
+    mockLiveUploadAdmissionError = undefined;
+    mockUploadSessionKey = 'tenant/user';
     mockUseNativeProjectQuery = false;
     projectFilesState = [];
     mockProjectQueryState = {
@@ -451,5 +474,155 @@ describe('ProjectResources', () => {
     expect(await screen.findByTestId('membership-action')).toHaveTextContent(
       'project-1:library-file',
     );
+  });
+
+  it('keeps the native add control visible/disabled with its actual German storage reason on focus', async () => {
+    mockUploadAdmissionError = 'com_upload_storage_unavailable';
+    renderResources();
+    expect(screen.getByRole('button', { name: 'Add files' })).toBeDisabled();
+    const explanation = screen.getByRole('group', { name: 'Add files' });
+    explanation.focus();
+    expect(explanation).toHaveFocus();
+    fireEvent.keyDown(explanation, { key: 'Enter' });
+    await waitFor(() =>
+      expect(screen.getByRole('tooltip')).toHaveTextContent(
+        mockGerman.com_upload_storage_unavailable,
+      ),
+    );
+    fireEvent.change(screen.getByTestId('project-upload-input'), {
+      target: { files: [new File(['x'], 'blocked.txt')] },
+    });
+    expect(mockUploadMutateAsync).not.toHaveBeenCalled();
+    expect(mockAddMutateAsync).not.toHaveBeenCalled();
+    expect(screen.queryByText('blocked.txt')).not.toBeInTheDocument();
+  });
+
+  it('closes an unknown status and rechecks a stale carrier at the input event before mutation', () => {
+    mockUploadAdmissionError = 'com_upload_status_unavailable';
+    const view = renderResources();
+    expect(screen.getByRole('button', { name: 'Add files' })).toBeDisabled();
+    mockUploadAdmissionError = null;
+    view.rerender(<ProjectResources project={project} />);
+    expect(screen.getByRole('button', { name: 'Add files' })).toBeEnabled();
+    mockLiveUploadAdmissionError = 'com_upload_storage_stale';
+    fireEvent.change(screen.getByTestId('project-upload-input'), {
+      target: { files: [new File(['x'], 'stale.txt')] },
+    });
+    expect(mockUploadMutateAsync).not.toHaveBeenCalled();
+    expect(mockShowToast).toHaveBeenCalledWith(
+      expect.objectContaining({ message: mockGerman.com_upload_storage_stale }),
+    );
+  });
+
+  it('storage recovery preserves manual pause, quota and permission causes', async () => {
+    mockUploadAdmissionError = 'com_upload_storage_unavailable';
+    const view = renderResources();
+    for (const cause of ['com_upload_admission_paused', 'com_upload_quota_exceeded']) {
+      mockUploadAdmissionError = cause;
+      view.rerender(<ProjectResources project={project} />);
+      expect(screen.getByRole('button', { name: 'Add files' })).toBeDisabled();
+    }
+    mockUploadAdmissionError = null;
+    mockCanUseFileSearch.mockReturnValue(false);
+    view.rerender(<ProjectResources project={project} />);
+    fireEvent.change(screen.getByTestId('project-upload-input'), {
+      target: { files: [new File(['x'], 'unauthorized.txt')] },
+    });
+    expect(mockUploadMutateAsync).not.toHaveBeenCalled();
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Add files' }));
+    expect(screen.queryByRole('menuitem', { name: 'Upload file' })).not.toBeInTheDocument();
+    expect(screen.getByRole('menuitem', { name: 'Choose an existing file' })).toBeVisible();
+  });
+
+  it('rechecks the same live owner before the next queued body while finishing the first association', async () => {
+    let finish!: (file: TFileUpload) => void;
+    mockUploadMutateAsync.mockReset().mockImplementationOnce(
+      () =>
+        new Promise<TFileUpload>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    renderResources();
+    fireEvent.change(screen.getByTestId('project-upload-input'), {
+      target: { files: [new File(['a'], 'first.txt'), new File(['b'], 'second.txt')] },
+    });
+    expect(mockUploadMutateAsync).toHaveBeenCalledTimes(1);
+    mockLiveUploadAdmissionError = 'com_upload_storage_unavailable';
+    finish(uploadedFile);
+    await waitFor(() => expect(mockAddMutateAsync).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText(mockGerman.com_upload_storage_unavailable)).toBeVisible();
+    expect(mockUploadMutateAsync).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('second.txt')).toBeVisible();
+  });
+
+  it('guards a byte retry from both disabled UI and a newer live failure without replacing its identity', async () => {
+    mockUploadMutateAsync
+      .mockReset()
+      .mockRejectedValueOnce(new Error('inert upload rejected'))
+      .mockResolvedValue(uploadedFile);
+    const view = renderResources();
+    fireEvent.change(screen.getByTestId('project-upload-input'), {
+      target: { files: [new File(['x'], 'retry.txt')] },
+    });
+    let retry = await screen.findByRole('button', { name: 'Retry' });
+    const originalBody = mockUploadMutateAsync.mock.calls[0][0] as FormData;
+    mockUploadAdmissionError = 'com_upload_storage_unavailable';
+    view.rerender(<ProjectResources project={project} />);
+    retry = screen.getByRole('button', { name: 'Retry' });
+    expect(retry).toBeDisabled();
+    mockUploadAdmissionError = null;
+    view.rerender(<ProjectResources project={project} />);
+    mockLiveUploadAdmissionError = 'com_upload_storage_stale';
+    retry = screen.getByRole('button', { name: 'Retry' });
+    fireEvent.click(retry);
+    expect(mockUploadMutateAsync).toHaveBeenCalledTimes(1);
+    mockLiveUploadAdmissionError = null;
+    fireEvent.click(retry);
+    await waitFor(() => expect(mockUploadMutateAsync).toHaveBeenCalledTimes(2));
+    expect((mockUploadMutateAsync.mock.calls[1][0] as FormData).get('file_id')).toBe(
+      originalBody.get('file_id'),
+    );
+  });
+
+  it('keeps an association-only retry and reference cleanup available without another byte upload', async () => {
+    mockUploadMutateAsync.mockReset().mockResolvedValue(uploadedFile);
+    mockAddMutateAsync
+      .mockRejectedValueOnce(new Error('inert association rejected'))
+      .mockResolvedValue({});
+    const view = renderResources();
+    fireEvent.change(screen.getByTestId('project-upload-input'), {
+      target: { files: [new File(['x'], 'owned.txt')] },
+    });
+    const retry = await screen.findByRole('button', { name: 'Retry' });
+    mockUploadAdmissionError = 'com_upload_storage_unavailable';
+    view.rerender(<ProjectResources project={project} />);
+    expect(retry).toBeEnabled();
+    fireEvent.click(retry);
+    await waitFor(() => expect(mockAddMutateAsync).toHaveBeenCalledTimes(2));
+    expect(mockUploadMutateAsync).toHaveBeenCalledTimes(1);
+  });
+
+  it('never continues a selected body or association under a replacement principal', async () => {
+    let finish!: (file: TFileUpload) => void;
+    mockUploadMutateAsync.mockReset().mockImplementationOnce(
+      () =>
+        new Promise<TFileUpload>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const view = renderResources();
+    fireEvent.change(screen.getByTestId('project-upload-input'), {
+      target: { files: [new File(['a'], 'original.txt'), new File(['b'], 'queued.txt')] },
+    });
+    expect(mockUploadMutateAsync).toHaveBeenCalledTimes(1);
+    mockUploadSessionKey = 'tenant/replacement';
+    view.rerender(<ProjectResources project={project} />);
+    finish(uploadedFile);
+    await waitFor(() => expect(screen.queryByText('Processing')).not.toBeInTheDocument());
+    expect(mockUploadMutateAsync).toHaveBeenCalledTimes(1);
+    expect(mockAddMutateAsync).not.toHaveBeenCalled();
+    expect(screen.getAllByRole('button', { name: 'Retry' })).toHaveLength(2);
+    for (const retry of screen.getAllByRole('button', { name: 'Retry' }))
+      expect(retry).toBeDisabled();
   });
 });

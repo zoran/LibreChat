@@ -1,7 +1,9 @@
+/** useFileUploadRouter applies admission before changing a destination or handing off a batch. */
 import { useCallback } from 'react';
 import { useSetRecoilState } from 'recoil';
 import { Constants, EToolResources } from 'librechat-data-provider';
 import type { UploadLifecycleCallbacks } from './useFileHandling';
+import { useManagedUploads } from '~/features/uploads/useManagedUploads';
 import { useChatContext } from '~/Providers/ChatContext';
 import { ephemeralAgentByConvoId } from '~/store';
 import useFileHandling from './useFileHandling';
@@ -15,12 +17,17 @@ import useFileHandling from './useFileHandling';
 export default function useFileUploadRouter() {
   const { handleFiles } = useFileHandling();
   const { conversation } = useChatContext();
+  const uploads = useManagedUploads();
   const setEphemeralAgent = useSetRecoilState(
     ephemeralAgentByConvoId(conversation?.conversationId ?? Constants.NEW_CONVO),
   );
 
   return useCallback(
     (files: File[], toolResource?: EToolResources, uploadLifecycle?: UploadLifecycleCallbacks) => {
+      if (uploads.enabled && uploads.getNewUploadError()) {
+        // The shared batch reports the localized cause; no destination state is changed first.
+        return handleFiles(files, toolResource, uploadLifecycle);
+      }
       if (toolResource && toolResource !== EToolResources.file_search) {
         setEphemeralAgent((prev) => ({
           ...prev,
@@ -29,6 +36,6 @@ export default function useFileUploadRouter() {
       }
       return handleFiles(files, toolResource, uploadLifecycle);
     },
-    [handleFiles, setEphemeralAgent],
+    [handleFiles, setEphemeralAgent, uploads],
   );
 }

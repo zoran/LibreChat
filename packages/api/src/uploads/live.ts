@@ -1,4 +1,4 @@
-import { isUploadPrincipal } from 'librechat-data-provider';
+import { isUploadPrincipal, readUploadStorageAvailability } from 'librechat-data-provider';
 import type { UploadPrincipal } from 'librechat-data-provider';
 import type { Request, Response } from 'express';
 import type { UploadRepository } from './contract';
@@ -14,6 +14,8 @@ export interface UploadLiveOptions {
   principal: UploadRequestPrincipal;
   /** Synchronous cached advisory status; this port must perform no I/O or grant authority. */
   admissionStatus(): boolean | null;
+  /** Same storage owner as backend admission; absent only for the legacy composition. */
+  storageAvailability?(): unknown;
   observe?: (event: {
     connections: number;
     outcome: 'connected' | 'changed' | 'reset' | 'heartbeat' | 'closed' | 'rejected';
@@ -104,7 +106,19 @@ export function createUploadLiveHub(options: UploadLiveOptions) {
         /* An unavailable advisory cache cannot become an open policy. */
       }
       // Busy hints postpone idle heartbeats, so every authenticated write carries status.
-      const status = `event: status\ndata: ${JSON.stringify({ admissionsPaused })}\n\n`;
+      let storageAvailability;
+      if (options.storageAvailability) {
+        try {
+          storageAvailability = readUploadStorageAvailability(options.storageAvailability());
+        } catch {
+          /* closed */
+        }
+        storageAvailability ??= { available: false, reason: 'storage-unavailable' };
+      }
+      const status = `event: status\ndata: ${JSON.stringify({
+        admissionsPaused,
+        ...(storageAvailability ? { storageAvailability } : {}),
+      })}\n\n`;
       const frames = (hint ? `event: ${hint}\ndata: {}\n\n` : '') + status;
       if (!connection.res.write(frames)) {
         close(connection, true);

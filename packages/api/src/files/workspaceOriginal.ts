@@ -5,7 +5,8 @@ import {
   buildManagedFileReadBinding,
   isUploadOriginalIntegrity,
   isUploadStorageReceipt,
-  matchesUploadSecurityApproval,
+  readHistoricalUploadSecurityApproval,
+  matchesHistoricalUploadSecurityApproval,
   readUploadDerivedOrigin,
   sameUploadDerivedOrigin,
 } from 'librechat-data-provider';
@@ -20,6 +21,7 @@ import type { DocumentWorkspaceMethods, WorkspaceFileSource } from '@librechat/d
 import type { EventEmitter } from 'node:events';
 import type { ManagedSourceResolver } from './managedSource';
 import type { StoragePort } from '~/uploads/contract';
+import { resolveFileStorageAuthority } from './storageAuthority';
 import { managedOriginalKey } from '../storage/s3/managed';
 
 export type WorkspaceOriginalRequest = Parameters<ManagedSourceResolver['authorize']>[0] &
@@ -129,7 +131,7 @@ export function createWorkspaceOriginalReader(
         file.user !== principal.userId ||
         file.tenantId !== principal.tenantId ||
         file.status !== 'ready' ||
-        file.source !== 's3' ||
+        !['s3', 'nas-s3'].includes(file.source) ||
         (file.type !== 'text/plain' && file.type !== 'text/csv') ||
         !Number.isSafeInteger(file.bytes) ||
         file.bytes < 1 ||
@@ -186,6 +188,7 @@ export function createWorkspaceOriginalReader(
       }
       const origin = validateFile(file, principal);
       const receipt = task?.original;
+      const approval = readHistoricalUploadSecurityApproval(file.securityApproval);
       if (
         operation?.id !== file.file_id ||
         operation.fileId !== file.file_id ||
@@ -207,19 +210,29 @@ export function createWorkspaceOriginalReader(
         task.attemptGeneration < 1 ||
         !isUploadStorageReceipt(receipt) ||
         receipt.outcome !== 'durable' ||
-        receipt.source !== 's3' ||
+        receipt.source !== file.source ||
+        !approval ||
+        (receipt.source === 'nas-s3' && approval.version !== 2) ||
         receipt.bytes !== file.bytes ||
         receipt.filepath !== file.filepath ||
         receipt.storageKey !== file.storageKey ||
-        receipt.storageKey !==
-          managedOriginalKey({
-            ...principal,
-            operationId: file.file_id,
-            generation: task.attemptGeneration,
-          }) ||
+        (receipt.source === 's3' &&
+          receipt.storageKey !==
+            managedOriginalKey({
+              ...principal,
+              operationId: file.file_id,
+              generation: task.attemptGeneration,
+            })) ||
+        !resolveFileStorageAuthority(task, {
+          operationId: file.file_id,
+          source: file.source,
+          storageKey: file.storageKey,
+          bytes: file.bytes,
+          mediaType: file.type,
+        }) ||
         !isUploadOriginalIntegrity(receipt.integrity, file.bytes) ||
-        !matchesUploadSecurityApproval(
-          file.securityApproval,
+        !matchesHistoricalUploadSecurityApproval(
+          approval,
           {
             tenantId: principal.tenantId,
             userId: principal.userId,
@@ -271,6 +284,8 @@ export function createWorkspaceOriginalReader(
       let length = 0;
       // Existing storage verifies block/full digests and EOF; no partial bytes escape this buffer.
       for await (const chunk of runtime.storage.read({
+        principal: access.principal,
+        operationId: access.file.uploadOperationId,
         original: access.receipt,
         signal: controller.signal,
       })) {

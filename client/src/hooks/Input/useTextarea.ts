@@ -1,3 +1,4 @@
+/** useTextarea owns composer paste and editing with shared file admission and preserved text input. */
 import { useEffect, useRef, useCallback } from 'react';
 import { v4 } from 'uuid';
 import debounce from 'lodash/debounce';
@@ -78,6 +79,7 @@ export default function useTextarea({
   const {
     getOptions: getUploadOptions,
     uploadsDisabled,
+    uploadAdmissionError,
     isConfigPending: isUploadConfigPending,
     isConfigResolved: isUploadConfigResolved,
     isUnifiedMode,
@@ -427,7 +429,10 @@ export default function useTextarea({
         }
 
         if (uploadsDisabled) {
-          showToast({ message: localize('com_ui_attach_error_disabled'), status: 'error' });
+          showToast({
+            message: localize(uploadAdmissionError ?? 'com_ui_attach_error_disabled'),
+            status: 'error',
+          });
           return;
         }
 
@@ -634,6 +639,7 @@ export default function useTextarea({
       index,
       textAreaRef,
       uploadsDisabled,
+      uploadAdmissionError,
       getUploadOptions,
       pasteLongTextAsFile,
       routeClipboardFiles,

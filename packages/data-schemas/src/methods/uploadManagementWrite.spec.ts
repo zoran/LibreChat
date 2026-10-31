@@ -1,3 +1,4 @@
+import { antivirusFixture } from '../../../data-provider/src/__fixtures__/upload-antivirus';
 /** Focused real write-owner persistence/fencing behavior; in-memory store port, no Mongo/native claims. */
 import type { UploadManagementContext } from './uploadManagementContext';
 import type { StoredUpload } from './uploadManagementStore';
@@ -30,8 +31,21 @@ const integrity = {
   chunkBytes: 262144,
   chunkSha256: ['b'.repeat(64)],
 };
+const antivirus = antivirusFixture(
+  {
+    tenantId: 'tenant',
+    userId: 'user',
+    operationId: 'operation',
+    transferGeneration: 2,
+    mediaType: 'text/plain',
+    bytes: 5,
+    sha256: input.wholeSHA256,
+  },
+  now,
+);
 const execution = {
-  version: 2 as const,
+  version: 3 as const,
+  antivirus: antivirus.custody,
   custody: { kind: 'none' as const },
   attemptId: 'operation.2',
   instanceId: '11111111-1111-4111-8111-111111111111',
@@ -40,7 +54,8 @@ const execution = {
 };
 const policy = 'c'.repeat(64);
 const approval = {
-  version: 1 as const,
+  version: 2 as const,
+  antivirus: antivirus.approval,
   decision: 'approved' as const,
   policySha256: policy,
   subject: {
@@ -70,7 +85,12 @@ function fixture() {
     declaredBytes: 5,
     mediaType: 'text/plain',
     securityExecution: execution,
-    securitySettlement: { execution, writerStopped: true, transientDataRemoved: true },
+    securitySettlement: {
+      execution,
+      writerStopped: true,
+      transientDataRemoved: true,
+      antivirusReceipt: antivirus.receipt,
+    },
   } as StoredUpload;
   const read = () => ({
     session: () => ({ lean: async () => JSON.parse(JSON.stringify(stored)) }),

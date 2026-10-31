@@ -20,12 +20,15 @@ import type {
   UploadSecurityDecision,
   UploadSecurityReason,
   UploadSecurityScopeReceipt,
+  UploadAntivirusReceipt,
 } from 'librechat-data-provider';
 import type { SecurityPdfOcrProvider, SecurityPdfOcrSession } from './pdf-ocr';
+import type { AntivirusRuntime, AntivirusSession } from './antivirus-runtime';
 import type { createSecurityProcessLauncher } from './process-launcher';
 import type { SecurityMarkingPolicy } from './markings';
 import type { UploadSecurityPort } from '../contract';
 import type { ApplicationWorkPort } from '~/app';
+import { waitForSecurityWorker as wait } from './cancellation';
 import { encodeSecurityProcessRequest } from './process-wire';
 import { SECURITY_INSPECTION_VERSION } from './inspection';
 import { inspectSecurityMarkings } from './markings';
@@ -36,6 +39,7 @@ export type SecurityWorker = UploadSecurityPort & {
 };
 
 type Options = {
+  antivirus: AntivirusRuntime;
   instanceId: string;
   policy: SecurityMarkingPolicy;
   policySha256: string;
@@ -49,6 +53,8 @@ type Options = {
   };
 };
 type RecordState = {
+  antivirus: AntivirusSession;
+  antivirusReceipt: UploadAntivirusReceipt | null;
   execution: UploadSecurityExecution;
   subject: UploadSecuritySubject;
   state: 'prepared' | 'running' | 'finished';
@@ -72,22 +78,10 @@ class ScanFailure extends Error {
     super('Security inspection failed');
   }
 }
-async function wait<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
-  if (signal.aborted) throw unavailable();
-  let abort = () => {};
-  const cancelled = new Promise<never>((_, reject) => {
-    abort = () => reject(unavailable());
-    signal.addEventListener('abort', abort, { once: true });
-  });
-  try {
-    return await Promise.race([promise, cancelled]);
-  } finally {
-    signal.removeEventListener('abort', abort);
-  }
-}
 
 /** ThreadPath/policy are trusted composition, never request data. No process/pod sandbox claim. */
 export function createSecurityWorker(options: Options): SecurityWorker {
+  if (!options.antivirus?.available()) throw unavailable();
   const now = options.now ?? Date.now;
   const maxActive = options.maxActive ?? 1;
   const ttlMs = options.ttlMs ?? 60_000;
@@ -129,9 +123,11 @@ export function createSecurityWorker(options: Options): SecurityWorker {
       (!record.preparation || !!record.provider);
     return {
       execution: readUploadSecurityExecution(execution)!,
-      writerStopped: stopped,
+      antivirusReceipt: record?.antivirusReceipt ?? null,
+      writerStopped: stopped && record?.antivirusReceipt?.originalProcessJoined === true,
       transientDataRemoved:
         stopped &&
+        record?.antivirusReceipt?.ownedTransientDataRemoved === true &&
         !!record?.bytesRemoved &&
         !!record.processCopiesRemoved &&
         (!record.provider || record.provider.localCopiesRemoved()),
@@ -155,12 +151,13 @@ export function createSecurityWorker(options: Options): SecurityWorker {
     record.controller.abort();
     if (record.state === 'prepared') record.state = 'finished';
     if (record.thread) void record.thread.terminate().catch(() => {});
-    if (record.preparation && !record.active) void retire(record, true);
+    if (!record.active) void retire(record, true);
   }
   async function retire(record: RecordState, cancel: boolean): Promise<void> {
-    if (!record.preparation) return;
     if (record.retirement) return record.retirement;
     record.retirement = (async () => {
+      record.antivirusReceipt = await record.antivirus.retire();
+      if (!record.preparation) return;
       try {
         await record.preparation!.flight;
       } catch {
@@ -237,6 +234,7 @@ export function createSecurityWorker(options: Options): SecurityWorker {
       )
         pendingWrites++;
     }
+    if (!pendingWrites && options.antivirus.pending()) pendingWrites++;
     return { queuedContinuations, pendingWrites };
   }
   const maintenance: ApplicationWorkPort = {
@@ -358,6 +356,8 @@ export function createSecurityWorker(options: Options): SecurityWorker {
     timer.unref();
     try {
       iterator = body[Symbol.asyncIterator]();
+      await record.antivirus.activate(record.controller.signal);
+      live(record);
       if (record.subject.bytes > (record.preparation ? 4 * 1024 * 1024 : 65_536))
         throw new ScanFailure('resource_limit');
       bytes = new Uint8Array(record.subject.bytes);
@@ -388,6 +388,13 @@ export function createSecurityWorker(options: Options): SecurityWorker {
       live(record);
       if (length !== record.subject.bytes || hash.digest('hex') !== record.subject.sha256)
         throw new ScanFailure('invalid_content');
+      const antivirus = await record.antivirus.inspect(bytes, record.controller.signal);
+      if (antivirus.verdict !== 'clean') {
+        if (antivirus.verdict === 'malicious') throw new ScanFailure('malware');
+        if (antivirus.reason === 'encrypted') throw new ScanFailure('encrypted');
+        if (antivirus.reason === 'resource_limit') throw new ScanFailure('resource_limit');
+        throw new ScanFailure('scanner_unavailable');
+      }
       let result: unknown;
       if (record.preparation) {
         if (!record.provider || !options.pdf) throw unavailable();
@@ -436,8 +443,9 @@ export function createSecurityWorker(options: Options): SecurityWorker {
         'coverage' in result
       ) {
         const candidate = {
-          version: 1,
+          version: 2,
           decision: 'approved',
+          antivirus: antivirus.approval,
           subject: { ...record.subject },
           policySha256,
           scannerVersion: SECURITY_INSPECTION_VERSION,
@@ -453,7 +461,10 @@ export function createSecurityWorker(options: Options): SecurityWorker {
       }
     } catch (error) {
       if (error instanceof ScanFailure)
-        decision = { version: 1, decision: 'uninspectable', reason: error.reason };
+        decision =
+          error.reason === 'malware'
+            ? { version: 1, decision: 'rejected', reason: 'malware' }
+            : { version: 1, decision: 'uninspectable', reason: error.reason };
     } finally {
       if (bytes.byteLength) bytes.fill(0);
       bytes = new Uint8Array(0);
@@ -531,16 +542,24 @@ export function createSecurityWorker(options: Options): SecurityWorker {
       )
         throw unavailable();
       const started = now();
+      const expiresAt = options.antivirus.deadline(new Date(started + ttlMs).toISOString());
+      const antivirus = await options.antivirus.prepare(subject, expiresAt);
       const execution = readUploadSecurityExecution({
-        version: 2,
+        version: 3,
+        antivirus: antivirus.custody,
         custody: { kind: 'none' as const },
         attemptId: input.attemptId,
         instanceId,
         executionId: randomUUID(),
-        expiresAt: new Date(started + ttlMs).toISOString(),
+        expiresAt,
       });
-      if (!execution) throw unavailable();
+      if (!execution) {
+        await antivirus.retire();
+        throw unavailable();
+      }
       const record: RecordState = {
+        antivirus,
+        antivirusReceipt: null,
         execution,
         subject,
         state: 'prepared',
@@ -553,21 +572,29 @@ export function createSecurityWorker(options: Options): SecurityWorker {
         processCopiesRemoved: true,
         localDeadline:
           performance.now() +
-          (subject.mediaType === 'application/pdf' ? Math.min(30_000, ttlMs - 1000) : ttlMs),
+          (subject.mediaType === 'application/pdf'
+            ? Math.min(30_000, Date.parse(expiresAt) - started - 1000)
+            : Date.parse(expiresAt) - started),
         ...(subject.mediaType === 'application/pdf'
           ? {
               preparation: {
-                workDeadline: Math.min(started + 30_000, started + ttlMs - 1000) / 1000,
-                cleanupDeadline: Math.min(started + 31_000, started + ttlMs) / 1000,
+                workDeadline: Math.min(started + 30_000, Date.parse(expiresAt) - 1000) / 1000,
+                cleanupDeadline: Math.min(started + 31_000, Date.parse(expiresAt)) / 1000,
               },
               providerReceipt: null,
             }
           : {}),
       };
       records.set(input.attemptId, record);
-      await preparePdf(record, input.signal);
-      live(record);
-      return snapshot(record);
+      try {
+        await preparePdf(record, input.signal);
+        live(record);
+        return snapshot(record);
+      } catch (error) {
+        stop(record);
+        await retire(record, true);
+        throw error;
+      }
     },
     async inspect(input: {
       execution: UploadSecurityExecution;
@@ -650,13 +677,16 @@ export function createSecurityWorker(options: Options): SecurityWorker {
       } catch {
         return { complete: false };
       }
+      const av = await options.antivirus.drain();
       return {
-        complete: [...records.values()].every((record) =>
-          isCompleteUploadSecuritySettlement(
-            settlement(record.execution, record),
-            record.execution,
+        complete:
+          av.complete &&
+          [...records.values()].every((record) =>
+            isCompleteUploadSecuritySettlement(
+              settlement(record.execution, record),
+              record.execution,
+            ),
           ),
-        ),
       };
     },
   };

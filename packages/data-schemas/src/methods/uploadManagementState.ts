@@ -1,5 +1,10 @@
 /** Private upload row contract and pure primitives shared below persistence and lifecycle owners. */
-import { isUploadPrincipal, UPLOAD_RECORD_BYTES } from 'librechat-data-provider';
+import { createHash } from 'node:crypto';
+import {
+  isUploadPrincipal,
+  UPLOAD_RECORD_BYTES,
+  UPLOAD_AV_RECORD_BYTES,
+} from 'librechat-data-provider';
 import type {
   UploadPrincipal,
   UploadDerivedOrigin,
@@ -19,6 +24,9 @@ import type {
   StorageDeletionBinding,
   StorageDeletionTerminalReceipt,
   StorageDeletionConsumptionResult,
+  NasUploadWriteBinding,
+  NasOriginalWriteJournal,
+  NasCleanupCustody,
 } from 'librechat-data-provider';
 import type { ManagedUploadWriteBinding } from './uploadManagementWriteTypes';
 import type { FileUploadCleanupAcknowledgment } from '../types/fileCleanup';
@@ -26,6 +34,22 @@ import type { FileUploadCleanupAcknowledgment } from '../types/fileCleanup';
 export const WAIT_MS = 600_000;
 export const PROCESS_MS = 3_600_000;
 export const UPLOAD_CLEANUP_HEADROOM: number = 16 * 1024;
+/** The stored server-selected allowance is authoritative; reads never retag historical charges. */
+export function uploadRecordBudget(row: Pick<StoredUpload, 'recordBytes'>): number {
+  if (row.recordBytes !== UPLOAD_RECORD_BYTES && row.recordBytes !== UPLOAD_AV_RECORD_BYTES)
+    reject('capacity_exceeded');
+  return row.recordBytes;
+}
+/** Pruning refunds the exact retained cohort charge; mixed historical/current rows never average. */
+export function releaseUploadRecordCharge(
+  row: Pick<StoredUpload, 'recordBytes'>,
+  global: { recordBytes: number },
+): void {
+  const charge = uploadRecordBudget(row);
+  if (!Number.isSafeInteger(global.recordBytes) || global.recordBytes < charge)
+    reject('unavailable');
+  global.recordBytes -= charge;
+}
 
 export type UploadCleanupCustody = {
   version: 1;
@@ -40,6 +64,7 @@ export type UploadCleanupCustody = {
   consumed?: Extract<StorageDeletionConsumptionResult, { state: 'recorded' }>;
   retiredAt?: number;
   promotionLocal?: { promotionId: string; generation: number; worker: UploadWorker };
+  nas?: NasCleanupCustody;
 };
 
 export type StoredUpload = {
@@ -70,7 +95,9 @@ export type StoredUpload = {
   attemptGeneration?: number;
   original?: UploadStorageReceipt;
   /** Private immutable dispatch identity; never projected into UploadOperation. */
-  writeBinding?: ManagedUploadWriteBinding;
+  writeBinding?: ManagedUploadWriteBinding | NasUploadWriteBinding;
+  /** Durable single-dispatch journal. Observation never recreates its original callback. */
+  originalWrite?: NasOriginalWriteJournal;
   /** Trusted scanner receipt, private to the original transfer rather than processing attempts. */
   securityApproval?: UploadSecurityApproval;
   securityExecution?: UploadSecurityExecution;
@@ -114,6 +141,17 @@ export type StoredUpload = {
   firstPublishedAtMs?: number;
 };
 
+/** Historical classifier receipts only service actual old-bound retained or cleanup obligations. */
+export function hasHistoricalUploadSecurityObligation(row: StoredUpload): boolean {
+  return (
+    row.writeBinding?.version !== 2 &&
+    !row.original?.backend &&
+    (row.writeBinding?.version === 1 ||
+      (row.acceptedAt != null && row.original?.source === 's3') ||
+      ['failed', 'cancelled', 'deleted', 'expired'].includes(row.state))
+  );
+}
+
 export function reject(code: UploadErrorCode): never {
   const error = Object.assign(new Error(code), { name: 'UploadManagementError', code });
   throw error;
@@ -131,7 +169,13 @@ export function storedUploadPrincipal(
 }
 
 export const uploadOriginalKey = (row: StoredUpload): string =>
-  `${row.tenantId === null ? '' : `t/${row.tenantId}/`}managed-uploads/${row.userId}/${row._id}.${row.attemptGeneration}__original`;
+  row.writeBinding?.version === 2
+    ? row.writeBinding.key
+    : `${row.tenantId === null ? '' : `t/${row.tenantId}/`}managed-uploads/${row.userId}/${row._id}.${row.attemptGeneration}__original`;
+
+/** Original provider identity is fixed by the actual stored binding. */
+export const uploadOriginalSource = (row: StoredUpload): 's3' | 'nas-s3' =>
+  row.writeBinding?.version === 2 ? 'nas-s3' : 's3';
 
 /** Maximum reachable custody extension; stable identity is measured, never replaced by a locator cap. */
 function cleanupCapacityEnvelope(row: StoredUpload): UploadCleanupCustody {
@@ -203,7 +247,8 @@ export function assertUploadCleanupCapacity(
   row: StoredUpload,
   size: (value: object) => number,
 ): void {
-  if (size(row) > UPLOAD_RECORD_BYTES) reject('capacity_exceeded');
+  const recordBytes = uploadRecordBudget(row);
+  if (size(row) > recordBytes) reject('capacity_exceeded');
   if (!row.cleanupCustody) return;
   const custody = cleanupCapacityEnvelope(row);
   // Future receipt writes can cross BSON's int32 boundary. Removal flags accompany final ACKs.
@@ -218,7 +263,25 @@ export function assertUploadCleanupCapacity(
   if (
     size(row.cleanupCustody) > UPLOAD_CLEANUP_HEADROOM ||
     size(custody) > UPLOAD_CLEANUP_HEADROOM ||
-    size(future) > UPLOAD_RECORD_BYTES
+    size(future) > recordBytes
   )
     reject('capacity_exceeded');
+}
+
+/** Stable digest for private snapshots and idempotent derived-content publication. */
+export function uploadDigest(value: unknown): string {
+  function stable(input: unknown): unknown {
+    if (Array.isArray(input)) return input.map(stable);
+    if (input && typeof input === 'object')
+      return Object.fromEntries(
+        Object.entries(input)
+          .filter(([, entry]) => entry !== undefined)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([key, entry]) => [key, stable(entry)]),
+      );
+    return input;
+  }
+  return createHash('sha256')
+    .update(JSON.stringify(stable(value)))
+    .digest('hex');
 }

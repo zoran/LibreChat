@@ -1,3 +1,4 @@
+import { statusTranslationKeys } from './classification';
 /** One SVG scene for every semantic zoom level. No metric-derived link traffic is invented. */
 import { useEffect, useId, useRef, useState } from 'react';
 import type { StatusSnapshot } from 'librechat-data-provider';
@@ -265,7 +266,7 @@ export default function StatusTopology({
                 data-node-id={node.id}
                 role="button"
                 tabIndex={active ? 0 : -1}
-                aria-label={`${node.label}: ${t(`com_status_state_${state}` as never)}${role ? ` · ${role}` : ''}`}
+                aria-label={`${node.label}: ${t(statusTranslationKeys.state[state])}${role ? ` · ${role}` : ''}`}
                 aria-pressed={selection?.id === node.id}
                 onClick={() => {
                   if (!moved.current) onSelect({ kind: 'node', id: node.id });
@@ -345,12 +346,12 @@ export default function StatusTopology({
                     <text x="18" y="48" data-role-label="true">
                       {role}
                       {node.classification
-                        ? ` · ${t(`com_status_basis_short_${node.classification.basis}` as never)}`
+                        ? ` · ${t(statusTranslationKeys.basis_short[node.classification.basis])}`
                         : ''}
                     </text>
                     <circle cx="18" cy="69" r="4" />
                     <text x="30" y="74">
-                      {t(`com_status_state_${state}` as never)}
+                      {t(statusTranslationKeys.state[state])}
                     </text>
                   </>
                 )}

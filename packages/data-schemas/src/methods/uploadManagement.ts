@@ -1,11 +1,15 @@
+import type { NasAntivirusAdmission } from './uploadManagementNasTypes';
 import { createUploadWriteMethods } from './uploadManagementWrite';
+import { createUploadNasMethods } from './uploadManagementNas';
 /** Compose the existing upload store, reservation and lifecycle owners; retain one repository. */
 import {
   UPLOAD_MAX_FILE_BYTES,
+  readUploadOriginalWriteBinding,
   UPLOAD_USER_WINDOW_BYTES,
   UPLOAD_WINDOW_MS,
-  UPLOAD_RECORD_BYTES,
-  readUploadSecuritySettlement,
+  UPLOAD_AV_RECORD_BYTES,
+  UPLOAD_DERIVED_MAX_ORIGIN_BYTES,
+  readHistoricalUploadSecuritySettlement,
   readUploadDerivedIntent,
   readUploadDerivedOrigin,
   uploadReservationFingerprint,
@@ -66,7 +70,10 @@ export type { UploadManagementRepository } from './uploadManagementTypes';
 
 export function createUploadManagementRepository(
   mongoose: typeof import('mongoose'),
-  options: UploadStoreOptions & { recordOriginalPublication?: UploadPublicationPort } = {},
+  options: UploadStoreOptions & {
+    recordOriginalPublication?: UploadPublicationPort;
+    nasAntivirusAdmission?: NasAntivirusAdmission;
+  } = {},
 ): UploadManagementRepository {
   const store = createUploadStore(mongoose, options);
   const jobs = createHousekeepingStore(mongoose);
@@ -77,25 +84,30 @@ export function createUploadManagementRepository(
   });
   const securityPolicySha256 = options.securityPolicySha256;
   const principalOf = storedUploadPrincipal;
-  const cleanupTask = (row: StoredUpload): UploadCleanupTask => ({
-    operationId: row._id,
-    generation: row.workerGeneration ?? row.generation,
-    attemptGeneration: row.attemptGeneration,
-    principal: principalOf(row),
-    worker: row.worker,
-    original: row.original,
-    fileId: row.fileId,
-    state: row.state,
-    parserExecution: row.parserExecution,
-    securityExecution: row.securityExecution,
-    securitySettlement: row.securitySettlement,
-    promotion: readStoredUploadPromotion(row),
-    writerStopped:
-      (row.writerStopped === true || actorCleanupFacts(row).writerStopped) &&
-      hasStoppedUploadPromotion(row) &&
-      (!row.securityExecution || hasCompleteUploadSecurityExecution(row)),
-    localCopiesAbsent: row.stagingHeld === false || actorCleanupFacts(row).localCopiesAbsent,
-  });
+  const cleanupTask = (row: StoredUpload): UploadCleanupTask => {
+    const binding = row.writeBinding ? readUploadOriginalWriteBinding(row.writeBinding) : null;
+    if (row.writeBinding && !binding) reject('migration_conflict');
+    return {
+      operationId: row._id,
+      generation: row.workerGeneration ?? row.generation,
+      attemptGeneration: row.attemptGeneration,
+      principal: principalOf(row),
+      worker: row.worker,
+      original: row.original,
+      ...(binding ? { writeBinding: binding } : {}),
+      fileId: row.fileId,
+      state: row.state,
+      parserExecution: row.parserExecution,
+      securityExecution: row.securityExecution,
+      securitySettlement: row.securitySettlement,
+      promotion: readStoredUploadPromotion(row),
+      writerStopped:
+        (row.writerStopped === true || actorCleanupFacts(row).writerStopped) &&
+        hasStoppedUploadPromotion(row) &&
+        (!row.securityExecution || hasCompleteUploadSecurityExecution(row)),
+      localCopiesAbsent: row.stagingHeld === false || actorCleanupFacts(row).localCopiesAbsent,
+    };
+  };
   async function owned(
     principal: UploadPrincipal,
     id: string,
@@ -254,7 +266,7 @@ export function createUploadManagementRepository(
       if (
         global.originalBytes + input.declaredBytes > RESOURCE_MAX.originalBytes ||
         global.objectBytes + input.declaredBytes > RESOURCE_MAX.objectBytes ||
-        global.recordBytes + UPLOAD_RECORD_BYTES > RESOURCE_MAX.recordBytes ||
+        global.recordBytes + UPLOAD_AV_RECORD_BYTES > RESOURCE_MAX.recordBytes ||
         global.bundles >= RESOURCE_MAX.bundles
       )
         reject('capacity_exceeded');
@@ -276,7 +288,7 @@ export function createUploadManagementRepository(
         // journal, before any external writer exists. Never reject cleanup because of row size.
         if (
           mongoose.mongo.BSON.calculateObjectSize({ derivedOrigin, fingerprint }) >
-          UPLOAD_RECORD_BYTES / 2
+          UPLOAD_DERIVED_MAX_ORIGIN_BYTES
         )
           reject('capacity_exceeded');
       }
@@ -298,7 +310,7 @@ export function createUploadManagementRepository(
         cleanupCustody: { version: 1 },
         originalBytes: input.declaredBytes,
         textBytes: 0,
-        recordBytes: UPLOAD_RECORD_BYTES,
+        recordBytes: UPLOAD_AV_RECORD_BYTES,
         queueCharged: false,
         pendingBytes: input.declaredBytes,
         stagingHeld: false,
@@ -366,9 +378,11 @@ export function createUploadManagementRepository(
     applyCleanup,
     usage,
     recordOriginalPublication: options.recordOriginalPublication,
+    nasAntivirusAdmission: options.nasAntivirusAdmission,
   };
   return {
     ...createUploadWriteMethods(context),
+    ...createUploadNasMethods(context),
     ...createUploadProcessingMethods(context),
     ...createUploadCleanupMethods(context),
     ...createUploadHousekeepingMethods(context, jobs, projectHousekeeping),
@@ -467,7 +481,7 @@ export function createUploadManagementRepository(
       const settlement =
         proof.securitySettlement === undefined
           ? undefined
-          : readUploadSecuritySettlement(proof.securitySettlement);
+          : readHistoricalUploadSecuritySettlement(proof.securitySettlement);
       if (settlement === null) reject('invalid_request');
       return store.transaction(async (session, global) => {
         const row = await store.Operation.findById(proof.operationId)

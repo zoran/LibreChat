@@ -1,3 +1,8 @@
+/** useUploadOptions tests preserve endpoint policy and independent upload availability gates. */
+jest.mock('~/features/uploads/useManagedUploads', () => ({
+  useManagedUploads: () => ({ enabled: true, newUploadError: mockUploadError }),
+}));
+let mockUploadError: string | null = null;
 import { RecoilRoot } from 'recoil';
 import { renderHook } from '@testing-library/react';
 import useUploadOptions from '../useUploadOptions';
@@ -82,5 +87,18 @@ describe('useUploadOptions endpoint resolution', () => {
     const { result } = render();
 
     expect(result.current.isConfigResolved).toBe(true);
+  });
+});
+
+describe('independent upload availability', () => {
+  it('disables new paste/drop options for storage failure without altering endpoint policy', () => {
+    mockUploadError = 'com_upload_storage_unavailable';
+    const { result, rerender } = render();
+    expect(result.current.uploadsDisabled).toBe(true);
+    expect(result.current.uploadAdmissionError).toBe('com_upload_storage_unavailable');
+    mockUploadError = 'com_upload_admission_paused';
+    rerender();
+    expect(result.current.uploadsDisabled).toBe(true);
+    expect(result.current.uploadAdmissionError).toBe('com_upload_admission_paused');
   });
 });

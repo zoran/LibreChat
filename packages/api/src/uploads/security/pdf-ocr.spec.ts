@@ -11,6 +11,7 @@ import {
   securityPdfPageRequestId,
   readSecurityPdfOcrStream,
 } from './pdf-ocr';
+import { antivirusCustodyFixture } from './antivirus-fixture.helper';
 import { createSecurityTlsFixture } from './tls-fixture.helper';
 
 const hash = (value: Uint8Array) => createHash('sha256').update(value).digest('hex');
@@ -29,12 +30,14 @@ const providerBinding = {
   workerIncarnation: 'worker-fixture',
 };
 function original(): UploadSecurityExecution {
+  const expiresAt = new Date(Date.now() + 60_000).toISOString();
   return {
-    version: 2,
+    version: 3,
+    antivirus: antivirusCustodyFixture(subject, expiresAt),
     attemptId: 'upload.1',
     instanceId: '22222222-2222-4222-8222-222222222222',
     executionId: '33333333-3333-4333-8333-333333333333',
-    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    expiresAt,
     custody: { kind: 'none' },
   };
 }

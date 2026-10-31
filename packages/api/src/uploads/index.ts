@@ -10,3 +10,22 @@ export * from './attempts';
 export * from './intake/channel';
 export * from './intake/control';
 export * from './intake/service';
+export {
+  createUploadStorageAvailability,
+  managedUploadStartupCapability,
+} from './storageAvailability';
+export type {
+  UploadStorageAvailabilityOwner,
+  UploadStorageAvailabilityOptions,
+} from './storageAvailability';
+export { createUploadNfsReportClient } from './nfsReports';
+export type { UploadNfsReportClientOptions } from './nfsReports';
+export {
+  createManagedUploadSecurityClient,
+  createLegacyUploadStorage,
+  selectManagedUploadConfiguration,
+  createNasAntivirusAdmission,
+  createNormalUploadStorage,
+  createHousekeepingUploadStorage,
+} from './composition/storage';
+export { createUploadPlatformFromConfiguration } from './platform/composition';

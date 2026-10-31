@@ -2,6 +2,7 @@ import type { ManagedUploadWriteInput, UploadWriteMethods } from './uploadManage
 /** Private immutable dispatch binding, persisted in the existing fenced transfer attempt. */
 import {
   isUploadOriginalIntegrity,
+  readUploadOriginalWriteBinding,
   matchesUploadSecurityApproval,
   readUploadSecurityExecution,
 } from 'librechat-data-provider';
@@ -40,6 +41,57 @@ function snapshot(value: ManagedUploadWriteInput): ManagedUploadWriteInput {
     reject('invalid_request');
   return structuredClone(value);
 }
+/** Shared actual transfer/security gate for legacy and NAS dispatch admission. */
+export function assertUploadWriteAdmission(
+  row: StoredUpload | null,
+  lease: import('librechat-data-provider').UploadLease,
+  input: ManagedUploadWriteInput,
+  integrity: import('librechat-data-provider').UploadOriginalIntegrity,
+  approval: import('librechat-data-provider').UploadSecurityApproval,
+  securityPolicySha256: string | undefined,
+  now: number,
+): asserts row is StoredUpload {
+  assertLease(row, lease, now);
+  if (
+    lease.kind !== 'transfer' ||
+    row.state !== 'transferring' ||
+    row.attemptGeneration !== lease.generation ||
+    input.operationId !== row._id ||
+    input.generation !== String(row.attemptGeneration) ||
+    input.key !== uploadOriginalKey(row) ||
+    input.bytes !== row.declaredBytes ||
+    input.mediaType !== row.mediaType ||
+    !isUploadOriginalIntegrity(integrity, input.bytes) ||
+    integrity.sha256 !== input.wholeSHA256
+  )
+    reject('lease_lost');
+  const execution = readUploadSecurityExecution(row.securityExecution);
+  if (
+    !securityPolicySha256 ||
+    !execution ||
+    approval.version !== 2 ||
+    JSON.stringify(approval.antivirus.custody) !== JSON.stringify(execution.antivirus) ||
+    !hasCompleteUploadSecurityExecution(row) ||
+    (execution?.custody.kind === 'pdf-ocr' &&
+      execution.custody.scope.documentSha256 !== input.wholeSHA256) ||
+    !matchesUploadSecurityApproval(
+      approval,
+      {
+        tenantId: row.tenantId,
+        userId: row.userId,
+        operationId: row._id,
+        transferGeneration: row.attemptGeneration!,
+        mediaType: input.mediaType,
+        bytes: input.bytes,
+        sha256: input.wholeSHA256,
+      },
+      securityPolicySha256,
+      now,
+    )
+  )
+    reject('security_uninspectable');
+}
+
 export function createUploadWriteMethods(context: UploadManagementContext): UploadWriteMethods {
   const { store, securityPolicySha256 } = context;
   return {
@@ -51,42 +103,15 @@ export function createUploadWriteMethods(context: UploadManagementContext): Uplo
         const row = await store.Operation.findById(lease.operationId)
           .session(session)
           .lean<StoredUpload>();
-        assertLease(row, lease, now);
-        if (
-          lease.kind !== 'transfer' ||
-          row.state !== 'transferring' ||
-          row.attemptGeneration !== lease.generation ||
-          input.operationId !== row._id ||
-          input.generation !== String(row.attemptGeneration) ||
-          input.key !== uploadOriginalKey(row) ||
-          input.bytes !== row.declaredBytes ||
-          input.mediaType !== row.mediaType ||
-          !isUploadOriginalIntegrity(integrity, input.bytes) ||
-          integrity.sha256 !== input.wholeSHA256
-        )
-          reject('lease_lost');
-        const execution = readUploadSecurityExecution(row.securityExecution);
-        if (
-          !securityPolicySha256 ||
-          !hasCompleteUploadSecurityExecution(row) ||
-          (execution?.custody.kind === 'pdf-ocr' &&
-            execution.custody.scope.documentSha256 !== input.wholeSHA256) ||
-          !matchesUploadSecurityApproval(
-            approval,
-            {
-              tenantId: row.tenantId,
-              userId: row.userId,
-              operationId: row._id,
-              transferGeneration: row.attemptGeneration!,
-              mediaType: input.mediaType,
-              bytes: input.bytes,
-              sha256: input.wholeSHA256,
-            },
-            securityPolicySha256,
-            now,
-          )
-        )
-          reject('security_uninspectable');
+        assertUploadWriteAdmission(
+          row,
+          lease,
+          input,
+          integrity,
+          approval,
+          securityPolicySha256,
+          now,
+        );
         if (row.writeBinding) {
           if (
             row.writeBinding.version !== 1 ||
@@ -117,7 +142,9 @@ export function createUploadWriteMethods(context: UploadManagementContext): Uplo
       }).lean<StoredUpload>();
       if (!row) reject('not_found');
       // Observation never extends deadline, mutates the attempt or grants another dispatch.
-      return row.writeBinding ? structuredClone(row.writeBinding) : null;
+      const binding = row.writeBinding ? readUploadOriginalWriteBinding(row.writeBinding) : null;
+      if (row.writeBinding && !binding) reject('migration_conflict');
+      return binding;
     },
   };
 }

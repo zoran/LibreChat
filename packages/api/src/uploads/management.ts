@@ -66,6 +66,8 @@ function reservationData(value: unknown, allowed: readonly string[]): Record<str
 }
 
 export interface UploadManagement {
+  /** Trusted server admission guard, also required before issuing a body-transfer capability. */
+  assertAdmissionSafe(): Promise<void>;
   reserve(principal: UploadPrincipal, request: UploadRequest): Promise<UploadOperation>;
   reserveDerived(
     principal: UploadPrincipal,
@@ -257,6 +259,7 @@ export function createUploadManagement(deps: UploadManagementDependencies): Uplo
     );
   }
   return {
+    assertAdmissionSafe: () => resources.assertSafe({ phase: 'admission' }),
     reserve: (principal, input) => reserve(principal, input, false),
     reserveDerived: (principal, input) => reserve(principal, input, true),
     get,
@@ -330,10 +333,14 @@ export function createUploadManagement(deps: UploadManagementDependencies): Uplo
       await resources.assertSafe({ phase: lease.kind, hostId: lease.hostId, lease });
       return repository.renew(lease, now());
     },
-    claimWorkBytes: (lease: UploadLease, requestedBytes: number) =>
-      repository.claimWorkBytes({ lease, requestedBytes, now: now() }),
-    bindOriginalWrite: (lease, input, integrity, approval) =>
-      repository.bindOriginalWrite(lease, input, integrity, approval, now()),
+    async claimWorkBytes(lease: UploadLease, requestedBytes: number) {
+      await resources.assertSafe({ phase: lease.kind, hostId: lease.hostId, lease });
+      return repository.claimWorkBytes({ lease, requestedBytes, now: now() });
+    },
+    async bindOriginalWrite(lease, input, integrity, approval) {
+      await resources.assertSafe({ phase: lease.kind, hostId: lease.hostId, lease });
+      return repository.bindOriginalWrite(lease, input, integrity, approval, now());
+    },
     bindSecurityExecution: (lease, execution) =>
       repository.bindSecurityExecution(lease, execution, now()),
     settleSecurityExecution: (lease, settlement) =>

@@ -1,24 +1,39 @@
+/** useManagedUploads owns identity-scoped upload status and current admission observations. */
 import { useCallback, useEffect, useMemo } from 'react';
 import { useRecoilValue } from 'recoil';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
+import { readManagedUploadFeatureCapability } from 'librechat-data-provider';
 import type { ManagedUploadSnapshot, ManagedUploadView } from 'librechat-data-provider';
-import { acquireUploadLive, getUploadAdmission, readManagedUploadSnapshot } from './live';
+import {
+  acquireUploadLive,
+  getUploadAdmission,
+  readManagedUploadSnapshot,
+  getUploadStorageAvailability,
+  getUploadManualPause,
+} from './live';
 import { useGetStartupConfig } from '~/data-provider';
+import { uploadAdmissionError } from './admission';
 import store from '~/store';
 
 export function useManagedUploads() {
   const client = useQueryClient();
   const user = useRecoilValue(store.user);
   const { data: config } = useGetStartupConfig();
-  const enabled = config?.managedUploads?.enabled === true;
-  const eligible = enabled && config?.managedUploads?.eligible === true && !!user;
+  const capability = readManagedUploadFeatureCapability(config?.managedUploads);
   const key = useMemo(
     () => ['managed-uploads', user?.tenantId ?? '', user?.id ?? ''],
     [user?.tenantId, user?.id],
   );
+  // A vanished/reset startup payload cannot silently switch an observed NAS identity to legacy.
+  const storageWasRequired = getUploadStorageAvailability(client, key) !== undefined;
+  const enabled =
+    capability?.enabled === true || config?.managedUploads?.enabled === true || storageWasRequired;
+  const eligible = enabled && capability?.enabled === true && capability.eligible && !!user;
+  const storageRequired =
+    storageWasRequired || (capability?.storageAvailabilityRequired ?? enabled);
   const query = useQuery<ManagedUploadSnapshot>(
     key,
-    ({ signal }) => readManagedUploadSnapshot(client, key, signal),
+    ({ signal }) => readManagedUploadSnapshot(client, key, signal, storageRequired),
     {
       enabled: eligible,
       staleTime: 15_000,
@@ -29,10 +44,20 @@ export function useManagedUploads() {
     },
   );
   useEffect(() => (eligible ? acquireUploadLive(client, key) : undefined), [client, key, eligible]);
-  const getAdmissionsPaused = useCallback(
-    () => (eligible ? getUploadAdmission(client, key) : null),
-    [client, key, eligible],
-  );
+  const getAdmissionsPaused = useCallback(() => {
+    if (!eligible) return null;
+    getUploadStorageAvailability(client, key, storageRequired);
+    return getUploadAdmission(client, key);
+  }, [client, key, eligible, storageRequired]);
+  const getNewUploadError = useCallback(() => {
+    if (!enabled) return null;
+    return uploadAdmissionError({
+      eligible,
+      admissionsPaused: getUploadAdmission(client, key),
+      storageAvailability: getUploadStorageAvailability(client, key, storageRequired),
+      availableBytes: client.getQueryData<ManagedUploadSnapshot>(key)?.usage?.availableBytes,
+    });
+  }, [client, key, enabled, eligible, storageRequired]);
   const refresh = useCallback(
     () => client.invalidateQueries({ queryKey: key, exact: true }),
     [client, key],
@@ -78,11 +103,17 @@ export function useManagedUploads() {
   return {
     enabled,
     eligible,
+    storageAvailabilityRequired: storageRequired,
     // Presentation only: the server eligibility bit remains the admission authority.
     isGuestAccount: eligible && user?.provider === 'browser',
     sessionKey: JSON.stringify(key),
     ...query,
-    admissionsPaused: getAdmissionsPaused(),
+    admissionsPaused: eligible ? getUploadManualPause(client, key) : null,
+    storageAvailability: eligible
+      ? getUploadStorageAvailability(client, key, storageRequired)
+      : undefined,
+    newUploadError: getNewUploadError(),
+    getNewUploadError,
     getAdmissionsPaused,
     refresh,
     waitForReady,

@@ -1,3 +1,4 @@
+import { statusTranslationKeys } from './classification';
 /** Read-only details. Values and explanations always come from the sole public snapshot. */
 import { STATUS_METRICS } from 'librechat-data-provider';
 import type { StatusSnapshot, StatusMeasurement } from 'librechat-data-provider';
@@ -97,7 +98,7 @@ export default function StatusInspector({
           ×
         </button>
       </div>
-      <p className="cortex-status-muted">{t(`com_status_state_${state}` as never)}</p>
+      <p className="cortex-status-muted">{t(statusTranslationKeys.state[state])}</p>
       {node && roleLabel(node, t) && (
         <dl>
           <dt>{t('com_status_classification' as never)}</dt>
@@ -105,11 +106,11 @@ export default function StatusInspector({
           <dt>{t('com_status_basis')}</dt>
           <dd>
             {node.classification
-              ? t(`com_status_basis_${node.classification.basis}` as never)
+              ? t(statusTranslationKeys.basis[node.classification.basis])
               : t('com_status_state_unknown')}
           </dd>
           <dt>{t('com_status_classification_freshness' as never)}</dt>
-          <dd>{t(`com_status_classification_${classificationState(node, now)}` as never)}</dd>
+          <dd>{t(statusTranslationKeys.classification[classificationState(node, now)])}</dd>
           {node.classification?.evidence.map((proof) => (
             <div className="contents" key={proof.sourceId}>
               <dt>{t('com_status_evidence')}</dt>
@@ -125,21 +126,21 @@ export default function StatusInspector({
           <dt>{t('com_status_direction')}</dt>
           <dd>{title}</dd>
           <dt>{t('com_status_purpose')}</dt>
-          <dd>{t(`com_status_purpose_${edge.purpose}` as never)}</dd>
+          <dd>{t(statusTranslationKeys.purpose[edge.purpose])}</dd>
           <dt>{t('com_status_basis')}</dt>
-          <dd>{t(`com_status_basis_${edge.basis}` as never)}</dd>
+          <dd>{t(statusTranslationKeys.basis[edge.basis])}</dd>
           {edge.membershipRoles && (
             <>
               <dt>{t('com_status_cluster_roles' as never)}</dt>
               <dd>
                 {edge.membershipRoles
-                  .map((role) => t(`com_status_membership_${role}` as never))
+                  .map((role) => t(statusTranslationKeys.membership[role]))
                   .join(' · ')}
               </dd>
             </>
           )}
           <dt>{t('com_status_reason')}</dt>
-          <dd>{t(`com_status_reason_${edge.reason}` as never)}</dd>
+          <dd>{t(statusTranslationKeys.reason[edge.reason])}</dd>
         </dl>
       )}
       {node && (
@@ -148,12 +149,17 @@ export default function StatusInspector({
           <dl>
             {node.assessments.map((a) => (
               <div key={a.dimension} className="contents">
-                <dt>{t(`com_status_dimension_${a.dimension}` as never)}</dt>
+                <dt>{t(statusTranslationKeys.dimension[a.dimension])}</dt>
                 <dd>
                   {t(
-                    `com_status_state_${a.evidence.some((e) => now - e.observedAt > e.maxAgeSeconds) && ['healthy', 'degraded'].includes(a.state) ? 'stale' : a.state}` as never,
+                    statusTranslationKeys.state[
+                      a.evidence.some((e) => now - e.observedAt > e.maxAgeSeconds) &&
+                      ['healthy', 'degraded'].includes(a.state)
+                        ? 'stale'
+                        : a.state
+                    ],
                   )}{' '}
-                  · {t(`com_status_reason_${a.reason}` as never)}
+                  · {t(statusTranslationKeys.reason[a.reason])}
                 </dd>
               </div>
             ))}
@@ -172,7 +178,7 @@ export default function StatusInspector({
             <h4>{m.key}</h4>
             <p className="cortex-status-muted">{measurementScope(m, t)}</p>
             <p>
-              {formatMeasurement(m)} · {t(`com_status_state_${stale ? 'stale' : m.state}` as never)}
+              {formatMeasurement(m)} · {t(statusTranslationKeys.state[stale ? 'stale' : m.state])}
             </p>
             {sample && (
               <p className="cortex-status-evidence">
@@ -182,7 +188,7 @@ export default function StatusInspector({
               </p>
             )}
             {!sample && (
-              <p className="cortex-status-muted">{t(`com_status_reason_${m.reason}` as never)}</p>
+              <p className="cortex-status-muted">{t(statusTranslationKeys.reason[m.reason])}</p>
             )}
           </div>
         );
@@ -197,14 +203,19 @@ export default function StatusInspector({
             <section className="cortex-status-parameter" key={`${p.key}:${p.stage}`}>
               <h4>{p.label}</h4>
               <dl>
-                <dt>{t(`com_status_stage_${p.stage}` as never)}</dt>
+                <dt>{t(statusTranslationKeys.stage[p.stage])}</dt>
                 <dd>
                   {parameterValue(p, t)} {p.unit !== 'none' && p.unit !== 'boolean' ? p.unit : ''}
                 </dd>
                 <dt>{t('com_status_state')}</dt>
                 <dd>
                   {t(
-                    `com_status_state_${p.state === 'known' && p.evidence.some((e) => now - e.observedAt > e.maxAgeSeconds) ? 'stale' : p.state}` as never,
+                    statusTranslationKeys.state[
+                      p.state === 'known' &&
+                      p.evidence.some((e) => now - e.observedAt > e.maxAgeSeconds)
+                        ? 'stale'
+                        : p.state
+                    ],
                   )}
                 </dd>
               </dl>
@@ -263,8 +274,8 @@ export default function StatusInspector({
               {snapshot.nodes.find((n) => n.id === e.to)?.label}
               <br />
               <span className="cortex-status-muted">
-                {t(`com_status_purpose_${e.purpose}` as never)} ·{' '}
-                {t(`com_status_basis_${e.basis}` as never)}
+                {t(statusTranslationKeys.purpose[e.purpose])} ·{' '}
+                {t(statusTranslationKeys.basis[e.basis])}
               </span>
             </button>
           ))}

@@ -1,5 +1,6 @@
 import type { UploadCleanupReceiptMethods } from './uploadCleanupReceipts';
 import type { UploadWriteMethods } from './uploadManagementWriteTypes';
+import type { UploadNasMethods } from './uploadManagementNasTypes';
 /** Public repository contract and private ports shared by the cohesive upload lifecycle owners. */
 import type {
   UploadPrincipal,
@@ -73,6 +74,7 @@ export type UploadActorCleanupProof = Pick<
 > & { localWriterStopped?: boolean };
 /** Upload repository contract and explicit internal composition ports. */
 export type UploadManagementRepository = UploadWriteMethods &
+  UploadNasMethods &
   UploadCleanupReceiptMethods &
   UploadControlMethods &
   UploadMigrationMethods &

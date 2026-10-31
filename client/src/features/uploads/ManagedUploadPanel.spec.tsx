@@ -1,15 +1,17 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react';
 import type { ManagedUploadSnapshot, ManagedUploadView } from 'librechat-data-provider';
 import type { ExtendedFile } from '~/common';
 import { ManagedUploadCard, ManagedUploadPanel } from './ManagedUploadPanel';
 import { readUploadSnapshot, changeUpload } from './api';
 import mockEnglish from '~/locales/en/translation.json';
+import { useManagedUploads } from './useManagedUploads';
 import mockGerman from '~/locales/de/translation.json';
 import { readManagedUploadSnapshot } from './live';
 
 let mockLocale = 'en';
 let mockEligible = true;
+let mockFeature: unknown;
 let mockUser: { id: string; tenantId?: string; provider: string };
 const mockStreams: { listeners: Record<string, (event?: unknown) => void> }[] = [];
 jest.mock('sse.js', () => ({
@@ -27,7 +29,10 @@ jest.mock('sse.js', () => ({
     stream() {}
   },
 }));
-jest.mock('librechat-data-provider', () => ({ getTokenHeader: () => 'Bearer verified' }));
+jest.mock('librechat-data-provider', () => ({
+  ...jest.requireActual('librechat-data-provider'),
+  getTokenHeader: () => 'Bearer verified',
+}));
 jest.mock('recoil', () => ({ useRecoilValue: () => mockUser }));
 jest.mock('react-i18next', () => ({
   useTranslation: () => ({ i18n: { resolvedLanguage: mockLocale, language: mockLocale } }),
@@ -35,7 +40,7 @@ jest.mock('react-i18next', () => ({
 jest.mock('~/store', () => ({ __esModule: true, default: { user: {} } }));
 jest.mock('~/data-provider', () => ({
   useGetStartupConfig: () => ({
-    data: { managedUploads: { enabled: true, eligible: mockEligible } },
+    data: { managedUploads: mockFeature ?? { enabled: true, eligible: mockEligible } },
   }),
 }));
 jest.mock('~/hooks/useLocalize', () => ({
@@ -103,6 +108,7 @@ describe('managed upload admission UI', () => {
   beforeEach(() => {
     mockLocale = 'en';
     mockEligible = true;
+    mockFeature = undefined;
     mockUser = { id: 'user', tenantId: 'tenant', provider: 'email_code' };
     mockStreams.length = 0;
     Object.defineProperty(document, 'hidden', { configurable: true, value: false });
@@ -464,5 +470,33 @@ describe('managed upload admission UI', () => {
       screen.getByText(`Aufbewahrung bis ${new Date(operation.expiresAt!).toLocaleString('de')}`),
     ).toBeInTheDocument();
     rendered.unmount();
+  });
+});
+
+/** NAS startup-reset regression uses the actual public capability and identity live owner. */
+describe('NAS startup reset cannot restore a legacy upload lane', () => {
+  it('retains a closed NAS requirement when startup metadata becomes invalid', async () => {
+    mockFeature = { enabled: true, eligible: true, storageAvailabilityRequired: true };
+    mockUser = { id: 'nas-reset', tenantId: 'tenant', provider: 'email_code' };
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    (readUploadSnapshot as jest.Mock).mockResolvedValue({
+      ...snapshot,
+      storageAvailability: { available: true, reason: null },
+    });
+    const hook = renderHook(() => useManagedUploads(), {
+      wrapper: ({ children }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      ),
+    });
+    await waitFor(() => expect(hook.result.current.getNewUploadError()).toBeNull());
+    mockFeature = { enabled: true, eligible: true, storageAvailabilityRequired: null };
+    hook.rerender();
+    expect(hook.result.current.enabled).toBe(true);
+    expect(hook.result.current.storageAvailabilityRequired).toBe(true);
+    expect(hook.result.current.getAdmissionsPaused()).toBeNull();
+    expect(hook.result.current.getNewUploadError()).not.toBeNull();
+    hook.unmount();
+    client.clear();
+    mockFeature = undefined;
   });
 });

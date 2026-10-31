@@ -1,3 +1,4 @@
+/** Bar owns persistent composer controls while upload admission stays in the upload feature. */
 import React, { memo, useMemo, useState, useCallback } from 'react';
 import * as Ariakit from '@ariakit/react';
 import { Mic, Plus, Check, Square, ChevronDown } from 'lucide-react';
@@ -6,12 +7,14 @@ import type { TConversation, EModelEndpoint, EndpointFileConfig } from 'librecha
 import type { PaletteEntry, PaletteMode } from '~/hooks/Input/usePaletteEntries';
 import type { Dictation } from '~/hooks/Input/useDictation';
 import type { ExtendedFile, FileSetter } from '~/common';
+import { useManagedUploads } from '~/features/uploads/useManagedUploads';
 import usePaletteEntries from '~/hooks/Input/usePaletteEntries';
 import MCPConfigDialog from '~/components/MCP/MCPConfigDialog';
 import useToolFavorites from '~/hooks/Input/useToolFavorites';
 import useElementSize from '~/hooks/Generic/useElementSize';
 import useChipPacking from '~/hooks/Input/useChipPacking';
 import { useBadgeRowContext } from '~/Providers';
+import AttachFile from '../Files/AttachFile';
 import TokenUsage from '../TokenUsage';
 import { useLocalize } from '~/hooks';
 import Thinking from './Thinking';
@@ -241,6 +244,7 @@ function Bar({
   dictation,
 }: BarProps) {
   const localize = useLocalize();
+  const uploads = useManagedUploads();
   const context = useBadgeRowContext();
   /* Latched on the palette's first open and never released: the skills catalog
      is only walked for composers whose palette was actually used, and closing
@@ -420,10 +424,19 @@ function Bar({
             files={files}
             setFiles={setFiles}
             setFilesLoading={setFilesLoading}
-            canAttach={canAttach}
+            canAttach={canAttach && !uploads.storageAvailabilityRequired}
             anchorRef={anchorRef}
           />
         </span>
+        {uploads.storageAvailabilityRequired && (
+          <AttachFile
+            disabled={disabled || !canAttach || dictating}
+            files={files}
+            setFiles={setFiles}
+            setFilesLoading={setFilesLoading}
+            conversation={conversation}
+          />
+        )}
         {/* A box rather than `contents` so it has something to move: the split
             only puts chips here when they all fit on this line, so wrapping as
             one unit and wrapping as siblings come to the same layout. */}

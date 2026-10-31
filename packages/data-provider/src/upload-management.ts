@@ -8,6 +8,8 @@ import type {
 import type { ResourceScope as UploadScope } from './resource-ownership';
 import type { UploadPromotionRecord } from './upload-intake';
 import type { UploadDerivedIntent } from './upload-derived';
+import { readNasS3Backend } from './upload-nas';
+import type { NasS3Backend, NasUploadWriteBinding } from './upload-nas';
 
 export const UPLOAD_CONTRACT_VERSION: number = 1;
 export const UPLOAD_MAX_FILE_BYTES: number = 31_457_280;
@@ -17,6 +19,8 @@ export const UPLOAD_RETENTION_MS: number = 28 * 86_400_000;
 export const UPLOAD_REPLAY_MS: number = 31 * 86_400_000;
 export const UPLOAD_MAX_TEXT_BYTES: number = 15 * 1_048_576;
 export const UPLOAD_RECORD_BYTES: number = 32 * 1024;
+/** Current AV receipts require a larger charged allowance; existing32KiB records retain their charge. */
+export const UPLOAD_AV_RECORD_BYTES: number = 64 * 1024;
 export const UPLOAD_INTEGRITY_CHUNK_BYTES: number = 262144;
 
 /** Private identity of the received original; fixed blocks permit verification before delivery. */
@@ -38,6 +42,7 @@ const RECEIPT_KEYS = [
   'etag',
   'versionId',
   'integrity',
+  'backend',
 ];
 function closedUploadRecord(value: unknown, keys: string[]): value is Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -193,6 +198,8 @@ export const UPLOAD_ERROR_CODES = [
   'cancelled',
   'unavailable',
   'admission_paused',
+  'storage_unavailable',
+  'storage_stale',
   'migration_conflict',
 ] as const;
 export type UploadErrorCode = (typeof UPLOAD_ERROR_CODES)[number];
@@ -266,7 +273,26 @@ export type UploadStorageReceipt = {
   versionId?: string;
   /** Absent only for uncertain or removed historical data; never invented from a later read. */
   integrity?: UploadOriginalIntegrity;
+  /** Missing means the original managed provider; existing rows are never repointed. */
+  backend?: NasS3Backend;
 };
+/** Existing managed protocol binding remains backend/version1, never repointed to NAS. */
+export type ManagedUploadWriteInput = Readonly<{
+  bucket: string;
+  key: string;
+  operationId: string;
+  generation: string;
+  bytes: number;
+  wholeSHA256: string;
+  mediaType: string;
+}>;
+export type ManagedUploadWriteBinding = ManagedUploadWriteInput &
+  Readonly<{
+    version: 1;
+    originalDeadline: string;
+  }>;
+/** Trusted same-row projection only; an ordinary DTO never grants storage authority. */
+export type UploadOriginalWriteBinding = ManagedUploadWriteBinding | NasUploadWriteBinding;
 /** One bounded receipt shape; durability, authority and canonical keys belong to the caller. */
 export function isUploadStorageReceipt(value: unknown): value is UploadStorageReceipt {
   if (
@@ -293,7 +319,10 @@ export function isUploadStorageReceipt(value: unknown): value is UploadStorageRe
     )
       return false;
   }
-  return value.integrity === undefined || isUploadOriginalIntegrity(value.integrity, value.bytes);
+  return (
+    (value.backend === undefined || readNasS3Backend(value.backend) !== null) &&
+    (value.integrity === undefined || isUploadOriginalIntegrity(value.integrity, value.bytes))
+  );
 }
 export type UploadProcessingInput = {
   operationId: string;
@@ -306,6 +335,8 @@ export type UploadProcessingInput = {
   securityApproval: UploadSecurityApproval;
 };
 export type UploadCleanupTask = {
+  /** Immutable original binding projected from this trusted operation row, including unknown PUTs. */
+  writeBinding?: UploadOriginalWriteBinding;
   operationId: string;
   generation: number;
   attemptGeneration?: number;

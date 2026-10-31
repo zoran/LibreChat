@@ -18,7 +18,7 @@ function connection(principal: UploadPrincipal = owner) {
     writableEnded: false,
     setHeader: jest.fn(),
     status: jest.fn().mockReturnThis(),
-    write: jest.fn(() => true),
+    write: jest.fn((_frame: string) => true),
     end: jest.fn(function (this: { writableEnded: boolean }) {
       this.writableEnded = true;
     }),
@@ -306,6 +306,38 @@ describe('bounded authenticated upload event hints', () => {
       expect(f.admissionStatus).not.toHaveBeenCalled();
       expect(a.response.write).not.toHaveBeenCalled();
     } finally {
+      f.hub.close();
+    }
+  });
+});
+
+describe('same canonical storage cause in authenticated status hints', () => {
+  it('preserves manual pause and never emits private or malformed storage status', async () => {
+    const f = fixture();
+    f.admissionStatus.mockReturnValue(true);
+    let value: unknown = { available: true, reason: null };
+    const hub = createUploadLiveHub({ ...f.options, storageAvailability: () => value });
+    const c = connection();
+    try {
+      await hub.open(c.req, c.res, owner);
+      expect(c.response.write).toHaveBeenLastCalledWith(
+        expect.stringContaining(
+          '"admissionsPaused":true,"storageAvailability":{"available":true,"reason":null}',
+        ),
+      );
+      value = { available: true, reason: null, endpoint: 'PRIVATE_ENDPOINT' };
+      c.response.write.mockClear();
+      // A second authenticated connection consumes the same owner port, not a second status source.
+      const other = connection();
+      await hub.open(other.req, other.res, owner);
+      const wire = String(other.response.write.mock.calls[0][0]);
+      expect(wire).toContain(
+        '"storageAvailability":{"available":false,"reason":"storage-unavailable"}',
+      );
+      expect(wire).not.toContain('PRIVATE_ENDPOINT');
+      expect(wire).toContain('"admissionsPaused":true');
+    } finally {
+      hub.close();
       f.hub.close();
     }
   });

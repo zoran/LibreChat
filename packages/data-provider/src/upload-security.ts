@@ -1,5 +1,26 @@
 /** Private scanner receipt data. Validation binds a receipt; only trusted server owners may issue it. */
-import { UPLOAD_MAX_FILE_BYTES } from './upload-management';
+import type {
+  UploadAntivirusCustody,
+  UploadAntivirusApproval,
+  UploadAntivirusReceipt,
+} from './upload-antivirus';
+import {
+  readClosedRecord,
+  identifier,
+  hash,
+  positiveInteger,
+  scannerVersion,
+  checkedAt,
+  uuidV4,
+  readUploadSecuritySubject,
+} from './upload-security-data';
+import {
+  readUploadAntivirusCustody,
+  readUploadAntivirusApproval,
+  readUploadAntivirusReceipt,
+} from './upload-antivirus';
+
+export { readUploadSecuritySubject } from './upload-security-data';
 
 export type UploadSecuritySubject = {
   tenantId: string | null;
@@ -12,7 +33,7 @@ export type UploadSecuritySubject = {
   sha256: string;
 };
 
-export type UploadSecurityApproval = {
+export type LegacyUploadSecurityApproval = {
   version: 1;
   decision: 'approved';
   policySha256: string;
@@ -21,6 +42,13 @@ export type UploadSecurityApproval = {
   checkedAt: string;
   coverage: { complete: true; pages: number; parts: number };
 };
+
+/** Current authenticated scanner approval; version1 is retained only for old-bound obligations. */
+export type CurrentUploadSecurityApproval = Omit<LegacyUploadSecurityApproval, 'version'> & {
+  version: 2;
+  antivirus: UploadAntivirusApproval;
+};
+export type UploadSecurityApproval = LegacyUploadSecurityApproval | CurrentUploadSecurityApproval;
 
 export type UploadSecurityReason =
   | 'classification_marking'
@@ -31,11 +59,12 @@ export type UploadSecurityReason =
   | 'invalid_content'
   | 'resource_limit'
   | 'scanner_unavailable'
-  | 'ambiguous_marking';
+  | 'ambiguous_marking'
+  | 'malware';
 
 export type UploadSecurityDecision =
   | UploadSecurityApproval
-  | { version: 1; decision: 'rejected'; reason: 'classification_marking' }
+  | { version: 1; decision: 'rejected'; reason: 'classification_marking' | 'malware' }
   | { version: 1; decision: 'uninspectable'; reason: UploadSecurityReason };
 
 /** A trusted adapter must explicitly attest execution stop and removal of its transient copies. */
@@ -85,7 +114,7 @@ export type UploadSecurityScopeReceipt = {
 };
 
 /** One current contract. Ordinary readers never adopt legacy or replacement executions. */
-export type UploadSecurityExecution = {
+export type LegacyUploadSecurityExecution = {
   version: 2;
   attemptId: string;
   instanceId: string;
@@ -94,6 +123,15 @@ export type UploadSecurityExecution = {
   custody: { kind: 'none' } | { kind: 'pdf-ocr'; scope: UploadSecurityProviderScope };
 };
 
+/** Current per-document execution includes the bound original AV process/generation. */
+export type CurrentUploadSecurityExecution = Omit<LegacyUploadSecurityExecution, 'version'> & {
+  version: 3;
+  antivirus: UploadAntivirusCustody;
+};
+export type UploadSecurityExecution =
+  | LegacyUploadSecurityExecution
+  | CurrentUploadSecurityExecution;
+
 /** False means unconfirmed, never a successful cancellation or proof that copies were removed. */
 export type UploadSecuritySettlement = {
   execution: UploadSecurityExecution;
@@ -101,6 +139,8 @@ export type UploadSecuritySettlement = {
   transientDataRemoved: boolean;
   /** Required only for PDF; null means the original remote obligation remains unknown. */
   providerReceipt?: UploadSecurityScopeReceipt | null;
+  /** Mandatory for current executions; null explicitly retains unknown AV retirement. */
+  antivirusReceipt?: UploadAntivirusReceipt | null;
 };
 
 const EXECUTION_KEYS = [
@@ -157,17 +197,9 @@ const SECURITY_REASONS: readonly UploadSecurityReason[] = [
   'resource_limit',
   'scanner_unavailable',
   'ambiguous_marking',
+  'malware',
 ];
 
-const SUBJECT_KEYS = [
-  'tenantId',
-  'userId',
-  'operationId',
-  'transferGeneration',
-  'mediaType',
-  'bytes',
-  'sha256',
-] as const;
 const APPROVAL_KEYS = [
   'version',
   'decision',
@@ -180,98 +212,13 @@ const APPROVAL_KEYS = [
 const COVERAGE_KEYS = ['complete', 'pages', 'parts'] as const;
 
 /** Snapshot data descriptors once: never read attacker-supplied getters or inherited fields. */
-function readClosedRecord(value: unknown, keys: readonly string[]): Record<string, unknown> | null {
-  try {
-    if (value === null || typeof value !== 'object' || Array.isArray(value)) return null;
-    const prototype = Object.getPrototypeOf(value);
-    if (prototype !== Object.prototype && prototype !== null) return null;
-    const ownKeys = Reflect.ownKeys(value);
-    if (ownKeys.length !== keys.length) return null;
-    const record: Record<string, unknown> = Object.create(null);
-    for (const key of ownKeys) {
-      if (typeof key !== 'string' || !keys.includes(key)) return null;
-      const descriptor = Object.getOwnPropertyDescriptor(value, key);
-      if (!descriptor?.enumerable || !Object.prototype.hasOwnProperty.call(descriptor, 'value'))
-        return null;
-      record[key] = descriptor.value;
-    }
-    return record;
-  } catch {
-    // Revoked proxies and failed reflection are invalid input, never validation exceptions.
-    return null;
-  }
-}
-
-function identifier(value: unknown): value is string {
-  return (
-    typeof value === 'string' &&
-    value.length > 0 &&
-    value.length <= 128 &&
-    !/[^a-zA-Z0-9_.-]/.test(value)
-  );
-}
-
-function hash(value: unknown): value is string {
-  return typeof value === 'string' && value.length === 64 && !/[^a-f0-9]/.test(value);
-}
-
-function positiveInteger(value: unknown, max = Number.MAX_SAFE_INTEGER): value is number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 && value <= max;
-}
-
-function mediaType(value: unknown): value is string {
-  if (typeof value !== 'string' || value.length > 127) return false;
-  const match = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/.exec(value);
-  return match?.[0] === value;
-}
-
-function scannerVersion(value: unknown): value is string {
-  return (
-    typeof value === 'string' &&
-    value.length > 0 &&
-    value.length <= 128 &&
-    /^[a-zA-Z0-9]/.test(value) &&
-    !/[^a-zA-Z0-9._:+/-]/.test(value)
-  );
-}
-
-function checkedAt(value: unknown): value is string {
-  if (typeof value !== 'string' || value.length !== 24) return false;
-  const time = Date.parse(value);
-  return Number.isFinite(time) && new Date(time).toISOString() === value;
-}
-
-/** Detached subject data for trusted server consumers; no accessor or inherited field is read. */
-export function readUploadSecuritySubject(value: unknown): UploadSecuritySubject | null {
-  const record = readClosedRecord(value, SUBJECT_KEYS);
+function readApproval(value: unknown, historical = false): UploadSecurityApproval | null {
+  const record =
+    readClosedRecord(value, [...APPROVAL_KEYS, 'antivirus']) ??
+    (historical ? readClosedRecord(value, APPROVAL_KEYS) : null);
   if (
     !record ||
-    (record.tenantId !== null &&
-      (!identifier(record.tenantId) || record.tenantId === '__SYSTEM__')) ||
-    !identifier(record.userId) ||
-    !identifier(record.operationId) ||
-    !positiveInteger(record.transferGeneration) ||
-    !mediaType(record.mediaType) ||
-    !positiveInteger(record.bytes, UPLOAD_MAX_FILE_BYTES) ||
-    !hash(record.sha256)
-  )
-    return null;
-  return {
-    tenantId: record.tenantId,
-    userId: record.userId,
-    operationId: record.operationId,
-    transferGeneration: record.transferGeneration,
-    mediaType: record.mediaType,
-    bytes: record.bytes,
-    sha256: record.sha256,
-  };
-}
-
-function readApproval(value: unknown): UploadSecurityApproval | null {
-  const record = readClosedRecord(value, APPROVAL_KEYS);
-  if (
-    !record ||
-    record.version !== 1 ||
+    (record.version !== 2 && !(historical && record.version === 1)) ||
     record.decision !== 'approved' ||
     !hash(record.policySha256) ||
     !scannerVersion(record.scannerVersion) ||
@@ -289,15 +236,24 @@ function readApproval(value: unknown): UploadSecurityApproval | null {
     !positiveInteger(coverage.parts, 2048)
   )
     return null;
-  return {
-    version: 1,
-    decision: 'approved',
+  const base = {
+    decision: 'approved' as const,
     policySha256: record.policySha256,
     subject,
     scannerVersion: record.scannerVersion,
     checkedAt: record.checkedAt,
-    coverage: { complete: true, pages: coverage.pages, parts: coverage.parts },
+    coverage: { complete: true as const, pages: coverage.pages, parts: coverage.parts },
   };
+  if (record.version === 1) return { version: 1, ...base };
+  const antivirus = readUploadAntivirusApproval(record.antivirus);
+  if (
+    !antivirus ||
+    JSON.stringify(antivirus.custody.subject) !== JSON.stringify(subject) ||
+    Date.parse(antivirus.cleanAt) > Date.parse(base.checkedAt) ||
+    Date.parse(base.checkedAt) > Date.parse(antivirus.custody.expiresAt)
+  )
+    return null;
+  return { version: 2, ...base, antivirus };
 }
 
 function readDecision(value: unknown): UploadSecurityDecision | null {
@@ -305,10 +261,17 @@ function readDecision(value: unknown): UploadSecurityDecision | null {
   if (approval) return approval;
   const record = readClosedRecord(value, NEGATIVE_DECISION_KEYS);
   if (!record || record.version !== 1) return null;
-  if (record.decision === 'rejected' && record.reason === 'classification_marking')
-    return { version: 1, decision: 'rejected', reason: 'classification_marking' };
+  if (
+    record.decision === 'rejected' &&
+    ['classification_marking', 'malware'].includes(String(record.reason))
+  )
+    return {
+      version: 1,
+      decision: 'rejected',
+      reason: record.reason as 'classification_marking' | 'malware',
+    };
   const reason = SECURITY_REASONS.find((reason) => reason === record.reason);
-  if (record.decision === 'uninspectable' && reason)
+  if (record.decision === 'uninspectable' && reason && reason !== 'malware')
     return { version: 1, decision: 'uninspectable', reason };
   return null;
 }
@@ -339,6 +302,13 @@ export function readUploadSecurityInspection(value: unknown): UploadSecurityInsp
           decision.coverage.parts !== 1)))
   )
     return null;
+  if (
+    decision.decision === 'approved' &&
+    (decision.version !== 2 ||
+      settlement.execution.version !== 3 ||
+      JSON.stringify(decision.antivirus.custody) !== JSON.stringify(settlement.execution.antivirus))
+  )
+    return null;
   return { decision, settlement };
 }
 
@@ -351,6 +321,17 @@ export function isUploadSecuritySubject(value: unknown): value is UploadSecurity
   return readUploadSecuritySubject(value) !== null;
 }
 
+/** Current approval snapshot, with complete AV custody, never a classification-only fallback. */
+export function readUploadSecurityApproval(value: unknown): CurrentUploadSecurityApproval | null {
+  const a = readApproval(value);
+  return a?.version === 2 ? a : null;
+}
+/** Retained old evidence reader; callers must independently prove an old-bound obligation. */
+export function readHistoricalUploadSecurityApproval(
+  value: unknown,
+): UploadSecurityApproval | null {
+  return readApproval(value, true);
+}
 /** Shape only, without a wall-clock dependency or any assertion about the receipt's issuer. */
 export function isUploadSecurityApproval(value: unknown): value is UploadSecurityApproval {
   return readApproval(value) !== null;
@@ -372,7 +353,9 @@ export function matchesUploadSecurityApproval(
     expected !== null &&
     approval.policySha256 === policySha256 &&
     Date.parse(approval.checkedAt) <= now &&
-    SUBJECT_KEYS.every((key) => approval.subject[key] === expected[key])
+    approval.version === 2 &&
+    now <= Date.parse(approval.antivirus.custody.expiresAt) &&
+    JSON.stringify(approval.subject) === JSON.stringify(expected)
   );
 }
 
@@ -382,15 +365,6 @@ function executionAttemptId(value: unknown): value is string {
   return match?.[0] === value;
 }
 
-function uuidV4(value: unknown): value is string {
-  return (
-    typeof value === 'string' &&
-    value.length === 36 &&
-    /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value)
-  );
-}
-
-/** Validate and detach every nested value before any consumer can await or persist it. */
 function readProviderScope(
   value: unknown,
   execution: Pick<
@@ -465,7 +439,7 @@ export function readUploadSecurityScopeReceipt(
   value: unknown,
   execution: UploadSecurityExecution,
 ): UploadSecurityScopeReceipt | null {
-  const original = readUploadSecurityExecution(execution);
+  const original = readHistoricalUploadSecurityExecution(execution);
   if (!original || original.custody.kind !== 'pdf-ocr') return null;
   const record = readClosedRecord(value, SCOPE_RECEIPT_KEYS);
   if (
@@ -512,11 +486,13 @@ export function readUploadSecurityScopeReceipt(
 }
 
 /** Shape and snapshot only; callers must authenticate the issuer and enforce their lease clock. */
-export function readUploadSecurityExecution(value: unknown): UploadSecurityExecution | null {
-  const record = readClosedRecord(value, EXECUTION_KEYS);
+function readExecution(value: unknown, historical = false): UploadSecurityExecution | null {
+  const record =
+    readClosedRecord(value, [...EXECUTION_KEYS, 'antivirus']) ??
+    (historical ? readClosedRecord(value, EXECUTION_KEYS) : null);
   if (
     !record ||
-    record.version !== 2 ||
+    (record.version !== 3 && !(historical && record.version === 2)) ||
     !executionAttemptId(record.attemptId) ||
     !uuidV4(record.instanceId) ||
     !uuidV4(record.executionId) ||
@@ -540,33 +516,74 @@ export function readUploadSecurityExecution(value: unknown): UploadSecurityExecu
     if (!scope) return null;
     custody = Object.freeze({ kind: 'pdf-ocr', scope });
   }
-  return Object.freeze({
-    version: 2,
+  const base = {
     attemptId: record.attemptId,
     instanceId: record.instanceId,
     executionId: record.executionId,
     expiresAt: record.expiresAt,
     custody,
-  });
+  };
+  if (record.version === 2) return Object.freeze({ version: 2, ...base });
+  const antivirus = readUploadAntivirusCustody(record.antivirus);
+  if (
+    !antivirus ||
+    antivirus.expiresAt !== record.expiresAt ||
+    `${antivirus.subject.operationId}.${antivirus.subject.transferGeneration}` !==
+      record.attemptId ||
+    (custody.kind === 'pdf-ocr' && custody.scope.documentSha256 !== antivirus.subject.sha256)
+  )
+    return null;
+  return Object.freeze({ version: 3, ...base, antivirus });
+}
+
+/** Current native worker protocol; legacy executions cannot start or approve a new write. */
+export function readUploadSecurityExecution(value: unknown): CurrentUploadSecurityExecution | null {
+  const e = readExecution(value);
+  return e?.version === 3 ? e : null;
+}
+/** Explicit retained-protocol reader for genuinely old-bound actor/storage obligations. */
+export function readHistoricalUploadSecurityExecution(
+  value: unknown,
+): UploadSecurityExecution | null {
+  return readExecution(value, true);
 }
 
 /** Preserve unknown outcomes explicitly and detach the nested identity before consumers await. */
-export function readUploadSecuritySettlement(value: unknown): UploadSecuritySettlement | null {
+function readSettlement(value: unknown, historical = false): UploadSecuritySettlement | null {
   const record =
-    readClosedRecord(value, SETTLEMENT_KEYS) ??
-    readClosedRecord(value, [...SETTLEMENT_KEYS, 'providerReceipt']);
+    readClosedRecord(value, [...SETTLEMENT_KEYS, 'antivirusReceipt']) ??
+    readClosedRecord(value, [...SETTLEMENT_KEYS, 'providerReceipt', 'antivirusReceipt']) ??
+    (historical
+      ? (readClosedRecord(value, SETTLEMENT_KEYS) ??
+        readClosedRecord(value, [...SETTLEMENT_KEYS, 'providerReceipt']))
+      : null);
   if (
     !record ||
     typeof record.writerStopped !== 'boolean' ||
     typeof record.transientDataRemoved !== 'boolean'
   )
     return null;
-  const execution = readUploadSecurityExecution(record.execution);
+  const execution = readExecution(record.execution, historical);
   if (!execution) return null;
+  let antivirusReceipt: ReturnType<typeof readUploadAntivirusReceipt> | undefined;
+  if (execution.version === 3) {
+    antivirusReceipt = null;
+    if (record.antivirusReceipt !== null)
+      antivirusReceipt = readUploadAntivirusReceipt(record.antivirusReceipt, execution.antivirus);
+  }
+  if (
+    execution.version === 3 &&
+    (!Object.prototype.hasOwnProperty.call(record, 'antivirusReceipt') ||
+      (record.antivirusReceipt !== null && !antivirusReceipt))
+  )
+    return null;
+  if (execution.version === 2 && Object.prototype.hasOwnProperty.call(record, 'antivirusReceipt'))
+    return null;
   const base = {
     execution,
     writerStopped: record.writerStopped,
     transientDataRemoved: record.transientDataRemoved,
+    ...(execution.version === 3 ? { antivirusReceipt } : {}),
   };
   if (execution.custody.kind === 'none')
     return Object.prototype.hasOwnProperty.call(record, 'providerReceipt') ? null : base;
@@ -579,6 +596,16 @@ export function readUploadSecuritySettlement(value: unknown): UploadSecuritySett
   return { ...base, providerReceipt };
 }
 
+/** Current retirement requires an explicit AV receipt/null and the exact full execution. */
+export function readUploadSecuritySettlement(value: unknown): UploadSecuritySettlement | null {
+  return readSettlement(value);
+}
+/** Retained cleanup never synthesizes a current AV receipt for an old execution. */
+export function readHistoricalUploadSecuritySettlement(
+  value: unknown,
+): UploadSecuritySettlement | null {
+  return readSettlement(value, true);
+}
 export function matchesUploadSecurityExecution(value: unknown, expected: unknown): boolean {
   const execution = readUploadSecurityExecution(value);
   const identity = readUploadSecurityExecution(expected);
@@ -596,8 +623,54 @@ export function isCompleteUploadSecuritySettlement(value: unknown, execution: un
     settlement !== null &&
     settlement.writerStopped &&
     settlement.transientDataRemoved &&
+    settlement.antivirusReceipt?.state === 'retired' &&
+    settlement.antivirusReceipt.originalProcessJoined &&
+    settlement.antivirusReceipt.ownedTransientDataRemoved &&
     (settlement.execution.custody.kind === 'none' ||
       settlement.providerReceipt?.state === 'retired') &&
     matchesUploadSecurityExecution(settlement.execution, execution)
+  );
+}
+
+/** Historical equality is never new-dispatch authority; it preserves original cleanup identity. */
+export function matchesHistoricalUploadSecurityExecution(
+  value: unknown,
+  expected: unknown,
+): boolean {
+  const e = readExecution(value, true),
+    original = readExecution(expected, true);
+  return !!e && !!original && JSON.stringify(e) === JSON.stringify(original);
+}
+export function isCompleteHistoricalUploadSecuritySettlement(
+  value: unknown,
+  execution: unknown,
+): boolean {
+  const s = readSettlement(value, true);
+  return (
+    !!s &&
+    s.writerStopped &&
+    s.transientDataRemoved &&
+    (s.execution.custody.kind === 'none' || s.providerReceipt?.state === 'retired') &&
+    (s.execution.version === 2 ||
+      (s.antivirusReceipt?.state === 'retired' &&
+        s.antivirusReceipt.originalProcessJoined &&
+        s.antivirusReceipt.ownedTransientDataRemoved)) &&
+    matchesHistoricalUploadSecurityExecution(s.execution, execution)
+  );
+}
+export function matchesHistoricalUploadSecurityApproval(
+  value: unknown,
+  subject: UploadSecuritySubject,
+  policySha256: string,
+  now: number,
+): boolean {
+  const a = readApproval(value, true),
+    scope = readUploadSecuritySubject(subject);
+  return (
+    !!a &&
+    !!scope &&
+    a.policySha256 === policySha256 &&
+    JSON.stringify(a.subject) === JSON.stringify(scope) &&
+    Date.parse(a.checkedAt) <= now
   );
 }

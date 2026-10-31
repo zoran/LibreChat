@@ -36,7 +36,7 @@ export async function reconcilePromotionOriginal({
     return record;
 
   const receipt = await options.storage
-    .observeOriginal({ binding, integrity: record.integrity, signal })
+    .observeOriginal({ principal: auth.principal, binding, integrity: record.integrity, signal })
     .catch(() => undefined);
 
   if (receipt?.outcome !== 'durable') return record;

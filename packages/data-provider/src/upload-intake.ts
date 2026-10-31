@@ -16,7 +16,10 @@ import {
   isUploadStorageReceipt,
   readUploadAcceptedMetadata,
 } from './upload-management';
-import { isUploadSecurityApproval } from './upload-security';
+import {
+  readUploadSecurityApproval,
+  readHistoricalUploadSecurityApproval,
+} from './upload-security';
 
 export type UploadIntakeGrant = {
   version: 1;
@@ -265,13 +268,15 @@ export function readUploadIntakeTicket(value: unknown): UploadIntakeTicket | nul
   };
 }
 
-function promotion(data: Record<string, unknown>): UploadPromotionInput | null {
+function promotion(data: Record<string, unknown>, historical = false): UploadPromotionInput | null {
   if (data.version !== 1 || !uuid(data.promotionId)) return null;
   const lease = transferLease(data.lease);
   const owner = worker(data.worker);
   const metadata = readUploadAcceptedMetadata(data.metadata);
-  const approval = data.approval;
-  if (!lease || !owner || !metadata || !isUploadSecurityApproval(approval)) return null;
+  const approval = historical
+    ? readHistoricalUploadSecurityApproval(data.approval)
+    : readUploadSecurityApproval(data.approval);
+  if (!lease || !owner || !metadata || !approval) return null;
   const subject = approval.subject;
   if (
     lease.tenantId !== subject.tenantId ||
@@ -298,10 +303,13 @@ export function readUploadPromotionInput(value: unknown): UploadPromotionInput |
   return data ? promotion(data) : null;
 }
 
-export function readUploadPromotionRecord(value: unknown): UploadPromotionRecord | null {
+export function readUploadPromotionRecord(
+  value: unknown,
+  historical = false,
+): UploadPromotionRecord | null {
   const data = closed(snapshot(value), RECORD_KEYS, ['receipt']);
   if (!data || typeof data.writerStopped !== 'boolean') return null;
-  const input = promotion(data);
+  const input = promotion(data, historical);
   if (!input || (data.receipt !== undefined && !isUploadStorageReceipt(data.receipt))) return null;
   const receipt = data.receipt;
   if (

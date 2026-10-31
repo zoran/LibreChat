@@ -1,10 +1,12 @@
+import { uploadOriginalSource } from './uploadManagementState';
+import { uploadRecordBudget } from './uploadManagementState';
 /** Private frozen snapshot, validated import and single-owner cutover for the upload repository. */
 import { mongo } from 'mongoose';
 import { randomUUID } from 'crypto';
 import {
   UPLOAD_MAX_FILE_BYTES,
   UPLOAD_MAX_TEXT_BYTES,
-  UPLOAD_RECORD_BYTES,
+  UPLOAD_DERIVED_MAX_ORIGIN_BYTES,
   UPLOAD_RETENTION_MS,
   isUploadOriginalIntegrity,
   isUploadStorageReceipt,
@@ -49,6 +51,7 @@ import { projectUploadHousekeeping } from './uploadHousekeepingProjection';
 import { validateUploadMigrationIntake } from './uploadManagementIntake';
 import { validateUploadFileCleanupMigration } from './uploadFileCleanup';
 import { readUploadAdmission } from './uploadManagementAdmission';
+import { uploadOriginalKey } from './uploadManagementState';
 import { uploadSecurityPolicySha256 } from './fileSecurity';
 
 /** One private replacement protocol; the existing File/storage owners reconcile their own data. */
@@ -101,7 +104,7 @@ export function createUploadMigrationMethods(
       (!['text/plain', 'text/csv'].includes(row.mediaType) ||
         row.declaredBytes > 65_536 ||
         mongo.BSON.calculateObjectSize({ derivedOrigin: origin, fingerprint: row.fingerprint }) >
-          UPLOAD_RECORD_BYTES / 2 ||
+          UPLOAD_DERIVED_MAX_ORIGIN_BYTES ||
         (row.original && row.original.filepath !== `/api/files/managed/${row._id}`))
     )
       reject('migration_conflict');
@@ -159,7 +162,7 @@ export function createUploadMigrationMethods(
       ![0, row.declaredBytes].includes(row.originalBytes) ||
       ![0, row.declaredBytes].includes(row.pendingBytes) ||
       !integer(row.textBytes, UPLOAD_MAX_TEXT_BYTES) ||
-      row.recordBytes !== UPLOAD_RECORD_BYTES
+      row.recordBytes !== uploadRecordBudget(row)
     )
       reject('migration_conflict');
     if (
@@ -195,11 +198,10 @@ export function createUploadMigrationMethods(
         row.original.outcome !== 'durable' ||
         (row.originalBytes > 0 &&
           !isUploadOriginalIntegrity(row.original.integrity, row.declaredBytes)) ||
-        row.original.source !== 's3' ||
+        row.original.source !== uploadOriginalSource(row) ||
         row.original.bytes !== row.actualBytes ||
         !text(row.original.filepath, 4096) ||
-        row.original.storageKey !==
-          `${row.tenantId === null ? '' : `t/${row.tenantId}/`}managed-uploads/${row.userId}/${row._id}.${row.attemptGeneration}__original` ||
+        row.original.storageKey !== uploadOriginalKey(row) ||
         ['waiting', 'cancelled'].includes(row.state)
       )
         reject('migration_conflict');

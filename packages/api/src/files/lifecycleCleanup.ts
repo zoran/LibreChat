@@ -10,6 +10,8 @@ import type {
 } from '@librechat/data-schemas';
 import type { StoragePort, StorageDeletionInput } from '../uploads/contract';
 import type { GenerationCleanupPort } from '../generation-cleanup';
+import type { NasStoragePort } from '../storage/nas';
+import { getNasS3StorageCapture } from '../storage/nas';
 
 export interface FileCleanupComposition {
   entry: FileCleanupClaimMethods;
@@ -20,6 +22,8 @@ export interface FileCleanupComposition {
     StoragePort,
     'describeDeletion' | 'beginDeletion' | 'observeDeletion' | 'acknowledgeDeletionConsumed'
   >;
+  /** Explicit NAS owner alongside the retained managed backend; never an outage fallback. */
+  nasStorage?: NasStoragePort;
   /** Actual transport deadline; no promise is detached by a timeout race. */
   storageBudgetMs: number;
 }
@@ -105,6 +109,37 @@ export function createFileCleanupPort(ports: FileCleanupComposition): FileCleanu
         current = await ports.lifecycle.observe(claim, signal);
         if (current.state !== 'progress') return outcome(current);
         const life = current.progress.lifecycle;
+        if (life?.upload.backend?.kind === 'nas-s3') {
+          const nasStorage = ports.nasStorage;
+          const capture = nasStorage && getNasS3StorageCapture(nasStorage);
+          const backend = life.upload.backend;
+          if (
+            !nasStorage ||
+            !capture ||
+            life.storage !== null ||
+            capture.backend.uid !== backend.uid ||
+            capture.backend.configurationSha256 !== backend.configurationSha256 ||
+            capture.backend.protocol !== backend.protocol
+          )
+            return { state: 'pending', code: 'owner_pending' };
+          if (life.nasStorage?.state !== 'consumed') {
+            const tenantId = life.upload.tenantId;
+            const result = await nasStorage.cleanupOriginal({
+              principal:
+                tenantId === null
+                  ? { authentication: 'guest', tenantId, userId: life.upload.userId }
+                  : { authentication: 'verified-email', tenantId, userId: life.upload.userId },
+              operationId: life.upload.operationId,
+              claim,
+              signal,
+              deadlineAtMs: Date.now() + ports.storageBudgetMs,
+            });
+            if (result.state !== 'complete') return { state: 'pending', code: 'owner_pending' };
+          }
+          // The actual NAS consumer already joined File/Upload/HK custody and retention in one
+          // transaction. Finalization rechecks that committed owner state, not the returned shape.
+          return outcome(await ports.lifecycle.finalize(claim, signal));
+        }
         const storage = life?.storage;
         if (!life || !storage) return { state: 'pending', code: 'owner_pending' };
         const base = {

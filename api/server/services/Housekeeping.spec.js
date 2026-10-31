@@ -113,6 +113,11 @@ describe('standalone Housekeeping service custody', () => {
       optionalEnabled: (value) => (value === undefined ? undefined : value === 'true'),
       createManagedS3Client: jest.fn(() => client),
       createManagedS3Storage: jest.fn(() => ({})),
+      createHousekeepingUploadStorage: jest.fn(async ({ managedStorage }) => ({
+        storage: managedStorage,
+        managedCleanup: managedStorage,
+        close: jest.fn(),
+      })),
       getManagedS3Provider: jest.fn(() => ({ state: 'unavailable' })),
       createManagedFilePurge: jest.fn(async () => retrieval),
       createManagedUploadCleanup: jest.fn(() => ({ reconcileCleanupOperation: jest.fn() })),
@@ -229,9 +234,11 @@ describe('standalone Housekeeping service custody', () => {
     dependencies.uploadCleanup.step(claim, signal);
     expect(cleanup.reconcileCleanupOperation).toHaveBeenCalledWith(claim, signal);
     expect(Object.keys(api.createManagedUploadCleanup.mock.calls[0][0]).sort()).toEqual([
+      'nasStorage',
       'repository',
       'storage',
     ]);
+    expect(api.createManagedUploadCleanup.mock.calls[0][0].nasStorage).toBeUndefined();
     const derivatives = schemas.createFileCleanupLifecycleMethods.mock.calls[0][4];
     const who = { userId: 'owner' };
     derivatives.purgeRetrieval(who, ['file'], signal);

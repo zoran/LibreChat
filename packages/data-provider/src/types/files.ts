@@ -4,6 +4,7 @@ import type { CodeEnvRef, CodeEnvRefMap } from '../codeEnvRef';
 import { EToolResources } from './tools';
 
 export enum FileSources {
+  nas_s3 = 'nas-s3',
   local = 'local',
   firebase = 'firebase',
   azure = 'azure',

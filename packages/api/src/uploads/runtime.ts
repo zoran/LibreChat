@@ -17,6 +17,8 @@ import { advanceUploadController, createUploadControllerState } from './control'
 
 type UploadStatus = Pick<ManagedUploadSnapshot, 'throttled' | 'waitingReason' | 'admissionsPaused'>;
 export interface UploadRuntimeOptions {
+  /** Same canonical NAS owner as resources; no second pause authority or I/O on status reads. */
+  storageAvailability?: { status(): NonNullable<ManagedUploadSnapshot['storageAvailability']> };
   ownerId: string;
   repository: Pick<
     UploadRepository,
@@ -199,7 +201,7 @@ export function createUploadRuntime(options: UploadRuntimeOptions): UploadRuntim
     });
     return flight;
   }
-  function status(): UploadStatus {
+  function statusBase(): UploadStatus {
     const at = clock();
     if (
       stopped ||
@@ -233,7 +235,12 @@ export function createUploadRuntime(options: UploadRuntimeOptions): UploadRuntim
   }
   return {
     tick,
-    status,
+    status: () => ({
+      ...statusBase(),
+      ...(options.storageAvailability
+        ? { storageAvailability: options.storageAvailability.status() }
+        : {}),
+    }),
     start() {
       if (stopped) throw new Error('closed_upload_runtime');
       if (timer) return;
@@ -256,7 +263,7 @@ export function createUploadRuntime(options: UploadRuntimeOptions): UploadRuntim
 
 export interface UploadRuntime {
   tick(): Promise<void>;
-  status(): UploadStatus;
+  status(): UploadStatus & Pick<ManagedUploadSnapshot, 'storageAvailability'>;
   start(): void;
   stop(): Promise<void>;
 }

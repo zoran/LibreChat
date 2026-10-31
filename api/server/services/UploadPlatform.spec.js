@@ -1,7 +1,10 @@
 jest.mock('node:fs/promises', () => ({ readFile: jest.fn() }));
-jest.mock('@librechat/api', () => ({
+jest.mock('../../../packages/api/src/uploads/platform/runtime', () => ({
   createUploadPlatformRuntime: jest.fn((options) => options),
-  parseUploadBackendBinding: jest.fn(),
+}));
+jest.mock('@librechat/api', () => ({
+  ...require('../../../packages/api/src/uploads/platform/runtime'),
+  ...jest.requireActual('../../../packages/api/src/uploads/platform/composition'),
 }));
 jest.mock('@librechat/data-schemas', () => ({ runAsSystem: jest.fn((operation) => operation()) }));
 const { readFile } = require('node:fs/promises');

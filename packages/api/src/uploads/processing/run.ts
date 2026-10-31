@@ -2,7 +2,12 @@ import path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { mkdir, open, rm } from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
-import type { UploadWorker, UploadLease, UploadParserExecution } from 'librechat-data-provider';
+import type {
+  UploadWorker,
+  UploadLease,
+  UploadParserExecution,
+  UploadPrincipal,
+} from 'librechat-data-provider';
 import type {
   DocumentPort,
   StoragePort,
@@ -107,6 +112,12 @@ export async function processNextManagedUpload(
     controller.signal.throwIfAborted();
     timer = setTimeout(renew, 5_000);
     const input = await deps.management.getProcessingInput(lease);
+    if (input.operationId !== lease.operationId)
+      throw new Error('Processing original operation mismatch');
+    const principal: UploadPrincipal =
+      lease.tenantId === null
+        ? { authentication: 'guest', tenantId: null, userId: lease.userId }
+        : { authentication: 'verified-email', tenantId: lease.tenantId, userId: lease.userId };
     const attemptId = uploadAttemptId(lease);
     const original = attemptOriginalPath(deps.stagingRoot, attemptId);
     stagingAttempted = true;
@@ -116,6 +127,8 @@ export async function processNextManagedUpload(
     let bytes = 0;
     try {
       for await (const chunk of deps.storage.read({
+        principal,
+        operationId: lease.operationId,
         original: input.original,
         signal: controller.signal,
       })) {

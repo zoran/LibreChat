@@ -3563,7 +3563,6 @@
   "com_auth_email_link_invalid": "This link is no longer valid. Request a new code.",
   "com_auth_email_link_unavailable": "Your current sign-in could not be checked. No code was redeemed.",
   "com_auth_email_link_working": "Checking your sign-in …",
-  "com_auth_email_link_switch": "You are already signed in. Use the sign-in from this email instead?",
   "com_auth_email_link_confirm": "Sign in using the code from this email.",
   "com_auth_email_link_continue": "Sign in",
   "com_auth_email_link_browser": "Open this link in the browser where you requested the code. On another device, request a new code.",
@@ -3789,5 +3788,7 @@
   "com_status_purpose_stack_component": "Kubernetes component",
   "com_status_purpose_configured_placement": "Configured target server",
   "com_status_purpose_orchestration": "Orchestration",
-  "com_status_role_legend": "Chip: CPU server · Card: GPU server · Hexagon: Kubernetes · Configured identity and health are separate"
+  "com_status_role_legend": "Chip: CPU server · Card: GPU server · Hexagon: Kubernetes · Configured identity and health are separate",
+  "com_upload_storage_unavailable": "Uploads are temporarily unavailable because storage cannot be reached. Please try again when the upload button is available.",
+  "com_upload_storage_stale": "The storage status could not be confirmed. Uploads will be available again after the connection is checked."
 }

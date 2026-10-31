@@ -1,6 +1,6 @@
 /** Private Workspace access composes the existing File approval, lineage and retention authority. */
 import {
-  matchesUploadSecurityApproval,
+  matchesHistoricalUploadSecurityApproval,
   readUploadDerivedIntent,
   readUploadDerivedOrigin,
   readUploadSecuritySubject,
@@ -34,7 +34,7 @@ export type WorkspaceFileSource = {
   tenantId: string | null;
   type: 'text/plain' | 'text/csv';
   bytes: number;
-  source: 's3';
+  source: 's3' | 'nas-s3';
   storageKey: string;
   filepath: string;
   status: 'ready';
@@ -168,7 +168,7 @@ export function createFileWorkspaceMethods(
       JSON.stringify(origin.binding) !== JSON.stringify(input.reference.binding) ||
       origin.ancestors.some((source) => source.subject.operationId === row.file_id) ||
       !subject ||
-      !matchesUploadSecurityApproval(row.securityApproval, subject, policy, input.now) ||
+      !matchesHistoricalUploadSecurityApproval(row.securityApproval, subject, policy, input.now) ||
       (row.type !== 'text/plain' && row.type !== 'text/csv') ||
       !Number.isSafeInteger(row.bytes) ||
       row.bytes < 1 ||
@@ -220,7 +220,7 @@ export function createFileWorkspaceMethods(
       tenantId: scope.tenantId,
       type: row.type,
       bytes: row.bytes,
-      source: 's3',
+      source: row.source === 'nas-s3' ? 'nas-s3' : 's3',
       storageKey: row.storageKey,
       filepath: row.filepath,
       status: 'ready',

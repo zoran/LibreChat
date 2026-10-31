@@ -3643,7 +3643,6 @@
   "com_auth_email_link_invalid": "Dieser Link ist nicht mehr gültig. Fordere einen neuen Code an.",
   "com_auth_email_link_unavailable": "Deine aktuelle Anmeldung konnte nicht geprüft werden. Es wurde kein Code eingelöst.",
   "com_auth_email_link_working": "Anmeldung wird geprüft …",
-  "com_auth_email_link_switch": "Du bist bereits angemeldet. Möchtest du die Anmeldung aus dieser E-Mail verwenden?",
   "com_auth_email_link_confirm": "Melde dich mit dem Code aus dieser E-Mail an.",
   "com_auth_email_link_continue": "Anmelden",
   "com_auth_email_link_browser": "Öffne den Link in dem Browser, in dem du den Code angefordert hast. Auf einem anderen Gerät kannst du einen neuen Code anfordern.",
@@ -3957,5 +3956,7 @@
   "com_status_usage_input_tokens": "Eingabetokens",
   "com_status_usage_all_tiers": "Alle Eingabegrößen",
   "com_status_usage_graph_reference": "Preisreferenz vom",
-  "com_status_usage_fx_stale": "Wechselkurs veraltet"
+  "com_status_usage_fx_stale": "Wechselkurs veraltet",
+  "com_upload_storage_unavailable": "Uploads sind vorübergehend nicht möglich, weil der Speicher nicht erreichbar ist. Versuche es erneut, sobald die Upload-Schaltfläche wieder verfügbar ist.",
+  "com_upload_storage_stale": "Der Speicherstatus konnte nicht bestätigt werden. Uploads sind nach der erneuten Verbindungsprüfung wieder möglich."
 }

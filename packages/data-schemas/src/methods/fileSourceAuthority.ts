@@ -1,3 +1,4 @@
+import { uploadOriginalSource } from './uploadManagementState';
 /** File-owned current receipt assembly and bounded observations; no activity or quota mutation. */
 import { createHash } from 'crypto';
 import {
@@ -5,7 +6,7 @@ import {
   UPLOAD_RETENTION_MS,
   isUploadOriginalIntegrity,
   isUploadStorageReceipt,
-  matchesUploadSecurityApproval,
+  matchesHistoricalUploadSecurityApproval,
   readManagedDocumentResult,
   readUploadDerivedOrigin,
   readHistoricalUploadDerivedOrigin,
@@ -222,7 +223,7 @@ export function assembleManagedFileSource(
     !isUploadStorageReceipt(original) ||
     original.outcome !== 'durable' ||
     !isUploadOriginalIntegrity(original.integrity, original.bytes) ||
-    original.source !== 's3' ||
+    original.source !== uploadOriginalSource(operation) ||
     original.source !== file.source ||
     original.filepath !== file.filepath ||
     operation.filename !== file.filename ||
@@ -242,7 +243,7 @@ export function assembleManagedFileSource(
     operation.userId !== owner.userId ||
     operation.tenantId !== (owner.tenantId ?? null) ||
     typeof policy !== 'string' ||
-    !matchesUploadSecurityApproval(
+    !matchesHistoricalUploadSecurityApproval(
       approval,
       {
         tenantId: owner.tenantId ?? null,

@@ -7,21 +7,12 @@ import type {
   UploadSecurityApproval,
 } from 'librechat-data-provider';
 
-export type ManagedUploadWriteInput = Readonly<{
-  bucket: string;
-  key: string;
-  operationId: string;
-  generation: string;
-  bytes: number;
-  wholeSHA256: string;
-  mediaType: string;
-}>;
-
-export type ManagedUploadWriteBinding = ManagedUploadWriteInput &
-  Readonly<{
-    version: 1;
-    originalDeadline: string;
-  }>;
+export type { ManagedUploadWriteInput, ManagedUploadWriteBinding } from 'librechat-data-provider';
+import type {
+  ManagedUploadWriteInput,
+  ManagedUploadWriteBinding,
+  UploadOriginalWriteBinding,
+} from 'librechat-data-provider';
 
 export type ManagedUploadWriteBinder = (
   input: ManagedUploadWriteInput,
@@ -38,5 +29,5 @@ export interface UploadWriteMethods {
   readOriginalWrite(
     principal: UploadPrincipal,
     operationId: string,
-  ): Promise<ManagedUploadWriteBinding | null>;
+  ): Promise<UploadOriginalWriteBinding | null>;
 }

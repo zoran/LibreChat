@@ -80,6 +80,9 @@ describe('standalone Housekeeping executable configuration and custody', () => {
       ...shutdown,
       HOUSEKEEPING_POLICY: { drainMs: 120000 },
       resolveCheckpointerConfig,
+      readHousekeepingLocalConfiguration: jest.requireActual(
+        '../../packages/api/src/housekeeping/localConfiguration',
+      ).readHousekeepingLocalConfiguration,
       loadManagedFileDeploymentConfiguration: jest.fn(async () => trustedFile),
     };
     jest.doMock('@librechat/api/housekeeping', () => api);
@@ -97,6 +100,45 @@ describe('standalone Housekeeping executable configuration and custody', () => {
   });
 
   const entry = () => require('./housekeeping');
+
+  it('passes the validated private NAS selection from the same local YAML into its service', async () => {
+    handle = mounted(
+      JSON.stringify({
+        version: '1.3.1',
+        fileConfig: {
+          managedUploads: {
+            storage: {
+              kind: 'nas-s3',
+              uid: 'owned-nas',
+              endpoint: 'https://storage.example.test:8010',
+              bucket: 'cortex-files',
+              credentialsFile: '/etc/cortex/nas-secret.json',
+              trust: { mode: 'ca-hostname' },
+            },
+            health: { requiredHosts: ['cpu-2', 'cpu-3', 'cpu-4', 'cpu-5'] },
+          },
+        },
+      }),
+    );
+    await expect(entry().startHousekeeping(environment())).resolves.toEqual({ ready: true });
+    expect(createService.mock.calls[0][0].managedUploads).toMatchObject({
+      storage: { kind: 'nas-s3', uid: 'owned-nas', region: 'us-east-1' },
+      health: { intervalMs: 60000, maxAgeMs: 90000 },
+    });
+    expect(handle.close).toHaveBeenCalledTimes(1);
+    expect(open).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses malformed selected NAS settings before starting any service', async () => {
+    handle = mounted(
+      JSON.stringify({ fileConfig: { managedUploads: { storage: { kind: 'nas-s3' } } } }),
+    );
+    await expect(entry().startHousekeeping(environment())).rejects.toThrow(
+      'Housekeeping configuration unavailable',
+    );
+    expect(createService).not.toHaveBeenCalled();
+    expect(handle.close).toHaveBeenCalledTimes(1);
+  });
 
   it('is inert at import, snapshots supplied identities and invokes one service with actual defaults', async () => {
     const count = process.listenerCount('SIGTERM');

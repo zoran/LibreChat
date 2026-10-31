@@ -10,9 +10,11 @@ import {
   langfuseConfigSchema,
   skillSyncConfigSchema,
   summarizationConfigSchema,
+  managedUploadsConfigSchema,
 } from 'librechat-data-provider';
 import type {
   FileSources,
+  TFileConfig,
   DeepPartial,
   TCustomConfig,
   TAgentsEndpoint,
@@ -161,6 +163,19 @@ export const AppService = async (params?: {
     throw new Error('Config is required');
   }
   const configDefaults = getConfigDefaults();
+  // Preserve the existing trusted custom-config boundary; never expose managed deployment paths.
+  const configuredFiles = config.fileConfig as TFileConfig | undefined;
+  let publicFileConfig: AppConfig['fileConfig'] = configuredFiles;
+  let managedUploads: AppConfig['managedUploads'];
+  if (configuredFiles && Object.prototype.hasOwnProperty.call(configuredFiles, 'managedUploads')) {
+    const { managedUploads: privateConfig, ...publicConfig } = configuredFiles;
+    publicFileConfig = publicConfig;
+    if (privateConfig !== undefined) {
+      const parsed = managedUploadsConfigSchema.safeParse(privateConfig);
+      if (!parsed.success) throw new Error('Managed upload configuration unavailable');
+      managedUploads = parsed.data;
+    }
+  }
 
   const ocr = loadOCRConfig(config.ocr);
   const webSearch = loadWebSearchConfig(config.webSearch);
@@ -273,7 +288,8 @@ export const AppService = async (params?: {
 
   const appConfig: AppConfig = {
     ...defaultConfig,
-    fileConfig: config?.fileConfig as AppConfig['fileConfig'],
+    fileConfig: publicFileConfig,
+    managedUploads,
     modelSpecs: processModelSpecs(config?.endpoints, config.modelSpecs, interfaceConfig),
     endpoints: loadedEndpoints,
   };

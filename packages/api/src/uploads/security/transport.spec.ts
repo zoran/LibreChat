@@ -7,6 +7,11 @@ import type { LookupAddress, LookupAllOptions } from 'node:dns';
 import type { RequestListener } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { UploadSecurityPort } from '../contract';
+import {
+  antivirusCustodyFixture,
+  antivirusApprovalFixture,
+  antivirusReceiptFixture,
+} from './antivirus-fixture.helper';
 import { createHttpUploadSecurityPort, createSecurityRequestHandler } from './transport';
 import { createSecurityTlsFixture } from './tls-fixture.helper';
 
@@ -20,13 +25,16 @@ const subject = {
   bytes: 5,
   sha256: createHash('sha256').update('hello').digest('hex'),
 };
+const fixtureNow = Date.now();
+const expiresAt = new Date(fixtureNow + 60_000).toISOString();
 const execution = {
-  version: 2 as const,
+  version: 3 as const,
+  antivirus: antivirusCustodyFixture(subject, expiresAt, fixtureNow),
   custody: { kind: 'none' as const },
   attemptId: 'operation.1',
   instanceId: '11111111-1111-4111-8111-111111111111',
   executionId: '22222222-2222-4222-8222-222222222222',
-  expiresAt: '2099-01-01T00:00:00.000Z',
+  expiresAt,
 };
 const signal = () => new AbortController().signal;
 // Select the exact native overload called by the helper; only the DNS boundary is controlled.
@@ -39,18 +47,25 @@ const body = async function* () {
 };
 const inspection = () => ({
   decision: {
-    version: 1 as const,
+    version: 2 as const,
+    antivirus: antivirusApprovalFixture(execution, fixtureNow),
     decision: 'approved' as const,
     subject: { ...subject },
     policySha256,
     scannerVersion: 'test/1',
-    checkedAt: '2026-10-17T00:00:00.000Z',
+    checkedAt: new Date(fixtureNow).toISOString(),
     coverage: { complete: true as const, pages: 1, parts: 1 },
   },
-  settlement: { execution, writerStopped: true as const, transientDataRemoved: true as const },
+  settlement: {
+    execution,
+    antivirusReceipt: antivirusReceiptFixture(execution),
+    writerStopped: true as const,
+    transientDataRemoved: true as const,
+  },
 });
 const settlement = () => ({
   execution: { ...execution },
+  antivirusReceipt: antivirusReceiptFixture(execution),
   writerStopped: true,
   transientDataRemoved: true,
 });
@@ -458,7 +473,7 @@ describe('bounded authenticated scanner transport', () => {
   });
   it.each([
     'bad-base64',
-    'a'.repeat(4097),
+    'a'.repeat(8193),
     Buffer.from(JSON.stringify({ execution, subject, extra: true })).toString('base64'),
   ])('rejects invalid inspect context #%#', async (context) => {
     const core = worker();

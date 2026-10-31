@@ -17,7 +17,7 @@ test('both build branches converge before pruning and security asset generation'
   assert.match(source, /apk add --no-cache[^\n]* setpriv util-linux-misc/);
   assert.match(
     source,
-    /fi &&\s*\\\s*npm prune --production &&\s*\\\s*npm cache clean --force[\s\S]*USER root\nRUN node scripts\/ci\/security-process-assets.mjs\nUSER node/,
+    /fi &&\s*\\\s*npm prune --production &&\s*\\\s*npm cache clean --force[\s\S]*USER root\nRUN node scripts\/ci\/security-process-assets.mjs[\s\S]*?USER node/,
   );
   assert.equal(source.match(/RUN node scripts\/ci\/security-process-assets.mjs/g)?.length, 1);
 });

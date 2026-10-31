@@ -15,11 +15,11 @@ import type { UploadSecurityPort } from '../contract';
 import { createPinnedServiceEndpoint } from '../intake/endpoint';
 
 const JSON_LIMIT = 8192;
-// Preserve the existing request/header budget. A complete v2 response also carries
-// the fixed dispatch table: 60 safe-integer counts, bounded identity and timestamps.
-// Its envelope fits within 4 KiB in addition to the previously supported 8 KiB payload.
-const RESPONSE_JSON_LIMIT = JSON_LIMIT + 4096;
-const CONTEXT_LIMIT = 4096;
+// Keep JSON/header input at8KiB. Mandatory AV original+approval+retirement and PDF
+// scopes are bounded together: the maximal representative envelope is under24KiB.
+// Base64 request context grows only to8KiB; actual raw-header admission stays8KiB.
+const RESPONSE_JSON_LIMIT = 24 * 1024;
+const CONTEXT_LIMIT = 8192;
 const DEADLINE_MS = 60_000;
 const failure = () => new Error('security_uninspectable');
 

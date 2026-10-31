@@ -2,15 +2,15 @@
 import path from 'node:path';
 import { lstat, realpath, rm } from 'node:fs/promises';
 import {
-  readUploadSecuritySettlement,
-  isCompleteUploadSecuritySettlement,
+  readHistoricalUploadSecuritySettlement,
+  isCompleteHistoricalUploadSecuritySettlement,
 } from 'librechat-data-provider';
 import type { UploadCleanupTask, UploadCleanupProof, UploadWorker } from 'librechat-data-provider';
 import type { UploadManagementRepository } from '@librechat/data-schemas';
 import type { DocumentPort, UploadAttemptPort, UploadSecurityPort } from './contract';
+import { cancelHistoricalSecurityExecution } from './security/cancellation';
 import { attemptOriginalPath, uploadAttemptId } from './processing/paths';
 import { settleUploadPromotionCleanup } from './intake/promotion-cleanup';
-import { cancelSecurityExecution } from './security/cancellation';
 
 export interface UploadActorSettlement {
   settle(task: UploadCleanupTask, signal: AbortSignal): Promise<UploadCleanupProof>;
@@ -120,10 +120,12 @@ export function createUploadActorSettlement(
       proof.localCopiesAbsent = await removeLocal(task);
     }
     if (local(task) && task.securityExecution) {
-      const stored = readUploadSecuritySettlement(task.securitySettlement);
-      const settled = isCompleteUploadSecuritySettlement(stored, task.securityExecution)
+      // Cleanup preserves the exact original protocol. Current executions still require AV
+      // retirement; an authentic retained V2 receipt cannot authorize a new dispatch.
+      const stored = readHistoricalUploadSecuritySettlement(task.securitySettlement);
+      const settled = isCompleteHistoricalUploadSecuritySettlement(stored, task.securityExecution)
         ? stored
-        : await cancelSecurityExecution(options.security, task.securityExecution, signal);
+        : await cancelHistoricalSecurityExecution(options.security, task.securityExecution, signal);
       securityPending = !settled;
       if (settled) proof.securitySettlement = settled;
     }

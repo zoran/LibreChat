@@ -1,3 +1,5 @@
+import { uploadOriginalSource } from './uploadManagementState';
+/** Internal same-session join: File owns physical deletion; Upload owns its retained accounting ACK. */
 /** Internal same-session join: File owns physical deletion; Upload owns its retained accounting ACK. */
 import { createHash, randomUUID } from 'node:crypto';
 import {
@@ -7,12 +9,10 @@ import {
   isStorageDeletionRequest,
   isStorageDeletionResult,
   isStorageDeletionConsumptionResult,
-  isUploadOriginalIntegrity,
 } from 'librechat-data-provider';
 import type { ClientSession, mongo } from 'mongoose';
 import type {
   FileCleanupProgress,
-  FileUploadCleanupBinding,
   FileUploadCleanupAcknowledgment,
   FileStorageCleanupCustody,
 } from '../types/fileCleanup';
@@ -25,12 +25,14 @@ import {
   validateUploadCleanupCustody,
   assertUploadCleanupCapacity,
 } from './uploadCleanupReceipts';
-import { uploadOriginalKey, readStoredUploadPromotion } from './uploadManagementIntake';
+
 import { createUploadStore, uploadDigest, reject } from './uploadManagementStore';
 import { managedFileScope, currentFileDeadline } from './fileSourceAuthority';
 import { createUploadCleanupTransitions } from './uploadManagementCleanup';
 import { managedFileRetrievalDeletionSettled } from './fileRetrieval';
 import { ownershipFilter } from './housekeepingStore';
+import { uploadFileCleanupBinding } from './uploadFileCleanupBinding';
+import { observeNasFileCleanup } from './uploadNasFileCleanup';
 
 type Pending = Exclude<
   Awaited<ReturnType<AcceptedFileCleanupOwner['fenceAcceptedFileCleanup']>>,
@@ -48,53 +50,7 @@ const pending = (reason: AcceptedFileCleanupPendingReason = 'owner_pending'): Pe
 });
 const digest = (v: string) => createHash('sha256').update(v).digest('hex');
 
-function bindingOf(row: StoredUpload): FileUploadCleanupBinding | null {
-  const original = row.original;
-  if (
-    row.acceptedAt == null ||
-    !row.fileId ||
-    !positive(row.attemptGeneration) ||
-    !positive(row.generation) ||
-    !original ||
-    original.outcome !== 'durable' ||
-    original.storageKey !== uploadOriginalKey(row) ||
-    original.bytes !== row.actualBytes ||
-    !isUploadOriginalIntegrity(original.integrity, original.bytes)
-  )
-    return null;
-  const promotion = readStoredUploadPromotion(row);
-  return {
-    tenantId: row.tenantId,
-    userId: row.userId,
-    fileId: row.fileId,
-    operationId: row._id,
-    cleanupGeneration: row.generation,
-    attemptGeneration: row.attemptGeneration,
-    workerGeneration: row.workerGeneration ?? null,
-    worker: row.worker ? { ...row.worker } : null,
-    promotion: promotion
-      ? {
-          promotionId: promotion.promotionId,
-          generation: promotion.lease.generation,
-          worker: { ...promotion.worker },
-        }
-      : null,
-    originalKey: original.storageKey,
-    originalSource: original.source,
-    originalBytes: original.bytes,
-    acceptedObjectSHA256: uploadDigest([
-      'upload-original-receipt-binding-v1',
-      {
-        tenantId: row.tenantId,
-        userId: row.userId,
-        operationId: row._id,
-        attemptGeneration: row.attemptGeneration,
-        key: original.storageKey,
-      },
-      original,
-    ]),
-  };
-}
+const bindingOf = uploadFileCleanupBinding;
 
 function retainedStorage(
   row: StoredUpload,
@@ -213,8 +169,18 @@ export async function validateUploadFileCleanupMigration(
     .maxTimeMS(1000)
     .lean<FileRow>();
   if (!row.cleanupCustody?.acceptedFileAck) {
+    if (file?.retentionCleanup?.lifecycle?.nasStorage?.state === 'consumed')
+      reject('migration_conflict');
     const state = file?.retentionCleanup?.lifecycle?.storage?.state;
     if (state === 'committed' || state === 'consumed') reject('migration_conflict');
+    return;
+  }
+  if (row.writeBinding?.version === 2) {
+    if (
+      !file ||
+      (await observeNasFileCleanup(mongoose, row, file, session)).state !== 'acknowledged'
+    )
+      reject('migration_conflict');
     return;
   }
   validateUploadCleanupCustody(row);
@@ -320,7 +286,8 @@ export function createUploadFileCleanupOwner(
       row.cleanupCustody?.request
     )
       return pending();
-    if (row.original?.source !== 's3') return pending('source_strategy_unavailable');
+    if (row.original?.source !== uploadOriginalSource(row))
+      return pending('source_strategy_unavailable');
     if (!bindingOf(row)) return pending();
     if (
       file.retentionCleanup?.lifecycle?.contentPrepared !== true &&
@@ -407,6 +374,8 @@ export function createUploadFileCleanupOwner(
       const p = file.retentionCleanup,
         l = p?.lifecycle,
         s = l?.storage;
+      if (row.writeBinding?.version === 2)
+        return observeNasFileCleanup(mongoose, row, file, session);
       if (
         p &&
         (p.schema !== 1 ||
@@ -525,6 +494,10 @@ export function createUploadFileCleanupOwner(
       const current = await load(input, session);
       if ('state' in current) return current;
       const { row, file, job, counter, global } = current;
+      if (row.writeBinding?.version === 2) {
+        const observed = await observeNasFileCleanup(mongoose, row, file, session);
+        return observed.state === 'pending' ? pending() : observed;
+      }
       const progress = file.retentionCleanup;
       if (
         !progress ||

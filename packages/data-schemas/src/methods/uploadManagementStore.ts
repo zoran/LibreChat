@@ -1,12 +1,13 @@
+import { uploadRecordBudget, hasHistoricalUploadSecurityObligation } from './uploadManagementState';
+/** Private persistence primitives for the one Upload Management repository. */
 /** Private persistence primitives for the one Upload Management repository. */
 import { performance } from 'perf_hooks';
 import { setTimeout as delay } from 'timers/promises';
-import { createHash, randomInt, randomUUID } from 'crypto';
+import { randomInt, randomUUID } from 'crypto';
 import {
   isUploadPrincipal,
-  readUploadSecurityExecution,
-  isCompleteUploadSecuritySettlement,
-  UPLOAD_RECORD_BYTES,
+  readHistoricalUploadSecurityExecution,
+  isCompleteHistoricalUploadSecuritySettlement,
 } from 'librechat-data-provider';
 import type {
   UploadPrincipal,
@@ -22,12 +23,19 @@ import type { ClientSession, Model } from 'mongoose';
 import type { FileCoverageState, FileCoverageMigrationState } from './fileHousekeepingCoverage';
 import type { ManagedRetrievalInventoryAuthority } from './fileRetrieval';
 import type { StoredUpload } from './uploadManagementState';
+import { validateNasUploadState } from './uploadManagementNasState';
 import { reject, assertUploadCleanupCapacity } from './uploadManagementState';
 import { projectUploadHousekeeping } from './uploadHousekeepingProjection';
 import { tenantStorage, SYSTEM_TENANT_ID } from '~/config/tenantContext';
 
 export type { StoredUpload } from './uploadManagementState';
-export { WAIT_MS, PROCESS_MS, reject, storedUploadPrincipal } from './uploadManagementState';
+export {
+  WAIT_MS,
+  PROCESS_MS,
+  reject,
+  storedUploadPrincipal,
+  uploadDigest,
+} from './uploadManagementState';
 
 export const LEASE_MS = 45_000;
 export const MAX_QUEUE_BYTES = 1_073_741_824;
@@ -389,6 +397,7 @@ export function createUploadStore(
       attemptGeneration: Number,
       original: S.Types.Mixed,
       writeBinding: S.Types.Mixed,
+      originalWrite: S.Types.Mixed,
       securityApproval: S.Types.Mixed,
       securityExecution: S.Types.Mixed,
       securitySettlement: S.Types.Mixed,
@@ -414,6 +423,10 @@ export function createUploadStore(
     { versionKey: false },
   );
   operationSchema.index({ tenantId: 1, userId: 1, idempotencyKey: 1 }, { unique: true });
+  operationSchema.index(
+    { 'writeBinding.backend.uid': 1, 'writeBinding.bucket': 1, 'writeBinding.key': 1 },
+    { unique: true, partialFilterExpression: { 'writeBinding.version': 2 } },
+  );
   operationSchema.index({ tenantId: 1, userId: 1, acceptedAt: 1 });
   operationSchema.index({ state: 1, createdAt: 1 });
   operationSchema.index({ cleanupPending: 1, _id: 1 });
@@ -519,6 +532,7 @@ export function createUploadStore(
     }
   }
   async function save(row: StoredUpload, session: ClientSession): Promise<void> {
+    validateNasUploadState(row);
     // BSON can grow when revision crosses int32, including historical rows without custody.
     const persisted = { ...row, revision: row.revision + 1 };
     assertUploadCleanupCapacity(persisted, mongoose.mongo.BSON.calculateObjectSize);
@@ -571,18 +585,19 @@ export function createUploadStore(
       .cursor({ batchSize: 64 });
     try {
       for await (const row of cursor) {
-        const execution = readUploadSecurityExecution(row.securityExecution);
+        const execution = readHistoricalUploadSecurityExecution(row.securityExecution);
         if (
           ++count > RESOURCE_MAX.bundles ||
           performance.now() >= deadline ||
           !execution ||
+          (execution.version === 2 && !hasHistoricalUploadSecurityObligation(row)) ||
           execution.attemptId !== `${row._id}.${row.attemptGeneration}` ||
           (row.mediaType === 'application/pdf') !== (execution.custody.kind === 'pdf-ocr') ||
-          !isCompleteUploadSecuritySettlement(row.securitySettlement, execution) ||
+          !isCompleteHistoricalUploadSecuritySettlement(row.securitySettlement, execution) ||
           (execution.custody.kind === 'pdf-ocr' &&
             row.original?.integrity &&
             execution.custody.scope.documentSha256 !== row.original.integrity.sha256) ||
-          mongoose.mongo.BSON.calculateObjectSize(row) > UPLOAD_RECORD_BYTES
+          mongoose.mongo.BSON.calculateObjectSize(row) > uploadRecordBudget(row)
         )
           reject('not_ready');
       }
@@ -666,22 +681,4 @@ export function createUploadStore(
     chargeQueue,
     totals,
   };
-}
-
-/** Stable digest for private snapshots and idempotent derived-content publication. */
-export function uploadDigest(value: unknown): string {
-  function stable(input: unknown): unknown {
-    if (Array.isArray(input)) return input.map(stable);
-    if (input && typeof input === 'object')
-      return Object.fromEntries(
-        Object.entries(input)
-          .filter(([, entry]) => entry !== undefined)
-          .sort(([a], [b]) => a.localeCompare(b))
-          .map(([key, entry]) => [key, stable(entry)]),
-      );
-    return input;
-  }
-  return createHash('sha256')
-    .update(JSON.stringify(stable(value)))
-    .digest('hex');
 }

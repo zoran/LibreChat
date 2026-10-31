@@ -4,11 +4,9 @@ import mongoose from 'mongoose';
 import { PassThrough } from 'node:stream';
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { MongoMemoryReplSet } from 'mongodb-memory-server';
+import { createHash, randomUUID } from 'node:crypto';
 import { UPLOAD_RETENTION_MS } from 'librechat-data-provider';
-import { createHash, randomUUID, X509Certificate } from 'node:crypto';
-import { createModels, createUploadManagementRepository } from '@librechat/data-schemas';
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import type {
   UploadDerivedOrigin,
   UploadSecurityApproval,
@@ -20,275 +18,20 @@ import type { IMongoFile } from '@librechat/data-schemas';
 import type { Request, Response } from 'express';
 import type { StoragePort, UploadSecurityPort } from '../contract';
 import type { SecurityPdfOcrProvider } from './pdf-ocr';
+import { createInertAntivirusFixture } from './antivirus-fixture.helper';
 import { extractManagedDocument } from '~/files/documents/managed';
-import { createSecurityTlsFixture } from './tls-fixture.helper';
+import { createSecurityFlowFixture } from './flow-fixture.helper';
 import { createRawUploadBodyHandler } from '../transport/body';
 import { observeSecurityProcess } from './process-observer';
-import { createHttpUploadSecurityPort } from './transport';
-import { createUploadManagement } from '../management';
 import { startSecurityService } from './service';
 import { createSecurityWorker } from './worker';
-
 describe('assembled scanner admission with real Mongo, mTLS and worker thread', () => {
-  const db = new mongoose.Mongoose();
-  const observer = new mongoose.Mongoose();
-  let mongo: MongoMemoryReplSet | undefined;
-  let certificates: ReturnType<typeof createSecurityTlsFixture> | undefined;
-  let service: Awaited<ReturnType<typeof startSecurityService>> | undefined;
-  let serviceOptions: Parameters<typeof startSecurityService>[0];
-  let port: UploadSecurityPort;
-  let repository: ReturnType<typeof createUploadManagementRepository>;
-  let management: ReturnType<typeof createUploadManagement>;
-  let root: string | undefined;
-  let stagingRoot: string;
-  let ordinaryRoot: string;
-  const policyBytes = Buffer.from(
-    JSON.stringify({
-      version: 1,
-      markings: [
-        'VS-NfD',
-        'VS-NUR FÜR DEN DIENSTGEBRAUCH',
-        'VS-VERTRAULICH',
-        'GEHEIM',
-        'STRENG GEHEIM',
-      ],
-      labels: ['Einstufung'],
-    }),
-  );
-  const policySha256 = createHash('sha256').update(policyBytes).digest('hex');
-  const principal = {
-    tenantId: 'flow-tenant',
-    userId: new mongoose.Types.ObjectId().toString(),
-    authentication: 'verified-email' as const,
-  };
-  const worker = { hostId: 'flow-host', instanceId: 'flow-app' };
-
-  beforeAll(async () => {
-    if (!process.env.UPLOAD_TEST_TMPDIR)
-      throw new Error('Explicit isolated upload test directory required');
-    const threadPath = path.resolve(__dirname, '../../../dist/uploads/security/worker-thread.cjs');
-    await stat(threadPath); // Missing build is a failure, never an implicit build or fake thread.
-    await mkdir(process.env.UPLOAD_TEST_TMPDIR, { recursive: true });
-    root = await mkdtemp(path.join(process.env.UPLOAD_TEST_TMPDIR, 'scanner-flow-'));
-    stagingRoot = path.join(root, 'staging');
-    ordinaryRoot = path.join(root, 'ordinary-storage-fake');
-    await Promise.all([mkdir(stagingRoot), mkdir(ordinaryRoot)]);
-    certificates = createSecurityTlsFixture();
-    const certificate = (name: string) => readFile(path.join(certificates!.directory, name));
-    const ca = await certificate('ca.pem');
-    serviceOptions = {
-      instanceId: '11111111-1111-4111-8111-111111111111',
-      peers: [
-        {
-          certificateSha256: createHash('sha256')
-            .update(new X509Certificate(await certificate('client.pem')).raw)
-            .digest('hex'),
-          role: 'intake',
-        },
-      ],
-      policyBytes,
-      policySha256,
-      threadPath,
-      host: '127.0.0.1',
-      port: 0,
-      tls: { ca, cert: await certificate('server.pem'), key: await certificate('server.key') },
-    };
-    service = await startSecurityService(serviceOptions);
-    port = createHttpUploadSecurityPort({
-      endpoint: `https://127.0.0.1:${service.address.port}`,
-      allowedHosts: ['127.0.0.1'],
-      policySha256,
-      tls: { ca, cert: await certificate('client.pem'), key: await certificate('client.key') },
-    });
-    mongo = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
-    await Promise.all([db.connect(mongo.getUri('flow')), observer.connect(mongo.getUri('flow'))]);
-    createModels(db);
-    createModels(observer);
-    await Promise.all([db.models.File.init(), observer.models.File.init()]);
-  }, 30_000);
-
-  beforeEach(async () => {
-    for (const name of [
-      'User',
-      'File',
-      'Message',
-      'UploadOperation',
-      'UploadCounter',
-      'HousekeepingJob',
-      'FileReadReceipt',
-    ])
-      if (db.models[name]) await db.models[name].deleteMany({});
-    await db.models.User.create({
-      _id: principal.userId,
-      tenantId: principal.tenantId,
-      email: 'scanner-flow@example.test',
-      emailVerified: true,
-    });
-    for (const name of await readdir(ordinaryRoot)) await rm(path.join(ordinaryRoot, name));
-    repository = createUploadManagementRepository(db, {
-      enabled: true,
-      reconciled: true,
-      securityPolicySha256: policySha256,
-      baseline: { originalBytes: 0, objectBytes: 0, textBytes: 0, recordBytes: 0, bundles: 0 },
-    });
-    const independent = createUploadManagementRepository(observer, {
-      securityPolicySha256: policySha256,
-    });
-    await repository.initialize();
-    await independent.initialize();
-    management = createUploadManagement({
-      repository,
-      // Fixed test principal; repository ownership fences remain real on both Mongo clients.
-      identity: {
-        authorize: async (owner, request) =>
-          owner.tenantId === principal.tenantId &&
-          owner.userId === principal.userId &&
-          owner.authentication === principal.authentication &&
-          request.owner.scope.kind === 'personal' &&
-          'ownerUserId' in request.owner &&
-          request.owner.ownerUserId === owner.userId &&
-          request.owner.tenantId === owner.tenantId,
-      },
-      // Trusted fixture admission only. This suite makes no native resource/isolation claim.
-      resources: {
-        assertSafe: async () => {
-          await stat(stagingRoot);
-        },
-      },
-    });
-  });
-
-  afterAll(async () => {
-    let complete = true;
-    try {
-      if (service) complete = (await service.close(AbortSignal.timeout(10_000))).complete;
-    } finally {
-      try {
-        await Promise.all([db.disconnect(), observer.disconnect()]);
-      } finally {
-        try {
-          await mongo?.stop();
-        } finally {
-          certificates?.close();
-          if (root) await rm(root, { recursive: true, force: true });
-        }
-      }
-    }
-    if (!complete) throw new Error('Security service did not confirm complete shutdown');
-  }, 30_000);
-
-  /** Same raw/scanner path; only the ordinary storage byte effect is a local fixture. */
-  async function ingestDerivedFlow(id: string, bytes: Buffer, security: UploadSecurityPort = port) {
-    const put = jest.fn(async (input: Parameters<StoragePort['put']>[0]) => {
-      expect(input.securityApproval).toMatchObject({
-        decision: 'approved',
-        subject: {
-          operationId: id,
-          bytes: bytes.length,
-          sha256: createHash('sha256').update(bytes).digest('hex'),
-        },
-      });
-      expect(await observer.models.File.countDocuments({ file_id: id })).toBe(0);
-      const chunks: Buffer[] = [];
-      for await (const chunk of input.body) {
-        input.signal.throwIfAborted();
-        chunks.push(Buffer.from(chunk));
-      }
-      await writeFile(path.join(ordinaryRoot, id), Buffer.concat(chunks), {
-        flag: 'wx',
-        mode: 0o600,
-      });
-      return {
-        outcome: 'durable' as const,
-        source: 's3',
-        bytes: input.bytes,
-        integrity: input.integrity,
-        filepath: `/api/files/managed/${id}`,
-        storageKey: `t/${input.lease.tenantId}/managed-uploads/${input.lease.userId}/${id}.${input.lease.generation}__original`,
-      };
-    });
-    const request = Object.assign(new PassThrough(), {
-      params: { id },
-      body: undefined,
-      headers: {
-        'content-type': 'application/octet-stream',
-        'content-length': String(bytes.length),
-        'x-upload-filename': encodeURIComponent('Abgeleiteter Entwurf.txt'),
-      },
-    });
-    const response = Object.assign(new EventEmitter(), {
-      writableEnded: false,
-      destroyed: false,
-      headersSent: false,
-      statusCode: 0,
-      value: undefined as unknown,
-      setHeader() {},
-      status(code: number) {
-        this.statusCode = code;
-        return this;
-      },
-      json(value: unknown) {
-        this.value = value;
-        this.headersSent = true;
-        this.writableEnded = true;
-        return this;
-      },
-    });
-    const handler = createRawUploadBodyHandler({
-      management,
-      principal: async () => principal,
-      storage: { put },
-      security,
-      worker,
-      stagingRoot,
-      claimBytes: management.claimWorkBytes,
-      completeBytes: management.completeWorkBytes,
-      deadlineMs: 15_000,
-    });
-    const done = handler(
-      request as unknown as Request,
-      response as unknown as Response,
-      (error) => {
-        if (error) throw error;
-      },
-    );
-    request.end(bytes);
-    await done;
-    expect(await readdir(stagingRoot)).toEqual([]);
-    return { response, put };
-  }
-
-  function document(): Buffer {
-    const stream = 'BT /F1 10 Tf 10 50 Td (Synthetic source) Tj ET';
-    const objects = [
-      '<< /Type /Catalog /Pages 2 0 R >>',
-      '<< /Type /Pages /Kids [4 0 R] /Count 1 >>',
-      '<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>',
-      '<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 100] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>',
-      `<< /Length ${Buffer.byteLength(stream)} >>\nstream\n${stream}\nendstream`,
-    ];
-    let text = '%PDF-1.4\n';
-    const offsets = [0];
-    for (const [i, item] of objects.entries()) {
-      offsets.push(Buffer.byteLength(text));
-      text += `${i + 1} 0 obj\n${item}\nendobj\n`;
-    }
-    const offset = Buffer.byteLength(text);
-    text +=
-      `xref\n0 ${offsets.length}\n0000000000 65535 f \n` +
-      offsets
-        .slice(1)
-        .map((n) => `${String(n).padStart(10, '0')} 00000 n \n`)
-        .join('');
-    return Buffer.from(
-      text + `trailer\n<< /Size ${offsets.length} /Root 1 0 R >>\nstartxref\n${offset}\n%%EOF\n`,
-    );
-  }
+  const fixture = createSecurityFlowFixture();
   it.each(['approved', 'lost-bind-ack', 'unknown-retirement'])(
     'keeps native PDF %s behind original Mongo binding and full scope retirement',
     async (mode) => {
-      const bytes = document();
-      const operation = await management.reserve(principal, {
+      const bytes = fixture.document();
+      const operation = await fixture.management.reserve(fixture.principal, {
         idempotencyKey: randomUUID(),
         mediaType: 'application/pdf',
         declaredBytes: bytes.length,
@@ -310,7 +53,7 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
       const provider: SecurityPdfOcrProvider = {
         async prepare(input) {
           expect(
-            await observer.models.UploadOperation.findById(operation.id).lean(),
+            await fixture.observer.models.UploadOperation.findById(operation.id).lean(),
           ).not.toHaveProperty('securityExecution');
           execution = {
             ...input.execution,
@@ -346,10 +89,12 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         },
         open: () => ({
           async readPage() {
-            const row = await observer.models.UploadOperation.findById(operation.id).lean();
+            const row = await fixture.observer.models.UploadOperation.findById(operation.id).lean();
             expect(row).toMatchObject({ securityExecution: execution });
             expect(row).not.toHaveProperty('original');
-            expect(await observer.models.File.countDocuments({ file_id: operation.id })).toBe(0);
+            expect(
+              await fixture.observer.models.File.countDocuments({ file_id: operation.id }),
+            ).toBe(0);
             pages++;
             return { complete: true, readable: true, text: 'Synthetic readable text' };
           },
@@ -384,25 +129,26 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         ),
       };
       const scanner = createSecurityWorker({
+        antivirus: createInertAntivirusFixture().runtime,
         instanceId: randomUUID(),
-        policy: JSON.parse(policyBytes.toString()),
-        policySha256,
-        threadPath: serviceOptions.threadPath,
+        policy: JSON.parse(fixture.policyBytes.toString()),
+        policySha256: fixture.policySha256,
+        threadPath: fixture.serviceOptions.threadPath,
         pdf: { provider, launcher },
       });
-      const bind = repository.bindSecurityExecution.bind(repository);
+      const bind = fixture.repository.bindSecurityExecution.bind(fixture.repository);
       const lost =
         mode === 'lost-bind-ack'
           ? jest
-              .spyOn(repository, 'bindSecurityExecution')
+              .spyOn(fixture.repository, 'bindSecurityExecution')
               .mockImplementationOnce(async (...args) => {
                 await bind(...args);
                 throw new Error('fixture-lost-bind-ack');
               })
           : undefined;
       try {
-        const result = await ingestDerivedFlow(operation.id, bytes, scanner);
-        const row = await observer.models.UploadOperation.findById(operation.id).lean();
+        const result = await fixture.ingestDerivedFlow(operation.id, bytes, scanner);
+        const row = await fixture.observer.models.UploadOperation.findById(operation.id).lean();
         expect(row).toMatchObject({ securityExecution: execution });
         if (mode === 'approved') {
           expect(result.response.statusCode).toBe(202);
@@ -414,7 +160,9 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         } else {
           expect(result.response.statusCode).toBe(422);
           expect(result.put).not.toHaveBeenCalled();
-          expect(await observer.models.File.countDocuments({ file_id: operation.id })).toBe(0);
+          expect(await fixture.observer.models.File.countDocuments({ file_id: operation.id })).toBe(
+            0,
+          );
           if (mode === 'lost-bind-ack') {
             expect(pages).toBe(0);
             expect(launcher.run).not.toHaveBeenCalled();
@@ -430,24 +178,23 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
       }
     },
   );
-
   async function publishDerivedFlow(id: string) {
-    const lease = await management.claimProcessing(worker);
+    const lease = await fixture.management.claimProcessing(fixture.worker);
     expect(lease?.operationId).toBe(id);
-    const input = await management.getProcessingInput(lease!);
+    const input = await fixture.management.getProcessingInput(lease!);
     expect(input.securityApproval.subject.operationId).toBe(id);
     // This receipt represents the joined in-process extractor below, not an isolated parser job.
-    await management.bindProcessingExecution(lease!, {
+    await fixture.management.bindProcessingExecution(lease!, {
       attemptId: `${id}.${lease!.generation}`,
       instanceId: 'flow-inline-extractor',
-      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      expiresAt: new Date(Date.now() + 60000).toISOString(),
     });
     const { text, structure } = await extractManagedDocument({
-      filePath: path.join(ordinaryRoot, id),
+      filePath: path.join(fixture.ordinaryRoot, id),
       mediaType: 'text/plain',
     });
-    await management.publish(lease!, { text, structure, writerStopped: true });
-    await management.confirmCleanup({
+    await fixture.management.publish(lease!, { text, structure, writerStopped: true });
+    await fixture.management.confirmCleanup({
       operationId: id,
       generation: lease!.generation,
       writerStopped: true,
@@ -455,33 +202,31 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
       originalAbsent: false,
       textAndHistoryRemoved: false,
     });
-    return management.get(principal, id);
+    return fixture.management.get(fixture.principal, id);
   }
-
   it.each(['approved', 'marked'] as const)(
     'keeps native derived %s bytes behind the same real scanner and source lifecycle',
     async (decision) => {
       const sourceBytes = Buffer.from('Unmarkierter Quellentext für den abgeleiteten Entwurf.');
-      const source = await management.reserve(principal, {
+      const source = await fixture.management.reserve(fixture.principal, {
         idempotencyKey: randomUUID(),
         mediaType: 'text/plain',
         declaredBytes: sourceBytes.length,
       });
-      const uploadedSource = await ingestDerivedFlow(source.id, sourceBytes);
+      const uploadedSource = await fixture.ingestDerivedFlow(source.id, sourceBytes);
       expect(uploadedSource.response.statusCode).toBe(202);
       const readySource = await publishDerivedFlow(source.id);
       expect(readySource).toMatchObject({ state: 'ready', canUseInComposer: true });
-      const sourceFile = await observer.models.File.findOne({ file_id: source.id })
+      const sourceFile = await fixture.observer.models.File.findOne({ file_id: source.id })
         .select('+securityApproval')
         .lean<IMongoFile>();
       expect(sourceFile).toMatchObject({ status: 'ready', text: sourceBytes.toString('utf8') });
-
       const bytes = Buffer.from(
         decision === 'marked'
           ? 'Einstufung: VS-VERTRAULICH\nNeu erzeugter Entwurf.'
           : 'Abgeleiteter Entwurf aus einer freigegebenen Quelle.',
       );
-      const derived = await management.reserveDerived(principal, {
+      const derived = await fixture.management.reserveDerived(fixture.principal, {
         idempotencyKey: randomUUID(),
         mediaType: 'text/plain',
         declaredBytes: bytes.length,
@@ -490,7 +235,7 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
           directSourceFileIds: [source.id],
         },
       });
-      const captured = await observer.models.UploadOperation.findById(derived.id).lean<{
+      const captured = await fixture.observer.models.UploadOperation.findById(derived.id).lean<{
         derivedOrigin?: UploadDerivedOrigin;
       }>();
       expect(captured?.derivedOrigin).toMatchObject({
@@ -499,14 +244,14 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         ancestors: [
           {
             subject: sourceFile!.securityApproval!.subject,
-            policySha256,
+            policySha256: fixture.policySha256,
             sourceBindingSha256: expect.stringMatching(/^[a-f0-9]{64}$/),
             expiresAt: Date.parse(readySource.expiresAt!),
           },
         ],
       });
-      const received = await ingestDerivedFlow(derived.id, bytes);
-      const stored = await observer.models.UploadOperation.findById(derived.id).lean<{
+      const received = await fixture.ingestDerivedFlow(derived.id, bytes);
+      const stored = await fixture.observer.models.UploadOperation.findById(derived.id).lean<{
         securityApproval?: UploadSecurityApproval;
       }>();
       expect(stored).toMatchObject({
@@ -522,13 +267,13 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         expect(received.put).not.toHaveBeenCalled();
         expect(stored).not.toHaveProperty('securityApproval');
         expect(stored).not.toHaveProperty('original');
-        expect(await observer.models.File.findOne({ file_id: derived.id })).toBeNull();
-        expect(await readdir(ordinaryRoot)).toEqual([source.id]);
-        expect(await management.claimProcessing(worker)).toBeNull();
+        expect(await fixture.observer.models.File.findOne({ file_id: derived.id })).toBeNull();
+        expect(await readdir(fixture.ordinaryRoot)).toEqual([source.id]);
+        expect(await fixture.management.claimProcessing(fixture.worker)).toBeNull();
       } else {
         expect(received.response.statusCode).toBe(202);
         expect(received.put).toHaveBeenCalledTimes(1);
-        expect(await readFile(path.join(ordinaryRoot, derived.id))).toEqual(bytes);
+        expect(await readFile(path.join(fixture.ordinaryRoot, derived.id))).toEqual(bytes);
         expect(stored?.securityApproval).toMatchObject({
           scannerVersion: 'complete-content-v4',
           subject: {
@@ -543,7 +288,7 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
           expiresAt: new Date(Date.parse(ready.acceptedAt!) + UPLOAD_RETENTION_MS).toISOString(),
         });
         expect(Date.parse(readySource.expiresAt!)).toBeGreaterThan(Date.parse(ready.expiresAt!));
-        const file = await observer.models.File.findOne({ file_id: derived.id })
+        const file = await fixture.observer.models.File.findOne({ file_id: derived.id })
           .select('+derivedOrigin')
           .lean();
         expect(file).toMatchObject({
@@ -553,18 +298,18 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
           expiredAt: new Date(ready.expiresAt!),
         });
         expect(
-          await observer.models.File.findOne({ file_id: derived.id }).lean(),
+          await fixture.observer.models.File.findOne({ file_id: derived.id }).lean(),
         ).not.toHaveProperty('derivedOrigin');
       }
-      const publicOperations = await management.list(principal);
+      const publicOperations = await fixture.management.list(fixture.principal);
       for (const operation of publicOperations) {
         expect(operation).not.toHaveProperty('derivedOrigin');
         expect(operation).not.toHaveProperty('securityApproval');
       }
-      expect(await management.get(principal, source.id)).toEqual(readySource);
-      expect(await readFile(path.join(ordinaryRoot, source.id))).toEqual(sourceBytes);
+      expect(await fixture.management.get(fixture.principal, source.id)).toEqual(readySource);
+      expect(await readFile(path.join(fixture.ordinaryRoot, source.id))).toEqual(sourceBytes);
       expect(
-        await observer.models.File.findOne({ file_id: source.id })
+        await fixture.observer.models.File.findOne({ file_id: source.id })
           .select('+securityApproval')
           .lean(),
       ).toMatchObject({
@@ -574,12 +319,11 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         expiredAt: sourceFile!.expiredAt,
       });
     },
-    30_000,
+    30000,
   );
-
   it('rejects a policy hash that does not bind the actual policy bytes', async () => {
     await expect(
-      startSecurityService({ ...serviceOptions, policySha256: '0'.repeat(64) }).then(
+      startSecurityService({ ...fixture.serviceOptions, policySha256: '0'.repeat(64) }).then(
         async (unexpected) => {
           await unexpected.close();
           return unexpected;
@@ -587,12 +331,11 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
       ),
     ).rejects.toThrow('Security policy unavailable');
   });
-
   it('rejects correctly hashed policy bytes that omit the required markings', async () => {
     const incomplete = Buffer.from(JSON.stringify({ version: 1, markings: ['SYNTHETIC'] }));
     await expect(
       startSecurityService({
-        ...serviceOptions,
+        ...fixture.serviceOptions,
         policyBytes: incomplete,
         policySha256: createHash('sha256').update(incomplete).digest('hex'),
       }).then(async (unexpected) => {
@@ -601,7 +344,6 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
       }),
     ).rejects.toThrow('Required security markings unavailable');
   });
-
   it.each([
     ['allowed', Buffer.from('Freigegebener Text mit überprüfbarem Inhalt.'), undefined],
     ['marked', Buffer.from('Einstufung: VS-VERTRAULICH'), 'security_rejected'],
@@ -610,39 +352,48 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
     'runs %s bytes through the real scanner before ordinary storage',
     async (name, bytes, rejection) => {
       const filename = `Cortex-TEST-Privat-Grüße-${name}.txt`;
-      const operation = await management.reserve(principal, {
+      const operation = await fixture.management.reserve(fixture.principal, {
         idempotencyKey: randomUUID(),
         mediaType: 'text/plain',
         declaredBytes: bytes.length,
       });
       const originalSha256 = createHash('sha256').update(bytes).digest('hex');
       const observedInspections: UploadSecurityInspection[] = [];
-      const bindings: { execution: UploadSecurityExecution; stored: unknown }[] = [];
-      const storageStates: { stored: unknown; files: number }[] = [];
-      const readOperation = () => observer.models.UploadOperation.findById(operation.id).lean();
+      const bindings: {
+        execution: UploadSecurityExecution;
+        stored: unknown;
+      }[] = [];
+      const storageStates: {
+        stored: unknown;
+        files: number;
+      }[] = [];
+      const readOperation = () =>
+        fixture.observer.models.UploadOperation.findById(operation.id).lean();
       expect(await readOperation()).not.toHaveProperty('filename');
       expect(JSON.stringify(await readOperation())).not.toContain('Cortex-TEST-Privat');
-      expect(JSON.stringify(await management.list(principal))).not.toContain('Cortex-TEST-Privat');
+      expect(JSON.stringify(await fixture.management.list(fixture.principal))).not.toContain(
+        'Cortex-TEST-Privat',
+      );
       const security: UploadSecurityPort = {
-        policySha256: port.policySha256,
-        prepare: (input) => port.prepare(input),
-        cancel: (input) => port.cancel(input),
+        policySha256: fixture.port.policySha256,
+        prepare: (input) => fixture.port.prepare(input),
+        cancel: (input) => fixture.port.cancel(input),
         async inspect(input) {
           const binding = { execution: input.execution, stored: await readOperation() };
           bindings.push(binding);
           expect(binding.stored).not.toHaveProperty('filename');
           expect(JSON.stringify(binding.stored)).not.toContain('Cortex-TEST-Privat');
-          const result = await port.inspect(input);
+          const result = await fixture.port.inspect(input);
           observedInspections.push(result);
           return result;
         },
       };
-      const ordinaryPath = path.join(ordinaryRoot, operation.id);
+      const ordinaryPath = path.join(fixture.ordinaryRoot, operation.id);
       // S3-compatible receipt shape only; the ordinary byte effect is exclusively this temp file.
       const put = jest.fn(async (input: Parameters<StoragePort['put']>[0]) => {
         storageStates.push({
           stored: await readOperation(),
-          files: await observer.models.File.countDocuments({}),
+          files: await fixture.observer.models.File.countDocuments({}),
         });
         const chunks: Buffer[] = [];
         for await (const chunk of input.body) {
@@ -712,15 +463,15 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         },
       });
       const handler = createRawUploadBodyHandler({
-        management,
-        principal: async () => principal,
+        management: fixture.management,
+        principal: async () => fixture.principal,
         storage,
         security,
-        worker,
-        stagingRoot,
-        claimBytes: management.claimWorkBytes,
-        completeBytes: management.completeWorkBytes,
-        deadlineMs: 15_000,
+        worker: fixture.worker,
+        stagingRoot: fixture.stagingRoot,
+        claimBytes: fixture.management.claimWorkBytes,
+        completeBytes: fixture.management.completeWorkBytes,
+        deadlineMs: 15000,
       });
       const done = handler(
         request as unknown as Request,
@@ -750,10 +501,10 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         // Rejected attempts remain owned by durable housekeeping after local cleanup.
         cleanupPending: rejection !== undefined,
       });
-      expect(await readdir(stagingRoot)).toEqual([]);
+      expect(await readdir(fixture.stagingRoot)).toEqual([]);
       await expect(
-        management.get(
-          { ...principal, userId: new mongoose.Types.ObjectId().toString() },
+        fixture.management.get(
+          { ...fixture.principal, userId: new mongoose.Types.ObjectId().toString() },
           operation.id,
         ),
       ).rejects.toMatchObject({ code: 'forbidden' });
@@ -764,16 +515,16 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
           decision: rejection === 'security_rejected' ? 'rejected' : 'uninspectable',
         });
         expect(put).not.toHaveBeenCalled();
-        expect(await readdir(ordinaryRoot)).toEqual([]);
-        expect(await observer.models.File.countDocuments({})).toBe(0);
+        expect(await readdir(fixture.ordinaryRoot)).toEqual([]);
+        expect(await fixture.observer.models.File.countDocuments({})).toBe(0);
         expect(stored).not.toHaveProperty('securityApproval');
         expect(stored).not.toHaveProperty('filename');
         expect(JSON.stringify(stored)).not.toContain('Cortex-TEST-Privat');
-        expect(JSON.stringify(await management.list(principal))).not.toContain(
+        expect(JSON.stringify(await fixture.management.list(fixture.principal))).not.toContain(
           'Cortex-TEST-Privat',
         );
-        expect(await management.claimProcessing(worker)).toBeNull();
-        expect(await management.usage(principal)).toMatchObject({
+        expect(await fixture.management.claimProcessing(fixture.worker)).toBeNull();
+        expect(await fixture.management.usage(fixture.principal)).toMatchObject({
           usedBytes: 0,
           retainedBytes: 0,
           reservedBytes: 0,
@@ -800,11 +551,11 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         const approved = observedInspections[0].decision;
         expect(approved).toMatchObject({
           decision: 'approved',
-          policySha256,
+          policySha256: fixture.policySha256,
           scannerVersion: 'complete-content-v4',
           subject: {
-            tenantId: principal.tenantId,
-            userId: principal.userId,
+            tenantId: fixture.principal.tenantId,
+            userId: fixture.principal.userId,
             operationId: operation.id,
             transferGeneration: 1,
             mediaType: 'text/plain',
@@ -817,23 +568,23 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
           securityApproval: approved,
           filename,
         });
-        const file = await observer.models.File.findOne({ file_id: operation.id })
+        const file = await fixture.observer.models.File.findOne({ file_id: operation.id })
           .select('+securityApproval')
           .lean();
         expect(file).toMatchObject({ status: 'pending', securityApproval: approved, filename });
-        expect(await management.usage(principal)).toMatchObject({
+        expect(await fixture.management.usage(fixture.principal)).toMatchObject({
           usedBytes: bytes.length,
           retainedBytes: bytes.length,
           reservedBytes: 0,
         });
-        const parserLease = await management.claimProcessing(worker);
+        const parserLease = await fixture.management.claimProcessing(fixture.worker);
         expect(parserLease?.generation).toBe(2);
-        expect((await management.getProcessingInput(parserLease!)).securityApproval).toEqual(
-          approved,
-        );
+        expect(
+          (await fixture.management.getProcessingInput(parserLease!)).securityApproval,
+        ).toEqual(approved);
         // No parser starts in this suite; release its admitted resources through the real owner.
-        await management.fail(parserLease!, 'processing_failed');
-        await management.confirmCleanup({
+        await fixture.management.fail(parserLease!, 'processing_failed');
+        await fixture.management.confirmCleanup({
           operationId: operation.id,
           generation: parserLease!.generation,
           writerStopped: true,
@@ -843,6 +594,6 @@ describe('assembled scanner admission with real Mongo, mTLS and worker thread', 
         });
       }
     },
-    30_000,
+    30000,
   );
 });

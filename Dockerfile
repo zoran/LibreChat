@@ -2,6 +2,22 @@
 
 # v0.8.8
 
+# Public immutable ClamAV/glibc payload is built separately; the application stays Alpine/musl.
+FROM node:24.16.0-bookworm-slim AS antivirus-build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      gcc libc6-dev binutils libgcc-s1 libstdc++6 ca-certificates
+WORKDIR /build
+ADD --checksum=sha256:d3ee9e401974855a1edc1761b1425417d126de618d5f0c91cd51209f69f6fcc2 https://www.clamav.net/downloads/production/clamav-1.4.6.linux.x86_64.deb /build/clamav.deb
+ADD --checksum=sha256:06dbc7adf96e2f6a27c548a841ce83c95360d1e121b106a6f7cf56f282a3c61b https://www.clamav.net/downloads/production/clamav-1.4.6.tar.gz /build/clamav-source.tar.gz
+ADD --checksum=sha256:f55ae2aa17482cf870f16578e56c2d77885c22ac748ebee9f6808c4dbba93bea https://www.clamav.net/downloads/production/clamav-1.4.6.tar.gz.sig /build/clamav-source.tar.gz.sig
+COPY scripts/ci/antivirus-assets.mjs /build/antivirus-assets.mjs
+COPY packages/api/src/uploads/security/native/antivirus-scope.c /build/antivirus-scope.c
+RUN test "$(dpkg --print-architecture)" = amd64 && \
+    mkdir /out /build/vendor && dpkg-deb --extract /build/clamav.deb /build/vendor && \
+    cc -O2 -Wall -Wextra -Werror -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+      -Wl,-z,relro,-z,now /build/antivirus-scope.c -o /build/antivirus-scope && \
+    node /build/antivirus-assets.mjs && rm -rf /var/lib/apt/lists/*
+
 # Base node image
 FROM node:24.16.0-alpine AS node
 
@@ -76,6 +92,8 @@ RUN --mount=type=bind,target=/build-context \
 # This is packaging evidence; host/kernel qualification is a separate deployment gate.
 USER root
 RUN node scripts/ci/security-process-assets.mjs
+RUN --mount=type=bind,from=antivirus-build,source=/out,target=/antivirus-build,ro \
+    node scripts/ci/antivirus-image-assets.mjs
 USER node
 
 # Optional build metadata surfaced in Settings -> About for support triage.

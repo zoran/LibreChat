@@ -1,6 +1,5 @@
 const jwt = require('jsonwebtoken');
-const { mkdir, lstat, readFile } = require('node:fs/promises');
-const { isAbsolute } = require('node:path');
+const { mkdir, lstat } = require('node:fs/promises');
 const {
   createUploadManagement,
   createManagedSourceResolver,
@@ -15,9 +14,7 @@ const {
   startIntakeControlService,
   createUploadWorkers,
   createManagedUploadCleanup,
-  createHttpUploadSecurityPort,
   createUnixDocumentPort,
-  createManagedS3Storage,
   getManagedS3Provider,
   createUploadMetrics,
   createManagedS3Client,
@@ -36,6 +33,14 @@ const {
 } = require('@librechat/data-schemas');
 
 const { createUploadTicketIssuer, managedIntakeControlConfig } = require('./UploadIntake');
+
+const {
+  managedSecurityClient,
+  createLegacyUploadStorage,
+  selectedManagedUploads,
+  nasAntivirusAdmission,
+  createNormalNasStorage,
+} = require('./UploadsNas');
 
 let current;
 let admissionsClosedBy;
@@ -78,41 +83,6 @@ const getManagedContextSources = (req) =>
     current?.sources,
     process.env.CORTEX_UPLOAD_MANAGEMENT_ENABLED === 'true',
   );
-
-/** Operator-owned mTLS identity; no request can choose hosts, credentials or policy. */
-async function managedSecurityClient() {
-  const endpoint = process.env.UPLOAD_SECURITY_ENDPOINT;
-  const policySha256 = process.env.UPLOAD_SECURITY_POLICY_SHA256;
-  const allowedHosts = (process.env.UPLOAD_SECURITY_ALLOWED_HOSTS ?? '').split(',').filter(Boolean);
-  const paths = ['CA', 'CERT', 'KEY'].map(
-    (name) => process.env[`UPLOAD_SECURITY_TLS_${name}_FILE`],
-  );
-  if (
-    !endpoint ||
-    !/^[a-f0-9]{64}$/.test(policySha256 ?? '') ||
-    !allowedHosts.length ||
-    paths.some((value) => !value || !isAbsolute(value))
-  ) {
-    throw new Error('Upload security configuration unavailable');
-  }
-  try {
-    const [ca, cert, key] = await Promise.all(
-      paths.map(async (file) => {
-        const value = await readFile(file);
-        if (value.length < 1 || value.length > 65536) throw new Error('Invalid TLS material');
-        return value;
-      }),
-    );
-    return createHttpUploadSecurityPort({
-      endpoint,
-      allowedHosts,
-      policySha256,
-      tls: { ca, cert, key },
-    });
-  } catch {
-    throw new Error('Upload security configuration unavailable');
-  }
-}
 
 /** Bind after the generation store is configured; File remains the only quota owner. */
 function configureUploadSourceReplay({ manager, models, metrics }) {
@@ -215,6 +185,8 @@ async function createUploadComposition({
   worker,
   platform,
   storage,
+  nasStorage,
+  managedCleanup = storage,
   documents,
   security,
   stagingRoot,
@@ -293,7 +265,8 @@ async function createUploadComposition({
   });
   const cleanup = createManagedUploadCleanup({
     repository,
-    storage,
+    storage: managedCleanup,
+    nasStorage,
     actor: workers.settlement,
   });
   const live = createUploadLiveHub({
@@ -302,6 +275,9 @@ async function createUploadComposition({
     tenantId: tenant,
     includeGuests: guestUploadTransitionEnabled(),
     admissionStatus: () => controller.status().admissionsPaused,
+    ...(platform.storageAvailability
+      ? { storageAvailability: () => platform.storageAvailability.status() }
+      : {}),
     observe({ connections, outcome }) {
       metrics.liveConnections(connections);
       if (['changed', 'reset'].includes(outcome)) metrics.event('update');
@@ -309,6 +285,7 @@ async function createUploadComposition({
     },
   });
   const controller = createUploadRuntime({
+    storageAvailability: platform.storageAvailability,
     repository,
     ownerId: worker.instanceId,
     expected: platform.expected,
@@ -474,9 +451,10 @@ async function initializeUploads({
     )
   )
     throw new Error('Upload process identity unavailable');
+  const managedUploads = await selectedManagedUploads();
   const intakeConfig = await managedIntakeControlConfig();
   signal?.throwIfAborted();
-  const security = await managedSecurityClient();
+  const security = await managedSecurityClient(signal);
   signal?.throwIfAborted();
   const client = managedStorageClient();
   const mongoose = require('mongoose');
@@ -500,44 +478,50 @@ async function initializeUploads({
     securityPolicySha256: security.policySha256,
     extractionPolicySha256: trustedFile?.extractionPolicySha256,
     recordOriginalPublication,
+    ...(managedUploads
+      ? { nasAntivirusAdmission: nasAntivirusAdmission(managedUploads, security) }
+      : {}),
   });
   // Initialization never attests an empty store or enables an unreconciled authority.
   await runAsSystem(() => repository.initialize());
   signal?.throwIfAborted();
-  const platform = await createUploadPlatform({ repository, worker, stagingRoot });
-  const storage = createManagedS3Storage({
-    client,
-    bucket: process.env.AWS_BUCKET_NAME,
-    urlForKey: async (key) => {
-      const match = /\/([a-zA-Z0-9-]+)\.[1-9][0-9]*__original$/.exec(key);
-      if (!match) throw new Error('Invalid managed original locator');
-      return `/api/files/managed/${match[1]}`;
-    },
-    observeBackend: (observation) => platform.metrics?.observeBackend(observation),
-    observeBackendService: (observation) => platform.metrics?.observeBackendService(observation),
+  let selected;
+  const legacyStorage = createLegacyUploadStorage(client, () => selected?.platform);
+  selected = await createNormalNasStorage({
+    configuration: managedUploads,
+    repository,
+    worker,
+    stagingRoot,
+    managedStorage: legacyStorage,
+    createUploadPlatform,
+    signal,
   });
+  const { storage, platform, nasStorage, managedCleanup } = selected;
   const documents = createUnixDocumentPort({
     stagingRoot,
     socketPath: '/var/run/cortex-upload-parser/parser.sock',
   });
   const origin = new URL(process.env.DOMAIN_CLIENT).origin;
-  const composition = await createUploadComposition({
-    repository,
-    models,
-    registry,
-    worker,
-    platform,
-    storage,
-    documents,
-    security,
-    stagingRoot,
-    allowedOrigins: [origin],
-    trustedFile,
-    signal,
-    retrievalOperations: (policySnapshot) =>
-      createFileRetrievalOperationOwner(mongoose, { policySnapshot }),
-  });
+  let composition;
   try {
+    composition = await createUploadComposition({
+      repository,
+      models,
+      registry,
+      worker,
+      platform,
+      storage,
+      nasStorage,
+      managedCleanup,
+      documents,
+      security,
+      stagingRoot,
+      allowedOrigins: [origin],
+      trustedFile,
+      signal,
+      retrievalOperations: (policySnapshot) =>
+        createFileRetrievalOperationOwner(mongoose, { policySnapshot }),
+    });
     signal?.throwIfAborted();
     if (admissionsClosedBy && !composition.maintenance.pauseAdmissions(admissionsClosedBy))
       throw new Error('Upload startup admission closure unconfirmed');
@@ -549,10 +533,13 @@ async function initializeUploads({
       /* Notify before original cleanup without skipping it. */
     }
     try {
-      await composition.close(AbortSignal.timeout(Math.max(1, getRemainingShutdownMs() ?? 30_000)));
+      await (composition
+        ? composition.close(AbortSignal.timeout(Math.max(1, getRemainingShutdownMs() ?? 30_000)))
+        : platform.close());
     } catch {
       /* Preserve the first startup failure after the original cleanup settles. */
     }
+    await selected.close();
     throw error;
   }
   let intakeControl;
@@ -607,7 +594,7 @@ async function initializeUploads({
     readStorageProvider: () =>
       initialization !== 'ready'
         ? { state: 'unavailable' }
-        : getManagedS3Provider(storage, platform.readStorageBackend()),
+        : getManagedS3Provider(managedCleanup, platform.readStorageBackend()),
     start() {
       if (intakePausedBy || closing)
         return Promise.reject(new Error('Upload startup admission is closed'));
@@ -659,6 +646,11 @@ async function initializeUploads({
           }
           try {
             await composition.close(signal);
+          } catch (error) {
+            failures.push(error);
+          }
+          try {
+            await selected.close();
           } catch (error) {
             failures.push(error);
           }

@@ -4,6 +4,8 @@ import type {
   StorageDeletionBinding,
   StorageDeletionTerminalReceipt,
   StorageDeletionConsumptionResult,
+  NasS3Backend,
+  NasDeletionReceipt,
 } from 'librechat-data-provider';
 import type {
   GenerationCleanupTarget,
@@ -118,7 +120,18 @@ export interface FileUploadCleanupBinding {
   originalBytes: number;
   /** Hash of Upload's immutable actual original receipt and exact principal/op/attempt/key. */
   acceptedObjectSHA256: string;
+  backend?: NasS3Backend;
+  originalWriteBindingSha256?: string;
 }
+
+/** Alternative provider custody, exclusive with managed storage; never a three-replica receipt. */
+export type NasFileStorageCustody = {
+  state: 'terminal' | 'consumed';
+  receipt: NasDeletionReceipt;
+  receiptSHA256: string;
+  consumerCommitId?: string;
+  uploadAck?: FileUploadCleanupAcknowledgment;
+};
 
 /** Created and retained once by the Upload owner after checking actual File custody. */
 export interface FileUploadCleanupAcknowledgment {
@@ -169,6 +182,7 @@ export interface FileLifecycleCustody {
     messages: 'pending' | 'complete';
   };
   storage: FileStorageCleanupCustody | null;
+  nasStorage?: NasFileStorageCustody;
   /** Set only with the existing File preparation/accounting/descendant guard transaction. */
   contentPrepared: boolean;
   completionRef: string | null;

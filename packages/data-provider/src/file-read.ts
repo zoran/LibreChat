@@ -3,9 +3,9 @@ import type { ManagedDocumentResult } from './document-structure';
 import type { UploadStorageReceipt } from './upload-management';
 import type { UploadSecurityApproval } from './upload-security';
 import type { ManagedSha256 } from './managed-retrieval';
+import { readHistoricalUploadSecurityApproval } from './upload-security';
 import { readManagedDocumentResult } from './document-structure';
 import { isUploadStorageReceipt } from './upload-management';
-import { isUploadSecurityApproval } from './upload-security';
 import { managedDigest } from './managed-retrieval';
 
 export const MANAGED_FILE_READ_HEADER = 'X-Cortex-File-Read';
@@ -113,7 +113,11 @@ export function buildManagedFileReadBinding(
     original.bytes !== bytes ||
     original.source !== source ||
     original.storageKey !== storageKey ||
-    !(approval === null || isUploadSecurityApproval(approval)) ||
+    !(
+      approval === null ||
+      (readHistoricalUploadSecurityApproval(approval) &&
+        (source !== 'nas-s3' || approval.version === 2))
+    ) ||
     !['original', 'preview'].includes(representation)
   )
     throw new Error('Invalid managed File read binding');

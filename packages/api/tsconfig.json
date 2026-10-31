@@ -5,6 +5,7 @@
     "module": "esnext",
     "noImplicitAny": true,
     "outDir": "./types",
+    "rootDir": "./src",
     "target": "es2015",
     "moduleResolution": "bundler",
     "allowSyntheticDefaultImports": true,

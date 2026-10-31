@@ -1,8 +1,10 @@
+/** useSharePointFileHandling applies common upload admission before external file selection downloads. */
 import { useCallback } from 'react';
 import type { EModelEndpoint } from 'librechat-data-provider';
 import type { SharePointFile } from '~/data-provider/Files/sharepoint';
 import type { FileHandlingState } from './useFileHandling';
 import useFileHandling, { useFileHandlingNoChatContext } from './useFileHandling';
+import { useManagedUploads } from '~/features/uploads/useManagedUploads';
 import useSharePointDownload from './useSharePointDownload';
 
 interface UseSharePointFileHandlingProps {
@@ -24,6 +26,7 @@ interface UseSharePointFileHandlingReturn {
 export default function useSharePointFileHandling(
   props?: UseSharePointFileHandlingProps,
 ): UseSharePointFileHandlingReturn {
+  const uploads = useManagedUploads();
   const { handleFiles } = useFileHandling(props);
   const { downloadSharePointFiles, isDownloading, downloadProgress, error } = useSharePointDownload(
     {
@@ -39,6 +42,7 @@ export default function useSharePointFileHandling(
 
   const handleSharePointFiles = useCallback(
     async (sharePointFiles: SharePointFile[]) => {
+      if (uploads.enabled && uploads.getNewUploadError()) return;
       try {
         await downloadSharePointFiles(sharePointFiles);
       } catch (error) {
@@ -46,7 +50,7 @@ export default function useSharePointFileHandling(
         throw error;
       }
     },
-    [downloadSharePointFiles],
+    [downloadSharePointFiles, uploads],
   );
 
   return {
@@ -61,6 +65,7 @@ export function useSharePointFileHandlingNoChatContext(
   props: UseSharePointFileHandlingProps | undefined,
   fileState: FileHandlingState,
 ): UseSharePointFileHandlingReturn {
+  const uploads = useManagedUploads();
   const { handleFiles } = useFileHandlingNoChatContext(props, fileState);
 
   const { downloadSharePointFiles, isDownloading, downloadProgress, error } = useSharePointDownload(
@@ -77,6 +82,7 @@ export function useSharePointFileHandlingNoChatContext(
 
   const handleSharePointFiles = useCallback(
     async (sharePointFiles: SharePointFile[]) => {
+      if (uploads.enabled && uploads.getNewUploadError()) return;
       try {
         await downloadSharePointFiles(sharePointFiles);
       } catch (error) {
@@ -84,7 +90,7 @@ export function useSharePointFileHandlingNoChatContext(
         throw error;
       }
     },
-    [downloadSharePointFiles],
+    [downloadSharePointFiles, uploads],
   );
 
   return {

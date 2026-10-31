@@ -2,7 +2,10 @@
 import { Readable } from 'node:stream';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { buildManagedFileReadBinding } from 'librechat-data-provider';
+import {
+  buildManagedFileReadBinding,
+  readHistoricalUploadSecurityApproval,
+} from 'librechat-data-provider';
 import type {
   UploadDerivedOrigin,
   UploadPrincipal,
@@ -25,6 +28,42 @@ import { createManagedSourceResolver } from './managedSource';
 
 const epoch = Date.parse('2026-10-17T10:00:00Z');
 const policy = 'c'.repeat(64);
+/** Synthetic accepted-row metadata only; no engine execution or AV readiness is claimed. */
+function syntheticNasApproval(base: UploadSecurityApproval): UploadSecurityApproval {
+  const checkedAt = base.checkedAt;
+  return {
+    ...base,
+    version: 2,
+    antivirus: {
+      engineVersion: 'synthetic-1.4.6',
+      readyObservedAt: checkedAt,
+      cleanAt: checkedAt,
+      custody: {
+        version: 1,
+        slot: 'synthetic-slot',
+        podUid: 'synthetic-pod',
+        runtimeImage: 'synthetic@sha256:' + 'd'.repeat(64),
+        sourceRevision: 'e'.repeat(40),
+        engineArtifactSha256: '1'.repeat(64),
+        profileSha256: '2'.repeat(64),
+        signatureManifestSha256: '3'.repeat(64),
+        signatureVerificationSha256: '4'.repeat(64),
+        dailyDatabaseVersion: 1,
+        dailyPublishedAt: checkedAt,
+        subject: { ...base.subject },
+        expiresAt: new Date(Date.parse(checkedAt) + 60000).toISOString(),
+        original: {
+          id: '11111111-1111-4111-8111-111111111111',
+          pid: 123,
+          startTicks: '1',
+          bootId: '22222222-2222-4222-8222-222222222222',
+          configurationSha256: '5'.repeat(64),
+        },
+      },
+    },
+  };
+}
+
 const snapshot = <T>(value: T): T => (value == null ? value : JSON.parse(JSON.stringify(value)));
 const user = {
   userId: '000000000000000000000001',
@@ -535,4 +574,76 @@ describe('private Workspace original reader', () => {
     expect(f.runtime.principal).not.toHaveBeenCalled();
     expect(f.client.send).not.toHaveBeenCalled();
   });
+});
+
+test('reads a NAS Workspace original only through its bound private owner and never falls back', async () => {
+  const f = fixture();
+  const backend = {
+    kind: 'nas-s3' as const,
+    protocol: 'acknowledged-only-v1' as const,
+    uid: 'private-backend',
+    configurationSha256: 'a'.repeat(64),
+  };
+  const accepted = readHistoricalUploadSecurityApproval(f.file.securityApproval);
+  if (!accepted) throw new Error('Fixture approval unavailable');
+  f.file.securityApproval = syntheticNasApproval(accepted);
+  f.file.source = 'nas-s3';
+  f.file.storageKey = 'originals/opaque-server-key';
+  f.receipt.source = 'nas-s3';
+  f.receipt.storageKey = f.file.storageKey;
+  f.receipt.backend = backend;
+  delete f.receipt.versionId;
+  const writeBinding = {
+    version: 2 as const,
+    backend,
+    bucket: 'private-files',
+    key: f.file.storageKey,
+    operationId: f.file.file_id,
+    generation: '1',
+    bytes: f.file.bytes,
+    wholeSHA256: f.receipt.integrity!.sha256,
+    mediaType: f.file.type,
+    originalDeadline: '2099-01-01T00:00:00.000Z',
+  };
+  f.runtime.repository.cleanupForFile.mockImplementation(async () => ({
+    ...snapshot(f.task),
+    state: 'ready',
+    writeBinding,
+  }));
+  const currentApproval = readHistoricalUploadSecurityApproval(f.file.securityApproval);
+  if (!currentApproval) throw new Error('Invalid fixture approval');
+  f.file.sourceBindingSha256 = buildManagedFileReadBinding(
+    {
+      owner: user,
+      fileId: f.file.file_id,
+      operationId: f.file.file_id,
+      filename: f.file.filename,
+      mediaType: f.file.type,
+      source: f.file.source,
+      bytes: f.file.bytes,
+      storageKey: f.file.storageKey,
+      transferGeneration: 1,
+      original: f.receipt,
+      approval: currentApproval,
+      representation: 'original',
+    },
+    (value) => createHash('sha256').update(value).digest('hex'),
+  );
+  const reads: Array<Parameters<typeof f.runtime.storage.read>[0]> = [];
+  f.runtime.storage.read = async function* (input) {
+    reads.push(input);
+    yield f.bytes;
+  };
+  await expect(f.read()).resolves.toEqual({ bytes: f.bytes, mediaType: 'text/plain' });
+  expect(reads[0]).toMatchObject({
+    principal: user,
+    operationId: f.file.file_id,
+    original: { backend },
+  });
+  expect(f.client.send).not.toHaveBeenCalled();
+  f.runtime.storage.read = async function* () {
+    yield await Promise.reject(new Error('NAS unavailable'));
+  };
+  await expect(f.read()).rejects.toMatchObject({ code: 'unavailable' });
+  expect(f.client.send).not.toHaveBeenCalled();
 });

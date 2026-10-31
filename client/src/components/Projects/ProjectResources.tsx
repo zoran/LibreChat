@@ -1,3 +1,4 @@
+/** ProjectResources owns project-reference UI while new device uploads share canonical admission. */
 import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { v4 } from 'uuid';
 import * as Ariakit from '@ariakit/react';
@@ -46,6 +47,8 @@ import {
 } from '~/data-provider';
 import { useAgentCapabilities, useGetAgentsConfig, useHasAccess, useLocalize } from '~/hooks';
 import FileSourceButton from '~/components/Chat/Input/Files/Table/FileSourceButton';
+import { UploadAvailabilityHint } from '~/features/uploads/UploadAvailabilityHint';
+import { useManagedUploads } from '~/features/uploads/useManagedUploads';
 import { NotificationSeverity, type LocalizeFunction } from '~/common';
 import ProjectLibraryAction from './ProjectLibraryAction';
 import { FileLibrary } from '~/features/library';
@@ -55,6 +58,7 @@ type ProjectResourcesProps = {
 
 type UploadState = {
   id: string;
+  admissionSessionKey: string;
   filename: string;
   file: File;
   fileId?: string;
@@ -106,6 +110,23 @@ export default function ProjectResources({ project }: ProjectResourcesProps) {
     permission: Permissions.USE,
   });
   const canUploadFromDevice = fileSearchEnabled && canUseFileSearch;
+  const uploads = useManagedUploads();
+  const uploadAdmissionMessage = uploads.newUploadError ? localize(uploads.newUploadError) : null;
+  // Queued selections and old retry closures must read the current policy and original live owner.
+  const uploadAdmissionRef = useRef({
+    canUploadFromDevice,
+    sessionKey: uploads.sessionKey,
+    getError: uploads.getNewUploadError,
+  });
+  uploadAdmissionRef.current = {
+    canUploadFromDevice,
+    sessionKey: uploads.sessionKey,
+    getError: uploads.getNewUploadError,
+  };
+  const getDeviceUploadError = () =>
+    uploadAdmissionRef.current.canUploadFromDevice
+      ? uploadAdmissionRef.current.getError()
+      : ('com_ui_attach_error_disabled' as const);
   const { showToast } = useToastContext();
   const inputRef = useRef<HTMLInputElement>(null);
   const pickerMenuRef = useRef<HTMLButtonElement>(null);
@@ -162,11 +183,32 @@ export default function ProjectResources({ project }: ProjectResourcesProps) {
     }
   }, [attachedIds, optimisticAttachedIds]);
 
+  const rejectAdmission = (item: UploadState, message: string) => {
+    pendingUploadIdsRef.current.delete(item.id);
+    setUploading((current) =>
+      current.map((candidate) =>
+        candidate.id === item.id
+          ? { ...candidate, status: 'failed', errorMessage: message }
+          : candidate,
+      ),
+    );
+  };
+  const sameUploadSession = (item: UploadState) =>
+    item.admissionSessionKey === uploadAdmissionRef.current.sessionKey;
   const runUpload = async (item: UploadState) => {
+    if (!sameUploadSession(item)) {
+      rejectAdmission(item, localize('com_upload_status_unavailable'));
+      return;
+    }
     let uploaded = false;
     try {
       let fileId = item.fileId;
       if (!fileId) {
+        const blocked = getDeviceUploadError();
+        if (blocked) {
+          rejectAdmission(item, localize(blocked));
+          return;
+        }
         const formData = new FormData();
         formData.append('file', item.file);
         formData.append('file_id', item.id);
@@ -183,6 +225,10 @@ export default function ProjectResources({ project }: ProjectResourcesProps) {
             candidate.id === item.id ? { ...candidate, fileId } : candidate,
           ),
         );
+      }
+      if (!sameUploadSession(item)) {
+        rejectAdmission(item, localize('com_upload_status_unavailable'));
+        return;
       }
       uploaded = true;
       await addFile.mutateAsync({ projectId: project._id, file_id: fileId });
@@ -215,9 +261,19 @@ export default function ProjectResources({ project }: ProjectResourcesProps) {
     if (!selected.length || !canUploadFromDevice) {
       return;
     }
+    const blocked = getDeviceUploadError();
+    if (blocked) {
+      showToast({
+        message: localize(blocked),
+        severity: NotificationSeverity.WARNING,
+        showIcon: true,
+      });
+      return;
+    }
     const availableCapacity = Math.max(0, projectFileLimit - getEffectiveFileCount());
     const accepted = selected.slice(0, availableCapacity).map((file) => ({
       id: v4(),
+      admissionSessionKey: uploadAdmissionRef.current.sessionKey,
       filename: file.name,
       file,
       status: 'processing' as const,
@@ -251,7 +307,24 @@ export default function ProjectResources({ project }: ProjectResourcesProps) {
   };
 
   const retryUpload = (item: UploadState) => {
+    if (!sameUploadSession(item)) {
+      showToast({
+        message: localize('com_upload_status_unavailable'),
+        severity: NotificationSeverity.WARNING,
+        showIcon: true,
+      });
+      return;
+    }
     if (pendingUploadIdsRef.current.has(item.id) || (!item.fileId && !canUploadFromDevice)) {
+      return;
+    }
+    const blocked = !item.fileId && getDeviceUploadError();
+    if (blocked) {
+      showToast({
+        message: localize(blocked),
+        severity: NotificationSeverity.WARNING,
+        showIcon: true,
+      });
       return;
     }
     if (getEffectiveFileCount() >= projectFileLimit) {
@@ -278,6 +351,11 @@ export default function ProjectResources({ project }: ProjectResourcesProps) {
     setUploading((current) => current.filter((item) => item.id !== id));
   };
 
+  const retryReason = (item: UploadState) => {
+    if (!sameUploadSession(item)) return localize('com_upload_status_unavailable');
+    if (!item.fileId) return uploadAdmissionMessage;
+    return null;
+  };
   return (
     <section
       className="border-border-light bg-surface-secondary flex h-full min-h-0 min-w-0 flex-col rounded-2xl border p-4 sm:p-5"
@@ -312,15 +390,25 @@ export default function ProjectResources({ project }: ProjectResourcesProps) {
             isOpen={isFileMenuOpen}
             setIsOpen={setIsFileMenuOpen}
             trigger={
-              <Ariakit.MenuButton
-                disabled={!hasFileCapacity || uploadFile.isLoading || addFile.isLoading}
-                className="aria-expanded:bg-surface-hover"
-                render={<Button type="button" variant="outline" size="sm" />}
+              <UploadAvailabilityHint
+                label={localize('com_ui_project_add_files')}
+                reason={uploadAdmissionMessage}
               >
-                <Plus className="size-4" aria-hidden="true" />
-                {localize('com_ui_project_add_files')}
-                <ChevronDown className="size-3.5" aria-hidden="true" />
-              </Ariakit.MenuButton>
+                <Ariakit.MenuButton
+                  disabled={
+                    !hasFileCapacity ||
+                    uploadFile.isLoading ||
+                    addFile.isLoading ||
+                    !!uploadAdmissionMessage
+                  }
+                  className="aria-expanded:bg-surface-hover"
+                  render={<Button type="button" variant="outline" size="sm" />}
+                >
+                  <Plus className="size-4" aria-hidden="true" />
+                  {localize('com_ui_project_add_files')}
+                  <ChevronDown className="size-3.5" aria-hidden="true" />
+                </Ariakit.MenuButton>
+              </UploadAvailabilityHint>
             }
             items={[
               ...(canUploadFromDevice
@@ -328,7 +416,10 @@ export default function ProjectResources({ project }: ProjectResourcesProps) {
                     {
                       label: localize('com_ui_project_upload_file'),
                       icon: <Upload className="text-text-secondary size-4" aria-hidden="true" />,
-                      onClick: () => inputRef.current?.click(),
+                      onClick: () => {
+                        if (getDeviceUploadError()) return;
+                        inputRef.current?.click();
+                      },
                     },
                   ]
                 : []),
@@ -416,15 +507,23 @@ export default function ProjectResources({ project }: ProjectResourcesProps) {
                 )}
                 {item.status === 'failed' && (
                   <>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      disabled={!item.fileId && !canUploadFromDevice}
-                      onClick={() => retryUpload(item)}
+                    <UploadAvailabilityHint
+                      label={localize('com_ui_retry')}
+                      reason={retryReason(item)}
                     >
-                      {localize('com_ui_retry')}
-                    </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        disabled={
+                          !sameUploadSession(item) ||
+                          (!item.fileId && (!canUploadFromDevice || !!uploadAdmissionMessage))
+                        }
+                        onClick={() => retryUpload(item)}
+                      >
+                        {localize('com_ui_retry')}
+                      </Button>
+                    </UploadAvailabilityHint>
                     <Button
                       type="button"
                       variant="ghost"

@@ -1,4 +1,5 @@
 import type { UploadOperation, UploadUsage } from './upload-management';
+import type { UploadStorageAvailability } from './upload-live';
 import type { TFile } from './types/files';
 
 /** Authenticated UI projection. Storage keys, lease tokens and other users never cross this port. */
@@ -23,4 +24,6 @@ export type ManagedUploadSnapshot = {
   admissionsPaused: boolean | null;
   throttled: boolean;
   waitingReason: 'capacity' | 'unavailable' | null;
+  /** Absent only for legacy storage. NAS always supplies its fail-closed current status. */
+  storageAvailability?: UploadStorageAvailability;
 };

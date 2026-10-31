@@ -4,9 +4,9 @@ import type { UploadSecurityExecution, UploadSecuritySettlement } from './upload
 import type { UploadWorker } from './upload-management';
 import {
   isCompleteUploadSecuritySettlement,
-  matchesUploadSecurityExecution,
-  readUploadSecurityExecution,
-  readUploadSecuritySettlement,
+  matchesHistoricalUploadSecurityExecution,
+  readHistoricalUploadSecurityExecution,
+  readHistoricalUploadSecuritySettlement,
 } from './upload-security';
 import { isStorageDeletionBinding, isStorageDeletionResult } from './storage-deletion';
 
@@ -224,14 +224,17 @@ export function readUploadIntakeRecovery(value: unknown): UploadIntakeRecovery |
   }
   let securityExecution: UploadSecurityExecution | undefined;
   if ('securityExecution' in data) {
-    const execution = readUploadSecurityExecution(data.securityExecution);
+    const execution = readHistoricalUploadSecurityExecution(data.securityExecution);
     if (!execution || !bound(execution, identity)) return null;
     securityExecution = execution;
   }
   let securitySettlement: UploadSecuritySettlement | undefined;
   if ('securitySettlement' in data) {
-    const settlement = readUploadSecuritySettlement(data.securitySettlement);
-    if (!settlement || !matchesUploadSecurityExecution(settlement.execution, securityExecution))
+    const settlement = readHistoricalUploadSecuritySettlement(data.securitySettlement);
+    if (
+      !settlement ||
+      !matchesHistoricalUploadSecurityExecution(settlement.execution, securityExecution)
+    )
       return null;
     securitySettlement = settlement;
   }
@@ -269,7 +272,7 @@ export function readUploadIntakeLocalSettlement(
   if (!identity) return null;
   let securitySettlement: UploadSecuritySettlement | undefined;
   if ('securitySettlement' in data) {
-    const settlement = readUploadSecuritySettlement(data.securitySettlement);
+    const settlement = readHistoricalUploadSecuritySettlement(data.securitySettlement);
     if (!settlement || !bound(settlement.execution, identity)) return null;
     securitySettlement = settlement;
   }
