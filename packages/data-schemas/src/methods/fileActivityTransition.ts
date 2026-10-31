@@ -1,5 +1,5 @@
 /** One arithmetic transition for successful original publication and finite user-read settlement. */
-import type { StoredFileRetentionActivity } from '~/types/fileActivity';
+import type { StoredFileRetentionActivity } from '../types/fileActivity';
 
 export const FILE_ACTIVITY_EXTENSION_MS: number = 7 * 86400000;
 const MAX_DATE = 8.64e15;

@@ -3,6 +3,7 @@ import { promises as dns } from 'node:dns';
 import { readFileSync, existsSync } from 'node:fs';
 import { createServer, request } from 'node:https';
 import { createHash, X509Certificate } from 'node:crypto';
+import type { UploadSecuritySettlement } from 'librechat-data-provider';
 import type { LookupAddress, LookupAllOptions } from 'node:dns';
 import type { RequestListener } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -63,7 +64,7 @@ const inspection = () => ({
     transientDataRemoved: true as const,
   },
 });
-const settlement = () => ({
+const settlement = (): UploadSecuritySettlement => ({
   execution: { ...execution },
   antivirusReceipt: antivirusReceiptFixture(execution),
   writerStopped: true,
@@ -523,7 +524,7 @@ describe('bounded authenticated scanner transport', () => {
       };
       res.end(
         kind === 'oversized response'
-          ? 'private'.repeat(2000)
+          ? JSON.stringify({ version: 2, dispatch: null, payload: result }) + ' '.repeat(64 * 1024)
           : JSON.stringify(
               kind === 'old envelope'
                 ? result
@@ -595,6 +596,7 @@ describe('bounded authenticated scanner transport', () => {
     });
     core.cancel.mockResolvedValueOnce({
       execution,
+      antivirusReceipt: null,
       writerStopped: false,
       transientDataRemoved: false,
     });
@@ -612,6 +614,7 @@ describe('bounded authenticated scanner transport', () => {
     await stopped;
     expect(await port.cancel({ execution, signal: signal() })).toEqual({
       execution,
+      antivirusReceipt: null,
       writerStopped: false,
       transientDataRemoved: false,
     });

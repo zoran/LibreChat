@@ -1,3 +1,4 @@
+import { antivirusFixture } from './__fixtures__/upload-antivirus';
 import {
   readUploadIntakeGrant,
   readUploadIntakeTicket,
@@ -19,6 +20,15 @@ const grant = () => ({
   expiresAt,
 });
 const ticket = () => ({ version: 1, operationId, capability: 'A'.repeat(43), expiresAt });
+const promotionSubject = () => ({
+  tenantId: 'tenant',
+  userId,
+  operationId,
+  transferGeneration: 1,
+  mediaType: 'text/plain',
+  bytes: 5,
+  sha256: 'b'.repeat(64),
+});
 const promotion = () => ({
   version: 1,
   promotionId,
@@ -34,21 +44,14 @@ const promotion = () => ({
   },
   worker: { hostId: 'app-host', instanceId: 'app-instance' },
   approval: {
-    version: 1,
+    version: 2,
+    antivirus: antivirusFixture(promotionSubject(), Date.parse(expiresAt)).approval,
     decision: 'approved',
     policySha256: 'a'.repeat(64),
     scannerVersion: 'scanner/1',
     checkedAt: expiresAt,
     coverage: { complete: true, pages: 1, parts: 1 },
-    subject: {
-      tenantId: 'tenant',
-      userId,
-      operationId,
-      transferGeneration: 1,
-      mediaType: 'text/plain',
-      bytes: 5,
-      sha256: 'b'.repeat(64),
-    },
+    subject: promotionSubject(),
   },
   integrity: {
     version: 1,
@@ -269,4 +272,14 @@ describe('isolated intake shared data boundaries', () => {
     input.receipt.integrity.chunkSha256[0] = 'c'.repeat(64);
     expect(result.receipt?.integrity?.chunkSha256).toEqual(['b'.repeat(64)]);
   });
+});
+
+it('retains explicit historical promotion custody without admitting a legacy current dispatch', () => {
+  const value = promotion();
+  const { antivirus: _oldAntivirus, ...legacy } = value.approval;
+  const input = { ...value, approval: { ...legacy, version: 1 } };
+  expect(readUploadPromotionInput(input)).toBeNull();
+  const retained = { ...input, state: 'settled', writerStopped: true, receipt: receipt() };
+  expect(readUploadPromotionRecord(retained)).toBeNull();
+  expect(readUploadPromotionRecord(retained, true)).toEqual(retained);
 });

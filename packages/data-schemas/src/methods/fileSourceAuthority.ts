@@ -14,11 +14,11 @@ import {
 } from 'librechat-data-provider';
 import type { ManagedFileReadRepresentation } from 'librechat-data-provider';
 import type { ClientSession, FilterQuery, Model } from 'mongoose';
-import type { FileOwnerScope, FileSourceInspection, IMongoFile } from '~/types/file';
+import type { FileOwnerScope, FileSourceInspection, IMongoFile } from '../types/file';
 import type { StoredUpload } from './uploadManagementStore';
 import { approvedFileFilter, uploadSecurityPolicySha256 } from './fileSecurity';
 import { hasCurrentUploadSecurityApproval } from './uploadManagement.security';
-import { tenantStorage, SYSTEM_TENANT_ID } from '~/config/tenantContext';
+import { tenantStorage, SYSTEM_TENANT_ID } from '../config/tenantContext';
 import { validFileRetentionActivity } from './fileActivityTransition';
 
 export class FileSourceUnavailableError extends Error {

@@ -36,7 +36,7 @@ import type {
   JobClaim,
   StepOutcome,
 } from '../types/housekeeping';
-import type { FileReadRepository } from '~/types/fileActivity';
+import type { FileReadRepository } from '../types/fileActivity';
 import type { UploadActivationMethods } from './uploadManagementActivation';
 import type { UploadAdmissionMethods } from './uploadManagementAdmission';
 import type { UploadControlMethods } from './uploadManagementControl';

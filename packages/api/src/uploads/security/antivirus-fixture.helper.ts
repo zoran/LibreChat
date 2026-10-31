@@ -36,6 +36,7 @@ export function antivirusCustodyFixture(
 export function antivirusReceiptFixture(
   execution: UploadSecurityExecution,
 ): UploadAntivirusReceipt {
+  if (execution.version !== 3) throw new Error('Legacy execution has no current AV custody');
   return {
     custody: JSON.parse(JSON.stringify(execution.antivirus)),
     state: 'retired',
@@ -49,6 +50,7 @@ export function antivirusApprovalFixture(
   execution: UploadSecurityExecution,
   now = Date.now(),
 ): UploadAntivirusApproval {
+  if (execution.version !== 3) throw new Error('Legacy execution has no current AV custody');
   return {
     custody: JSON.parse(JSON.stringify(execution.antivirus)),
     engineVersion: representative.inspection.decision.antivirus.engineVersion,

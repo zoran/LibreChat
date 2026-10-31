@@ -10,7 +10,7 @@ import type { FileRetentionMigrationRecord, UploadDerivedSource } from 'librecha
 import type { ClientSession } from 'mongoose';
 import type { CurrentManagedFileSource } from './fileSourceAuthority';
 import type { StoredUpload } from './uploadManagementStore';
-import type { IMongoFile } from '~/types/file';
+import type { IMongoFile } from '../types/file';
 import {
   assembleManagedFileSource,
   currentFileDeadline,

@@ -8,7 +8,7 @@ export type {
   ConfigSection,
   SystemCapability,
   CapabilityCategory,
-} from '~/admin/capabilities';
+} from '../admin/capabilities';
 
 /* ── Admin API response types ───────────────────────────────────────── */
 

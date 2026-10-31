@@ -1,8 +1,8 @@
 /** Existing File/job projection checks shared by the historical source owner. */
 import type { ClientSession, mongo } from 'mongoose';
-import type { HousekeepingJobRecord } from '~/models/housekeepingJob';
+import type { HousekeepingJobRecord } from '../models/housekeepingJob';
 import type { UploadStore } from './uploadManagementStore';
-import type { IMongoFile } from '~/types/file';
+import type { IMongoFile } from '../types/file';
 import {
   isFileCoverageInteger as integer,
   isFileCoverageIdentifier as id,

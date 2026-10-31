@@ -23,7 +23,12 @@ import type {
 import { createIntakeControlHandlers } from './control';
 import type { IntakeControlOptions } from './control';
 import { createUploadAttemptJournal } from '../attempts';
+import {
+  antivirusCustodyFixture,
+  antivirusApprovalFixture,
+} from '../security/antivirus-fixture.helper';
 import { createOriginalIntegrity } from '../storage/integrity';
+import { uploadLocalReservation } from '../platform/local';
 import { UploadManagementError } from '../errors';
 
 // Keep the fake DB's plain JSON data in the same realm as Jest's validators.
@@ -61,18 +66,29 @@ const grant: UploadIntakeGrant = {
   policyVersion: 1,
   expiresAt: new Date(now + 300_000).toISOString(),
 };
+const subject = {
+  tenantId: principal.tenantId,
+  userId: principal.userId,
+  operationId,
+  transferGeneration: 1,
+  mediaType: 'text/plain',
+  bytes: 5,
+  sha256: integrity.sha256,
+};
+const execution = {
+  version: 3 as const,
+  attemptId: `${operationId}.1`,
+  instanceId: '33333333-3333-4333-8333-333333333333',
+  executionId: '44444444-4444-4444-8444-444444444444',
+  expiresAt: lease.expiresAt,
+  custody: { kind: 'none' as const },
+  antivirus: antivirusCustodyFixture(subject, lease.expiresAt, now),
+};
 const approval = {
-  version: 1 as const,
+  version: 2 as const,
+  antivirus: antivirusApprovalFixture(execution, now),
   decision: 'approved' as const,
-  subject: {
-    tenantId: principal.tenantId,
-    userId: principal.userId,
-    operationId,
-    transferGeneration: 1,
-    mediaType: 'text/plain',
-    bytes: 5,
-    sha256: integrity.sha256,
-  },
+  subject,
   policySha256: 'a'.repeat(64),
   scannerVersion: 'test/1',
   checkedAt: new Date(now).toISOString(),
@@ -150,6 +166,7 @@ function fixture(observeSecurityDispatch?: IntakeControlOptions['observeSecurity
       return copy(lease);
     }),
     renew: jest.fn(async () => copy(lease)),
+    claimWorkBytes: jest.fn(async () => ({ generation: 1, bytes: 5, expiresAt: lease.expiresAt })),
     preparePromotion: jest.fn(async (input) => {
       record = { ...copy(input), state: 'prepared', writerStopped: true };
       return copy(record);
@@ -198,7 +215,11 @@ function fixture(observeSecurityDispatch?: IntakeControlOptions['observeSecurity
     accept: jest.fn(async () => operation),
     confirmCleanup: jest.fn(async () => operation),
   };
-  const resources = { assertSafe: jest.fn(async () => undefined) };
+  const resources = {
+    assertSafe: jest.fn(
+      async (_input: Parameters<IntakeControlOptions['resources']['assertSafe']>[0]) => undefined,
+    ),
+  };
   const storage = {
     observeOriginal: jest.fn(async () => ({ ...copy(receipt), outcome: 'unknown' as const })),
     put: jest.fn(async (input: Parameters<IntakeControlOptions['storage']['put']>[0]) => {
@@ -445,9 +466,20 @@ describe('application intake control', () => {
     const f = fixture();
     const count = Math.ceil(UPLOAD_MAX_FILE_BYTES / UPLOAD_INTEGRITY_CHUNK_BYTES);
     expect(count).toBe(120);
+    const maximumSubject = { ...approval.subject, bytes: UPLOAD_MAX_FILE_BYTES };
     const input = {
       ...preparation,
-      approval: { ...approval, subject: { ...approval.subject, bytes: UPLOAD_MAX_FILE_BYTES } },
+      approval: {
+        ...approval,
+        subject: maximumSubject,
+        antivirus: antivirusApprovalFixture(
+          {
+            ...execution,
+            antivirus: antivirusCustodyFixture(maximumSubject, lease.expiresAt, now),
+          },
+          now,
+        ),
+      },
       integrity: {
         ...integrity,
         chunkSha256: Array.from({ length: count }, () => integrity.sha256),
@@ -564,6 +596,84 @@ describe('application intake control', () => {
     });
     expect(f.repository.renew).toHaveBeenCalledWith(lease, now);
     expect(f.repository.renew).toHaveBeenCalledTimes(1);
+  });
+
+  it('charges the original Intake lease while checking only the App-owned resource pool', async () => {
+    const f = fixture();
+    f.resources.assertSafe.mockImplementation(async (input) => {
+      expect(input.hostId).toBe(app.hostId);
+      uploadLocalReservation({
+        worker: app,
+        journal: {
+          worker: app,
+          observedAt: now,
+          heldBytes: 0,
+          counts: { transfer: 0, processing: 0 },
+          attempts: [],
+        },
+        disk: {
+          observedAtMs: now,
+          observedMonotonicMs: 0,
+          usedBytes: 0,
+          freeBytes: 128 * 1048576,
+          freeInodes: 100,
+          originals: {},
+        },
+        phase: input.phase,
+        lease: input.lease,
+        clock: { nowMs: now, monotonicMs: 0 },
+      });
+    });
+    await expect(
+      f.command({ action: 'claim-bytes', lease, requestedBytes: 5 }),
+    ).resolves.toMatchObject({ generation: 1, bytes: 5 });
+    expect(f.resources.assertSafe).toHaveBeenCalledWith({ phase: 'admission', hostId: app.hostId });
+    expect(f.repository.claimWorkBytes).toHaveBeenCalledWith({ lease, requestedBytes: 5, now });
+    expect(f.management.claimWorkBytes).not.toHaveBeenCalled();
+  });
+
+  it('does not mutate byte grants after App admission denial or an abort during that check', async () => {
+    const f = fixture();
+    f.resources.assertSafe.mockRejectedValueOnce(new UploadManagementError('unavailable'));
+    await expect(
+      f.command({ action: 'claim-bytes', lease, requestedBytes: 5 }),
+    ).rejects.toMatchObject({ code: 'unavailable' });
+    expect(f.repository.claimWorkBytes).not.toHaveBeenCalled();
+    const aborted = new AbortController();
+    f.resources.assertSafe.mockImplementationOnce(async () => {
+      aborted.abort();
+    });
+    await expect(
+      f.handlers.control(
+        context,
+        { action: 'claim-bytes', lease, requestedBytes: 5 },
+        aborted.signal,
+      ),
+    ).rejects.toMatchObject({ name: 'AbortError' });
+    expect(f.repository.claimWorkBytes).not.toHaveBeenCalled();
+  });
+
+  it('fences a foreign binding and preserves native stale-lease rejection without substituting App identity', async () => {
+    const f = fixture();
+    await expect(
+      f.command({ action: 'claim-bytes', lease: { ...lease, ...app }, requestedBytes: 5 }),
+    ).rejects.toMatchObject({ code: 'lease_lost' });
+    await expect(
+      f.command({ action: 'claim-bytes', lease: { ...lease, generation: 2 }, requestedBytes: 5 }),
+    ).rejects.toMatchObject({ code: 'lease_lost' });
+    expect(f.repository.claimWorkBytes).not.toHaveBeenCalled();
+    const stale = { ...lease, expiresAt: new Date(now - 1).toISOString() };
+    jest
+      .mocked(f.repository.claimWorkBytes)
+      .mockRejectedValueOnce(new UploadManagementError('lease_lost'));
+    await expect(
+      f.command({ action: 'claim-bytes', lease: stale, requestedBytes: 5 }),
+    ).rejects.toMatchObject({ code: 'lease_lost' });
+    expect(f.repository.claimWorkBytes).toHaveBeenCalledWith({
+      lease: stale,
+      requestedBytes: 5,
+      now,
+    });
   });
 
   it('does not settle another in-flight App claim when journal binding loses a race', async () => {

@@ -127,7 +127,7 @@ describe('Upload startup admission at the actual composition', () => {
       './UploadsNas': {
         managedSecurityClient: async () => api.createHttpUploadSecurityPort(),
         createLegacyUploadStorage: () => api.createManagedS3Storage(),
-        selectedManagedUploads: async () => undefined,
+        selectedManagedUploads: jest.fn(async () => undefined),
         nasAntivirusAdmission: () => {
           throw new Error('NAS is not selected in this lifecycle fixture');
         },
@@ -160,6 +160,7 @@ describe('Upload startup admission at the actual composition', () => {
       files,
       workers,
       platform,
+      nas: modules['./UploadsNas'],
       intake,
       settleIntake: () => finishIntake(intake),
       identity: {
@@ -189,6 +190,18 @@ describe('Upload startup admission at the actual composition', () => {
     expect(f.files.mkdir).not.toHaveBeenCalled();
     expect(f.api.startIntakeControlService).not.toHaveBeenCalled();
     expect(f.uploadMaintenance.resumeAdmissions('startup')).toBe(true);
+  });
+
+  it('keeps private configuration acquisition failure unavailable before acquiring storage', async () => {
+    const f = fixture();
+    const failure = new Error('Synthetic private configuration unavailable');
+    f.nas.selectedManagedUploads.mockRejectedValueOnce(failure);
+    await expect(f.initializeUploads({ identity: f.identity })).rejects.toBe(failure);
+    expect(f.nas.selectedManagedUploads).toHaveBeenCalledTimes(1);
+    expect(f.files.mkdir).not.toHaveBeenCalled();
+    expect(f.api.createManagedS3Storage).not.toHaveBeenCalled();
+    expect(f.api.startIntakeControlService).not.toHaveBeenCalled();
+    expect(f.uploadMaintenance.readStorageProvider()).toEqual({ state: 'unavailable' });
   });
 
   it('keeps partial acquisition and closing unqualified without adopting a missing web backend', async () => {

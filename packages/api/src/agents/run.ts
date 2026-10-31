@@ -2687,7 +2687,7 @@ export async function createRun(options: CreateRunOptions): Promise<Run<IState>>
 
     /** Resolves issues with new OpenAI usage field */
     if (
-      customProviders.has(agent.provider) ||
+      Array.from(customProviders).some((customProvider) => customProvider === agent.provider) ||
       (agent.provider === Providers.OPENAI && agent.endpoint !== agent.provider)
     ) {
       if (!hasExplicitStreamUsage) {

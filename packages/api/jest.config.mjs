@@ -43,8 +43,11 @@ export default {
   },
   transformIgnorePatterns: [`/node_modules/(?!(${esModules})/).*/`],
   moduleNameMapper: {
+    '^librechat-data-provider$': '<rootDir>/../data-provider/src/index.ts',
+    '^~/config/(tenantContext|winston|meiliLogger)$': '<rootDir>/../data-schemas/src/config/$1.ts',
+    '^src/(.*)$': '<rootDir>/../data-provider/src/$1',
     '^@src/(.*)$': '<rootDir>/src/$1',
-    '~/(.*)': '<rootDir>/src/$1',
+    '^~/(.*)$': '<rootDir>/src/$1',
   },
   // coverageThreshold: {
   //   global: {
@@ -54,7 +57,8 @@ export default {
   //     lines: 57,
   //   },
   // },
-  setupFiles: ['<rootDir>/jest.setup.cjs', '<rootDir>/../../config/jest.setup.logging.cjs'],
+  setupFiles: ['<rootDir>/../../config/jest.setup.logging.cjs'],
+  setupFilesAfterEnv: ['<rootDir>/jest.setup.cjs'],
   maxWorkers,
   restoreMocks: true,
   testTimeout: 15000,

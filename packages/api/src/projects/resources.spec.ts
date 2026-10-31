@@ -1,6 +1,6 @@
 import mongoose from 'mongoose';
 import { FileContext } from 'librechat-data-provider';
-import { MongoMemoryServer } from 'mongodb-memory-server';
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
 import { createModels, createMethods } from '@librechat/data-schemas';
 import type { IChatProject, IMongoFile, ProjectFileRecord } from '@librechat/data-schemas';
 import {
@@ -12,12 +12,12 @@ import {
 } from './resources';
 import { getChatProjectContextKey, resolveChatProjectContext } from './context';
 
-let mongoServer: InstanceType<typeof MongoMemoryServer>;
+let mongoServer: InstanceType<typeof MongoMemoryReplSet>;
 let File: mongoose.Model<IMongoFile>;
 let modelsToCleanup: string[] = [];
 
 beforeAll(async () => {
-  mongoServer = await MongoMemoryServer.create();
+  mongoServer = await MongoMemoryReplSet.create({ replSet: { count: 1 } });
   const models = createModels(mongoose);
   modelsToCleanup = Object.keys(models);
   Object.assign(mongoose.models, models);

@@ -28,6 +28,11 @@ const lease = {
   instanceId: 'instance',
   expiresAt: '2099-01-01T00:00:00Z',
 };
+const principal = {
+  tenantId: lease.tenantId,
+  userId: lease.userId,
+  authentication: 'verified-email' as const,
+};
 const originalDeadline = new Date(Date.now() + 300000).toISOString();
 const expectedKey = 't/tenant/managed-uploads/user/operation.2__original';
 const signal = () => new AbortController().signal;
@@ -199,7 +204,13 @@ describe('managed S3 adapter preserves lifecycle and uncertainty', () => {
     const original = await storage.put({ ...put(), lease: guest });
     expect(original.outcome).toBe('durable');
     const received = [];
-    for await (const chunk of storage.read({ original, signal: signal() })) received.push(chunk);
+    for await (const chunk of storage.read({
+      principal: { ...principal, tenantId: null, authentication: 'guest' },
+      operationId: guest.operationId,
+      original,
+      signal: signal(),
+    }))
+      received.push(chunk);
     expect(Buffer.concat(received).toString()).toBe('hello');
   });
 
@@ -273,6 +284,8 @@ describe('managed S3 adapter preserves lifecycle and uncertainty', () => {
     });
     const values: Buffer[] = [];
     for await (const chunk of fixture(send).storage.read({
+      principal,
+      operationId: lease.operationId,
       original: {
         source: 's3',
         storageKey: expectedKey,
@@ -303,6 +316,8 @@ describe('managed S3 adapter preserves lifecycle and uncertainty', () => {
     );
     const reader = storage
       .read({
+        principal,
+        operationId: lease.operationId,
         original: {
           source: 's3',
           storageKey: expectedKey,
@@ -413,6 +428,8 @@ describe('managed S3 adapter preserves lifecycle and uncertainty', () => {
       await expect(
         (async () => {
           for await (const _ of storage.read({
+            principal,
+            operationId: lease.operationId,
             original: {
               source: 's3',
               storageKey: expectedKey,
@@ -453,6 +470,8 @@ describe('managed S3 adapter preserves lifecycle and uncertainty', () => {
     await expect(
       (async () => {
         for await (const value of storage.read({
+          principal,
+          operationId: lease.operationId,
           original: {
             source: 's3',
             storageKey: expectedKey,
@@ -487,7 +506,12 @@ describe('managed S3 adapter preserves lifecycle and uncertainty', () => {
       expect(command.input).toMatchObject({ Key: expectedKey, VersionId: 'original-version' });
       return { Body: Readable.from([Buffer.from('hello')]) };
     });
-    const reading = fixture(send).storage.read({ original, signal: signal() });
+    const reading = fixture(send).storage.read({
+      principal,
+      operationId: lease.operationId,
+      original,
+      signal: signal(),
+    });
     original.storageKey = 'changed';
     original.versionId = 'changed';
     original.bytes = 9;
@@ -504,6 +528,8 @@ describe('managed S3 adapter preserves lifecycle and uncertainty', () => {
     const { storage } = fixture(jest.fn(async () => ({ Body: body })));
     const reader = storage
       .read({
+        principal,
+        operationId: lease.operationId,
         original: {
           source: 's3',
           storageKey: expectedKey,
@@ -713,6 +739,7 @@ describe('managed original bound status through actual AWS SDK', () => {
     });
     await expect(
       f.storage.observeOriginal({
+        principal,
         binding: b,
         integrity: manifest(Buffer.from('hello')),
         signal: signal(),
@@ -766,6 +793,7 @@ describe('managed original bound status through actual AWS SDK', () => {
     }));
     await expect(
       f.storage.observeOriginal({
+        principal,
         binding: b,
         integrity: manifest(Buffer.from('hello')),
         signal: signal(),

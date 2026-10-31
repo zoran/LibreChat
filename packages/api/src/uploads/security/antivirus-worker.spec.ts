@@ -12,13 +12,15 @@ import { createSecurityWorker } from './worker';
 jest.mock('node:worker_threads', () => ({
   Worker: jest.fn().mockImplementation(() => {
     const { EventEmitter } = jest.requireActual<typeof import('node:events')>('node:events');
-    const thread = new EventEmitter();
-    thread.stdout = { resume() {} };
-    thread.stderr = { resume() {} };
-    thread.terminate = async () => {
-      thread.emit('exit', 0);
-      return 0;
-    };
+    class ClassifierThread extends EventEmitter {
+      stdout = { resume() {} };
+      stderr = { resume() {} };
+      async terminate() {
+        this.emit('exit', 0);
+        return 0;
+      }
+    }
+    const thread = new ClassifierThread();
     queueMicrotask(() => {
       thread.emit(
         'message',
@@ -69,6 +71,7 @@ describe('actual worker with mandatory original antivirus', () => {
       signal: signal(),
     });
     expect(execution.version).toBe(3);
+    if (execution.version !== 3) throw new Error('Current worker must return Execution3');
     expect(f.events).toEqual(['prepare']);
     f.bind();
     const result = await f.worker.inspect({

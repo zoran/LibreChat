@@ -2,10 +2,10 @@
 import type { FileHistoryCursor } from 'librechat-data-provider';
 import type { ClientSession, mongo } from 'mongoose';
 import type { MongoHistoryLeaf } from './fileHousekeepingMongoHistory';
-import type { HousekeepingJobRecord } from '~/models/housekeepingJob';
+import type { HousekeepingJobRecord } from '../models/housekeepingJob';
 import type { MongoHistoryScope } from './fileHousekeepingHistory';
 import type { UploadStore } from './uploadManagementStore';
-import type { IMongoFile } from '~/types/file';
+import type { IMongoFile } from '../types/file';
 import { observeCompleteUpload, UploadHistoryObservationError } from './uploadManagementHistory';
 import { prepareStandaloneFileCoverage } from './fileRetentionMigration';
 import { mongoHistoryLeaf } from './fileHousekeepingMongoHistory';

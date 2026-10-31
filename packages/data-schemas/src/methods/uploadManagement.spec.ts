@@ -1,3 +1,4 @@
+import { antivirusFixture } from '../../../data-provider/src/__fixtures__/upload-antivirus';
 /** Real replica-set evidence for the one durable upload store, through two independent clients. */
 import mongoose from 'mongoose';
 import { createHash } from 'crypto';
@@ -107,27 +108,31 @@ describe('durable upload management', () => {
     originalAbsent: false,
     textAndHistoryRemoved: false,
   });
+  const securitySubject = (lease: UploadLease, bytes = 8) => ({
+    tenantId: lease.tenantId,
+    userId: lease.userId,
+    operationId: lease.operationId,
+    transferGeneration: lease.generation,
+    mediaType: 'text/plain',
+    bytes,
+    sha256: receipt(lease, bytes).integrity.sha256,
+  });
   const approval = (lease: UploadLease, bytes = 8, checkedAt = now) => ({
-    version: 1 as const,
+    version: 2 as const,
+    antivirus: antivirusFixture(securitySubject(lease, bytes), checkedAt).approval,
     decision: 'approved' as const,
     policySha256: securityPolicySha256,
-    subject: {
-      tenantId: lease.tenantId,
-      userId: lease.userId,
-      operationId: lease.operationId,
-      transferGeneration: lease.generation,
-      mediaType: 'text/plain',
-      bytes,
-      sha256: receipt(lease, bytes).integrity.sha256,
-    },
+    subject: securitySubject(lease, bytes),
     scannerVersion: 'fixture-v1',
     checkedAt: new Date(checkedAt).toISOString(),
     coverage: { complete: true as const, pages: 1, parts: 1 },
   });
 
-  async function completeScanner(lease: UploadLease, at: number) {
+  async function completeScanner(lease: UploadLease, at: number, bytes = 8) {
+    const av = antivirusFixture(securitySubject(lease, bytes), at);
     const execution = {
-      version: 2 as const,
+      version: 3 as const,
+      antivirus: av.custody,
       custody: { kind: 'none' as const },
       attemptId: `${lease.operationId}.${lease.generation}`,
       instanceId: '11111111-1111-4111-8111-111111111111',
@@ -137,7 +142,23 @@ describe('durable upload management', () => {
     await first.bindSecurityExecution(lease, execution, at);
     await second.settleSecurityExecution(
       lease,
-      { execution, writerStopped: true, transientDataRemoved: true },
+      { execution, antivirusReceipt: av.receipt, writerStopped: true, transientDataRemoved: true },
+      at,
+    );
+    const original = receipt(lease, bytes);
+    await first.bindOriginalWrite(
+      lease,
+      {
+        bucket: 'isolated',
+        key: original.storageKey,
+        operationId: lease.operationId,
+        generation: String(lease.generation),
+        bytes,
+        wholeSHA256: original.integrity.sha256,
+        mediaType: 'text/plain',
+      },
+      original.integrity,
+      approval(lease, bytes, at),
       at,
     );
   }
@@ -199,7 +220,7 @@ describe('durable upload management', () => {
       now: at,
     });
     expect(lease).not.toBeNull();
-    await completeScanner(lease!, at);
+    await completeScanner(lease!, at, bytes);
     const operation = await second.accept(
       principal,
       lease!,

@@ -1,3 +1,5 @@
+import { antivirusFixture } from '../../../data-provider/src/__fixtures__/upload-antivirus';
+import { readUploadSecuritySubject } from 'librechat-data-provider';
 /** Real Mongo lifecycle evidence; native storage replies and empty generation/checkpoint inventories are fixtures. */
 import mongoose from 'mongoose';
 import { v4 as uuid } from 'uuid';
@@ -267,8 +269,30 @@ describe('source-dependent message retention', () => {
       now: at,
     });
     if (!transfer) throw new Error('Managed fixture transfer was not admitted');
-    const execution = {
+    const subject = readUploadSecuritySubject({
+      userId: user,
+      tenantId: null,
+      operationId: sourceId,
+      transferGeneration: transfer.generation,
+      mediaType: 'text/plain',
+      bytes: 6,
+      sha256: 'a'.repeat(64),
+    });
+    if (!subject) throw new Error('Current scanner subject fixture unavailable');
+    const av = antivirusFixture(subject, at);
+    const securityApproval = {
       version: 2 as const,
+      antivirus: av.approval,
+      decision: 'approved' as const,
+      policySha256: policy,
+      subject,
+      scannerVersion: 'fixture-v1',
+      checkedAt: new Date(at).toISOString(),
+      coverage: { complete: true as const, pages: 1, parts: 1 },
+    };
+    const execution = {
+      version: 3 as const,
+      antivirus: av.custody,
       custody: { kind: 'none' as const },
       attemptId: `${sourceId}.${transfer.generation}`,
       instanceId: uuid(),
@@ -278,7 +302,28 @@ describe('source-dependent message retention', () => {
     await uploads.bindSecurityExecution(transfer, execution, at);
     await uploads.settleSecurityExecution(
       transfer,
-      { execution, writerStopped: true, transientDataRemoved: true },
+      { execution, antivirusReceipt: av.receipt, writerStopped: true, transientDataRemoved: true },
+      at,
+    );
+    await uploads.bindOriginalWrite(
+      transfer,
+      {
+        bucket: 'isolated',
+        key: `managed-uploads/${user}/${sourceId}.${transfer.generation}__original`,
+        operationId: sourceId,
+        generation: String(transfer.generation),
+        bytes: 6,
+        wholeSHA256: 'a'.repeat(64),
+        mediaType: 'text/plain',
+      },
+      {
+        version: 1,
+        algorithm: 'sha256',
+        sha256: 'a'.repeat(64),
+        chunkBytes: 262144,
+        chunkSha256: ['b'.repeat(64)],
+      },
+      securityApproval,
       at,
     );
     await uploads.accept(
@@ -298,23 +343,7 @@ describe('source-dependent message retention', () => {
           chunkSha256: ['b'.repeat(64)],
         },
       },
-      {
-        version: 1,
-        decision: 'approved',
-        policySha256: policy,
-        subject: {
-          userId: user,
-          tenantId: null,
-          operationId: sourceId,
-          transferGeneration: transfer.generation,
-          mediaType: 'text/plain',
-          bytes: 6,
-          sha256: 'a'.repeat(64),
-        },
-        scannerVersion: 'fixture-v1',
-        checkedAt: new Date(at).toISOString(),
-        coverage: { complete: true, pages: 1, parts: 1 },
-      },
+      securityApproval,
       { filename: 'A.txt' },
       at,
     );

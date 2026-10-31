@@ -5,7 +5,7 @@ import type {
   StatefulCodeEnvironment,
 } from 'librechat-data-provider';
 import type { Document, Types } from 'mongoose';
-import { CursorPaginationParams } from '~/common';
+import { CursorPaginationParams } from '../common';
 
 export interface IUser extends Document {
   _id: Types.ObjectId;

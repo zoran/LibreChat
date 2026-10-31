@@ -8,8 +8,8 @@ import {
 } from 'librechat-data-provider';
 import type { UploadSecurityApproval } from 'librechat-data-provider';
 import type { FilterQuery } from 'mongoose';
-import type { ManagedUploadAcceptance } from '~/types/file';
-import type { IMongoFile } from '~/types';
+import type { ManagedUploadAcceptance } from '../types/file';
+import type { IMongoFile } from '../types';
 
 export function uploadSecurityPolicySha256(
   value: unknown = process.env.UPLOAD_SECURITY_POLICY_SHA256,
@@ -178,7 +178,6 @@ export function approvedFileFilter(
         },
         {
           $eq: [
-            '$storageKey',
             {
               $cond: [
                 { $eq: ['$securityApproval.version', 2] },
@@ -203,6 +202,7 @@ export function approvedFileFilter(
                 },
               ],
             },
+            '$storageKey',
           ],
         },
       ],

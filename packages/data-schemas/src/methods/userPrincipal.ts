@@ -1,5 +1,5 @@
 import type { ClientSession } from 'mongoose';
-import { currentTenantScope } from '~/tenant/policy';
+import { currentTenantScope } from '../tenant/policy';
 
 type UserPrincipal = Readonly<{ userId: string; tenantId: string | null }>;
 

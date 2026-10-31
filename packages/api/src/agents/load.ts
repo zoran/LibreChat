@@ -2,6 +2,7 @@ import { logger } from '@librechat/data-schemas';
 import {
   Tools,
   Constants,
+  ArtifactModes,
   isAgentsEndpoint,
   isEphemeralAgentId,
   getEphemeralSender,
@@ -210,8 +211,9 @@ export async function loadEphemeralAgent(
     result.tool_options = mergeSynthesizedToolOptions(result.tool_options, intentToolOptions);
   }
 
-  if (ephemeralAgent?.artifacts) {
-    result.artifacts = ephemeralAgent.artifacts;
+  const artifacts = Object.values(ArtifactModes).find((mode) => mode === ephemeralAgent?.artifacts);
+  if (artifacts !== undefined) {
+    result.artifacts = artifacts;
   }
   if (modelSpec?.subagents) {
     result.subagents = modelSpec.subagents;

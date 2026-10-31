@@ -50,7 +50,7 @@ export type IntakeControlOptions = {
     | 'sealIntakeRecovery'
     | 'confirmIntakeRecovery'
     | 'readActorCleanupRecovery'
-    | 'bindOriginalWrite'
+    | 'claimWorkBytes'
     | 'readOriginalWrite'
   >;
   identityRepository: Pick<EmailCodeRepository, 'readEmailCodeIdentity'>;
@@ -391,7 +391,13 @@ export function createIntakeControlHandlers(options: IntakeControlOptions): Inta
       case 'claim-bytes':
         if (!integer(command.requestedBytes) || command.requestedBytes > UPLOAD_MAX_FILE_BYTES)
           fail();
-        return management.claimWorkBytes(held!, command.requestedBytes);
+        await options.resources.assertSafe({ phase: 'admission', hostId: appWorker.hostId });
+        signal.throwIfAborted();
+        return repository.claimWorkBytes({
+          lease: held!,
+          requestedBytes: command.requestedBytes,
+          now: now(),
+        });
       case 'complete-bytes':
         if (!integer(command.generation)) fail();
         return management.completeWorkBytes(held!, command.generation);

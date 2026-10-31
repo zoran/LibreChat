@@ -9,8 +9,8 @@ import {
 } from 'librechat-data-provider';
 
 import type { ClientSession, FilterQuery, Model } from 'mongoose';
-import type { FileOwnerScope } from '~/types/file';
-import type { IMongoFile } from '~/types';
+import type { FileOwnerScope } from '../types/file';
+import type { IMongoFile } from '../types';
 
 import { adjustRetainedTextBytes } from './uploadManagementStore';
 import { approvedFileFilter } from './fileSecurity';

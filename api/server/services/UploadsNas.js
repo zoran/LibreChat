@@ -6,7 +6,6 @@ const {
   createNasAntivirusAdmission,
   createNormalUploadStorage,
 } = require('@librechat/api');
-const { getAppConfig } = require('./Config/app');
 module.exports = {
   managedSecurityClient: (signal) =>
     createManagedUploadSecurityClient({ env: process.env, signal }),
@@ -16,7 +15,11 @@ module.exports = {
       platform,
       bucket: process.env.AWS_BUCKET_NAME,
     }),
-  selectedManagedUploads: () => selectManagedUploadConfiguration(getAppConfig),
+  selectedManagedUploads: () =>
+    selectManagedUploadConfiguration(() => {
+      const { getAppConfig } = require('./Config/app');
+      return getAppConfig();
+    }),
   nasAntivirusAdmission: (configuration, security) =>
     createNasAntivirusAdmission({
       configuration,

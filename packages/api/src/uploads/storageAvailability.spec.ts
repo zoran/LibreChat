@@ -165,3 +165,114 @@ it('exposes only the selected startup bit and preserves feature/auth eligibility
     storageAvailabilityRequired: false,
   });
 });
+
+it('refreshes before an aged collector report expires, retaining the genuine source clocks', async () => {
+  jest.useFakeTimers({ now: healthNow });
+  const readNfs = jest.fn(async () => nfsHealthFixture(healthNow + 15000));
+  readNfs.mockResolvedValueOnce(nfsHealthFixture(healthNow - 45000));
+  const probeS3 = jest.fn(async () => s3HealthFixture(Date.now()));
+  const owner = createUploadStorageAvailability({
+    binding: healthBinding,
+    readNfs,
+    probeS3,
+    clock: () => ({ nowMs: Date.now(), monotonicMs: Date.now() - healthNow + 1000 }),
+  });
+  try {
+    owner.start();
+    owner.start();
+    await jest.advanceTimersByTimeAsync(0);
+    expect(owner.status().available).toBe(true);
+    expect(owner.durability().expiresAtMs).toBe(healthNow + 45000);
+    expect(jest.getTimerCount()).toBe(1);
+    await jest.advanceTimersByTimeAsync(29999);
+    await owner.tick();
+    expect(readNfs).toHaveBeenCalledTimes(1);
+    await jest.advanceTimersByTimeAsync(1);
+    expect(readNfs).toHaveBeenCalledTimes(2);
+    expect(owner.durability().observedAtMs).toBe(healthNow + 15000);
+    expect(owner.durability().expiresAtMs).toBe(healthNow + 105000);
+    await jest.advanceTimersByTimeAsync(15001);
+    expect(owner.status().available).toBe(true);
+    expect(readNfs).toHaveBeenCalledTimes(2);
+    expect(jest.getTimerCount()).toBe(1);
+  } finally {
+    await owner.stop();
+    expect(jest.getTimerCount()).toBe(0);
+    jest.useRealTimers();
+  }
+});
+it('bounds early refresh and closes at the unchanged earliest S3 source expiry', async () => {
+  jest.useFakeTimers({ now: healthNow });
+  const readNfs = jest.fn(async () => nfsHealthFixture());
+  const probeS3 = jest.fn(async () => s3HealthFixture(healthNow - 89000));
+  const owner = createUploadStorageAvailability({
+    binding: healthBinding,
+    readNfs,
+    probeS3,
+    clock: () => ({ nowMs: Date.now(), monotonicMs: Date.now() - healthNow + 1000 }),
+  });
+  try {
+    owner.start();
+    await jest.advanceTimersByTimeAsync(0);
+    expect(owner.status().available).toBe(true);
+    expect(owner.durability().expiresAtMs).toBe(healthNow + 1000);
+    await jest.advanceTimersByTimeAsync(1000);
+    expect(owner.status()).toEqual({ available: false, reason: 'storage-stale' });
+    // Reading status cannot schedule, refresh, or extend the old source's deadline.
+    await owner.tick();
+    expect(readNfs).toHaveBeenCalledTimes(1);
+    await jest.advanceTimersByTimeAsync(13999);
+    expect(probeS3).toHaveBeenCalledTimes(1);
+    await jest.advanceTimersByTimeAsync(1);
+    expect(probeS3).toHaveBeenCalledTimes(2);
+    expect(owner.status()).toEqual({ available: false, reason: 'storage-stale' });
+    await jest.advanceTimersByTimeAsync(59999);
+    expect(probeS3).toHaveBeenCalledTimes(2);
+    await jest.advanceTimersByTimeAsync(1);
+    expect(probeS3).toHaveBeenCalledTimes(3);
+  } finally {
+    await owner.stop();
+    expect(jest.getTimerCount()).toBe(0);
+    jest.useRealTimers();
+  }
+});
+it('rearms no timer or replacement until an automatically refreshed original really joins', async () => {
+  jest.useFakeTimers({ now: healthNow });
+  let release!: (v: ReturnType<typeof nfsHealthFixture>) => void;
+  const readNfs = jest.fn(async () => nfsHealthFixture(healthNow - 45000));
+  readNfs.mockImplementationOnce(async () => nfsHealthFixture(healthNow - 45000));
+  readNfs.mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+  );
+  const owner = createUploadStorageAvailability({
+    binding: healthBinding,
+    readNfs,
+    probeS3: async () => s3HealthFixture(Date.now()),
+    clock: () => ({ nowMs: Date.now(), monotonicMs: Date.now() - healthNow + 1000 }),
+  });
+  owner.start();
+  await jest.advanceTimersByTimeAsync(30000);
+  const original = owner.tick();
+  expect(readNfs).toHaveBeenCalledTimes(2);
+  await jest.advanceTimersByTimeAsync(15000);
+  expect(owner.status().available).toBe(false);
+  expect(jest.getTimerCount()).toBe(0);
+  await jest.advanceTimersByTimeAsync(120000);
+  expect(readNfs).toHaveBeenCalledTimes(2);
+  expect(owner.tick()).toBe(original);
+  let joined = false;
+  const stopping = owner.stop().then(() => {
+    joined = true;
+  });
+  await Promise.resolve();
+  expect(joined).toBe(false);
+  release(nfsHealthFixture());
+  await original;
+  await stopping;
+  expect(joined).toBe(true);
+  expect(jest.getTimerCount()).toBe(0);
+  jest.useRealTimers();
+});

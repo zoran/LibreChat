@@ -21,8 +21,8 @@ import type {
   FileSourceCopyReservation,
   ManagedUploadAcceptance,
   FileRetentionAdmission,
-} from '~/types/file';
-import type { IMongoFile } from '~/types';
+} from '../types/file';
+import type { IMongoFile } from '../types';
 import {
   FileSourceUnavailableError,
   FileSourceCapacityError,
@@ -53,7 +53,7 @@ export {
   inspectFileSources,
 } from './fileSourceAuthority';
 
-import type { FilePublicationActivityResult } from '~/types/fileActivity';
+import type { FilePublicationActivityResult } from '../types/fileActivity';
 import {
   initialFileRetentionActivity,
   advanceFileRetentionActivity,
@@ -556,4 +556,4 @@ export function createFileRetentionMethods(
     ...lifecycle,
   };
 }
-export type { ManagedUploadAcceptance } from '~/types/file';
+export type { ManagedUploadAcceptance } from '../types/file';

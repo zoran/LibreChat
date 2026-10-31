@@ -2557,10 +2557,10 @@ export async function initializeAgent(
       .join('\n\n');
   }
 
-  if (typeof agent.artifacts === 'string' && agent.artifacts !== '') {
+  if (typeof agent.artifacts === 'string' && agent.artifacts.length > 0) {
     const artifactsPromptResult = generateArtifactsPrompt({
       endpoint: agent.provider,
-      artifacts: agent.artifacts as never,
+      artifacts: agent.artifacts,
     });
     appendAdditionalInstructions(agent, artifactsPromptResult);
   }

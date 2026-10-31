@@ -13,8 +13,8 @@ import type {
   FileSourceCopyReservation,
   ManagedUploadAcceptance,
   FileRetentionAdmission,
-} from '~/types/file';
-import type { IMongoFile } from '~/types';
+} from '../types/file';
+import type { IMongoFile } from '../types';
 
 export {
   FileSourceUnavailableError,
@@ -23,7 +23,7 @@ export {
   inspectFileSources,
 } from './fileSourceAuthority';
 
-import type { FilePublicationActivityResult } from '~/types/fileActivity';
+import type { FilePublicationActivityResult } from '../types/fileActivity';
 
 export type FileRetentionMethods = {
   reserveFileSourceCopies(

@@ -14,7 +14,7 @@ import type {
 } from 'librechat-data-provider';
 import type { ClientSession } from 'mongoose';
 import type { CurrentManagedFileSource } from './fileSourceAuthority';
-import type { FileOwnerScope, IMongoFile } from '~/types/file';
+import type { FileOwnerScope, IMongoFile } from '../types/file';
 import type { StoredUpload } from './uploadManagementStore';
 import {
   assembleManagedFileSource,

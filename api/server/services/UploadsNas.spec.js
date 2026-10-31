@@ -96,3 +96,38 @@ it('preserves the old backend when private NAS configuration is absent', async (
   expect(result.storage).toBe(managedStorage);
   expect(result.nasStorage).toBeUndefined();
 });
+
+/** Only the external configuration acquisition is inert; the shipped selector and wiring run. */
+function loadWithConfiguration(acquireConfiguration) {
+  const fs = require('node:fs');
+  const vm = require('node:vm');
+  const module = { exports: {} };
+  vm.runInNewContext(fs.readFileSync(path.join(__dirname, 'UploadsNas.js'), 'utf8'), {
+    module,
+    process: { env: {} },
+    require: (id) => {
+      if (id === '@librechat/api') return require('@librechat/api');
+      if (id === './Config/app') return acquireConfiguration();
+      throw new Error(`Unexpected dependency: ${id}`);
+    },
+  });
+  return module.exports;
+}
+it('acquires AppConfig only at private storage selection, never while importing unrelated consumers', async () => {
+  const privateConfig = { synthetic: true };
+  const getAppConfig = jest.fn(async () => ({ managedUploads: privateConfig }));
+  const acquireConfiguration = jest.fn(() => ({ getAppConfig }));
+  const nas = loadWithConfiguration(acquireConfiguration);
+  expect(acquireConfiguration).not.toHaveBeenCalled();
+  expect(getAppConfig).not.toHaveBeenCalled();
+  await expect(nas.selectedManagedUploads()).resolves.toBe(privateConfig);
+  expect(acquireConfiguration).toHaveBeenCalledTimes(1);
+  expect(getAppConfig).toHaveBeenCalledTimes(1);
+});
+it('propagates real configuration initialization failure without selecting a legacy fallback', async () => {
+  const failure = new Error('Synthetic configuration initialization failure');
+  const nas = loadWithConfiguration(() => {
+    throw failure;
+  });
+  await expect(nas.selectedManagedUploads()).rejects.toBe(failure);
+});

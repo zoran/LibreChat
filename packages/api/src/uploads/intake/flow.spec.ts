@@ -6,9 +6,9 @@ import { request } from 'node:http';
 import assert from 'node:assert/strict';
 import { performance } from 'node:perf_hooks';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
-import { readUploadIntakeRecovery } from 'librechat-data-provider';
 import { createHash, randomBytes, randomUUID, X509Certificate } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { readUploadIntakeRecovery, readUploadOriginalWriteBinding } from 'librechat-data-provider';
 import {
   createEmailCodeMethods,
   createModels,
@@ -22,6 +22,7 @@ import type {
   UploadSecuritySettlement,
   UploadSecurityApproval,
   UploadStorageReceipt,
+  UploadOriginalWriteBinding,
 } from 'librechat-data-provider';
 import type { ResourcePort, StoragePort } from '../contract';
 import type { IntakeChannel } from './channel';
@@ -31,6 +32,7 @@ import {
   measureUploadDirectory,
   uploadLocalReservation,
 } from '../platform/local';
+import { createInertAntivirusFixture } from '../security/antivirus-fixture.helper';
 import { createIntakeChannel, startIntakeControlService } from './channel';
 import { createSecurityTlsFixture } from '../security/tls-fixture.helper';
 import { createHttpUploadSecurityPort } from '../security/transport';
@@ -140,6 +142,7 @@ describe('isolated Intake through native authority, scanner and App promotion', 
       securitySettlement?: UploadSecuritySettlement;
       securityApproval?: UploadSecurityApproval;
       promotion?: UploadPromotionRecord;
+      writeBinding?: UploadOriginalWriteBinding;
       intake?: { closed?: boolean; cleanupAcknowledged?: boolean };
       writerStopped?: boolean;
       cleanupPending: boolean;
@@ -166,6 +169,8 @@ describe('isolated Intake through native authority, scanner and App promotion', 
     tls = createSecurityTlsFixture();
     scanner = await startSecurityService({
       instanceId: '11111111-1111-4111-8111-111111111111',
+      // Only the original external AV process is inert; current readers and retirement stay real.
+      antivirus: createInertAntivirusFixture().runtime,
       policyBytes,
       policySha256,
       threadPath,
@@ -349,6 +354,29 @@ describe('isolated Intake through native authority, scanner and App promotion', 
       assert.equal(row?.promotion?.approval.policySha256, policySha256);
       assert.equal(input.securityApproval?.decision, 'approved');
       assert.equal(input.securityApproval?.policySha256, policySha256);
+      const storageKey = `t/${input.lease.tenantId}/managed-uploads/${input.lease.userId}/${input.lease.operationId}.${input.lease.generation}__original`;
+      const proposal = {
+        bucket: 'fixture-flow-originals',
+        key: storageKey,
+        operationId: input.lease.operationId,
+        generation: String(input.lease.generation),
+        bytes: input.bytes,
+        wholeSHA256: input.integrity.sha256,
+        mediaType: input.mediaType,
+      };
+      // Match the real S3 adapter: persist the exact original before reading any body byte.
+      assert.equal(typeof input.bindWrite, 'function');
+      const binding = { ...(await input.bindWrite(proposal)) };
+      assert.deepEqual(readUploadOriginalWriteBinding(binding), binding);
+      assert.deepEqual(binding, {
+        version: 1,
+        ...proposal,
+        originalDeadline: binding.originalDeadline,
+      });
+      assert.ok(Date.parse(binding.originalDeadline) > Date.now());
+      const persisted = await stored(input.lease.operationId);
+      assert.ok(persisted?.writeBinding);
+      assert.deepEqual(readUploadOriginalWriteBinding({ ...persisted.writeBinding }), binding);
       const chunks: Buffer[] = [];
       for await (const chunk of input.body) {
         input.signal.throwIfAborted();
@@ -366,7 +394,7 @@ describe('isolated Intake through native authority, scanner and App promotion', 
         bytes: input.bytes,
         integrity: input.integrity,
         filepath: `/api/files/download/${input.lease.operationId}`,
-        storageKey: `t/${input.lease.tenantId}/managed-uploads/${input.lease.userId}/${input.lease.operationId}.${input.lease.generation}__original`,
+        storageKey,
       };
     });
     const handlers = createIntakeControlHandlers({

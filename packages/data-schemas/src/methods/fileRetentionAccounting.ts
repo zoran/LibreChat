@@ -1,9 +1,9 @@
 /** fileRetentionAccounting owns retained-copy liabilities and source activity fences. */
 
 import type { ClientSession, FilterQuery, Model } from 'mongoose';
-import type { IMongoFile, SourceRetentionContext } from '~/types';
-import type { RetainedTextAllocation } from '~/types/file';
-import type { FileOwnerScope } from '~/types/file';
+import type { IMongoFile, SourceRetentionContext } from '../types';
+import type { RetainedTextAllocation } from '../types/file';
+import type { FileOwnerScope } from '../types/file';
 import {
   FileSourceUnavailableError,
   fileSourceScope,
@@ -13,7 +13,7 @@ import {
   currentManagedFileFilter,
 } from './fileSourceAuthority';
 import { adjustRetainedTextBytes } from './uploadManagementStore';
-import { SYSTEM_TENANT_ID } from '~/config/tenantContext';
+import { SYSTEM_TENANT_ID } from '../config/tenantContext';
 import { approvedFileFilter } from './fileSecurity';
 export {
   FileSourceUnavailableError,

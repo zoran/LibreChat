@@ -1,3 +1,4 @@
+import { antivirusFixture } from './__fixtures__/upload-antivirus';
 /** Untrusted recovery messages must not manufacture authority or combine unrelated stop evidence. */
 import type {
   UploadIntakeLocalSettlement,
@@ -17,8 +18,23 @@ const scope = () => ({
   transferGeneration: 7,
   worker: { hostId: 'intake-host', instanceId: 'intake-pod' },
 });
+const antivirus = () =>
+  antivirusFixture(
+    {
+      tenantId: 'tenant',
+      userId: 'a'.repeat(24),
+      operationId,
+      transferGeneration: 7,
+      mediaType: 'text/plain',
+      bytes: 5,
+      sha256: 'b'.repeat(64),
+    },
+    Date.parse('2026-10-17T03:59:00.000Z'),
+    '2026-10-17T04:00:00.000Z',
+  );
 const execution = () => ({
-  version: 2 as const,
+  version: 3 as const,
+  antivirus: antivirus().custody,
   custody: { kind: 'none' as const },
   attemptId: `${operationId}.7`,
   instanceId: '22222222-2222-4222-8222-222222222222',
@@ -27,6 +43,7 @@ const execution = () => ({
 });
 const scanner = () => ({
   execution: execution(),
+  antivirusReceipt: antivirus().receipt,
   writerStopped: true,
   transientDataRemoved: true,
 });
@@ -408,4 +425,19 @@ describe('persisted owner cleanup receipt recovery shape', () => {
     expect(readUploadIntakeRecovery(input)).toBeNull();
     expect(getter).not.toHaveBeenCalled();
   });
+});
+
+it('retains legacy cancellation custody as an unacknowledged historical snapshot', () => {
+  const { antivirus: _oldAntivirus, ...old } = execution();
+  const legacy = { ...old, version: 2 as const };
+  const stopped = { execution: legacy, writerStopped: true, transientDataRemoved: true };
+  const input = {
+    ...recovery(),
+    acknowledged: false,
+    securityExecution: legacy,
+    securitySettlement: stopped,
+  };
+  expect(readUploadIntakeRecovery(input)).toEqual(input);
+  const localInput = { ...local(), securitySettlement: stopped };
+  expect(readUploadIntakeLocalSettlement(localInput)).toEqual(localInput);
 });

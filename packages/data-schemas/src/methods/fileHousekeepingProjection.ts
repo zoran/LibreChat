@@ -1,7 +1,7 @@
 /** File-owned transaction join. Housekeeping owns job identity, CAS and retained effect evidence. */
 import type { ClientSession } from 'mongoose';
-import type { HousekeepingWork } from '~/types/housekeeping';
-import type { IMongoFile } from '~/types/file';
+import type { HousekeepingWork } from '../types/housekeeping';
+import type { IMongoFile } from '../types/file';
 import { createHousekeepingStore } from './housekeepingStore';
 import { currentFileDeadline } from './fileSourceAuthority';
 

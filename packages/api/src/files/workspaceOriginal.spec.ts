@@ -87,6 +87,23 @@ function fixture(
     directSourceFileIds: [] as string[],
     ancestors: [] as UploadDerivedOrigin['ancestors'],
   };
+  const securityApproval = (): UploadSecurityApproval => ({
+    version: 1,
+    decision: 'approved',
+    policySha256: policy,
+    checkedAt: new Date(epoch).toISOString(),
+    scannerVersion: 'synthetic-scanner/v1',
+    coverage: { complete: true, pages: 1, parts: 1 },
+    subject: {
+      userId: user.userId,
+      tenantId: user.tenantId,
+      operationId: 'derived-file',
+      transferGeneration: 1,
+      mediaType: 'text/plain',
+      bytes: bytes.length,
+      sha256,
+    },
+  });
   const file = {
     file_id: 'derived-file',
     filename: 'Draft.txt',
@@ -102,23 +119,7 @@ function fixture(
     status: 'ready',
     retentionAcceptedAt: new Date(epoch),
     expiredAt: new Date(options.parentBound ? epoch + 10000 : epoch + 28 * 86400000),
-    securityApproval: {
-      version: 1,
-      decision: 'approved',
-      policySha256: policy,
-      checkedAt: new Date(epoch).toISOString(),
-      scannerVersion: 'synthetic-scanner/v1',
-      coverage: { complete: true, pages: 1, parts: 1 },
-      subject: {
-        userId: user.userId,
-        tenantId: user.tenantId,
-        operationId: 'derived-file',
-        transferGeneration: 1,
-        mediaType: 'text/plain',
-        bytes: bytes.length,
-        sha256,
-      },
-    },
+    securityApproval: securityApproval(),
     derivedOrigin: origin,
   };
   const operation = {

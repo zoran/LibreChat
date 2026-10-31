@@ -15,7 +15,7 @@ import type {
   ManagedRetrievalState,
   UploadSecurityApproval,
 } from 'librechat-data-provider';
-import type { FileRetrievalCreation } from '~/types/file';
+import type { FileRetrievalCreation } from '../types/file';
 const sha256 = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
 const unavailable = () =>
   Object.assign(new Error('Managed retrieval inventory is unresolved'), {
