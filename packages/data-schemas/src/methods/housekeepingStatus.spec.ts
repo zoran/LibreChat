@@ -22,6 +22,7 @@ describe('read-only Housekeeping Status composition', () => {
   let mongo: MongoMemoryReplSet;
   let jobs: ReturnType<typeof createHousekeepingStore>;
   let uploads: ReturnType<typeof createUploadStore>;
+  let repository: ReturnType<typeof createUploadManagementRepository>;
   const File = mongoose.model('File', fileSchema);
   const read = createHousekeepingStatusReader(mongoose);
   const signal = new AbortController().signal;
@@ -31,6 +32,8 @@ describe('read-only Housekeeping Status composition', () => {
     jobs = createHousekeepingStore(mongoose);
     uploads = createUploadStore(mongoose, {});
     await Promise.all([File.init(), jobs.initialize(), uploads.initialize()]);
+    repository = createUploadManagementRepository(mongoose, {});
+    await mongoose.models.FileReadReceipt.init();
   });
   beforeEach(async () => {
     await jobs.model.deleteMany({});
@@ -183,7 +186,6 @@ describe('read-only Housekeeping Status composition', () => {
   });
 
   it('exposes one bound Upload coverage owner with a finite read and no completeness from flags', async () => {
-    const repository = createUploadManagementRepository(mongoose, {});
     const coverage = repository.coverageUploadHousekeeping;
     const before = await uploads.Counter.findById('global').lean<CounterRow>();
     const session = await mongoose.startSession({ snapshot: true, causalConsistency: false });

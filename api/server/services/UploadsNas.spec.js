@@ -20,8 +20,13 @@ jest.mock(
   { virtual: true },
 );
 jest.mock('./Config/app', () => ({ getAppConfig: jest.fn() }));
-const { getNasS3StorageCapture } = require('../../../packages/api/src/storage/nas/storage');
-const { createNormalNasStorage, selectedManagedUploads } = require('./UploadsNas');
+const fixtureApi = require('@librechat/api');
+const fixtureGraph = fixtureApi.__nasFixtureGraph;
+const { getNasS3StorageCapture } = fixtureGraph.storage;
+const { createNormalNasStorage, selectedManagedUploads } = loadWithConfiguration(
+  () => require('./Config/app'),
+  fixtureApi,
+);
 let root;
 let nasDiagnostic;
 const opened = [];
@@ -44,12 +49,7 @@ const repository = {};
 /** Observe the failing fixture graph without replacing its adapter or any capture result. */
 function createNasDiagnostic() {
   const started = performance.now();
-  let entry;
-  try {
-    entry = require('@librechat/api');
-  } catch {
-    // The original composition still owns module failure; observation is optional.
-  }
+  const entry = fixtureApi;
   const graph = entry?.__nasFixtureGraph;
   const restores = [];
   const events = [];
@@ -169,6 +169,9 @@ function createNasDiagnostic() {
       returned = value;
       note('composition-returned');
     },
+    clientCapture() {
+      return graph.client.getNasS3ClientCapture(client);
+    },
     note,
     failed() {
       failureObserved = true;
@@ -236,6 +239,9 @@ it('reads private deployment selection from the normal base AppConfig owner', as
 it('composes the real branded NAS cleanup adapter alongside the retained legacy backend', async () => {
   nasDiagnostic = createNasDiagnostic();
   try {
+    expect(createNormalNasStorage).toBe(fixtureApi.createNormalUploadStorage);
+    expect(createNormalNasStorage).toBe(fixtureGraph.producer.createNormalUploadStorage);
+    expect(getNasS3StorageCapture).toBe(fixtureGraph.storage.getNasS3StorageCapture);
     const storageAvailability = { assertSafe: jest.fn() };
     const createUploadPlatform = jest.fn(async ({ nas }) => {
       nasDiagnostic.nas(nas.storage);
@@ -255,12 +261,16 @@ it('composes the real branded NAS cleanup adapter alongside the retained legacy 
     opened.push(value);
     expect(value.managedCleanup).toBe(managedStorage);
     expect(getNasS3StorageCapture(value.nasStorage)).toBeDefined();
+    expect(nasDiagnostic.clientCapture()).toMatchObject({
+      instanceId: getNasS3StorageCapture(value.nasStorage).clientInstanceId,
+    });
     expect(value.storage).not.toBe(value.nasStorage);
     expect(value.platform.storageAvailability).toBe(storageAvailability);
     nasDiagnostic.note('before-close');
     await value.close();
     nasDiagnostic.note('after-close');
     expect(getNasS3StorageCapture(value.nasStorage)).toBeUndefined();
+    expect(nasDiagnostic.clientCapture()).toBeUndefined();
   } catch (error) {
     nasDiagnostic.failed(error);
     throw error;
@@ -291,7 +301,7 @@ it('preserves the old backend when private NAS configuration is absent', async (
 });
 
 /** Only the external configuration acquisition is inert; the shipped selector and wiring run. */
-function loadWithConfiguration(acquireConfiguration) {
+function loadWithConfiguration(acquireConfiguration, api = fixtureApi) {
   const fs = require('node:fs');
   const vm = require('node:vm');
   const module = { exports: {} };
@@ -299,7 +309,7 @@ function loadWithConfiguration(acquireConfiguration) {
     module,
     process: { env: {} },
     require: (id) => {
-      if (id === '@librechat/api') return require('@librechat/api');
+      if (id === '@librechat/api') return api;
       if (id === './Config/app') return acquireConfiguration();
       throw new Error(`Unexpected dependency: ${id}`);
     },

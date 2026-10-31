@@ -7,6 +7,7 @@ import {
   constants,
   openSync,
   closeSync,
+  chmodSync,
   fstatSync,
   readSync,
   readFileSync,
@@ -579,6 +580,35 @@ export function createAntivirusProcessOwner(
             ),
           ),
         );
+        let socketAttempted = false;
+        let socketIdentity: ReturnType<AntivirusOriginal['socket']> = null;
+        const uid = process.getuid!(),
+          gid = process.getgid!();
+        const socketUsable = () =>
+          !stopping &&
+          !events.failure() &&
+          !events.state().closed &&
+          !events.state().exited &&
+          performance.now() < monoEnd - 10000 &&
+          Date.now() < originalDeadlineAtMs - 10000 &&
+          same();
+        const socketAnchors = () =>
+          [p.transientRoot, directory!].every((path) => {
+            const actual = lstatSync(path);
+            const expected = path === p.transientRoot ? root : anchor;
+            return (
+              actual.isDirectory() &&
+              !actual.isSymbolicLink() &&
+              (['dev', 'ino', 'uid', 'gid', 'mode'] as const).every(
+                (key) => actual[key] === expected[key],
+              )
+            );
+          });
+        const refuseSocket = () => {
+          socketAttempted = true;
+          socketIdentity = null;
+          return null;
+        };
         return Object.freeze({
           custody,
           retire: reconcile,
@@ -593,22 +623,46 @@ export function createAntivirusProcessOwner(
             return events.activate();
           },
           socket() {
-            if (
-              stopping ||
-              events.failure() ||
-              events.state().closed ||
-              events.state().exited ||
-              performance.now() >= monoEnd - 10000 ||
-              Date.now() >= originalDeadlineAtMs - 10000
-            )
-              return null;
+            if (!socketUsable() || (socketAttempted && !socketIdentity)) return null;
+            let probing = false;
             try {
+              if (!socketAnchors()) return refuseSocket();
+              probing = true;
               const s = lstatSync(socket);
-              return s.isSocket() && s.uid === process.getuid?.() && (s.mode & 0o077) === 0
-                ? Object.freeze({ path: socket, device: s.dev, inode: s.ino, uid: s.uid })
-                : null;
-            } catch {
-              return null;
+              probing = false;
+              if (
+                !s.isSocket() ||
+                s.uid !== uid ||
+                s.gid !== gid ||
+                s.nlink !== 1 ||
+                s.mode & 0o077 ||
+                (socketIdentity &&
+                  (s.dev !== socketIdentity.device ||
+                    s.ino !== socketIdentity.inode ||
+                    (s.mode & 0o7777) !== 0o600))
+              )
+                return refuseSocket();
+              if (!socketAttempted) {
+                socketAttempted = true;
+                chmodSync(socket, 0o600);
+              }
+              const observed = lstatSync(socket);
+              if (
+                !socketAnchors() ||
+                !observed.isSocket() ||
+                (['dev', 'ino', 'uid', 'gid', 'nlink'] as const).some(
+                  (key) => observed[key] !== s[key],
+                ) ||
+                (observed.mode & 0o7777) !== 0o600 ||
+                !socketUsable()
+              )
+                return refuseSocket();
+              socketIdentity ??= Object.freeze({ path: socket, device: s.dev, inode: s.ino, uid });
+              return socketIdentity;
+            } catch (error) {
+              if (probing && !socketAttempted && (error as NodeJS.ErrnoException).code === 'ENOENT')
+                return null;
+              return refuseSocket();
             }
           },
         });

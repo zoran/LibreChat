@@ -45,192 +45,301 @@ afterEach(async () => {
   }
 });
 
-it('binds the real producer argv to its actual parent PID before permitting the same inert child', async () => {
-  // Model only immutable image/kernel observations; the producer, PID and child custody stay real.
-  const actual = { ...fs },
-    actualSpawn = childProcess.spawn,
-    hash = (body: string | Buffer) => crypto.createHash('sha256').update(body).digest('hex');
-  const root = actual.mkdtempSync(join(tmpdir(), 'av-parent-contract-'));
-  const transient = '/run/cortex-document-security/av';
-  actual.mkdirSync(join(root, 'owned'), { mode: 0o700 });
-  actual.mkdirSync(join(root, 'generation'));
-  const paths = new Map<string, string>();
-  const asset = (
-    path: string,
-    body: string | Buffer,
-    physical = join(root, 'asset-' + paths.size),
-  ) => {
-    actual.writeFileSync(physical, body, { mode: 0o400 });
-    paths.set(path, physical);
-    return { path, sha256: hash(body) };
-  };
-  const generation = ['bytecode.cvd', 'daily.cvd', 'main.cvd'].map((name) => ({
-    name,
-    sha256: hash(name),
-  }));
-  const signatureManifestSha256 = hash(JSON.stringify(generation));
-  const signatureDirectory = '/var/lib/cortex-av-signatures/generations/' + signatureManifestSha256;
-  const program = asset('/usr/local/sbin/clamd', 'inert ClamD image stand-in');
-  program.sha256 = '03a1bea28cba1cf7dd5aec447e2317c61bac188e3057e342d09119a34d277839';
-  const profile: AntivirusProcessProfile = {
-    schema: 1,
-    purpose: 'clamd-local-v1',
-    image: 'registry.invalid/av@sha256:' + 'a'.repeat(64),
-    packageSha256: 'd3ee9e401974855a1edc1761b1425417d126de618d5f0c91cd51209f69f6fcc2',
-    program,
-    loader: asset('/lib/av-contract-loader', 'loader'),
-    setpriv: asset('/usr/bin/setpriv', 'setpriv'),
-    scopeHelper: asset('/app/packages/api/dist/uploads/security/native/antivirus-scope', 'scope'),
-    filter: asset(
-      '/etc/cortex-document-security/antivirus-profile.bpf',
-      createAntivirusProcessPolicy(),
-    ),
-    libraries: [],
-    signatureDirectory,
-    signatures: generation.map(({ name }) =>
-      asset(signatureDirectory + '/' + name, name, join(root, 'generation', name)),
-    ),
-    signatureManifestSha256,
-    transientRoot: transient,
-    memoryMaxBytes: 4294967296,
-  };
-  const owner = createAntivirusProcessOwner(profile);
-  const mapped = (path: fs.PathLike) => {
-    const logical = String(path);
-    if (logical === signatureDirectory) return join(root, 'generation');
-    if (logical === transient || logical.startsWith(transient + '/'))
-      return join(root, 'owned', logical.slice(transient.length));
-    return paths.get(logical) ?? logical;
-  };
-  const assetFds = new Set<number>();
-  let child: ReturnType<typeof spawn> | undefined,
-    joined: Promise<void> | undefined,
-    report: Promise<string> | undefined;
-  try {
-    const gid = process.getgid!(),
-      uid = process.getuid!();
-    const observations = new Map([
-      [
-        '/proc/self/status',
-        [
-          `Uid: ${uid} ${uid} ${uid} ${uid}`,
-          `Gid: ${gid} ${gid} ${gid} ${gid}`,
-          ...['CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb'].map(
-            (k) => k + ': 0000000000000000',
-          ),
-        ].join('\n'),
-      ],
-      ['/proc/self/limits', 'Max core file size 0 0 bytes'],
-      ['/proc/sys/kernel/core_pattern', 'core'],
-      ['/proc/self/cgroup', '0::/av-parent-contract'],
-      ['/sys/fs/cgroup/av-parent-contract/pids.max', '64'],
-      ['/sys/fs/cgroup/av-parent-contract/memory.max', '4294967296'],
-      ['/sys/fs/cgroup/av-parent-contract/cpu.max', '200000 100000'],
-      ['/proc/self/mountinfo', '1 0 0:1 / / ro - overlay overlay ro'],
-    ]);
-    jest.spyOn(process, 'getgroups').mockReturnValue([gid]);
-    jest
-      .spyOn(fs, 'readFileSync')
-      .mockImplementation(
-        (path, options) => observations.get(String(path)) ?? actual.readFileSync(path, options),
-      );
-    jest.spyOn(fs, 'realpathSync').mockImplementation((path) => String(path));
-    jest.spyOn(fs, 'lstatSync').mockImplementation((path) => {
+it.each([
+  'finalize',
+  'root-anchor',
+  'directory-anchor',
+  'socket-uid',
+  'socket-gid',
+  'socket-links',
+  'socket-type',
+  'socket-symlink',
+  'post-replacement',
+  'mutation-error',
+  'later-mode',
+  'retired',
+  'expired',
+  'post-expired',
+] as const)(
+  'binds the real producer argv and socket custody to the same inert child (%s)',
+  async (scenario) => {
+    // Model only immutable image/kernel observations; the producer, PID and child custody stay real.
+    const actual = { ...fs },
+      actualSpawn = childProcess.spawn,
+      hash = (body: string | Buffer) => crypto.createHash('sha256').update(body).digest('hex');
+    const root = actual.mkdtempSync(join(tmpdir(), 'av-parent-contract-'));
+    const transient = '/run/cortex-document-security/av';
+    actual.mkdirSync(join(root, 'owned'), { mode: 0o700 });
+    actual.mkdirSync(join(root, 'generation'));
+    const paths = new Map<string, string>();
+    const asset = (
+      path: string,
+      body: string | Buffer,
+      physical = join(root, 'asset-' + paths.size),
+    ) => {
+      actual.writeFileSync(physical, body, { mode: 0o400 });
+      paths.set(path, physical);
+      return { path, sha256: hash(body) };
+    };
+    const generation = ['bytecode.cvd', 'daily.cvd', 'main.cvd'].map((name) => ({
+      name,
+      sha256: hash(name),
+    }));
+    const signatureManifestSha256 = hash(JSON.stringify(generation));
+    const signatureDirectory =
+      '/var/lib/cortex-av-signatures/generations/' + signatureManifestSha256;
+    const program = asset('/usr/local/sbin/clamd', 'inert ClamD image stand-in');
+    program.sha256 = '03a1bea28cba1cf7dd5aec447e2317c61bac188e3057e342d09119a34d277839';
+    const profile: AntivirusProcessProfile = {
+      schema: 1,
+      purpose: 'clamd-local-v1',
+      image: 'registry.invalid/av@sha256:' + 'a'.repeat(64),
+      packageSha256: 'd3ee9e401974855a1edc1761b1425417d126de618d5f0c91cd51209f69f6fcc2',
+      program,
+      loader: asset('/lib/av-contract-loader', 'loader'),
+      setpriv: asset('/usr/bin/setpriv', 'setpriv'),
+      scopeHelper: asset('/app/packages/api/dist/uploads/security/native/antivirus-scope', 'scope'),
+      filter: asset(
+        '/etc/cortex-document-security/antivirus-profile.bpf',
+        createAntivirusProcessPolicy(),
+      ),
+      libraries: [],
+      signatureDirectory,
+      signatures: generation.map(({ name }) =>
+        asset(signatureDirectory + '/' + name, name, join(root, 'generation', name)),
+      ),
+      signatureManifestSha256,
+      transientRoot: transient,
+      memoryMaxBytes: 4294967296,
+    };
+    const owner = createAntivirusProcessOwner(profile);
+    const mapped = (path: fs.PathLike) => {
       const logical = String(path);
+      if (logical === signatureDirectory) return join(root, 'generation');
       if (logical === transient || logical.startsWith(transient + '/'))
-        return actual.lstatSync(mapped(path));
-      return Object.assign(actual.lstatSync(paths.get(logical) ?? root), {
-        uid: 0,
-        gid: 0,
-        mode: paths.has(logical) ? 0o100400 : 0o40755,
-      });
-    });
-    jest.spyOn(fs, 'openSync').mockImplementation((path, flags, mode) => {
-      const fd = actual.openSync(mapped(path), flags, mode);
-      assetFds.add(fd);
-      return fd;
-    });
-    jest
-      .spyOn(fs, 'fstatSync')
-      .mockImplementation((fd) =>
-        Object.assign(actual.fstatSync(fd), assetFds.has(fd) ? { uid: 0, gid: 0 } : {}),
-      );
-    jest
-      .spyOn(fs, 'statfsSync')
-      .mockImplementation(() => Object.assign(actual.statfsSync(root), { type: 0x01021994 }));
-    jest
-      .spyOn(fs, 'mkdirSync')
-      .mockImplementation((path, options) => actual.mkdirSync(mapped(path), options));
-    jest
-      .spyOn(fs, 'writeFileSync')
-      .mockImplementation((path, data, options) =>
-        actual.writeFileSync(typeof path === 'number' ? path : mapped(path), data, options),
-      );
-    jest
-      .spyOn(fs, 'readdirSync')
-      .mockImplementation((path, options) => actual.readdirSync(mapped(path), options));
-    jest.spyOn(fs, 'unlinkSync').mockImplementation((path) => actual.unlinkSync(mapped(path)));
-    jest.spyOn(fs, 'rmdirSync').mockImplementation((path) => actual.rmdirSync(mapped(path)));
-    // Only the external pinned ClamD bytes are substituted; all remaining hashes use SHA-256.
-    jest
-      .spyOn(crypto, 'createHash')
-      .mockReturnValueOnce(
-        Object.assign(crypto.createHash('sha256'), { digest: () => program.sha256 }),
-      );
-    const nativeSpawn = jest
-      .spyOn(childProcess, 'spawn')
-      .mockImplementation((_command, args, options) => {
-        child = actualSpawn(
-          process.execPath,
+        return join(root, 'owned', logical.slice(transient.length));
+      return paths.get(logical) ?? logical;
+    };
+    const assetFds = new Set<number>();
+    let socketFault: Partial<fs.Stats> | undefined;
+    let rootFault = false,
+      directoryFault = false;
+    let child: ReturnType<typeof spawn> | undefined,
+      joined: Promise<void> | undefined,
+      report: Promise<string> | undefined;
+    try {
+      const gid = process.getgid!(),
+        uid = process.getuid!();
+      const observations = new Map([
+        [
+          '/proc/self/status',
           [
-            '-e',
-            `
+            `Uid: ${uid} ${uid} ${uid} ${uid}`,
+            `Gid: ${gid} ${gid} ${gid} ${gid}`,
+            ...['CapInh', 'CapPrm', 'CapEff', 'CapBnd', 'CapAmb'].map(
+              (k) => k + ': 0000000000000000',
+            ),
+          ].join('\n'),
+        ],
+        ['/proc/self/limits', 'Max core file size 0 0 bytes'],
+        ['/proc/sys/kernel/core_pattern', 'core'],
+        ['/proc/self/cgroup', '0::/av-parent-contract'],
+        ['/sys/fs/cgroup/av-parent-contract/pids.max', '64'],
+        ['/sys/fs/cgroup/av-parent-contract/memory.max', '4294967296'],
+        ['/sys/fs/cgroup/av-parent-contract/cpu.max', '200000 100000'],
+        ['/proc/self/mountinfo', '1 0 0:1 / / ro - overlay overlay ro'],
+      ]);
+      jest.spyOn(process, 'getgroups').mockReturnValue([gid]);
+      jest
+        .spyOn(fs, 'readFileSync')
+        .mockImplementation(
+          (path, options) => observations.get(String(path)) ?? actual.readFileSync(path, options),
+        );
+      jest.spyOn(fs, 'realpathSync').mockImplementation((path) => String(path));
+      jest.spyOn(fs, 'lstatSync').mockImplementation((path) => {
+        const logical = String(path);
+        if (logical === transient || logical.startsWith(transient + '/')) {
+          const stat = actual.lstatSync(mapped(path));
+          if (
+            (logical === transient && rootFault) ||
+            (logical.startsWith(transient + '/') && stat.isDirectory() && directoryFault)
+          )
+            stat.ino++;
+          return Object.assign(stat, logical.endsWith('/clamd.sock') ? socketFault : undefined);
+        }
+        return Object.assign(actual.lstatSync(paths.get(logical) ?? root), {
+          uid: 0,
+          gid: 0,
+          mode: paths.has(logical) ? 0o100400 : 0o40755,
+        });
+      });
+      jest.spyOn(fs, 'openSync').mockImplementation((path, flags, mode) => {
+        const fd = actual.openSync(mapped(path), flags, mode);
+        assetFds.add(fd);
+        return fd;
+      });
+      jest
+        .spyOn(fs, 'fstatSync')
+        .mockImplementation((fd) =>
+          Object.assign(actual.fstatSync(fd), assetFds.has(fd) ? { uid: 0, gid: 0 } : {}),
+        );
+      jest
+        .spyOn(fs, 'statfsSync')
+        .mockImplementation(() => Object.assign(actual.statfsSync(root), { type: 0x01021994 }));
+      jest
+        .spyOn(fs, 'mkdirSync')
+        .mockImplementation((path, options) => actual.mkdirSync(mapped(path), options));
+      jest
+        .spyOn(fs, 'writeFileSync')
+        .mockImplementation((path, data, options) =>
+          actual.writeFileSync(typeof path === 'number' ? path : mapped(path), data, options),
+        );
+      jest
+        .spyOn(fs, 'readdirSync')
+        .mockImplementation((path, options) => actual.readdirSync(mapped(path), options));
+      jest.spyOn(fs, 'unlinkSync').mockImplementation((path) => actual.unlinkSync(mapped(path)));
+      jest.spyOn(fs, 'rmdirSync').mockImplementation((path) => actual.rmdirSync(mapped(path)));
+      const modeChanges = jest
+        .spyOn(fs, 'chmodSync')
+        .mockImplementation((path, mode) => actual.chmodSync(mapped(path), mode));
+      // Only the external pinned ClamD bytes are substituted; all remaining hashes use SHA-256.
+      jest
+        .spyOn(crypto, 'createHash')
+        .mockReturnValueOnce(
+          Object.assign(crypto.createHash('sha256'), { digest: () => program.sha256 }),
+        );
+      const nativeSpawn = jest
+        .spyOn(childProcess, 'spawn')
+        .mockImplementation((_command, args, options) => {
+          child = actualSpawn(
+            process.execPath,
+            [
+              '-e',
+              `
         const fs = require('node:fs'), byte = Buffer.alloc(1);
         const [permit, parent, command] = process.argv.slice(1, 4);
         if (permit !== '--permit-fd=3' || parent !== '--parent-pid=' + process.ppid || command !== '/usr/bin/setpriv') process.exit(77);
         const count = fs.readSync(3, byte, 0, 1, null);
         fs.closeSync(3);
-        fs.writeSync(1, JSON.stringify({ parent: process.ppid, count, permit: byte.toString('ascii') }));
-            setInterval(() => {}, 1000);
+            const server = require('node:net').createServer();
+            server.listen('clamd.sock', () => {
+              fs.chmodSync('clamd.sock', 0);
+              fs.writeSync(1, JSON.stringify({ parent: process.ppid, count, permit: byte.toString('ascii') }));
+            });
       `,
-            '--',
-            ...args,
-          ],
-          { ...options, cwd: mapped(options.cwd ?? root) },
+              '--',
+              ...args,
+            ],
+            { ...options, cwd: mapped(options.cwd ?? root) },
+          );
+          joined = new Promise<void>((resolve) => child!.once('close', () => resolve()));
+          report = new Promise<string>((resolve) =>
+            child!.stdout!.once('data', (b: Buffer) => resolve(b.toString('ascii'))),
+          );
+          return child;
+        });
+      const deadline = Date.now() + 30_000;
+      const original = await owner.start(deadline);
+      expect(nativeSpawn).toHaveBeenCalledTimes(1);
+      expect(nativeSpawn.mock.calls[0][0]).toBe(profile.scopeHelper.path);
+      expect(nativeSpawn.mock.calls[0][1].slice(0, 3)).toEqual([
+        '--permit-fd=3',
+        `--parent-pid=${process.pid}`,
+        '/usr/bin/setpriv',
+      ]);
+      expect(original?.custody.pid).toBe(child?.pid);
+      if (!original) throw new Error('Actual producer did not retain its inert original');
+      expect(original.socket()).toBeNull();
+      expect(original.socket()).toBeNull();
+      expect(modeChanges).not.toHaveBeenCalled();
+      expect(await original.activate()).toBe(true);
+      expect(JSON.parse(await report!)).toEqual({ parent: process.pid, count: 1, permit: 'G' });
+      const directory = String(nativeSpawn.mock.calls[0][2].cwd);
+      const socket = directory + '/clamd.sock',
+        physical = mapped(socket);
+      const before = actual.lstatSync(physical);
+      expect(before.isSocket()).toBe(true);
+      expect(before.mode & 0o7777).toBe(0);
+      let clock: jest.SpyInstance | undefined;
+      if (scenario === 'root-anchor') rootFault = true;
+      if (scenario === 'directory-anchor') directoryFault = true;
+      if (scenario === 'socket-uid') socketFault = { uid: before.uid + 1 };
+      if (scenario === 'socket-gid') socketFault = { gid: before.gid + 1 };
+      if (scenario === 'socket-links') socketFault = { nlink: 2 };
+      if (scenario === 'socket-type' || scenario === 'socket-symlink') {
+        actual.unlinkSync(physical);
+        if (scenario === 'socket-type') actual.writeFileSync(physical, '', { mode: 0o600 });
+        else actual.symlinkSync(join(root, 'asset-0'), physical);
+      }
+      if (
+        scenario === 'mutation-error' ||
+        scenario === 'post-replacement' ||
+        scenario === 'post-expired'
+      ) {
+        modeChanges.mockImplementationOnce((path, mode) => {
+          actual.chmodSync(mapped(path), mode);
+          if (scenario === 'mutation-error')
+            throw Object.assign(new Error('Uncertain mode commit'), { code: 'EIO' });
+          if (scenario === 'post-expired')
+            clock = jest.spyOn(Date, 'now').mockReturnValue(deadline);
+          if (scenario === 'post-replacement') {
+            actual.unlinkSync(physical);
+            actual.writeFileSync(physical, '', { mode: 0o600 });
+          }
+        });
+      }
+      if (scenario === 'expired') clock = jest.spyOn(Date, 'now').mockReturnValue(deadline);
+      if (scenario === 'retired') await original.retire();
+      if (scenario === 'finalize' || scenario === 'later-mode') {
+        expect(original.socket()).toEqual({
+          path: socket,
+          device: before.dev,
+          inode: before.ino,
+          uid: before.uid,
+        });
+        expect(actual.lstatSync(physical).mode & 0o7777).toBe(0o600);
+        expect(actual.lstatSync(physical).ino).toBe(before.ino);
+        expect(modeChanges).toHaveBeenCalledTimes(1);
+        if (scenario === 'later-mode') {
+          actual.chmodSync(physical, 0o400);
+          expect(original.socket()).toBeNull();
+          actual.chmodSync(physical, 0o600);
+          expect(original.socket()).toBeNull();
+        } else expect(original.socket()).toEqual(original.socket());
+        expect(modeChanges).toHaveBeenCalledTimes(1);
+      } else {
+        expect(original.socket()).toBeNull();
+        clock?.mockRestore();
+        rootFault = directoryFault = false;
+        socketFault = undefined;
+        if (scenario === 'socket-symlink') {
+          expect(actual.statSync(join(root, 'asset-0')).mode & 0o7777).toBe(0o400);
+          actual.unlinkSync(physical);
+          actual.writeFileSync(physical, '', { mode: 0o600 });
+        }
+        const mutations = modeChanges.mock.calls.length;
+        expect(mutations).toBe(
+          ['mutation-error', 'post-replacement', 'post-expired'].includes(scenario) ? 1 : 0,
         );
-        joined = new Promise<void>((resolve) => child!.once('close', () => resolve()));
-        report = new Promise<string>((resolve) =>
-          child!.stdout!.once('data', (b: Buffer) => resolve(b.toString('ascii'))),
-        );
-        return child;
+        if (scenario !== 'expired') expect(original.socket()).toBeNull();
+        expect(modeChanges).toHaveBeenCalledTimes(mutations);
+      }
+      expect(await original.retire()).toEqual({
+        originalProcessJoined: true,
+        ownedTransientDataRemoved: true,
       });
-    const original = await owner.start(Date.now() + 30_000);
-    expect(nativeSpawn).toHaveBeenCalledTimes(1);
-    expect(nativeSpawn.mock.calls[0][0]).toBe(profile.scopeHelper.path);
-    expect(nativeSpawn.mock.calls[0][1].slice(0, 3)).toEqual([
-      '--permit-fd=3',
-      `--parent-pid=${process.pid}`,
-      '/usr/bin/setpriv',
-    ]);
-    expect(original?.custody.pid).toBe(child?.pid);
-    if (!original) throw new Error('Actual producer did not retain its inert original');
-    expect(await original.activate()).toBe(true);
-    expect(JSON.parse(await report!)).toEqual({ parent: process.pid, count: 1, permit: 'G' });
-    expect(await original.retire()).toEqual({
-      originalProcessJoined: true,
-      ownedTransientDataRemoved: true,
-    });
-    await joined;
-    expect(actual.readdirSync(join(root, 'owned'))).toEqual([]);
-    expect(nativeSpawn).toHaveBeenCalledTimes(1);
-  } finally {
-    await owner.drain();
-    if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
-    await joined;
-    jest.restoreAllMocks();
-    actual.rmSync(root, { recursive: true, force: true });
-  }
-});
+      await joined;
+      expect(actual.readdirSync(join(root, 'owned'))).toEqual([]);
+      expect(nativeSpawn).toHaveBeenCalledTimes(1);
+    } finally {
+      await owner.drain();
+      if (child && child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+      await joined;
+      jest.restoreAllMocks();
+      actual.rmSync(root, { recursive: true, force: true });
+    }
+  },
+);
 
 it('retains the actual pre-permit exit and refuses a later dispatch without a replacement child', async () => {
   const { child, events } = launch('process.exit(77)');

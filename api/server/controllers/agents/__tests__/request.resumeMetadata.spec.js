@@ -45,6 +45,7 @@ const mockGenerationJobManager = {
     closeAndDrain: jest.fn(),
     park: jest.fn(),
     consumeRecovered: jest.fn(),
+    getRecoveredQuoteRetention: jest.fn(),
   },
 };
 
@@ -574,6 +575,7 @@ describe('ResumableAgentController resume metadata', () => {
     mockGenerationJobManager.steering.closeAndDrain.mockResolvedValue([]);
     mockGenerationJobManager.steering.park.mockResolvedValue(undefined);
     mockGenerationJobManager.steering.consumeRecovered.mockResolvedValue(true);
+    mockGenerationJobManager.steering.getRecoveredQuoteRetention.mockResolvedValue(undefined);
     mockSaveMessage.mockResolvedValue({});
     mockSaveConvo.mockResolvedValue({});
     mockAppendConvoMessageReference.mockResolvedValue({});

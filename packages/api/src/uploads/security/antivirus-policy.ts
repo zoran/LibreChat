@@ -38,7 +38,12 @@ export function createAntivirusProcessPolicy(): Buffer {
   add(0x15, 0x00010900, 1);
   add(0x06, deny);
   add(0x06, allow);
-  const restrictedArgument = (syscall: number, argument: number, values: number[]) => {
+  const restrictedArgument = (
+    syscall: number,
+    argument: number,
+    values: number[],
+    result = allow,
+  ) => {
     add(0x15, syscall, 0, 5 + values.length * 2);
     add(0x20, 20 + argument * 8);
     add(0x15, 0, 1);
@@ -46,10 +51,20 @@ export function createAntivirusProcessPolicy(): Buffer {
     add(0x20, 16 + argument * 8);
     for (const value of values) {
       add(0x15, value, 0, 1);
-      add(0x06, allow);
+      add(0x06, result);
     }
     add(0x06, deny);
   };
+  // ClamD requests mode 0600; the trusted parent alone commits and observes that mode.
+  restrictedArgument(90, 1, [0o600], 0x00050000); // Return zero without executing chmod.
+  add(0x15, 95, 0, 7); // umask changes only this original's process-local creation mask.
+  add(0x20, 20);
+  add(0x15, 0, 1);
+  add(0x06, deny);
+  add(0x20, 16);
+  add(0x45, ~0o777 >>> 0, 1);
+  add(0x06, allow);
+  add(0x06, deny);
   // Only AF_UNIX SOCK_STREAM creation; no INET/INET6 and no connect syscall.
   for (const syscall of [41, 53]) {
     const block: number[][] = [];
