@@ -103,7 +103,7 @@ const mockCreateAgentEventActorTurn = jest.fn((input, dependencies) => {
             : await mockExecuteAgentEventActor(input.checkpoint.input, dependencies.actor);
         return { adapter: 'checkpoint', ...result };
       }
-      const token = 'event-actor-history-token';
+      const token = 'fixture-event-actor-history-token';
       const acquired = await dependencies.history.begin({ ...input.history.owner, token });
       if (!acquired) {
         throw Object.assign(new Error('The event actor is temporarily unavailable'), {
@@ -327,6 +327,12 @@ jest.mock('@librechat/api', () => ({
   assertChatProjectInstructions: jest.requireActual('@librechat/api').assertChatProjectInstructions,
   getChatProjectTurnFailure: jest.requireActual('@librechat/api').getChatProjectTurnFailure,
   GenerationJobManager: mockGenerationJobManager,
+  normalizeReferencedQuoteSources:
+    jest.requireActual('@librechat/api').normalizeReferencedQuoteSources,
+  serializeQuoteRetention: jest.requireActual('@librechat/api').serializeQuoteRetention,
+  quoteRetentionContext: jest.requireActual('@librechat/api').quoteRetentionContext,
+  getAttachmentTitleText: jest.requireActual('@librechat/api').getAttachmentTitleText,
+  readFileSourceRetention: jest.requireActual('@librechat/api').readFileSourceRetention,
   getReferencedQuotes: jest.fn((quotes) => {
     if (!Array.isArray(quotes)) {
       return null;
@@ -2882,6 +2888,50 @@ describe('ResumableAgentController resume metadata', () => {
       signedUrl,
     );
     expect(JSON.stringify(mockSaveMessage.mock.calls)).not.toContain(signedUrl);
+  });
+
+  it('returns a stable admission conflict without exposing its private reason or changing cleanup', async () => {
+    const { GenerationAdmissionHeldError } = jest.requireActual(
+      '../../../../../packages/api/src/stream/generationAdmission',
+    );
+    const failure = new GenerationAdmissionHeldError('CONVERSATION_ACTIVE');
+    mockGenerationJobManager.createJob.mockRejectedValue(failure);
+    const initializeClient = jest.fn();
+    const req = {
+      user: { id: 'user-123' },
+      body: {
+        text: 'Private synthetic question',
+        messageId: 'user-msg',
+        clientRequestId: 'req-abc',
+        conversationId: 'conversation-123',
+        endpointOption: { endpoint: 'agents', modelOptions: { model: 'gpt-4.1' } },
+      },
+      config: {},
+    };
+    const res = createResumableResponse();
+    await AgentController(req, res, jest.fn(), initializeClient, null);
+    expect(res.status).toHaveBeenCalledWith(409);
+    const payload = res.json.mock.calls[0][0];
+    expect(payload).toMatchObject({
+      status: 409,
+      code: 'GENERATION_ADMISSION_HELD',
+      error: 'The status of your request is still uncertain. Please do not send it again for now.',
+    });
+    expect(payload).not.toHaveProperty('reason');
+    expect(payload).not.toHaveProperty('stage');
+    expect(JSON.stringify(payload)).not.toMatch(
+      /CONVERSATION_ACTIVE|Private synthetic|user-123|conversation-123/,
+    );
+    expect(initializeClient).not.toHaveBeenCalled();
+    expect(mockGenerationJobManager.beginProviderExecution).not.toHaveBeenCalled();
+    expect(mockGenerationJobManager.completeJob).not.toHaveBeenCalled();
+    expect(mockGenerationJobManager.releaseGeneration).toHaveBeenCalledWith(
+      'user-123',
+      'req-abc',
+      'conversation-123',
+      DEFAULT_OWNED_CLAIM,
+    );
+    expect(mockDecrementPendingRequest).toHaveBeenCalledWith('user-123');
   });
 
   it('returns a typed recovery conflict before acknowledging generation startup', async () => {
@@ -6205,7 +6255,7 @@ describe('ResumableAgentController resume metadata', () => {
       reconciliations: [],
       epoch: 0,
       legacyTurn: {
-        token: 'crashed-legacy-turn',
+        token: 'fixture-crashed-legacy-turn',
         startedAt: new Date(Date.now() - 2 * 60 * 60 * 1000),
       },
     });

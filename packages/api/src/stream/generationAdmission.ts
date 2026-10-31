@@ -15,6 +15,8 @@ import type {
   GenerationCheckpointSourceRecovery,
 } from '@librechat/data-schemas';
 import type { GenerationMaintenanceCensus } from '~/app';
+import { GenerationAdmissionHeldError, acquireHeldError } from './generationAdmissionError';
+export { GenerationAdmissionHeldError } from './generationAdmissionError';
 
 /** Only the issuing live coordinator may consume this acknowledged preparation once. */
 export interface GenerationPreparationReceipt {
@@ -52,13 +54,6 @@ export interface GenerationCheckpointRecoveryPorts {
   } | null>;
 }
 export type GenerationAdmissionCensus = GenerationMaintenanceCensus;
-export class GenerationAdmissionHeldError extends Error {
-  readonly code = 'GENERATION_ADMISSION_HELD';
-  readonly status = 409;
-  constructor() {
-    super('Generation work is held; a confirmed admission or settlement is required');
-  }
-}
 /** A deadline requests cancellation; only the task's actual settlement releases its owner. */
 export async function awaitGenerationAuxiliaryWork<T>(
   work: Promise<T>,
@@ -319,7 +314,7 @@ export class GenerationAdmissionCoordinator {
     const result = await this.config.methods.acquireGenerationAdmission(input, preparation?.input);
     if (!result.ok || !result.value.acquired) {
       if (result.ok || result.error.code !== 'OUTCOME_UNKNOWN') this.local.delete(key);
-      throw new GenerationAdmissionHeldError();
+      throw acquireHeldError(result);
     }
     this.local.set(key, { input, phase: 'admitted' });
     if (preparation) this.prepared.delete(preparation);

@@ -136,6 +136,14 @@ function sendGenerationJson(res, status, body, generationProtocolVersion) {
 }
 
 function getInitializationFailure(error) {
+  if (error?.code === 'GENERATION_ADMISSION_HELD') {
+    return {
+      status: 409,
+      code: 'GENERATION_ADMISSION_HELD',
+      error: 'The status of your request is still uncertain. Please do not send it again for now.',
+    };
+  }
+
   if (error?.code === ErrorTypes.RESOURCE_RECOVERY_REQUIRED) {
     return {
       status: 409,

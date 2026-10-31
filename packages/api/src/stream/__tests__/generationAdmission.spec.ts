@@ -1,16 +1,18 @@
 import mongoose from 'mongoose';
 import { MongoMemoryReplSet } from 'mongodb-memory-server';
-import { createGenerationAdmissionMethods } from '@librechat/data-schemas';
+import { createGenerationAdmissionMethods, logger } from '@librechat/data-schemas';
 import type { GenerationCheckpointBinding } from '@librechat/data-schemas';
 import type { CreateGenerationJobOptions } from '../GenerationJobManager';
 import type { SerializableJobData } from '../interfaces/IJobStore';
+import { generationRequestBinding, GenerationAdmissionCoordinator } from '../generationAdmission';
 import { buildPendingAction, buildToolApprovalPayload } from '~/agents/hitl/policy';
 import { InMemoryEventTransport } from '../implementations/InMemoryEventTransport';
 import { NOT_OWNED_STORAGE_PROVIDERS } from '../../storage/providerObservation';
 import { RedisEventTransport } from '../implementations/RedisEventTransport';
 import { InMemoryJobStore } from '../implementations/InMemoryJobStore';
 import { GenerationJobManagerClass } from '../GenerationJobManager';
-import { generationRequestBinding } from '../generationAdmission';
+import * as admissionMetrics from '../generationAdmissionMetrics';
+import { acquireHeldError } from '../generationAdmissionError';
 import { createCheckpointNamespace } from '../checkpoints';
 
 describe('generation owner durable integration', () => {
@@ -162,6 +164,159 @@ describe('generation owner durable integration', () => {
   const options = () => ({
     generationAdmission: generationRequestBinding('request', { text: 'hello' }),
   });
+  it.each([
+    'INVALID_INPUT',
+    'REQUEST_CONFLICT',
+    'CONVERSATION_ACTIVE',
+    'HELD',
+    'OUTCOME_UNKNOWN',
+  ] as const)(
+    'retains the closed %s acquisition reason without logging private inputs',
+    async (reason) => {
+      const coordinator = new GenerationAdmissionCoordinator();
+      coordinator.configure({
+        required: true,
+        methods,
+        ownerInstanceId: 'private-pod',
+        processBootId: 'private-boot',
+      });
+      const acquire = jest
+        .spyOn(methods, 'acquireGenerationAdmission')
+        .mockResolvedValueOnce({ ok: false, error: { code: reason } });
+      const warn = jest.spyOn(logger, 'warn').mockImplementation(() => logger);
+      const record = jest.spyOn(admissionMetrics, 'recordGenerationAdmissionRefusal');
+      await expect(
+        coordinator.enroll(
+          'private-stream',
+          7,
+          'private-segment',
+          'private-principal',
+          undefined,
+          'private-conversation',
+          2,
+          generationRequestBinding('private-request', { text: 'private-body' }),
+        ),
+      ).rejects.toMatchObject({
+        code: 'GENERATION_ADMISSION_HELD',
+        status: 409,
+        stage: 'acquire',
+        reason,
+      });
+      expect(acquire).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(record).toHaveBeenCalledTimes(1);
+      expect(record).toHaveBeenCalledWith(reason);
+      const logged: unknown = warn.mock.calls[0][0];
+      expect(typeof logged).toBe('string');
+      if (typeof logged !== 'string') throw new Error('Expected a structured logger message');
+      expect(JSON.parse(logged)).toEqual({
+        event: 'generation_admission_refused',
+        code: 'GENERATION_ADMISSION_HELD',
+        stage: 'acquire',
+        reason,
+      });
+      expect(JSON.stringify(warn.mock.calls)).not.toContain('private-');
+      expect(coordinator.getLocalCustody()).toEqual({
+        pending: 0,
+        unresolved: reason === 'OUTCOME_UNKNOWN' ? 1 : 0,
+      });
+    },
+  );
+
+  it('never logs or counts an unrecognized runtime refusal reason', () => {
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => logger);
+    const record = jest.spyOn(admissionMetrics, 'recordGenerationAdmissionRefusal');
+    const error = Reflect.apply(acquireHeldError, undefined, [
+      { ok: false, error: { code: 'private-database-message' } },
+    ]);
+    expect(error).toMatchObject({ code: 'GENERATION_ADMISSION_HELD', status: 409 });
+    expect(error.reason).toBeUndefined();
+    expect(error.stage).toBeUndefined();
+    expect(warn).not.toHaveBeenCalled();
+    expect(record).not.toHaveBeenCalled();
+  });
+
+  it('preserves the original denial when metric and logger observers throw', () => {
+    jest.spyOn(admissionMetrics, 'recordGenerationAdmissionRefusal').mockImplementation(() => {
+      throw new Error('private-metric-failure');
+    });
+    jest.spyOn(logger, 'warn').mockImplementation(() => {
+      throw new Error('private-log-failure');
+    });
+    const error = acquireHeldError({ ok: false, error: { code: 'OUTCOME_UNKNOWN' } });
+    expect(error).toMatchObject({
+      code: 'GENERATION_ADMISSION_HELD',
+      status: 409,
+      stage: 'acquire',
+      reason: 'OUTCOME_UNKNOWN',
+    });
+    expect(error.message).not.toMatch(/private-/);
+  });
+
+  it('records an existing receipt as ALREADY_ADMITTED without granting dispatch', async () => {
+    const coordinator = new GenerationAdmissionCoordinator();
+    coordinator.configure({
+      required: true,
+      methods,
+      ownerInstanceId: 'pod',
+      processBootId: 'boot',
+    });
+    const binding = generationRequestBinding('prior-request', { text: 'private-body' })!;
+    const input = {
+      ...binding,
+      tenantId: '__single_tenant__',
+      principalId: 'principal',
+      conversationId: 'conversation',
+      protocol: '2',
+      ownerInstanceId: 'pod',
+      processBootId: 'boot',
+      generationEpoch: 7,
+      segmentId: 'segment',
+    };
+    const original = await methods.acquireGenerationAdmission(input);
+    if (!original.ok) throw new Error('Fixture admission failed');
+    const duplicate = jest.spyOn(methods, 'acquireGenerationAdmission').mockResolvedValueOnce({
+      ok: true,
+      value: { acquired: false, record: original.value.record },
+    });
+    const warn = jest.spyOn(logger, 'warn').mockImplementation(() => logger);
+    const record = jest.spyOn(admissionMetrics, 'recordGenerationAdmissionRefusal');
+    try {
+      await expect(
+        coordinator.enroll(
+          'stream',
+          7,
+          'segment',
+          'principal',
+          undefined,
+          'conversation',
+          2,
+          binding,
+        ),
+      ).rejects.toMatchObject({
+        code: 'GENERATION_ADMISSION_HELD',
+        stage: 'acquire',
+        reason: 'ALREADY_ADMITTED',
+      });
+      expect(record).toHaveBeenCalledTimes(1);
+      expect(record).toHaveBeenCalledWith('ALREADY_ADMITTED');
+      expect(duplicate).toHaveBeenCalledTimes(1);
+      const logged: unknown = warn.mock.calls[0][0];
+      expect(typeof logged).toBe('string');
+      if (typeof logged !== 'string') throw new Error('Expected a structured logger message');
+      expect(JSON.parse(logged)).toEqual({
+        event: 'generation_admission_refused',
+        code: 'GENERATION_ADMISSION_HELD',
+        stage: 'acquire',
+        reason: 'ALREADY_ADMITTED',
+      });
+      expect(coordinator.canBeginProviderExecution('stream', 7, 'segment')).toBe(false);
+      expect(coordinator.getLocalCustody()).toEqual({ pending: 0, unresolved: 0 });
+    } finally {
+      expect((await methods.cancelUndispatchedGenerationAdmission(input)).ok).toBe(true);
+    }
+  });
+
   const checkpoint = (): GenerationCheckpointBinding => ({
     version: 1,
     runId: 'initial-run',

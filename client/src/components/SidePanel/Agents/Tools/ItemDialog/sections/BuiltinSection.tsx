@@ -24,7 +24,7 @@ interface Props {
 }
 
 const ARTIFACT_MODES: Array<{
-  value: string;
+  value: ArtifactModes;
   labelKey: TranslationKeys;
   infoKey?: TranslationKeys;
 }> = [
@@ -46,8 +46,8 @@ const ARTIFACT_MODES: Array<{
 ];
 
 interface ArtifactsConfigProps {
-  value: string;
-  onChange: (next: string) => void;
+  value: ArtifactModes | '';
+  onChange: (next: ArtifactModes) => void;
 }
 
 function ArtifactsConfig({ value, onChange }: ArtifactsConfigProps) {
@@ -66,7 +66,10 @@ function ArtifactsConfig({ value, onChange }: ArtifactsConfigProps) {
       <Radio
         options={options}
         value={value}
-        onChange={onChange}
+        onChange={(next) => {
+          const selected = ARTIFACT_MODES.find((mode) => mode.value === next);
+          if (selected) onChange(selected.value);
+        }}
         fullWidth
         aria-labelledby="artifacts-mode-label"
       />
@@ -138,7 +141,7 @@ export default function BuiltinSection({
   const localize = useLocalize();
   const { control, setValue } = useFormContext<AgentForm>();
 
-  const artifactsValue = (useWatch({ control, name: AgentCapabilities.artifacts }) ?? '') as string;
+  const artifactsValue = useWatch({ control, name: AgentCapabilities.artifacts }) ?? '';
   const memoryScope = (useWatch({ control, name: 'memory_scope' }) ?? MemoryScope.user) as string;
 
   let body: React.ReactNode = null;

@@ -420,7 +420,7 @@ export const defaultAgentFormValues = {
   tool_options: {},
   provider: {},
   edges: [],
-  artifacts: '',
+  artifacts: '' as const,
   recursion_limit: undefined,
   [Tools.execute_code]: false,
   [Tools.file_search]: false,

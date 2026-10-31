@@ -78,7 +78,6 @@ function AgentSelect({
       const isGlobal = fullAgent.isPublic ?? false;
       const update = {
         ...fullAgent,
-        provider: createProviderOption(fullAgent.provider),
         label: fullAgent.name ?? '',
         value: fullAgent.id || '',
         icon: isGlobal ? <EarthIcon className="icon-lg text-status-success" /> : null,
@@ -120,6 +119,7 @@ function AgentSelect({
       const formValues: Partial<AgentForm & TAgentCapabilities> = {
         ...capabilities,
         agent: update,
+        provider: createProviderOption(fullAgent.provider),
         model: update.model,
         tools: agentTools,
         // Ensure the category is properly set for the form
@@ -142,8 +142,12 @@ function AgentSelect({
       };
 
       Object.entries(fullAgent).forEach(([name, value]) => {
+        if (name === 'provider') {
+          return;
+        }
+
         if (name === 'model_parameters') {
-          formValues[name] = value;
+          formValues.model_parameters = fullAgent.model_parameters;
           return;
         }
 
@@ -176,17 +180,17 @@ function AgentSelect({
         }
 
         if (name === 'edges' && Array.isArray(value)) {
-          formValues[name] = value;
+          formValues.edges = fullAgent.edges;
           return;
         }
 
         if (name === 'subagents' && typeof value === 'object' && value !== null) {
-          formValues[name] = value;
+          formValues.subagents = fullAgent.subagents;
           return;
         }
 
         if (name === 'tool_options' && typeof value === 'object' && value !== null) {
-          formValues[name] = value;
+          formValues.tool_options = fullAgent.tool_options;
           return;
         }
 

@@ -1,5 +1,6 @@
 import { Counter, Histogram } from 'prom-client';
 import type { Registry } from 'prom-client';
+import { attachGenerationAdmissionMetrics } from '../stream/generationAdmissionMetrics';
 
 type Operation = 'snapshot' | 'observer' | 'request';
 type Outcome = 'success' | 'failure' | 'cached' | 'refreshed' | 'aborted' | 'timeout' | 'busy';
@@ -12,6 +13,7 @@ let record: (
 
 /** The existing App registry owns lifecycle and publication; all labels are closed enums. */
 export function attachStatusMetrics(registry?: Registry): void {
+  attachGenerationAdmissionMetrics(registry);
   record = () => {};
   if (!registry) return;
   const calls = new Counter({

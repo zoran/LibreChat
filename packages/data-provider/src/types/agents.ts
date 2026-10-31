@@ -1183,6 +1183,8 @@ export type AgentCreateParams = {
   provider: AgentProvider;
   model: string | null;
   model_parameters: AgentModelParameters;
+  /** The existing HTTP wire uses an empty string to disable artifacts. */
+  artifacts?: ArtifactModes | '';
 } & Pick<
   Agent,
   | 'agent_ids'
@@ -1195,7 +1197,6 @@ export type AgentCreateParams = {
   | 'code_environment_ids'
   | 'code_workspace_id'
   | 'repositoryInstructions'
-  | 'artifacts'
   | 'recursion_limit'
   | 'category'
   | 'support_contact'
@@ -1222,6 +1223,8 @@ export type AgentUpdateParams = {
   provider?: AgentProvider;
   model?: string | null;
   model_parameters?: AgentModelParameters;
+  /** Preserve the explicit OFF value instead of omitting a disabling update. */
+  artifacts?: ArtifactModes | '';
 } & Pick<
   Agent,
   | 'agent_ids'
@@ -1235,7 +1238,6 @@ export type AgentUpdateParams = {
   | 'git_identity'
   | 'code_workspace_id'
   | 'repositoryInstructions'
-  | 'artifacts'
   | 'recursion_limit'
   | 'category'
   | 'support_contact'

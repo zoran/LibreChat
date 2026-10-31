@@ -28,6 +28,7 @@ let mockStartupData: {
   compactionEnabled: false,
 };
 let mockAccess: Record<string, boolean> = {};
+let mockLocale: 'en' | 'de' = 'en';
 
 /** Keep this unit spec independent of query providers while exercising the real renderer hooks. */
 jest.mock('~/hooks', () => ({
@@ -35,7 +36,9 @@ jest.mock('~/hooks', () => ({
     () =>
     (key: string, values?: Record<string, unknown>): string => {
       const template =
-        (jest.requireActual('~/locales/en/translation.json') as Record<string, string>)[key] ?? key;
+        (jest.requireActual(`~/locales/${mockLocale}/translation.json`) as Record<string, string>)[
+          key
+        ] ?? key;
       if (!values) {
         return template;
       }
@@ -152,9 +155,30 @@ const dateTimeFormat = new Intl.DateTimeFormat(undefined, {
 });
 
 beforeEach(() => {
+  mockLocale = 'en';
   mockEndpointsData = { openAI: { userProvide: true } };
   mockStartupData = { compactionEnabled: false };
   mockAccess = {};
+});
+
+describe('generation admission conflict copy', () => {
+  it('uses the stable code to show German copy without exposing diagnostic or English detail', () => {
+    mockLocale = 'de';
+    renderError({
+      status: 409,
+      code: 'GENERATION_ADMISSION_HELD',
+      error: 'Generation work is held; a confirmed admission or settlement is required',
+      reason: 'private-database-detail',
+    });
+    expect(
+      screen.getByText(
+        'Der Status deiner Anfrage ist noch unklar. Bitte sende sie vorerst nicht erneut.',
+      ),
+    ).toBeInTheDocument();
+    expect(document.body.textContent).not.toMatch(
+      /Generation work|private-database-detail|GENERATION_ADMISSION_HELD/,
+    );
+  });
 });
 
 describe('LibreChat attachment limits', () => {

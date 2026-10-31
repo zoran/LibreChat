@@ -68,7 +68,7 @@ export type AgentForm = {
   agent_ids?: string[];
   edges?: GraphEdge[];
   subagents?: AgentSubagentsConfig;
-  [AgentCapabilities.artifacts]?: ArtifactModes | string;
+  [AgentCapabilities.artifacts]?: ArtifactModes | '';
   recursion_limit?: number;
   support_contact?: SupportContact;
   conversation_starters?: string[];

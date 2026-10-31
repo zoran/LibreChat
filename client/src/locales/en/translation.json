@@ -734,6 +734,7 @@
   "com_error_request_blocked": "This request was blocked.",
   "com_error_reset_password_limit": "Too many password reset requests. Wait a moment and try again.",
   "com_error_resource_recovery_required": "Some files from this conversation could not be restored. Reattach the files and try again.",
+  "com_error_generation_admission_held": "Your request status is still uncertain. Please do not send it again for now.",
   "com_error_retry_available": "You can send another message now.",
   "com_error_retry_at": "You can send another message at {{0}}.",
   "com_error_retry_countdown": "You can send another message in {{0}}.",

@@ -13,7 +13,7 @@ const mockGetValues = jest.fn();
 
 const createMockTool = (toolId: string): AgentToolType => ({
   tool_id: toolId,
-  metadata: { name: toolId, description: `Description for ${toolId}` },
+  metadata: { name: toolId, pluginKey: toolId, description: `Description for ${toolId}` },
 });
 
 describe('useMCPToolOptions', () => {
