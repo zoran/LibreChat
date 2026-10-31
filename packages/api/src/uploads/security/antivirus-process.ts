@@ -428,6 +428,7 @@ export function createAntivirusProcessOwner(
         const anchor = lstatSync(directory);
         const args = [
           '--permit-fd=3',
+          `--parent-pid=${process.pid}`,
           '/usr/bin/setpriv',
           '--no-new-privs',
           '--inh-caps=-all',

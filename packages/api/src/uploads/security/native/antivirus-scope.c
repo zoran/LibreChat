@@ -1,9 +1,10 @@
 /* antivirus-scope.c owns only the ClamD Landlock domain scope before the existing setpriv launcher.
- * Closed ABI: exactly /usr/bin/setpriv plus its trusted owner-constructed argv; never a request path.
+ * Closed ABI: the trusted owner's parent PID and /usr/bin/setpriv argv; never a request path.
  * No privileged operation, network client, daemon, user-data parser or fallback is provided. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,18 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 struct av_ruleset { uint64_t fs, net, scoped; };
+static pid_t parent_pid(const char *arg) {
+  const char prefix[]="--parent-pid=";
+  if(strncmp(arg,prefix,sizeof prefix-1))return 0;
+  const char *value=arg+sizeof prefix-1;
+  if(*value<'1'||*value>'9')return 0;
+  int parent=0;
+  for(;*value;value++) {
+    if(*value<'0'||*value>'9'||parent>(INT_MAX-(*value-'0'))/10)return 0;
+    parent=parent*10+(*value-'0');
+  }
+  return (pid_t)parent;
+}
 static int preconditions(void) {
   FILE *f=fopen("/proc/self/status","re"); char line[512]; int caps=0, ids=0;
   if(!f || getuid()==0 || geteuid()!=getuid() || getgid()==0 || getegid()!=getgid()) return 0;
@@ -30,8 +43,8 @@ static int preconditions(void) {
 }
 int main(int argc,char **argv) {
   if(argc==2&&!strcmp(argv[1],"--gate")) { puts(preconditions()?"av-rootless-gate-open":"av-rootless-gate-closed");return preconditions()?0:77; }
-  if(argc<4||strcmp(argv[1],"--permit-fd=3")||strcmp(argv[2],"/usr/bin/setpriv")||!preconditions())return 77;
-  pid_t parent=getppid();if(parent<=1||prctl(PR_SET_PDEATHSIG,SIGKILL)||getppid()!=parent)return 77;
+  if(argc<5||strcmp(argv[1],"--permit-fd=3")||strcmp(argv[3],"/usr/bin/setpriv")||!preconditions())return 77;
+  pid_t parent=parent_pid(argv[2]);if(!parent||getppid()!=parent||prctl(PR_SET_PDEATHSIG,SIGKILL)||getppid()!=parent)return 77;
   char permit=0;if(read(3,&permit,1)!=1||permit!='G')return 78;close(3);
   int abi=syscall(SYS_landlock_create_ruleset,NULL,0,1);
   if(abi<6||prctl(PR_SET_NO_NEW_PRIVS,1,0,0,0))return 77;
@@ -39,5 +52,5 @@ int main(int argc,char **argv) {
   int fd=syscall(SYS_landlock_create_ruleset,&rule,sizeof rule,0);
   if(fd<0)return 77;
   int ok=syscall(SYS_landlock_restrict_self,fd,0);close(fd);if(ok)return 77;
-  execv("/usr/bin/setpriv",argv+2);return 78;
+  execv("/usr/bin/setpriv",argv+3);return 78;
 }
